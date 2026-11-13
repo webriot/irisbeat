@@ -66,6 +66,11 @@ export function operatorPage() {
         </aside>
         <div><button>Save configuration</button></div>
       </form>
+      <form id="webhook" aria-labelledby="webhook-heading">
+        <h2 id="webhook-heading">Operator alerts</h2>
+        <label for="webhookUrl">HTTPS webhook URL</label><input id="webhookUrl" name="url" type="url" maxlength="2048" autocomplete="off">
+        <button>Save webhook</button>
+      </form>
       <section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2><ul id="incidents" class="incidents"></ul></section>
       <div class="actions"><button id="refresh" type="button">Refresh</button><button id="logout" type="button">Sign out</button></div>
     </section>
@@ -114,6 +119,7 @@ const login = document.getElementById('login');
 const editor = document.getElementById('editor');
 const form = document.getElementById('configuration');
 const message = document.getElementById('message');
+const webhook = document.getElementById('webhook');
 let secret = '';
 const timingDefaults = { intervalSeconds: 60, timeoutSeconds: 10, failureThreshold: 2, recoveryThreshold: 2, silenceSeconds: 180, recoverySpacingSeconds: 60 };
 async function load(method = 'GET') {
@@ -132,6 +138,7 @@ async function load(method = 'GET') {
     if (!response.ok) throw new Error(data.error || 'Request failed');
     login.hidden = true;
     editor.hidden = false;
+    document.getElementById('webhookUrl').value = data.webhookUrl || '';
     document.getElementById('pageName').value = data.pageName;
     document.getElementById('name').value = data.monitor?.name || '';
     document.getElementById('url').value = data.monitor?.url || '';
@@ -173,11 +180,24 @@ login.addEventListener('submit', async event => {
   await load(); document.getElementById('secret').value = '';
   if (!editor.hidden) document.getElementById('name').focus();
 });
+webhook.addEventListener('submit', async event => {
+  event.preventDefault(); message.textContent = '';
+  try {
+    const response = await fetch('/api/operator/webhook', {
+      method: 'PUT', headers: { Authorization: 'Bearer ' + secret, 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.fromEntries(new FormData(webhook)))
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Request failed');
+    document.getElementById('webhookUrl').value = data.webhookUrl || '';
+    message.textContent = data.webhookUrl ? 'Webhook saved' : 'Webhook removed';
+  } catch (error) { message.textContent = error.message; }
+});
 form.addEventListener('submit', async event => { event.preventDefault(); await load('PUT'); });
 document.getElementById('monitor-link').addEventListener('click', () => document.getElementById('name').focus());
 document.getElementById('refresh').addEventListener('click', () => load());
 document.getElementById('logout').addEventListener('click', () => {
-  secret = ''; form.reset(); editor.hidden = true; login.hidden = false;
+  secret = ''; form.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
   document.getElementById('monitor-link').textContent = 'Configure website';
   document.getElementById('state').textContent = '';
   document.getElementById('incidents').replaceChildren(); message.textContent = '';

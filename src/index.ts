@@ -39,7 +39,7 @@ type Monitor = Configuration & Timing & {
   recoveryReceiptAt: number | null;
 };
 export type Status = ReturnType<MonitoringContext["status"]>;
-type StoredContext = { monitor: Monitor | null };
+type StoredContext = { monitor: Monitor | null; webhookUrl?: string | null };
 
 export class MonitoringContext extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -77,6 +77,13 @@ export class MonitoringContext extends DurableObject<Env> {
     return this.status(true);
   }
 
+  configureWebhook(url: string | null) {
+    const state = this.read();
+    state.webhookUrl = url;
+    this.ctx.storage.kv.put("context", state);
+    return this.status(true);
+  }
+
   private checking = false;
 
   async check(at: number) {
@@ -85,7 +92,7 @@ export class MonitoringContext extends DurableObject<Env> {
     if (attempt?.kind === "heartbeat") {
       if (at >= (attempt.lastSeen ?? attempt.createdAt) + attempt.silenceSeconds * 1000) {
         attempt.recoveryReceiptAt = null;
-        this.record(state, attempt, at, false, 1, attempt.recoveryThreshold);
+        await this.record(state, attempt, at, false, 1, attempt.recoveryThreshold);
       }
       return;
     }
@@ -114,13 +121,14 @@ export class MonitoringContext extends DurableObject<Env> {
     // Record the executed attempt without overwriting newer configuration.
     const monitor = current.monitor;
     if (!monitor) return;
-    this.record(current, monitor, at, success, attempt.failureThreshold, attempt.recoveryThreshold);
+    await this.record(current, monitor, at, success, attempt.failureThreshold, attempt.recoveryThreshold);
   }
 
-  private record(current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number) {
+  private async record(current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number) {
     monitor.lastResult = { at, outcome: success ? "success" : "failure" };
     monitor.failures = success ? 0 : monitor.failures + 1;
     monitor.successes = success ? monitor.successes + 1 : 0;
+    let transition: "opened" | "recovered" | undefined;
     this.ctx.storage.transactionSync(() => {
       const open = this.ctx.storage.sql
         .exec<Incident>(
@@ -128,6 +136,7 @@ export class MonitoringContext extends DurableObject<Env> {
         )
         .toArray()[0];
       if (!open && monitor.failures >= failureThreshold) {
+        transition = "opened";
         monitor.state = "down";
         this.ctx.storage.sql.exec(
           "INSERT INTO incidents (id, monitorId, openedAt) VALUES (?, ?, ?)",
@@ -141,6 +150,7 @@ export class MonitoringContext extends DurableObject<Env> {
           at,
           open.id,
         );
+        transition = "recovered";
         monitor.state = "up";
       } else if (!open && success) {
         monitor.state = "up";
@@ -148,9 +158,38 @@ export class MonitoringContext extends DurableObject<Env> {
       current.monitor = monitor;
       this.ctx.storage.kv.put("context", current);
     });
+    // Delivery follows the committed transition; transport failure cannot undo detection.
+    if (transition && current.webhookUrl)
+      await this.deliverWebhook(current.webhookUrl, monitor.name, transition);
   }
 
-  heartbeat(id: string, at: number) {
+  private async deliverWebhook(
+    url: string,
+    name: string,
+    transition: "opened" | "recovered",
+  ) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10_000);
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: `${name.replace(/\s+/g, " ")}: Incident ${transition}`,
+        }),
+        redirect: "manual",
+        signal: controller.signal,
+      });
+      await response.body?.cancel();
+      if (!response.ok) throw new Error("Delivery failed");
+    } catch {
+      console.error(JSON.stringify({ event: "webhook_delivery_failed" }));
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async heartbeat(id: string, at: number) {
     const current = this.read();
     const monitor = current.monitor;
     if (!monitor || monitor.id !== id || monitor.kind !== "heartbeat") return false;
@@ -158,7 +197,7 @@ export class MonitoringContext extends DurableObject<Env> {
     if (monitor.state !== "down" || monitor.recoveryReceiptAt === null ||
         at >= monitor.recoveryReceiptAt + monitor.recoverySpacingSeconds * 1000) {
       monitor.recoveryReceiptAt = at;
-      this.record(current, monitor, at, true, 1, monitor.recoveryThreshold);
+      await this.record(current, monitor, at, true, 1, monitor.recoveryThreshold);
     } else {
       this.ctx.storage.kv.put("context", current);
     }
@@ -168,6 +207,7 @@ export class MonitoringContext extends DurableObject<Env> {
   status(operator = false) {
     const state = this.read();
     return {
+      ...(operator ? { webhookUrl: state.webhookUrl ?? null } : {}),
       pageName: state.monitor?.pageName ?? "Irisbeat",
       monitor: state.monitor
         ? {
@@ -246,6 +286,30 @@ function parseConfiguration(value: unknown, existingKind: Configuration["kind"] 
   }
 }
 
+function parseWebhook(value: unknown): string | null | undefined {
+  if (value === "") return null;
+  if (typeof value !== "string" || value.length > 2048 || /\s/.test(value))
+    return undefined;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password || url.hash)
+      return undefined;
+    const discordPath = url.pathname.match(
+      /^(\/api(?:\/v\d+)?\/webhooks\/[^/]+\/[^/]+)(?:\/slack)?\/?$/,
+    );
+    if (
+      /^(?:(?:canary|ptb)\.)?discord(?:app)?\.com$/.test(url.hostname) &&
+      discordPath
+    ) {
+      url.pathname = discordPath[1] + "/slack";
+      return url.href;
+    }
+    return value;
+  } catch {
+    return undefined;
+  }
+}
+
 export default {
   async scheduled(controller, env) {
     await env.MONITORING.getByName("personal").check(controller.scheduledTime);
@@ -305,7 +369,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         headers: { "Content-Type": "text/javascript; charset=utf-8" },
       });
   }
-  if (path === "/api/operator") {
+  if (path === "/api/operator" || path === "/api/operator/webhook") {
     if (!(await authorized(request, env.INSTALLATION_SECRET)))
       return Response.json({ error: "Unauthorized" }, { status: 401 });
     if (request.method === "GET")
@@ -344,6 +408,18 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         value = JSON.parse(body);
       } catch {
         return Response.json({ error: "Invalid JSON" }, { status: 400 });
+      }
+      if (path === "/api/operator/webhook") {
+        const url = value && typeof value === "object"
+          ? (value as Record<string, unknown>).url
+          : undefined;
+        const destination = parseWebhook(url);
+        if (destination === undefined)
+          return Response.json(
+            { error: "Enter an HTTPS webhook URL" },
+            { status: 400 },
+          );
+        return Response.json(await context.configureWebhook(destination));
       }
       const existing = (await context.status(true)).monitor;
       const configuration = parseConfiguration(value, existing?.kind);
