@@ -1,0 +1,6 @@
+{
+  "name": "irisbeat-contract-test-consumer",
+  "private": true,
+  "type": "module",
+  "dependencies": { "irisbeat": "file:../../dist/irisbeat-0.1.0.tgz" }
+}

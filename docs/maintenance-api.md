@@ -50,11 +50,12 @@ this change does not synthesize them. Existing Incident history is unchanged.
 ## Hosted #10 and pause #11
 
 `maintenance(id, value, end?)` is a synchronous DO operation. When merging #10,
-include the route in hosted editor authorization and keep reader controls hidden;
-retain adapter context resolution, operator metadata, allowance enforcement and
+the route uses hosted editor authorization and hides reader controls.
+Retain adapter context resolution, operator metadata, allowance enforcement and
 heartbeat credential rotation. Suppression returns from shared `record` before
 Incident mutation or post-commit delivery; both `deliverWebhook` and
-`onIncidentTransition` must remain downstream of it. There are no Maintenance
+`onIncidentTransition` remain downstream of it. Installed-consumer tests cover
+both delivery paths for HTTP, TCP and Heartbeat. There are no Maintenance
 transition alert events.
 
 #11 must make pause override Maintenance for checking/recording/display and retain
