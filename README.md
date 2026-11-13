@@ -16,6 +16,8 @@ Track work in [GitHub Issues](https://github.com/Webriot/irisbeat/issues). Agent
 
 ## License
 
-This project's own code is source-available under the [Functional Source License 1.1, Apache-2.0 future license](LICENSE) (`FSL-1.1-ALv2`). Each version becomes additionally available under Apache-2.0 on the second anniversary of the date it is made available. FSL restricts competing commercial uses; see the full license for its terms.
+Copyright 2026 Webriot.
+
+This project's own code is licensed under the [GNU Affero General Public License, version 3](LICENSE) (`AGPL-3.0-only`).
 
 Third-party components retain their own licenses.

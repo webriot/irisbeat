@@ -7,7 +7,7 @@
 
 Read `README.md` before planning product changes; it defines the public application and hosted integration boundary.
 Keep infrastructure and secrets out of this public repository. Preserve third-party license notices.
-Describe this project's own code as source-available under FSL-1.1-ALv2; see `LICENSE`.
+Describe this project's own code as open source under AGPL-3.0-only; see `LICENSE`.
 
 ## Agent skills
 
