@@ -34,8 +34,10 @@ export type Incident = {
   openedAt: number;
   closedAt: number | null;
 };
-type CheckResult = { at: number; outcome: "success" | "failure" };
+type CheckResult = { at: number; outcome: "success" | "failure" | "maintenance" };
+export type MaintenanceWindow = { startedAt: number; endsAt: number };
 type Monitor = MonitorConfiguration & Timing & {
+  maintenance?: MaintenanceWindow | null;
   published: boolean;
   id: string;
   state: "unknown" | "up" | "down";
@@ -57,15 +59,26 @@ export class MonitoringContext extends DurableObject<Env> {
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS incidents (
       id TEXT PRIMARY KEY, monitorId TEXT NOT NULL, openedAt INTEGER NOT NULL, closedAt INTEGER
     )`);
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS observations (
+      id INTEGER PRIMARY KEY, monitorId TEXT NOT NULL, at INTEGER NOT NULL, outcome TEXT NOT NULL
+    )`);
     if (!ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(incidents)").toArray().some(column => column.name === "monitorName")) {
       ctx.storage.sql.exec("ALTER TABLE incidents ADD COLUMN monitorName TEXT");
     }
   }
-  private read(): StoredContext {
+  private read(at = Date.now()): StoredContext {
     const stored = this.ctx.storage.kv.get<StoredContext | LegacyContext>("context");
     if (!stored) return { pageName: "Irisbeat", monitors: [] };
     if ("monitors" in stored) {
       stored.monitors = stored.monitors.map(monitor => { monitor.kind ??= "http"; return { ...timingDefaults, ...monitor, createdAt: monitor.createdAt ?? 0, lastSeen: monitor.lastSeen ?? null, recoveryReceiptAt: monitor.recoveryReceiptAt ?? null }; });
+      let changed = false;
+      for (const monitor of stored.monitors) {
+        if (monitor.maintenance && at >= monitor.maintenance.endsAt) {
+          this.endMaintenance(monitor);
+          changed = true;
+        }
+      }
+      if (changed) this.ctx.storage.kv.put("context", stored);
       return stored;
     }
     const { monitor: legacyMonitor, ...context } = stored;
@@ -138,6 +151,31 @@ export class MonitoringContext extends DurableObject<Env> {
     return this.status(true);
   }
 
+  private endMaintenance(monitor: Monitor) {
+    monitor.maintenance = null;
+    monitor.failures = 0;
+    monitor.successes = 0;
+    monitor.recoveryReceiptAt = null;
+  }
+
+  maintenance(id: string, value: unknown, end = false) {
+    const at = Date.now();
+    const state = this.read(at);
+    const monitor = state.monitors.find(monitor => monitor.id === id);
+    if (!monitor) return null;
+    if (end) {
+      if (monitor.maintenance) this.endMaintenance(monitor);
+    } else {
+      if (!value || typeof value !== "object" || Array.isArray(value) ||
+          Object.keys(value).length !== 1 || !("endsAt" in value) ||
+          typeof value.endsAt !== "number" || !Number.isSafeInteger(value.endsAt) ||
+          value.endsAt <= at || value.endsAt > 8_640_000_000_000_000) return undefined;
+      monitor.maintenance = { startedAt: at, endsAt: value.endsAt };
+    }
+    this.ctx.storage.kv.put("context", state);
+    return this.status(true);
+  }
+
   private applyEdit(monitor: Monitor, patch: Partial<MonitorConfiguration>) {
     // Preserve #3's last-dispatch anchor, including a running attempt.
     if (monitor.nextDue && patch.intervalSeconds !== undefined)
@@ -160,7 +198,7 @@ export class MonitoringContext extends DurableObject<Env> {
   }
 
   private async checkMonitor(id: string, at: number) {
-    const state = this.read();
+    const state = this.read(at);
     const attempt = state.monitors.find(monitor => monitor.id === id);
     if (!attempt) return;
     if (attempt.kind === "heartbeat") {
@@ -210,7 +248,7 @@ export class MonitoringContext extends DurableObject<Env> {
       }
       this.checking.delete(id);
     }
-    const current = this.read();
+    const current = this.read(at);
     // Record the executed attempt without overwriting newer configuration.
     const monitor = current.monitors.find(monitor => monitor.id === attempt.id);
     if (!monitor) return;
@@ -218,7 +256,12 @@ export class MonitoringContext extends DurableObject<Env> {
   }
 
   private async record(current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number) {
-    monitor.lastResult = { at, outcome: success ? "success" : "failure" };
+    monitor.lastResult = { at, outcome: monitor.maintenance ? "maintenance" : success ? "success" : "failure" };
+    this.ctx.storage.sql.exec("INSERT INTO observations (monitorId, at, outcome) VALUES (?, ?, ?)", monitor.id, at, monitor.lastResult.outcome);
+    if (monitor.maintenance) {
+      this.ctx.storage.kv.put("context", current);
+      return;
+    }
     monitor.failures = success ? 0 : monitor.failures + 1;
     monitor.successes = success ? monitor.successes + 1 : 0;
     let transition: "opened" | "recovered" | undefined;
@@ -288,7 +331,9 @@ export class MonitoringContext extends DurableObject<Env> {
     const monitor = current.monitors.find(monitor => monitor.id === id);
     if (!monitor || monitor.kind !== "heartbeat") return false;
     monitor.lastSeen = at;
-    if (monitor.state !== "down" || monitor.recoveryReceiptAt === null ||
+    if (monitor.maintenance) {
+      await this.record(current, monitor, at, true, 1, monitor.recoveryThreshold);
+    } else if (monitor.state !== "down" || monitor.recoveryReceiptAt === null ||
         at >= monitor.recoveryReceiptAt + monitor.recoverySpacingSeconds * 1000) {
       monitor.recoveryReceiptAt = at;
       await this.record(current, monitor, at, true, 1, monitor.recoveryThreshold);
@@ -302,7 +347,7 @@ export class MonitoringContext extends DurableObject<Env> {
     const state = this.read();
     const monitors = state.monitors.filter(monitor => operator || monitor.published).map(monitor => ({
       id: monitor.id, name: monitor.name, kind: monitor.kind,
-      ...(monitor.kind === "heartbeat" ? { lastSeen: monitor.lastSeen } : {}), state: monitor.state, lastResult: monitor.lastResult,
+      ...(monitor.kind === "heartbeat" ? { lastSeen: monitor.lastSeen } : {}), state: monitor.maintenance ? "maintenance" as const : monitor.state, maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult,
       ...(operator ? {
         kind: monitor.kind,
         ...(monitor.kind === "tcp" ? { hostname: monitor.hostname, port: monitor.port } : monitor.kind === "http" ? { url: monitor.url } : {}),
@@ -499,19 +544,24 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         headers: { "Content-Type": "text/javascript; charset=utf-8" },
       });
   }
+  const maintenanceMatch = path.match(/^\/api\/operator\/monitors\/([^/]+)\/maintenance$/);
   const monitorMatch = path.match(/^\/api\/operator\/monitors\/([^/]+)$/);
-  if (path === "/api/operator" || path === "/api/operator/webhook" || path === "/api/operator/monitors" || monitorMatch) {
+  if (path === "/api/operator" || path === "/api/operator/webhook" || path === "/api/operator/monitors" || monitorMatch || maintenanceMatch) {
     if (!(await authorized(request, env.INSTALLATION_SECRET)))
       return Response.json({ error: "Unauthorized" }, { status: 401 });
+    if (maintenanceMatch && request.method === "DELETE") {
+      const result = await context.maintenance(maintenanceMatch[1], null, true);
+      return result ? Response.json(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
+    }
     if (monitorMatch && request.method === "DELETE") {
       const result = await context.remove(monitorMatch[1]);
       return result ? Response.json(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
     }
-    if (request.method === "GET" && !monitorMatch)
+    if (request.method === "GET" && !monitorMatch && !maintenanceMatch)
       return Response.json(await context.status(true));
     if (((path === "/api/operator" || path === "/api/operator/webhook") && request.method === "PUT") ||
         (path === "/api/operator/monitors" && request.method === "POST") ||
-        (monitorMatch && request.method === "PATCH")) {
+        (monitorMatch && request.method === "PATCH") || (maintenanceMatch && request.method === "PUT")) {
       if (!request.headers.get("Content-Type")?.startsWith("application/json"))
         return Response.json(
           { error: "Use application/json" },
@@ -559,6 +609,11 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           );
         return Response.json(await context.configureWebhook(destination));
       }
+      if (maintenanceMatch) {
+        const result = await context.maintenance(maintenanceMatch[1], value);
+        if (result === undefined) return Response.json({ error: "Enter a future end time in epoch milliseconds" }, { status: 400 });
+        return result ? Response.json(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
+      }
       if (monitorMatch) {
         const result = await context.edit(monitorMatch[1], value);
         if (result === undefined) return Response.json({ error: "Enter valid Monitor settings and an HTTP(S)/TCP target or Heartbeat settings; type cannot change" }, { status: 400 });
@@ -586,7 +641,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       if (result === undefined) return Response.json({ error: "Monitor type cannot change" }, { status: 400 });
       return result ? Response.json(result) : Response.json({ error: "Monitor changed; reload before saving" }, { status: 409 });
     }
-    return new Response(null, { status: 405, headers: { Allow: monitorMatch ? "PATCH, DELETE" : path === "/api/operator/monitors" ? "GET, POST" : "GET, PUT" } });
+    return new Response(null, { status: 405, headers: { Allow: maintenanceMatch ? "PUT, DELETE" : monitorMatch ? "PATCH, DELETE" : path === "/api/operator/monitors" ? "GET, POST" : "GET, PUT" } });
   }
   if (path === "/api/status" && request.method === "GET")
     return Response.json(await context.status());

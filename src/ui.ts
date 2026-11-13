@@ -13,6 +13,7 @@ const stateLabel = {
   unknown: "Awaiting check",
   up: "Operational",
   down: "Unavailable",
+  maintenance: "Maintenance",
 };
 function document(title: string, body: string, operator = false) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(title)}</title><link rel="stylesheet" href="/app.css">${operator ? "" : '<meta http-equiv="refresh" content="60">'}</head><body><header><a class="brand" href="/">irisbeat</a><nav aria-label="Application"><a href="/"${operator ? "" : ' aria-current="page"'}>Status page</a><a href="/operator"${operator ? ' aria-current="page"' : ""}>Operator</a></nav></header><main>${body}</main></body></html>`;
@@ -23,8 +24,12 @@ export function statusPage(status: Status) {
     `<time datetime="${new Date(at).toISOString()}">${new Date(at).toISOString()}</time>`;
   const banner = !status.monitors.length
     ? "No Monitors published"
-    : status.monitors.some(monitor => monitor.state === "down")
+    : status.incidents.some(incident => incident.closedAt === null) || status.monitors.some(monitor => monitor.state === "down")
       ? "Services unavailable"
+      : status.monitors.every(monitor => monitor.state === "maintenance")
+        ? "Maintenance"
+      : status.monitors.every(monitor => monitor.state === "up" || monitor.state === "maintenance") && status.monitors.some(monitor => monitor.state === "maintenance")
+        ? "Some services in Maintenance"
       : status.monitors.every(monitor => monitor.state === "up")
         ? "All services operational"
         : "Awaiting check";
@@ -44,6 +49,11 @@ export function operatorPage() {
     <form id="login"><label for="secret">Installation secret</label><input id="secret" type="password" required autocomplete="current-password"><button>Sign in</button></form>
     <section id="editor" hidden>
       <table aria-label="Monitors"><thead><tr><th scope="col">Monitor</th><th scope="col">State</th><th scope="col">Publication</th><th scope="col">Actions</th></tr></thead><tbody id="monitor-rows"></tbody></table>
+      <form id="maintenance" hidden aria-labelledby="maintenance-heading">
+        <h2 id="maintenance-heading">Maintenance</h2>
+        <label for="maintenance-end">End time</label><input id="maintenance-end" type="datetime-local" required>
+        <button id="save-maintenance">Declare Maintenance</button><button id="cancel-maintenance" type="button">Cancel</button>
+      </form>
       <button id="new-monitor" type="button">New Monitor</button>
       <div class="configuration-layout">
         <form id="configuration" hidden aria-labelledby="monitor-settings">
@@ -128,6 +138,7 @@ const editor = byId('editor');
 const form = byId('configuration');
 const pageForm = byId('page-configuration');
 const webhook = byId('webhook');
+const maintenanceForm = byId('maintenance');
 const message = byId('message');
 const timingDefaults = { intervalSeconds: 60, timeoutSeconds: 10, failureThreshold: 2, recoveryThreshold: 2, silenceSeconds: 180, recoverySpacingSeconds: 60 };
 let secret = '';
@@ -151,8 +162,16 @@ function edit(monitor = null) {
   byId('name').focus();
 }
 function cancelEdit() { editingId = null; form.reset(); form.hidden = true; }
+function declareMaintenance(monitor) {
+  maintenanceForm.dataset.monitorId = monitor.id;
+  byId('maintenance-heading').textContent = monitor.name + ' — Maintenance';
+  byId('save-maintenance').textContent = monitor.maintenance ? 'Replace Maintenance' : 'Declare Maintenance';
+  const end = new Date(monitor.maintenance?.endsAt ?? Date.now() + 3600000);
+  byId('maintenance-end').value = new Date(end.getTime() - end.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  maintenanceForm.hidden = false; byId('maintenance-end').focus();
+}
 function signOut() {
-  secret = ''; cancelEdit(); pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
+  secret = ''; cancelEdit(); maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
   byId('monitor-rows').replaceChildren(); byId('incidents').replaceChildren();
   message.textContent = ''; byId('secret').value = ''; byId('secret').focus();
 }
@@ -170,8 +189,10 @@ function render(data) {
     const path = '/api/operator/monitors/' + encodeURIComponent(monitor.id);
     for (const [label, action] of [
       ['Edit', () => edit(monitor)],
+      [monitor.maintenance ? 'Replace Maintenance' : 'Declare Maintenance', () => declareMaintenance(monitor)],
+      ...(monitor.maintenance ? [['End Maintenance', () => run(path + '/maintenance', 'DELETE', undefined, () => { maintenanceForm.hidden = true; })]] : []),
       [monitor.published ? 'Unpublish' : 'Publish', () => run(path, 'PATCH', { published: !monitor.published })],
-      ['Delete', () => { if (confirm('Delete ' + monitor.name + '?')) run(path, 'DELETE', undefined, () => { if (editingId === monitor.id) cancelEdit(); }); }]
+      ['Delete', () => { if (confirm('Delete ' + monitor.name + '?')) run(path, 'DELETE', undefined, () => { if (editingId === monitor.id) cancelEdit(); if (maintenanceForm.dataset.monitorId === monitor.id) maintenanceForm.hidden = true; }); }]
     ]) {
       const button = document.createElement('button'); button.type = 'button'; button.textContent = label;
       button.setAttribute('aria-label', label + ' ' + monitor.name);
@@ -205,7 +226,7 @@ async function run(path = '/api/operator', method = 'GET', body, after) {
     const data = await response.json();
     if (!response.ok) { if (response.status === 401) signOut(); throw new Error(data.error || 'Request failed'); }
     render(data); if (after) after();
-    if (method !== 'GET') message.textContent = method === 'DELETE' ? 'Deleted' : 'Saved';
+    if (method !== 'GET') message.textContent = method === 'DELETE' ? (path.endsWith('/maintenance') ? 'Maintenance ended' : 'Deleted') : 'Saved';
   } catch (error) { message.textContent = error.message; }
   finally {
     busy = false;
@@ -245,6 +266,11 @@ form.addEventListener('submit', async event => {
   for (const field of Object.keys(timingDefaults)) { if (!byId(field).disabled) body[field] = Number(byId(field).value); }
   await run('/api/operator/monitors' + (editingId ? '/' + encodeURIComponent(editingId) : ''), editingId ? 'PATCH' : 'POST', body, cancelEdit);
 });
+maintenanceForm.addEventListener('submit', async event => {
+  event.preventDefault();
+  await run('/api/operator/monitors/' + encodeURIComponent(maintenanceForm.dataset.monitorId) + '/maintenance', 'PUT', { endsAt: new Date(byId('maintenance-end').value).getTime() }, () => { maintenanceForm.hidden = true; });
+});
+byId('cancel-maintenance').addEventListener('click', () => { maintenanceForm.hidden = true; });
 webhook.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator/webhook', 'PUT', { url: byId('webhookUrl').value }); });
 pageForm.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator', 'PUT', { pageName: byId('pageName').value }); });
 byId('new-monitor').addEventListener('click', () => edit());
