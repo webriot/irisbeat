@@ -2,7 +2,7 @@
 import { createHostedWorker } from '../src/index';
 import { env } from 'cloudflare:workers';
 import { reset } from 'cloudflare:test';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 const app = createHostedWorker({
   contractVersion: '1',
   resolve(request) {
@@ -14,7 +14,7 @@ const app = createHostedWorker({
   contexts: () => ['a.example', 'b.example'],
 });
 const request = (host: string, path: string, method = 'GET', body?: unknown, token = 'editor') => app.fetch(new Request('https://' + host + path, { method, headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', 'x-context-id': 'b.example' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }), env);
-afterEach(() => reset());
+afterEach(async () => { vi.restoreAllMocks(); await reset(); });
 it('resolves only trusted hosts and isolates context names and operator access', async () => {
   expect((await request('unknown.example', '/api/status')).status).toBe(404);
   expect((await request('a.example', '/api/operator', 'PUT', { pageName: 'Tenant A' })).status).toBe(200);
@@ -95,4 +95,23 @@ it('denies every mutation to readers and keeps public names and destinations iso
   expect(await (await request('a.example', '/api/operator', 'GET', undefined, 'reader')).json()).toMatchObject({ pageName: 'A only', monitors: [{ name: 'Private producer' }] });
   expect(await (await request('a.example', '/api/status')).json()).toMatchObject({ pageName: 'A only', monitors: [] });
   expect(await (await request('b.example', '/api/status')).json()).toMatchObject({ pageName: 'Irisbeat', monitors: [] });
+});
+
+it('restricts Maintenance to context editors and preserves hosted metadata and reader destination filtering', async () => {
+  const now = Date.UTC(2026, 10, 13);
+  vi.spyOn(Date, 'now').mockReturnValue(now);
+  await request('a.example', '/api/operator/monitors', 'POST', { name: 'Producer', kind: 'heartbeat', published: false });
+  const saved = await (await request('a.example', '/api/operator')).json() as { monitor: { id: string } };
+  const path = '/api/operator/monitors/' + saved.monitor.id + '/maintenance';
+  expect((await request('a.example', path, 'PUT', { endsAt: now + 60_000 }, 'reader')).status).toBe(403);
+  expect((await request('a.example', path, 'DELETE', undefined, 'reader')).status).toBe(403);
+  expect((await request('b.example', path, 'PUT', { endsAt: now + 60_000 })).status).toBe(404);
+  expect(await (await request('a.example', path, 'PUT', { endsAt: now + 60_000 })).json()).toMatchObject({ hosted: true, permission: 'editor', monitor: { state: 'maintenance' } });
+  await request('a.example', '/api/operator/webhook', 'PUT', { url: 'https://alerts.example/private-destination' });
+  const reader = await request('a.example', '/api/operator', 'GET', undefined, 'reader');
+  const data = await reader.text();
+  expect(data).toContain('maintenance');
+  expect(data).not.toContain('private-destination');
+  expect(await (await request('a.example', '/api/status')).json()).toMatchObject({ monitors: [] });
+  expect(await (await request('a.example', path, 'DELETE')).json()).toMatchObject({ hosted: true, permission: 'editor', monitor: { maintenance: null } });
 });

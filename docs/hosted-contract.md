@@ -110,8 +110,12 @@ Pause is **not implemented by this ticket**. #11 should extend this context adap
 and shared DO detector with the spec's explicit pause/resume semantics; merely
 omitting an ID from `contexts()` does not implement pause (receipts still detect
 and no paused banner/reset exists). No pause flag or claim is exposed here.
-Maintenance #8 must apply its suppression decision to both `deliverWebhook` and
-`onIncidentTransition` in `record`; the hosted hook must never bypass that guard.
+Maintenance #8 returns from shared `record` before Incident mutation and both
+`deliverWebhook` and `onIncidentTransition`; the hosted hook must never bypass that
+guard. Editors use `PUT`/`DELETE /api/operator/monitors/:id/maintenance`; readers
+cannot mutate windows. See [Maintenance handoff](maintenance-api.md) for status
+fields, observation retention, and the #11 precedence seam. Installed-consumer
+coverage verifies suppression of both delivery paths for all three check kinds.
 The hook observes committed detector transitions, not every raw observation.
 History remains its own ticket. The release candidate must be
 regenerated after integration changes, before #12 publishes anything.
