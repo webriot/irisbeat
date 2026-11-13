@@ -41,12 +41,14 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
   let deliveryFails = false;
   let releaseWebhook, webhookStarted;
   let holdWebhook = false;
+  let overlapAction;
   let now = 0;
   const mf = new Miniflare(convertV4MiniflareOptions({ name: 'consumer', modules: true, script, compatibilityDate: '2026-11-13', durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } }, outboundService: async request => {
     if (request.url.startsWith('https://delivery.example/')) { deliveries.push(await request.json()); return new Response(null, { status: deliveryFails ? 503 : 204 }); }
     if (request.url.startsWith('https://webhook.example/')) { webhooks.push(await request.json());
       if (holdWebhook) { await new Promise(resolve => { releaseWebhook = resolve; webhookStarted(); }); }
       return new Response(null, { status: 204 }); }
+    if (overlapAction) await overlapAction();
     return new Response(null, { status: outcome });
   } }));
   const request = (host, path, method = 'GET', body, token = 'editor') => mf.dispatchFetch('https://' + host + path, { method, headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', 'x-test-at': String(now) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
@@ -152,6 +154,56 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       assert.equal(deliveries.at(-1).transition, 'recovered');
       await request('a.example', path, 'DELETE');
     }
+    for (const kind of ['http', 'tcp']) {
+      const base = now + 60_000;
+      now = base; outcome = 503;
+      const target = kind === 'http' ? { url: 'https://target.example/' } : { hostname: 'db.example', port: 5432 };
+      const added = await (await request('a.example', '/api/operator/monitors', 'POST', { name: 'Overlap ' + kind, kind, ...target })).json();
+      const path = '/api/operator/monitors/' + added.monitors.at(-1).id;
+      const before = [deliveries.length, webhooks.length];
+      overlapAction = async () => {
+        overlapAction = undefined;
+        now = base + 1_000;
+        await request('a.example', path + '/maintenance', 'PUT', { endsAt: base + 5_000 });
+        now = base + 2_000;
+        await request('a.example', path + '/maintenance', 'PUT', { endsAt: base + 3_000 });
+        now = base + 2_500;
+        await request('a.example', path + '/maintenance', 'DELETE');
+      };
+      await tick(base);
+      let current = await (await request('a.example', '/api/operator')).json();
+      assert.deepEqual(current.monitor.lastResult, { at: base, outcome: 'maintenance' });
+      assert.deepEqual([deliveries.length, webhooks.length], before, kind + ' completed window overlap suppresses both paths');
+      await tick(base + 60_000);
+      assert.deepEqual([deliveries.length, webhooks.length], before, 'overlap does not seed failure counts');
+      await tick(base + 120_000);
+      const incident = deliveries.at(-1).incident;
+      assert.deepEqual([deliveries.length, webhooks.length], before.map(n => n + 1));
+      now = base + 179_000;
+      await request('a.example', path + '/maintenance', 'PUT', { endsAt: base + 185_000 });
+      outcome = 204;
+      let expiredWindow = 'not evaluated';
+      overlapAction = async () => {
+        overlapAction = undefined;
+        now = base + 181_000;
+        await request('a.example', path + '/maintenance', 'PUT', { endsAt: base + 182_000 });
+        now = base + 182_000;
+        expiredWindow = (await (await request('a.example', '/api/operator')).json()).monitor.maintenance;
+      };
+      await tick(base + 180_000);
+      assert.equal(expiredWindow, null);
+      current = await (await request('a.example', '/api/operator')).json();
+      assert.deepEqual(current.monitor.lastResult, { at: base + 180_000, outcome: 'maintenance' });
+      assert.equal(current.incidents.find(candidate => candidate.id === incident.id).closedAt, null);
+      assert.deepEqual([deliveries.length, webhooks.length], before.map(n => n + 1), kind + ' overlap after replacement expiry freezes both deliveries');
+      await tick(base + 240_000);
+      assert.deepEqual([deliveries.length, webhooks.length], before.map(n => n + 1), 'overlap does not seed recovery counts');
+      await tick(base + 300_000);
+      assert.deepEqual([deliveries.length, webhooks.length], before.map(n => n + 2));
+      assert.equal(deliveries.at(-1).incident.id, incident.id);
+      assert.equal(deliveries.at(-1).transition, 'recovered');
+      await request('a.example', path, 'DELETE');
+    }
     // A delivery already submitted before declaration cannot be recalled; a later hook must still be suppressed.
     now += 60_000; outcome = 503;
     const pending = await (await request('a.example', '/api/operator/monitors', 'POST', { name: 'Committed before window', url: 'https://target.example/', failureThreshold: 1 })).json();
@@ -166,6 +218,6 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     await dispatch;
     holdWebhook = false;
     assert.equal(deliveries.length, hookCount, 'a hook waiting behind an earlier webhook cannot start during Maintenance');
-    console.log('PASS packed irisbeat@0.1.0: reproducible artifact, pinned integrity, consumer typecheck, isolated scheduling/Incidents, HTTP/TCP/heartbeat hooks, failure isolation, webhooks rotated tenant credentials and three-kind Maintenance suppression of both delivery paths');
+    console.log('PASS packed irisbeat@0.1.0: reproducible artifact, pinned integrity, consumer typecheck, isolated scheduling/Incidents, HTTP/TCP/heartbeat hooks, failure isolation, webhooks rotated tenant credentials and three-kind Maintenance suppression and HTTP/TCP boundary overlap of both delivery paths');
   } finally { await mf.dispose(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

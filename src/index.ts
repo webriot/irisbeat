@@ -196,6 +196,8 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
           typeof value.endsAt !== "number" || !Number.isSafeInteger(value.endsAt) ||
           value.endsAt <= at || value.endsAt > 8_640_000_000_000_000) return undefined;
       monitor.maintenance = { startedAt: at, endsAt: value.endsAt };
+      const attempt = this.checking.get(id);
+      if (attempt) attempt.maintenance = true;
     }
     this.ctx.storage.kv.put("context", state);
     return this.status(true);
@@ -216,7 +218,8 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return this.status(true);
   }
 
-  private checking = new Set<string>();
+  // Keep overlap evidence with the running attempt even after a window is replaced or ends.
+  private checking = new Map<string, { maintenance: boolean }>();
 
   async check(at: number) {
     await Promise.all(this.read().monitors.map(monitor => this.checkMonitor(monitor.id, at)));
@@ -234,7 +237,8 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       return;
     }
     if (this.checking.has(id) || at < attempt.nextDue) return;
-    this.checking.add(id);
+    const observation = { maintenance: !!attempt.maintenance };
+    this.checking.set(id, observation);
     attempt.nextDue = at + attempt.intervalSeconds * 1000;
     this.ctx.storage.kv.put("context", state);
     const controller = new AbortController();
@@ -273,17 +277,17 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
       this.checking.delete(id);
     }
-    const current = this.read(at);
+    const current = this.read(Math.max(at, Date.now()));
     // Record the executed attempt without overwriting newer configuration.
     const monitor = current.monitors.find(monitor => monitor.id === attempt.id);
     if (!monitor) return;
-    await this.record(current, monitor, at, success, attempt.failureThreshold, attempt.recoveryThreshold);
+    await this.record(current, monitor, at, success, attempt.failureThreshold, attempt.recoveryThreshold, observation.maintenance);
   }
 
-  private async record(current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number) {
-    monitor.lastResult = { at, outcome: monitor.maintenance ? "maintenance" : success ? "success" : "failure" };
+  private async record(current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number, maintenance = !!monitor.maintenance) {
+    monitor.lastResult = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" };
     this.ctx.storage.sql.exec("INSERT INTO observations (monitorId, at, outcome) VALUES (?, ?, ?)", monitor.id, at, monitor.lastResult.outcome);
-    if (monitor.maintenance) {
+    if (maintenance) {
       this.ctx.storage.kv.put("context", current);
       return;
     }

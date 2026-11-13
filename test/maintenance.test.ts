@@ -176,3 +176,115 @@ it('keeps healthy state, skips missing executions, and makes repeated early end 
   await tick(660_000);
   expect((await status()).incidents).toMatchObject([{ openedAt: start + 660_000 }]);
 });
+it.each(['http', 'tcp'].flatMap(kind => ['early end', 'expiry', 'active window'].map(boundary => ({ kind, boundary }))))('retains $kind overlap evidence when starting before declaration through $boundary', async ({ kind, boundary }) => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+  const monitor = await create(kind === 'tcp' ? { kind, url: undefined, hostname: 'db.example', port: 5432 } : {});
+  const messages: unknown[] = [];
+  network.use(http.post('https://alerts.example/hook', async ({ request }) => { messages.push(await request.json()); return new HttpResponse(null, { status: 204 }); }));
+  await mutate('/api/operator/webhook', 'PUT', { url: 'https://alerts.example/hook' });
+  const duringAttempt = async () => {
+    clock.mockReturnValue(start + 1_000);
+    await maintenance(monitor.id, start + 5_000);
+    clock.mockReturnValue(start + 2_000);
+    if (boundary === 'early end') await maintenance(monitor.id);
+    if (boundary === 'expiry') clock.mockReturnValue(start + 5_000);
+  };
+  const outbound = globalThis.fetch;
+  const target = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+    if (init?.method === 'POST') return outbound(input, init);
+    await duringAttempt();
+    return new Response(null, { status: 503 });
+  });
+  vi.mocked(connect).mockImplementation(() => ({ opened: duringAttempt().then(() => { throw new Error('refused'); }), closed: Promise.resolve(), close: async () => {} } as Socket));
+  await tick(0);
+  expect((await status()).monitor).toMatchObject({ state: boundary === 'active window' ? 'maintenance' : 'unknown', lastResult: { at: start, outcome: 'maintenance' } });
+  expect((await status()).incidents).toEqual([]);
+  expect(messages).toEqual([]);
+  // Overlap cannot contribute the first failure after the window.
+  target.mockImplementation(async (input, init) => init?.method === 'POST' ? outbound(input, init) : new Response(null, { status: 503 }));
+  vi.mocked(connect).mockImplementation(() => ({ opened: Promise.reject(new Error('refused')), closed: Promise.resolve(), close: async () => {} } as Socket));
+  clock.mockReturnValue(start + 60_000); await tick(60_000);
+  expect((await status()).incidents).toEqual([]);
+  clock.mockReturnValue(start + 120_000); await tick(120_000);
+  expect((await status()).incidents).toMatchObject([{ openedAt: start + 120_000 }]);
+  expect(messages).toEqual([{ text: 'Website: Incident opened' }]);
+});
+
+it.each(['http', 'tcp'].flatMap(kind => ['expiry', 'early end'].map(boundary => ({ kind, boundary }))))('freezes an open $kind Incident across replacement and $boundary until post-window recovery', async ({ kind, boundary }) => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+  const monitor = await create(kind === 'tcp' ? { kind, url: undefined, hostname: 'db.example', port: 5432 } : {});
+  const messages: unknown[] = [];
+  network.use(http.post('https://alerts.example/hook', async ({ request }) => { messages.push(await request.json()); return new HttpResponse(null, { status: 204 }); }));
+  await mutate('/api/operator/webhook', 'PUT', { url: 'https://alerts.example/hook' });
+  let up = false;
+  let duringAttempt = async () => {};
+  const outbound = globalThis.fetch;
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+    if (init?.method === 'POST') return outbound(input, init);
+    await duringAttempt();
+    return new Response(null, { status: up ? 200 : 503 });
+  });
+  vi.mocked(connect).mockImplementation(() => ({ opened: duringAttempt().then(() => { if (!up) throw new Error('refused'); return {}; }), closed: Promise.resolve(), close: async () => {} } as Socket));
+  await tick(0);
+  clock.mockReturnValue(start + 60_000); await tick(60_000);
+  const incident = (await status()).incidents[0];
+  clock.mockReturnValue(start + 119_000);
+  await maintenance(monitor.id, start + 125_000);
+  up = true;
+  let maintenanceAfterBoundary: unknown = 'not evaluated';
+  duringAttempt = async () => {
+    clock.mockReturnValue(start + 121_000);
+    await maintenance(monitor.id, start + 122_000); // Replacement shortens the window.
+    if (boundary === 'early end') {
+      // End the replacement before its natural expiry.
+      clock.mockReturnValue(start + 121_500); await maintenance(monitor.id);
+    }
+    clock.mockReturnValue(start + 122_000);
+    maintenanceAfterBoundary = (await status()).monitor?.maintenance;
+  };
+  clock.mockReturnValue(start + 120_000); await tick(120_000);
+  expect(maintenanceAfterBoundary).toBeNull();
+  expect((await status()).monitor).toMatchObject({ state: 'down', lastResult: { at: start + 120_000, outcome: 'maintenance' } });
+  expect((await status()).incidents).toEqual([incident]);
+  expect(messages).toEqual([{ text: 'Website: Incident opened' }]);
+  duringAttempt = async () => {};
+  clock.mockReturnValue(start + 180_000); await tick(180_000);
+  expect((await status()).incidents).toEqual([incident]);
+  clock.mockReturnValue(start + 240_000); await tick(240_000);
+  expect((await status()).incidents).toEqual([{ ...incident, closedAt: start + 240_000 }]);
+  expect(messages).toEqual([{ text: 'Website: Incident opened' }, { text: 'Website: Incident recovered' }]);
+});
+
+it.each(['http', 'tcp'] as const)('counts a %s attempt starting exactly at the Maintenance end normally', async kind => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+  const monitor = await create({ ...(kind === 'tcp' ? { kind, url: undefined, hostname: 'db.example', port: 5432 } : {}), failureThreshold: 1 });
+  await maintenance(monitor.id, start + 5_000);
+  network.use(http.get('https://target.example/', () => new HttpResponse(null, { status: 503 })));
+  vi.mocked(connect).mockImplementation(() => ({ opened: Promise.reject(new Error('refused')), closed: Promise.resolve(), close: async () => {} } as Socket));
+  clock.mockReturnValue(start + 5_000); await tick(5_000);
+  expect((await status()).monitor).toMatchObject({ state: 'down', lastResult: { at: start + 5_000, outcome: 'failure' } });
+  expect((await status()).incidents).toMatchObject([{ openedAt: start + 5_000 }]);
+});
+
+it.each(['http', 'tcp'] as const)('discards an overlapping %s result after deletion without affecting its replacement', async kind => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+  const settings = { ...(kind === 'tcp' ? { kind, url: undefined, hostname: 'db.example', port: 5432 } : {}), failureThreshold: 1 };
+  const monitor = await create(settings);
+  let removed = false;
+  const duringAttempt = async () => {
+    if (removed) return;
+    removed = true;
+    clock.mockReturnValue(start + 1_000); await maintenance(monitor.id, start + 5_000);
+    await mutate('/api/operator/monitors/' + monitor.id, 'DELETE');
+    await create({ ...settings, name: 'Replacement' });
+  };
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async () => { await duringAttempt(); return new Response(null, { status: 503 }); });
+  vi.mocked(connect).mockImplementation(() => ({ opened: duringAttempt().then(() => { throw new Error('refused'); }), closed: Promise.resolve(), close: async () => {} } as Socket));
+  await tick(0);
+  expect((await status()).monitors).toHaveLength(1);
+  expect((await status()).monitor).toMatchObject({ name: 'Replacement', lastResult: null, maintenance: null });
+  expect((await status()).monitor?.id).not.toBe(monitor.id);
+  expect((await status()).incidents).toEqual([]);
+  clock.mockReturnValue(start + 60_000); await tick(60_000);
+  expect((await status()).incidents).toMatchObject([{ monitorId: (await status()).monitor!.id, monitorName: 'Replacement', openedAt: start + 60_000 }]);
+});

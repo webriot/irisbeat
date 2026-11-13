@@ -49,8 +49,7 @@ this change does not synthesize them. Existing Incident history is unchanged.
 
 ## Hosted #10 and pause #11
 
-`maintenance(id, value, end?)` is a synchronous DO operation. When merging #10,
-the route uses hosted editor authorization and hides reader controls.
+`maintenance(id, value, end?)` is a synchronous DO operation. The route uses hosted editor authorization and hides reader controls.
 Retain adapter context resolution, operator metadata, allowance enforcement and
 heartbeat credential rotation. Suppression returns from shared `record` before
 Incident mutation or post-commit delivery; both `deliverWebhook` and
@@ -64,10 +63,22 @@ active when it would start.
 unexpired windows for resume. Do not infer subscriptions or hosted identity from
 Maintenance. This ticket adds no pause flag or commercial policy.
 
-## Pending owner decision
+## In-flight attempts
 
-The classification of an outbound attempt that crosses a Maintenance boundary is
-still awaiting the owner: any overlap as Maintenance, or completion time only.
-Neither is claimed as implemented/accepted by this draft. In particular, starting
-before declaration, completing after expiry/early end, or spanning replacement
-needs the final boundary slice and request-level regression before this PR is ready.
+The [owner confirmed any overlap is Maintenance](https://github.com/webriot/irisbeat/issues/8#issuecomment-6867542753).
+An HTTP/TCP attempt starting inside a window, or still pending when a window is
+declared, records `maintenance` even if the window expires, ends early, or is
+replaced before completion. The running attempt retains its own overlap flag;
+changing/clearing the current window cannot erase that evidence. The existing
+per-Monitor in-flight guard still prevents duplicate execution, and deletion still
+discards a late result without affecting a replacement Monitor.
+
+The observation retains its attempt-start timestamp, including when declaration
+happens later. Its outcome contributes neither outage/recovery counts nor the
+success/failure availability denominator. An attempt starting exactly at `endsAt`
+has no overlap with that expired window and counts normally unless another window
+intersects it. Open Incidents remain frozen for overlap results; only wholly
+post-window results satisfy normal thresholds. No result is created for a skipped
+execution. Installed-consumer tests exercise both webhook and hosted-hook
+suppression when windows are replaced/ended entirely during a pending attempt and
+when a successful attempt spans replacement/expiry of an open Incident's window.
