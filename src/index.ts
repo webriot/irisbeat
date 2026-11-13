@@ -7,15 +7,19 @@ const timingDefaults = {
   timeoutSeconds: 10,
   failureThreshold: 2,
   recoveryThreshold: 2,
+  silenceSeconds: 180,
+  recoverySpacingSeconds: 60,
 };
 const timingBounds = {
   intervalSeconds: [60, 86_400],
   timeoutSeconds: [1, 60],
   failureThreshold: [1, 100],
   recoveryThreshold: [1, 100],
+  silenceSeconds: [60, 86_400],
+  recoverySpacingSeconds: [60, 86_400],
 } as const;
 type Timing = typeof timingDefaults;
-type Configuration = { pageName: string; name: string; url: string } & Partial<Timing>;
+type Configuration = { pageName: string; name: string; url: string; kind: "http" | "heartbeat" } & Partial<Timing>;
 type MonitorConfiguration = Omit<Configuration, "pageName"> & { published?: boolean };
 export type Incident = {
   id: string;
@@ -33,6 +37,9 @@ type Monitor = Omit<Configuration, "pageName"> & Timing & {
   failures: number;
   successes: number;
   nextDue: number;
+  createdAt: number;
+  lastSeen: number | null;
+  recoveryReceiptAt: number | null;
 };
 export type Status = ReturnType<MonitoringContext["status"]>;
 type StoredContext = { pageName: string; monitors: Monitor[]; webhookUrl?: string | null };
@@ -52,7 +59,7 @@ export class MonitoringContext extends DurableObject<Env> {
     const stored = this.ctx.storage.kv.get<StoredContext | LegacyContext>("context");
     if (!stored) return { pageName: "Irisbeat", monitors: [] };
     if ("monitors" in stored) {
-      stored.monitors = stored.monitors.map(monitor => ({ ...timingDefaults, ...monitor }));
+      stored.monitors = stored.monitors.map(monitor => ({ ...timingDefaults, ...monitor, kind: monitor.kind ?? "http", createdAt: monitor.createdAt ?? 0, lastSeen: monitor.lastSeen ?? null, recoveryReceiptAt: monitor.recoveryReceiptAt ?? null }));
       return stored;
     }
     const { monitor: legacyMonitor, ...context } = stored;
@@ -65,7 +72,7 @@ export class MonitoringContext extends DurableObject<Env> {
     // Preserve the legacy ID, detector progress and Incident identity on upgrade.
     if (stored.monitor) {
       const { pageName: _pageName, ...monitor } = stored.monitor;
-      state.monitors.push({ ...timingDefaults, ...monitor, published: true });
+      state.monitors.push({ ...timingDefaults, ...monitor, kind: monitor.kind ?? "http", createdAt: monitor.createdAt ?? 0, lastSeen: monitor.lastSeen ?? null, recoveryReceiptAt: monitor.recoveryReceiptAt ?? null, published: true });
     }
     this.ctx.storage.transactionSync(() => {
       if (stored.monitor) this.ctx.storage.sql.exec(
@@ -77,23 +84,25 @@ export class MonitoringContext extends DurableObject<Env> {
     return state;
   }
 
-  configure(configuration: Configuration | { pageName: string }) {
+  configure(configuration: Configuration | { pageName: string }, expectedMonitorId: string | null = null) {
     const state = this.read();
-    state.pageName = configuration.pageName;
     // Keep the original single-Monitor save contract for existing clients.
     if ("name" in configuration) {
       const monitor = state.monitors[0];
+      // A legacy save must never move to a sibling after validation.
+      if ((monitor?.id ?? null) !== expectedMonitorId || (monitor && monitor.kind !== configuration.kind)) return null;
       const { pageName: _pageName, ...settings } = configuration;
       if (monitor) this.applyEdit(monitor, settings);
       else state.monitors.push(this.newMonitor(settings));
     }
+    state.pageName = configuration.pageName;
     this.ctx.storage.kv.put("context", state);
     return this.status(true);
   }
 
   private newMonitor(configuration: MonitorConfiguration): Monitor {
     return { ...timingDefaults, ...configuration, id: crypto.randomUUID(), published: configuration.published ?? true, state: "unknown", lastResult: null,
-      failures: 0, successes: 0, nextDue: 0 };
+      failures: 0, successes: 0, nextDue: 0, createdAt: Date.now(), lastSeen: null, recoveryReceiptAt: null };
   }
 
   create(configuration: MonitorConfiguration) {
@@ -143,7 +152,15 @@ export class MonitoringContext extends DurableObject<Env> {
   private async checkMonitor(id: string, at: number) {
     const state = this.read();
     const attempt = state.monitors.find(monitor => monitor.id === id);
-    if (!attempt || this.checking.has(id) || at < attempt.nextDue) return;
+    if (!attempt) return;
+    if (attempt.kind === "heartbeat") {
+      if (at >= (attempt.lastSeen ?? attempt.createdAt) + attempt.silenceSeconds * 1000) {
+        attempt.recoveryReceiptAt = null;
+        await this.record(state, attempt, at, false, 1, attempt.recoveryThreshold);
+      }
+      return;
+    }
+    if (this.checking.has(id) || at < attempt.nextDue) return;
     this.checking.add(id);
     attempt.nextDue = at + attempt.intervalSeconds * 1000;
     this.ctx.storage.kv.put("context", state);
@@ -168,6 +185,10 @@ export class MonitoringContext extends DurableObject<Env> {
     // Record the executed attempt without overwriting newer configuration.
     const monitor = current.monitors.find(monitor => monitor.id === attempt.id);
     if (!monitor) return;
+    await this.record(current, monitor, at, success, attempt.failureThreshold, attempt.recoveryThreshold);
+  }
+
+  private async record(current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number) {
     monitor.lastResult = { at, outcome: success ? "success" : "failure" };
     monitor.failures = success ? 0 : monitor.failures + 1;
     monitor.successes = success ? monitor.successes + 1 : 0;
@@ -179,7 +200,7 @@ export class MonitoringContext extends DurableObject<Env> {
           monitor.id,
         )
         .toArray()[0];
-      if (!open && monitor.failures >= attempt.failureThreshold) {
+      if (!open && monitor.failures >= failureThreshold) {
         transition = "opened";
         monitor.state = "down";
         this.ctx.storage.sql.exec(
@@ -189,7 +210,7 @@ export class MonitoringContext extends DurableObject<Env> {
           at,
           monitor.name,
         );
-      } else if (open && monitor.successes >= attempt.recoveryThreshold) {
+      } else if (open && monitor.successes >= recoveryThreshold) {
         this.ctx.storage.sql.exec(
           "UPDATE incidents SET closedAt = ? WHERE id = ?",
           at,
@@ -233,14 +254,31 @@ export class MonitoringContext extends DurableObject<Env> {
     }
   }
 
+  async heartbeat(id: string, at: number) {
+    const current = this.read();
+    const monitor = current.monitors.find(monitor => monitor.id === id);
+    if (!monitor || monitor.kind !== "heartbeat") return false;
+    monitor.lastSeen = at;
+    if (monitor.state !== "down" || monitor.recoveryReceiptAt === null ||
+        at >= monitor.recoveryReceiptAt + monitor.recoverySpacingSeconds * 1000) {
+      monitor.recoveryReceiptAt = at;
+      await this.record(current, monitor, at, true, 1, monitor.recoveryThreshold);
+    } else {
+      this.ctx.storage.kv.put("context", current);
+    }
+    return true;
+  }
+
   status(operator = false) {
     const state = this.read();
     const monitors = state.monitors.filter(monitor => operator || monitor.published).map(monitor => ({
-      id: monitor.id, name: monitor.name, state: monitor.state, lastResult: monitor.lastResult,
+      id: monitor.id, name: monitor.name, kind: monitor.kind,
+      ...(monitor.kind === "heartbeat" ? { lastSeen: monitor.lastSeen } : {}), state: monitor.state, lastResult: monitor.lastResult,
       ...(operator ? {
         url: monitor.url, published: monitor.published,
         intervalSeconds: monitor.intervalSeconds, timeoutSeconds: monitor.timeoutSeconds,
         failureThreshold: monitor.failureThreshold, recoveryThreshold: monitor.recoveryThreshold,
+        silenceSeconds: monitor.silenceSeconds, recoverySpacingSeconds: monitor.recoverySpacingSeconds,
       } : {}),
     }));
     return {
@@ -268,9 +306,9 @@ async function authorized(request: Request, secret: string | undefined) {
   return crypto.subtle.timingSafeEqual(actual, expected);
 }
 
-function parseConfiguration(value: unknown): Configuration | null {
+function parseConfiguration(value: unknown, existingKind: Configuration["kind"] = "http"): Configuration | null {
   if (!value || typeof value !== "object") return null;
-  const { pageName, name, url } = value as Record<string, unknown>;
+  const { pageName, name, url, kind = existingKind } = value as Record<string, unknown>;
   if (
     typeof pageName !== "string" ||
     !pageName.trim() ||
@@ -278,19 +316,19 @@ function parseConfiguration(value: unknown): Configuration | null {
     typeof name !== "string" ||
     !name.trim() ||
     name.length > 120 ||
-    typeof url !== "string" ||
-    url.length > 2048
+    (kind !== "http" && kind !== "heartbeat") ||
+    (kind !== "heartbeat" && (typeof url !== "string" || url.length > 2048))
   )
     return null;
   try {
-    const target = new URL(url);
+    const target = kind === "http" ? new URL(url as string) : null;
     if (
-      !["http:", "https:"].includes(target.protocol) ||
+      target && (!["http:", "https:"].includes(target.protocol) ||
       target.username ||
-      target.password
+      target.password)
     )
       return null;
-    target.hash = "";
+    if (target) target.hash = "";
     const timing: Partial<Timing> = {};
     for (const key of Object.keys(timingDefaults) as (keyof Timing)[]) {
       if (!(key in value)) continue;
@@ -300,21 +338,21 @@ function parseConfiguration(value: unknown): Configuration | null {
         return null;
       timing[key] = input;
     }
-    return { pageName: pageName.trim(), name: name.trim(), url: target.href, ...timing };
+    return { pageName: pageName.trim(), name: name.trim(), url: target?.href ?? "", kind: kind as Configuration["kind"], ...timing };
   } catch {
     return null;
   }
 }
 
-function parseMonitorPatch(value: unknown): Partial<MonitorConfiguration> | null {
+function parseMonitorPatch(value: unknown, existingKind: Configuration["kind"] = "http"): Partial<MonitorConfiguration> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const fields = value as Record<string, unknown>;
-  if (!Object.keys(fields).length || Object.keys(fields).some(key => !["name", "url", "published", ...Object.keys(timingDefaults)].includes(key))) return null;
+  if (!Object.keys(fields).length || Object.keys(fields).some(key => !["name", "url", "kind", "published", ...Object.keys(timingDefaults)].includes(key))) return null;
   if ("published" in fields && typeof fields.published !== "boolean") return null;
-  const configuration = parseConfiguration({ pageName: "Irisbeat", name: "Monitor", url: "https://example.com", ...fields });
+  const configuration = parseConfiguration({ pageName: "Irisbeat", name: "Monitor", url: "https://example.com", ...fields }, existingKind);
   if (!configuration) return null;
-  const { pageName: _pageName, name: _name, url: _url, ...timing } = configuration;
-  return { ...timing, ...("name" in fields ? { name: configuration.name } : {}),
+  const { pageName: _pageName, name: _name, url: _url, kind: _kind, ...timing } = configuration;
+  return { ...timing, ...("kind" in fields ? { kind: configuration.kind } : {}), ...("name" in fields ? { name: configuration.name } : {}),
     ...("url" in fields ? { url: configuration.url } : {}),
     ...("published" in fields ? { published: fields.published as boolean } : {}) };
 }
@@ -376,6 +414,14 @@ export default {
 async function handleRequest(request: Request, env: Env): Promise<Response> {
   const path = new URL(request.url).pathname;
   const context = env.MONITORING.getByName("personal");
+  if (path.startsWith("/heartbeat/")) {
+    if (!(await authorized(request, env.INSTALLATION_SECRET)))
+      return Response.json({ error: "Unauthorized" }, { status: 401 });
+    if (request.method !== "POST")
+      return new Response(null, { status: 405, headers: { Allow: "POST" } });
+    const accepted = await context.heartbeat(path.slice("/heartbeat/".length), Date.now());
+    return new Response(null, { status: accepted ? 204 : 404 });
+  }
   if (request.method === "GET") {
     if (path === "/")
       return new Response(statusPage(await context.status()), {
@@ -454,8 +500,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         return Response.json(await context.configureWebhook(destination));
       }
       if (monitorMatch) {
-        const patch = parseMonitorPatch(value);
-        if (!patch) return Response.json({ error: "Enter a Monitor name, HTTP(S) URL without credentials or publication boolean" }, { status: 400 });
+        const existing = (await context.status(true)).monitors.find(monitor => monitor.id === monitorMatch[1]);
+        if (!existing) return Response.json({ error: "Monitor not found" }, { status: 404 });
+        const patch = parseMonitorPatch(value, existing.kind);
+        if (!patch || (patch.kind !== undefined && patch.kind !== existing.kind)) return Response.json({ error: "Use a valid name, publication boolean and integer timing; kind cannot change. HTTP requires a credential-free HTTP(S) URL" }, { status: 400 });
         const result = await context.edit(monitorMatch[1], patch);
         return result ? Response.json(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
       }
@@ -468,14 +516,16 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       }
       if (path === "/api/operator/monitors") {
         const patch = parseMonitorPatch(value);
-        if (!patch || !patch.name || !patch.url)
-          return Response.json({ error: "Enter a Monitor name and HTTP(S) URL without credentials" }, { status: 400 });
-        return Response.json(await context.create({ ...patch, name: patch.name, url: patch.url }), { status: 201 });
+        if (!patch || !patch.name || (patch.kind !== "heartbeat" && !patch.url))
+          return Response.json({ error: "Enter a name, valid integer timing and an HTTP(S) target or Heartbeat kind" }, { status: 400 });
+        return Response.json(await context.create({ ...patch, kind: patch.kind ?? "http", name: patch.name, url: patch.kind === "heartbeat" ? "" : patch.url! }), { status: 201 });
       }
-      const configuration = parseConfiguration(value);
-      if (!configuration)
-        return Response.json({ error: "Enter a page name, Monitor name and HTTP(S) URL without credentials" }, { status: 400 });
-      return Response.json(await context.configure(configuration));
+      const existing = (await context.status(true)).monitor;
+      const configuration = parseConfiguration(value, existing?.kind);
+      if (!configuration || (existing && configuration.kind !== existing.kind))
+        return Response.json({ error: "Enter page/Monitor names and valid timing; kind cannot change. HTTP requires a credential-free HTTP(S) URL" }, { status: 400 });
+      const result = await context.configure(configuration, existing?.id ?? null);
+      return result ? Response.json(result) : Response.json({ error: "Monitor changed; reload before saving" }, { status: 409 });
     }
     return new Response(null, { status: 405, headers: { Allow: monitorMatch ? "PATCH, DELETE" : path === "/api/operator/monitors" ? "GET, POST" : "GET, PUT" } });
   }
