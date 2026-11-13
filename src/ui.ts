@@ -37,11 +37,11 @@ export function statusPage(status: Status) {
   );
 }
 
-export function operatorPage() {
+export function operatorPage(hosted = false) {
   return document(
     "Irisbeat operator",
     `<h1>Monitors</h1>
-    <form id="login"><label for="secret">Installation secret</label><input id="secret" type="password" required autocomplete="current-password"><button>Sign in</button></form>
+    <form id="login"><label for="secret">${hosted ? "Access token" : "Installation secret"}</label><input id="secret" type="password" required autocomplete="current-password"><button>Sign in</button></form>
     <section id="editor" hidden>
       <table aria-label="Monitors"><thead><tr><th scope="col">Monitor</th><th scope="col">State</th><th scope="col">Publication</th><th scope="col">Actions</th></tr></thead><tbody id="monitor-rows"></tbody></table>
       <button id="new-monitor" type="button">New Monitor</button>
@@ -51,6 +51,8 @@ export function operatorPage() {
           <label for="name">Monitor name</label><input id="name" name="name" required maxlength="120">
           <label for="kind">Check type</label><select id="kind" name="kind"><option value="http">HTTP(S)</option><option value="tcp">TCP</option><option value="heartbeat">Heartbeat</option></select>
           <output id="heartbeat-path"></output>
+          <button id="rotate-heartbeat" type="button" hidden>Rotate heartbeat secret</button>
+          <output id="heartbeat-credential"></output>
           <fieldset id="http-target"><label for="url">HTTP(S) target</label><input id="url" name="url" type="url" required maxlength="2048"></fieldset>
           <fieldset id="tcp-target" hidden disabled><label for="hostname">Hostname</label><input id="hostname" name="hostname" required maxlength="253" autocapitalize="none" spellcheck="false">
           <label for="port">Port</label><input id="port" name="port" type="number" min="1" max="65535" step="1" required></fieldset>
@@ -133,6 +135,7 @@ const timingDefaults = { intervalSeconds: 60, timeoutSeconds: 10, failureThresho
 let secret = '';
 let editingId = null;
 let busy = false;
+let hosted = false;
 function edit(monitor = null) {
   editingId = monitor?.id || null;
   form.reset();
@@ -145,12 +148,14 @@ function edit(monitor = null) {
   byId('port').value = monitor?.port || '';
   byId('published').checked = monitor?.published ?? true;
   for (const [field, value] of Object.entries(timingDefaults)) byId(field).value = monitor?.[field] ?? value;
-  byId('heartbeat-path').textContent = monitor?.kind === 'heartbeat' ? 'POST /heartbeat/' + monitor.id : '';
+  byId('heartbeat-path').textContent = monitor?.kind === 'heartbeat' ? (hosted ? 'POST /heartbeat' : 'POST /heartbeat/' + monitor.id) : '';
+  byId('rotate-heartbeat').hidden = !hosted || monitor?.kind !== 'heartbeat';
+  byId('heartbeat-credential').textContent = '';
   updateKind();
   form.hidden = false;
   byId('name').focus();
 }
-function cancelEdit() { editingId = null; form.reset(); form.hidden = true; }
+function cancelEdit() { byId('heartbeat-credential').textContent = ''; editingId = null; form.reset(); form.hidden = true; }
 function signOut() {
   secret = ''; cancelEdit(); pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
   byId('monitor-rows').replaceChildren(); byId('incidents').replaceChildren();
@@ -158,6 +163,10 @@ function signOut() {
 }
 function render(data) {
   login.hidden = true; editor.hidden = false;
+  hosted = !!data.hosted;
+  const canEdit = data.permission !== 'reader';
+  if (!canEdit) cancelEdit();
+  byId('new-monitor').hidden = !canEdit; pageForm.closest('aside').hidden = !canEdit; webhook.hidden = !canEdit;
   byId('pageName').value = data.pageName;
   byId('webhookUrl').value = data.webhookUrl || '';
   const rows = data.monitors.map(monitor => {
@@ -168,11 +177,11 @@ function render(data) {
     const actions = document.createElement('td');
     const group = document.createElement('div'); group.className = 'actions';
     const path = '/api/operator/monitors/' + encodeURIComponent(monitor.id);
-    for (const [label, action] of [
+    for (const [label, action] of (canEdit ? [
       ['Edit', () => edit(monitor)],
       [monitor.published ? 'Unpublish' : 'Publish', () => run(path, 'PATCH', { published: !monitor.published })],
       ['Delete', () => { if (confirm('Delete ' + monitor.name + '?')) run(path, 'DELETE', undefined, () => { if (editingId === monitor.id) cancelEdit(); }); }]
-    ]) {
+    ] : [])) {
       const button = document.createElement('button'); button.type = 'button'; button.textContent = label;
       button.setAttribute('aria-label', label + ' ' + monitor.name);
       button.addEventListener('click', action); group.append(button);
@@ -204,7 +213,9 @@ async function run(path = '/api/operator', method = 'GET', body, after) {
     });
     const data = await response.json();
     if (!response.ok) { if (response.status === 401) signOut(); throw new Error(data.error || 'Request failed'); }
-    render(data); if (after) after();
+    if (data.secret) { byId('heartbeat-credential').textContent = 'Bearer ' + data.secret; }
+    else render(data);
+    if (after) after();
     if (method !== 'GET') message.textContent = method === 'DELETE' ? 'Deleted' : 'Saved';
   } catch (error) { message.textContent = error.message; }
   finally {
@@ -235,7 +246,7 @@ updateKind();
 login.addEventListener('submit', async event => {
   event.preventDefault(); secret = byId('secret').value;
   await run(); byId('secret').value = '';
-  if (!editor.hidden) byId('new-monitor').focus();
+  if (!editor.hidden) byId(byId('new-monitor').hidden ? 'refresh' : 'new-monitor').focus();
 });
 form.addEventListener('submit', async event => {
   event.preventDefault();
@@ -248,6 +259,7 @@ form.addEventListener('submit', async event => {
 webhook.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator/webhook', 'PUT', { url: byId('webhookUrl').value }); });
 pageForm.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator', 'PUT', { pageName: byId('pageName').value }); });
 byId('new-monitor').addEventListener('click', () => edit());
+byId('rotate-heartbeat').addEventListener('click', () => { if (confirm('Replace this Monitor’s heartbeat secret?')) run('/api/operator/monitors/' + encodeURIComponent(editingId) + '/heartbeat-secret', 'POST'); });
 byId('cancel-edit').addEventListener('click', cancelEdit);
 byId('refresh').addEventListener('click', () => run());
 byId('logout').addEventListener('click', signOut);
