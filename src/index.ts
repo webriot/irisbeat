@@ -584,7 +584,7 @@ async function handleRequest(request: Request, env: EngineEnv, resolved?: Resolv
     if (rotationMatch) {
       if (request.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST" } });
       const result = await context.rotateHeartbeatSecret(rotationMatch[1]);
-      return result ? Response.json(result) : new Response(null, { status: 404 });
+      return result ? Response.json(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
     }
     if (monitorMatch && request.method === "DELETE") {
       const result = await context.remove(monitorMatch[1]);
