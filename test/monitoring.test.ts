@@ -318,7 +318,9 @@ it("presents the selected Status ledger with Monitor configuration beside page s
   expect(operator).toContain('<aside aria-labelledby="page-settings">');
   expect(operator).toContain('id="page-settings">Status page</h2>');
   expect(operator).not.toContain("Schedule Maintenance");
-  expect(operator).not.toContain("Save webhook");
+  expect(operator).toContain("Save webhook");
+  expect(operator).toContain('for="webhookUrl"');
+  expect(operator).toContain('id="webhook"');
   await configure();
   network.use(
     http.get(config.url, () => new HttpResponse(null, { status: 200 })),
@@ -574,4 +576,291 @@ it("retains named Incidents independently when one unavailable Monitor recovers 
   const history = await (await operatorRequest("/api/operator")).json<import("../src/index").Status>();
   expect(history.incidents.find(incident => incident.monitorId === id)).toMatchObject({ monitorName: "Other", closedAt: null });
   expect((await status()).incidents).toMatchObject([{ closedAt: start + 180_000 }]);
+});
+
+async function saveWebhook(url: unknown, authenticated = true) {
+  return request('/api/operator/webhook', {
+    method: 'PUT',
+    headers: { ...(authenticated ? { authorization } : {}), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url }),
+  });
+}
+
+it('saves one context webhook independently and keeps it out of public responses', async () => {
+  const url = 'https://hooks.slack.com/services/test/secret?token=private';
+  expect((await saveWebhook(url, false)).status).toBe(401);
+  expect((await saveWebhook(url)).status).toBe(200);
+  await configure();
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  expect(await (await request('/api/operator', { headers: { authorization } })).json()).toMatchObject({ webhookUrl: url });
+  for (const path of ['/api/status', '/', '/operator', '/operator.js']) {
+    expect(await (await request(path)).text()).not.toContain(url);
+  }
+});
+
+it('rejects invalid or credential-bearing webhook URLs without replacing the saved destination', async () => {
+  const url = 'https://hooks.example/secret';
+  await saveWebhook(url);
+  for (const invalid of [null, 42, 'http://hooks.example', 'ftp://hooks.example', 'https://user:password@hooks.example', 'https://hooks.example/#secret', 'not a URL', ' https://hooks.example', 'https://hooks.example/' + 'x'.repeat(2048)]) {
+    expect((await saveWebhook(invalid)).status, String(invalid)).toBe(400);
+  }
+  expect(await (await request('/api/operator', { headers: { authorization } })).json()).toMatchObject({ webhookUrl: url });
+});
+
+it('activates on save and alerts once per actual opening and recovery without resetting detection', async () => {
+  await configure({ ...config, name: 'Main\nWebsite' });
+  let healthy = false;
+  const deliveries: { url: string; body: unknown; contentType: string | null }[] = [];
+  network.use(
+    http.get(config.url, () => new HttpResponse(null, { status: healthy ? 204 : 503 })),
+    http.post('https://hooks.example/*', async ({ request }) => {
+      deliveries.push({ url: request.url, body: await request.json(), contentType: request.headers.get('Content-Type') });
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  await tick(0);
+  expect(deliveries).toEqual([]);
+  await saveWebhook('https://hooks.example/first');
+  await tick(60_000);
+  await tick(120_000);
+  expect(deliveries).toEqual([{ url: 'https://hooks.example/first', body: { text: 'Main Website: Incident opened' }, contentType: 'application/json' }]);
+  healthy = true;
+  await tick(180_000);
+  await saveWebhook('https://hooks.example/second');
+  await tick(240_000);
+  await tick(300_000);
+  expect(deliveries).toHaveLength(2);
+  expect(deliveries[1]).toMatchObject({ url: 'https://hooks.example/second', body: { text: 'Main Website: Incident recovered' } });
+  expect(await status()).toMatchObject({ incidents: [{ openedAt: start + 60_000, closedAt: start + 240_000 }] });
+  await saveWebhook('');
+  healthy = false;
+  await tick(360_000);
+  await tick(420_000);
+  expect(deliveries).toHaveLength(2);
+  expect((await status()).incidents).toHaveLength(2);
+});
+
+it('preserves Slack URLs and normalizes Discord compatibility paths exactly once', async () => {
+  await configure();
+  network.use(http.get(config.url, () => new HttpResponse(null, { status: 503 })));
+  const destinations = [
+    ['https://hooks.slack.com/services/T/B/Token?x=1', 'https://hooks.slack.com/services/T/B/Token?x=1'],
+    ['https://discord.com/api/webhooks/123/token?wait=true', 'https://discord.com/api/webhooks/123/token/slack?wait=true'],
+    ['https://discord.com/api/webhooks/123/token/slack', 'https://discord.com/api/webhooks/123/token/slack'],
+    ['https://discordapp.com/api/v10/webhooks/123/token/', 'https://discordapp.com/api/v10/webhooks/123/token/slack'],
+    ['https://canary.discord.com/api/webhooks/123/token/slack/', 'https://canary.discord.com/api/webhooks/123/token/slack'],
+    ['https://discord.com/api/webhooks/123/slack', 'https://discord.com/api/webhooks/123/slack/slack'],
+    ['https://discord.com.evil.example/api/webhooks/123/token', 'https://discord.com.evil.example/api/webhooks/123/token'],
+  ];
+  const received: string[] = [];
+  network.use(http.post('*', ({ request }) => { received.push(request.url); return new HttpResponse(null, { status: 204 }); }));
+  let offset = 0;
+  for (const [input, expected] of destinations) {
+    expect((await saveWebhook(input)).status).toBe(200);
+    await tick(offset);
+    await tick(offset + 60_000);
+    expect(received.at(-1)).toBe(expected);
+    // Saving the returned destination must remain idempotent.
+    const saved = await (await request('/api/operator', { headers: { authorization } })).json() as { webhookUrl: string };
+    expect(saved.webhookUrl).toBe(expected);
+    await saveWebhook(saved.webhookUrl);
+    network.use(http.get(config.url, () => new HttpResponse(null, { status: 204 })));
+    await tick(offset + 120_000);
+    await tick(offset + 180_000);
+    expect(received.at(-1)).toBe(expected);
+    network.use(http.get(config.url, () => new HttpResponse(null, { status: 503 })));
+    offset += 240_000;
+  }
+  expect(received).toHaveLength(14);
+});
+
+it.each(['rejected', 'network error', 'redirect'])('keeps Incident detection committed when webhook delivery is %s', async (failure) => {
+  await configure();
+  await saveWebhook('https://hooks.example/credential');
+  let healthy = false;
+  const messages: unknown[] = [];
+  const forwarded: string[] = [];
+  network.use(
+    http.get(config.url, () => new HttpResponse(null, { status: healthy ? 204 : 503 })),
+    http.post('https://hooks.example/credential', async ({ request }) => {
+      messages.push(await request.json());
+      if (failure === 'network error') return HttpResponse.error();
+      if (failure === 'redirect') return HttpResponse.redirect('https://other.example/leak');
+      return new HttpResponse('private upstream error', { status: 500 });
+    }),
+    http.all('https://other.example/leak', ({ request }) => { forwarded.push(request.url); return new HttpResponse(null); }),
+  );
+  await tick(0);
+  await tick(60_000);
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  await tick(120_000);
+  expect(await status()).toMatchObject({ monitor: { state: 'down' }, incidents: [{ closedAt: null }] });
+  expect(messages).toEqual([{ text: 'Website: Incident opened' }]);
+  healthy = true;
+  await tick(180_000);
+  await tick(240_000);
+  expect(await status()).toMatchObject({ monitor: { state: 'up' }, incidents: [{ closedAt: start + 240_000 }] });
+  expect(messages).toEqual([{ text: 'Website: Incident opened' }, { text: 'Website: Incident recovered' }]);
+  expect(forwarded).toEqual([]);
+  expect(await (await request('/api/status')).text()).not.toContain('credential');
+});
+
+it('bounds webhook delivery time without undoing the opening or leaking the target', async () => {
+  await configure();
+  await saveWebhook('https://hooks.example/timeout-secret');
+  network.use(http.get(config.url, () => new HttpResponse(null, { status: 503 })));
+  await tick(0);
+  const realTimeout = globalThis.setTimeout;
+  vi.spyOn(globalThis, 'setTimeout').mockImplementation((callback, milliseconds, ...args) =>
+    realTimeout(callback, milliseconds === 10_000 ? 0 : milliseconds, ...args),
+  );
+  const outbound = globalThis.fetch;
+  const deliveries: string[] = [];
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+    if (init?.method !== 'POST') return outbound(input, init);
+    deliveries.push(String(input));
+    return new Promise<Response>((_resolve, reject) => {
+      init.signal?.addEventListener('abort', () => reject(new Error('timeout-secret')), { once: true });
+    });
+  });
+  await tick(60_000);
+  await tick(120_000);
+  expect(deliveries).toEqual(['https://hooks.example/timeout-secret']);
+  expect(await status()).toMatchObject({ monitor: { state: 'down' }, incidents: [{ openedAt: start + 60_000, closedAt: null }] });
+  expect(await (await request('/api/status')).text()).not.toContain('timeout-secret');
+});
+
+it('alerts independently for public and private Monitors while every configuration save retains the context destination', async () => {
+  const destination = 'https://hooks.example/fleet';
+  await saveWebhook(destination);
+  await configure();
+  const created = await (await operatorRequest('/api/operator/monitors', 'POST', {
+    name: 'Private API', url: 'https://private.example/health', published: false,
+    intervalSeconds: 120, failureThreshold: 1, recoveryThreshold: 1,
+  })).json<import('../src/index').Status>();
+  const [website, privateApi] = created.monitors;
+  const messages: unknown[] = [];
+  let publicHealthy = false;
+  let privateHealthy = false;
+  network.use(
+    http.get(config.url, () => new HttpResponse(null, { status: publicHealthy ? 204 : 503 })),
+    http.get('https://private.example/health', () => new HttpResponse(null, { status: privateHealthy ? 204 : 503 })),
+    http.post(destination, async ({ request }) => {
+      messages.push(await request.json());
+      // The alert observes already committed state, even for a private Monitor.
+      const committed = await (await operatorRequest('/api/operator')).json<import('../src/index').Status>();
+      expect(committed.incidents).toHaveLength(messages.length === 1 ? 1 : 2);
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  await tick(0);
+  expect(messages).toEqual([{ text: 'Private API: Incident opened' }]);
+  expect(await status()).toMatchObject({ monitors: [{ id: website.id }], incidents: [] });
+  await operatorRequest('/api/operator', 'PUT', { pageName: 'Fleet' });
+  await operatorRequest(`/api/operator/monitors/${website.id}`, 'PATCH', { timeoutSeconds: 5 });
+  await operatorRequest(`/api/operator/monitors/${privateApi.id}`, 'PATCH', { published: true });
+  await operatorRequest(`/api/operator/monitors/${privateApi.id}`, 'PATCH', { published: false });
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  expect(await (await operatorRequest('/api/operator')).json()).toMatchObject({ webhookUrl: destination });
+  await tick(60_000);
+  await tick(120_000);
+  expect(messages).toEqual([{ text: 'Private API: Incident opened' }, { text: 'Website: Incident opened' }]);
+  publicHealthy = true;
+  await tick(180_000);
+  await tick(240_000);
+  expect(messages.at(-1)).toEqual({ text: 'Website: Incident recovered' });
+  expect(await status()).toMatchObject({ monitors: [{ state: 'up' }], incidents: [{ closedAt: start + 240_000 }] });
+  privateHealthy = true;
+  await tick(300_000);
+  expect(messages).toHaveLength(3);
+  await tick(360_000);
+  await tick(480_000);
+  expect(messages).toEqual([
+    { text: 'Private API: Incident opened' }, { text: 'Website: Incident opened' },
+    { text: 'Website: Incident recovered' }, { text: 'Private API: Incident recovered' },
+  ]);
+  await operatorRequest(`/api/operator/monitors/${privateApi.id}`, 'DELETE');
+  await operatorRequest(`/api/operator/monitors/${website.id}`, 'DELETE');
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  expect(await (await operatorRequest('/api/operator')).json()).toMatchObject({ webhookUrl: destination, monitors: [] });
+  expect(messages).toHaveLength(4);
+});
+
+it.each(['opening', 'recovery'])('discards a deleted Monitor’s late %s without an alert or future checks', async phase => {
+  await configure();
+  await saveWebhook('https://hooks.example/deletion');
+  let healthy = false;
+  let attempts = 0;
+  const messages: unknown[] = [];
+  network.use(
+    http.get(config.url, () => { attempts++; return new HttpResponse(null, { status: healthy ? 204 : 503 }); }),
+    http.post('https://hooks.example/deletion', async ({ request }) => {
+      messages.push(await request.json()); return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  await tick(0);
+  if (phase === 'recovery') { await tick(60_000); healthy = true; await tick(120_000); }
+  const before = await status();
+  const id = before.monitors[0].id;
+  vi.spyOn(globalThis, 'fetch').mockImplementationOnce(async () => {
+    expect((await operatorRequest(`/api/operator/monitors/${id}`, 'DELETE')).status).toBe(200);
+    return new Response(null, { status: healthy ? 204 : 503 });
+  });
+  await tick(phase === 'opening' ? 60_000 : 180_000);
+  vi.restoreAllMocks();
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  await tick(240_000);
+  await tick(300_000);
+  expect(attempts).toBe(phase === 'opening' ? 1 : 3);
+  expect(messages).toEqual(phase === 'opening' ? [] : [{ text: 'Website: Incident opened' }]);
+  expect(await status()).toMatchObject({ monitors: [], incidents: [] });
+  expect(await (await operatorRequest('/api/operator')).json()).toMatchObject({
+    webhookUrl: 'https://hooks.example/deletion', monitors: [], incidents: before.incidents,
+  });
+});
+
+it('uses an active Monitor’s timing snapshot while preserving concurrent context and sibling edits', async () => {
+  await configure();
+  await saveWebhook('https://hooks.example/old');
+  const created = await (await operatorRequest('/api/operator/monitors', 'POST', {
+    name: 'Sibling', url: 'https://sibling.example/health', intervalSeconds: 300,
+  })).json<import('../src/index').Status>();
+  const [website, sibling] = created.monitors;
+  const messages: { url: string; body: unknown }[] = [];
+  network.use(
+    http.get(config.url, () => new HttpResponse(null, { status: 503 })),
+    http.get('https://sibling.example/health', () => new HttpResponse(null, { status: 204 })),
+    http.get('https://edited.example/health', () => new HttpResponse(null, { status: 503 })),
+    http.post('https://hooks.example/*', async ({ request }) => {
+      messages.push({ url: request.url, body: await request.json() });
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  await tick(0);
+  vi.spyOn(globalThis, 'fetch').mockImplementationOnce(async () => {
+    await operatorRequest(`/api/operator/monitors/${website.id}`, 'PATCH', {
+      failureThreshold: 100, intervalSeconds: 120, timeoutSeconds: 1, url: 'https://edited.example/health',
+    });
+    await operatorRequest(`/api/operator/monitors/${sibling.id}`, 'PATCH', { name: 'Renamed sibling', published: false });
+    await operatorRequest('/api/operator', 'PUT', { pageName: 'Edited during attempt' });
+    await saveWebhook('https://hooks.example/latest');
+    await tick(60_000);
+    return new Response(null, { status: 503 });
+  });
+  await tick(60_000);
+  vi.restoreAllMocks();
+  expect(messages).toEqual([{ url: 'https://hooks.example/latest', body: { text: 'Website: Incident opened' } }]);
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  expect(await (await operatorRequest('/api/operator')).json()).toMatchObject({
+    pageName: 'Edited during attempt', webhookUrl: 'https://hooks.example/latest',
+    monitors: [
+      { id: website.id, state: 'down', failureThreshold: 100, intervalSeconds: 120, timeoutSeconds: 1, url: 'https://edited.example/health' },
+      { id: sibling.id, name: 'Renamed sibling', published: false, lastResult: { at: start } },
+    ],
+  });
+  await tick(120_000);
+  expect((await status()).monitor?.lastResult?.at).toBe(start + 60_000);
+  await tick(180_000);
+  expect((await status()).monitor?.lastResult?.at).toBe(start + 180_000);
+  expect(messages).toHaveLength(1);
 });

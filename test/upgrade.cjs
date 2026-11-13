@@ -19,21 +19,28 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
   const bundle = async index => (await build({stdin:{contents:wrapper(index), resolveDir:project, loader:'ts'}, bundle:true, write:false, format:'esm', platform:'neutral', external:['cloudflare:workers']})).outputFiles[0].text;
   let outcome = 503;
   let attempts = 0;
-  const options = script => convertV4MiniflareOptions({ name:'irisbeat', modules:true, script, compatibilityDate:'2026-11-13', bindings:{INSTALLATION_SECRET:'upgrade-test-secret'}, durableObjects:{MONITORING:{className:'MonitoringContext',useSQLite:true}}, durableObjectsPersist:join(temporary,'state'), outboundService:() => { attempts++; return new Response(null,{status:outcome}); } });
+  const deliveries = [];
+  const destination = 'https://hooks.example/upgrade';
+  const options = (script, stateDirectory = 'state') => convertV4MiniflareOptions({ name:'irisbeat', modules:true, script, compatibilityDate:'2026-11-13', bindings:{INSTALLATION_SECRET:'upgrade-test-secret'}, durableObjects:{MONITORING:{className:'MonitoringContext',useSQLite:true}}, durableObjectsPersist:join(temporary,stateDirectory), outboundService:async request => { if (request.method === 'POST') { deliveries.push({ url: request.url, body: await request.json() }); return new Response(null, { status: 204 }); } attempts++; return new Response(null,{status:outcome}); } });
   let mf = new Miniflare(options(await bundle(join(temporary,'index.ts'))));
   const request = (path, method='GET', body) => mf.dispatchFetch('https://irisbeat.example'+path,{method,headers:{authorization:'Bearer upgrade-test-secret','content-type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});
   const tick = at => request('/test-tick?at='+at);
   const start = Date.UTC(2026,10,13);
   try {
+    const webhookSave = await request('/api/operator/webhook','PUT',{url:destination});
+    const supportsWebhook = webhookSave.status === 200;
+    assert.ok(supportsWebhook || webhookSave.status === 404);
     assert.equal((await request('/api/operator','PUT',{pageName:'Old page',name:'Legacy service',url:'https://target.example/health',timeoutSeconds:7})).status,200);
     await tick(start); await tick(start+60000);
     const before = await (await request('/api/status')).json();
     assert.equal(before.monitor.state,'down');
     const beforeTiming = await (await request('/api/operator')).json();
+    if (supportsWebhook) assert.equal(beforeTiming.webhookUrl,destination);
     // One recovery observation before replacing the actual Worker bundle.
     outcome = 204; await tick(start+120000);
     await mf.setOptions(options(await bundle(join(project,'src/index.ts'))));
     const after = await (await request('/api/operator')).json();
+    if (supportsWebhook) assert.equal(after.webhookUrl,destination);
     assert.equal(after.pageName,'Old page');
     assert.equal(after.monitors[0].id,'website');
     assert.equal(after.monitors[0].published,true);
@@ -46,14 +53,32 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     assert.equal(after.incidents[0].id,before.incidents[0].id);
     assert.equal(after.incidents[0].monitorName,'Legacy service');
     assert.equal(after.incidents[0].closedAt,null);
+    assert.deepEqual(after.monitors[0].lastResult,{at:start+120000,outcome:'success'});
     await tick(start+120000); assert.equal(attempts,3);
     await tick(start+180000);
     const recovered = await (await request('/api/status')).json();
+    if (supportsWebhook) assert.deepEqual(deliveries,[
+      {url:destination,body:{text:'Legacy service: Incident opened'}},
+      {url:destination,body:{text:'Legacy service: Incident recovered'}},
+    ]);
     assert.equal(recovered.monitors[0].state,'up');
     assert.equal(recovered.incidents[0].closedAt,start+180000);
     assert.equal((await request('/api/operator/monitors/website','DELETE')).status,200);
     assert.equal((await (await request('/api/status')).json()).incidents.length,0);
     assert.equal((await (await request('/api/operator')).json()).incidents[0].monitorName,'Legacy service');
-    console.log('PASS: real foundation Worker -> current Worker preserves identity, page, target, due time, open Incident, recovery streak, publication and retained deleted history');
+    if (supportsWebhook) {
+      await mf.dispose();
+      mf = new Miniflare(options(await bundle(join(temporary,'index.ts')), 'webhook-only'));
+      assert.equal((await request('/api/operator/webhook','PUT',{url:destination})).status,200);
+      await mf.setOptions(options(await bundle(join(project,'src/index.ts')), 'webhook-only'));
+      assert.deepEqual(await (await request('/api/operator')).json(),{
+        pageName:'Irisbeat', webhookUrl:destination, monitors:[], monitor:null, incidents:[],
+      });
+      assert.equal((await request('/api/operator','PUT',{pageName:'New page'})).status,200);
+      assert.equal((await request('/api/operator/monitors','POST',{name:'New service',url:'https://target.example/health'})).status,201);
+      assert.equal((await (await request('/api/operator')).json()).webhookUrl,destination);
+    }
+    console.log(`PASS: ${base} -> current; webhook preservation/delivery ${supportsWebhook ? 'verified' : 'not supported by old bundle'}`);
+    console.log('PASS: real legacy Worker -> current Worker preserves identity, page, target, due time, open Incident, recovery streak, publication and retained deleted history');
   } finally { await mf.dispose(); rmSync(temporary,{recursive:true,force:true}); }
 })().catch(error => { console.error(error); process.exitCode=1; });

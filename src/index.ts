@@ -35,8 +35,8 @@ type Monitor = Omit<Configuration, "pageName"> & Timing & {
   nextDue: number;
 };
 export type Status = ReturnType<MonitoringContext["status"]>;
-type StoredContext = { pageName: string; monitors: Monitor[] };
-type LegacyContext = { monitor: (Omit<Monitor, "published" | keyof Timing> & Partial<Timing> & { pageName: string }) | null };
+type StoredContext = { pageName: string; monitors: Monitor[]; webhookUrl?: string | null };
+type LegacyContext = { webhookUrl?: string | null; monitor: (Omit<Monitor, "published" | keyof Timing> & Partial<Timing> & { pageName: string }) | null };
 
 export class MonitoringContext extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -55,8 +55,10 @@ export class MonitoringContext extends DurableObject<Env> {
       stored.monitors = stored.monitors.map(monitor => ({ ...timingDefaults, ...monitor }));
       return stored;
     }
-    const pageName = stored.monitor?.pageName ?? "Irisbeat";
+    const { monitor: legacyMonitor, ...context } = stored;
+    const pageName = legacyMonitor?.pageName ?? "Irisbeat";
     const state: StoredContext = {
+      ...context,
       pageName,
       monitors: [],
     };
@@ -97,6 +99,13 @@ export class MonitoringContext extends DurableObject<Env> {
   create(configuration: MonitorConfiguration) {
     const state = this.read();
     state.monitors.push(this.newMonitor(configuration));
+    this.ctx.storage.kv.put("context", state);
+    return this.status(true);
+  }
+
+  configureWebhook(url: string | null) {
+    const state = this.read();
+    state.webhookUrl = url;
     this.ctx.storage.kv.put("context", state);
     return this.status(true);
   }
@@ -162,6 +171,7 @@ export class MonitoringContext extends DurableObject<Env> {
     monitor.lastResult = { at, outcome: success ? "success" : "failure" };
     monitor.failures = success ? 0 : monitor.failures + 1;
     monitor.successes = success ? monitor.successes + 1 : 0;
+    let transition: "opened" | "recovered" | undefined;
     this.ctx.storage.transactionSync(() => {
       const open = this.ctx.storage.sql
         .exec<Incident>(
@@ -170,6 +180,7 @@ export class MonitoringContext extends DurableObject<Env> {
         )
         .toArray()[0];
       if (!open && monitor.failures >= attempt.failureThreshold) {
+        transition = "opened";
         monitor.state = "down";
         this.ctx.storage.sql.exec(
           "INSERT INTO incidents (id, monitorId, openedAt, monitorName) VALUES (?, ?, ?, ?)",
@@ -184,12 +195,42 @@ export class MonitoringContext extends DurableObject<Env> {
           at,
           open.id,
         );
+        transition = "recovered";
         monitor.state = "up";
       } else if (!open && success) {
         monitor.state = "up";
       }
       this.ctx.storage.kv.put("context", current);
     });
+    // Delivery follows the committed transition; transport failure cannot undo detection.
+    if (transition && current.webhookUrl)
+      await this.deliverWebhook(current.webhookUrl, monitor.name, transition);
+  }
+
+  private async deliverWebhook(
+    url: string,
+    name: string,
+    transition: "opened" | "recovered",
+  ) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10_000);
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: `${name.replace(/\s+/g, " ")}: Incident ${transition}`,
+        }),
+        redirect: "manual",
+        signal: controller.signal,
+      });
+      await response.body?.cancel();
+      if (!response.ok) throw new Error("Delivery failed");
+    } catch {
+      console.error(JSON.stringify({ event: "webhook_delivery_failed" }));
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   status(operator = false) {
@@ -203,6 +244,7 @@ export class MonitoringContext extends DurableObject<Env> {
       } : {}),
     }));
     return {
+      ...(operator ? { webhookUrl: state.webhookUrl ?? null } : {}),
       pageName: state.pageName,
       monitors,
       monitor: monitors[0] ?? null,
@@ -277,6 +319,30 @@ function parseMonitorPatch(value: unknown): Partial<MonitorConfiguration> | null
     ...("published" in fields ? { published: fields.published as boolean } : {}) };
 }
 
+function parseWebhook(value: unknown): string | null | undefined {
+  if (value === "") return null;
+  if (typeof value !== "string" || value.length > 2048 || /\s/.test(value))
+    return undefined;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password || url.hash)
+      return undefined;
+    const discordPath = url.pathname.match(
+      /^(\/api(?:\/v\d+)?\/webhooks\/[^/]+\/[^/]+)(?:\/slack)?\/?$/,
+    );
+    if (
+      /^(?:(?:canary|ptb)\.)?discord(?:app)?\.com$/.test(url.hostname) &&
+      discordPath
+    ) {
+      url.pathname = discordPath[1] + "/slack";
+      return url.href;
+    }
+    return value;
+  } catch {
+    return undefined;
+  }
+}
+
 export default {
   async scheduled(controller, env) {
     await env.MONITORING.getByName("personal").check(controller.scheduledTime);
@@ -329,7 +395,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       });
   }
   const monitorMatch = path.match(/^\/api\/operator\/monitors\/([^/]+)$/);
-  if (path === "/api/operator" || path === "/api/operator/monitors" || monitorMatch) {
+  if (path === "/api/operator" || path === "/api/operator/webhook" || path === "/api/operator/monitors" || monitorMatch) {
     if (!(await authorized(request, env.INSTALLATION_SECRET)))
       return Response.json({ error: "Unauthorized" }, { status: 401 });
     if (monitorMatch && request.method === "DELETE") {
@@ -338,7 +404,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     }
     if (request.method === "GET" && !monitorMatch)
       return Response.json(await context.status(true));
-    if ((path === "/api/operator" && request.method === "PUT") ||
+    if (((path === "/api/operator" || path === "/api/operator/webhook") && request.method === "PUT") ||
         (path === "/api/operator/monitors" && request.method === "POST") ||
         (monitorMatch && request.method === "PATCH")) {
       if (!request.headers.get("Content-Type")?.startsWith("application/json"))
@@ -374,6 +440,18 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         value = JSON.parse(body);
       } catch {
         return Response.json({ error: "Invalid JSON" }, { status: 400 });
+      }
+      if (path === "/api/operator/webhook") {
+        const url = value && typeof value === "object"
+          ? (value as Record<string, unknown>).url
+          : undefined;
+        const destination = parseWebhook(url);
+        if (destination === undefined)
+          return Response.json(
+            { error: "Enter an HTTPS webhook URL" },
+            { status: 400 },
+          );
+        return Response.json(await context.configureWebhook(destination));
       }
       if (monitorMatch) {
         const patch = parseMonitorPatch(value);

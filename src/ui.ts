@@ -61,6 +61,11 @@ export function operatorPage() {
           <form id="page-configuration"><label for="pageName">Page name</label><input id="pageName" name="pageName" required maxlength="120"><button>Save page</button></form>
         </aside>
       </div>
+      <form id="webhook" aria-labelledby="webhook-heading">
+        <h2 id="webhook-heading">Operator alerts</h2>
+        <label for="webhookUrl">HTTPS webhook URL</label><input id="webhookUrl" name="url" type="url" maxlength="2048" autocomplete="off">
+        <button>Save webhook</button>
+      </form>
       <section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2><ul id="incidents" class="incidents"></ul></section>
       <div class="actions"><button id="refresh" type="button">Refresh</button><button id="logout" type="button">Sign out</button></div>
     </section>
@@ -115,6 +120,7 @@ const login = byId('login');
 const editor = byId('editor');
 const form = byId('configuration');
 const pageForm = byId('page-configuration');
+const webhook = byId('webhook');
 const message = byId('message');
 const timingDefaults = { intervalSeconds: 60, timeoutSeconds: 10, failureThreshold: 2, recoveryThreshold: 2 };
 let secret = '';
@@ -133,13 +139,14 @@ function edit(monitor = null) {
 }
 function cancelEdit() { editingId = null; form.reset(); form.hidden = true; }
 function signOut() {
-  secret = ''; cancelEdit(); pageForm.reset(); editor.hidden = true; login.hidden = false;
+  secret = ''; cancelEdit(); pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
   byId('monitor-rows').replaceChildren(); byId('incidents').replaceChildren();
   message.textContent = ''; byId('secret').value = ''; byId('secret').focus();
 }
 function render(data) {
   login.hidden = true; editor.hidden = false;
   byId('pageName').value = data.pageName;
+  byId('webhookUrl').value = data.webhookUrl || '';
   const rows = data.monitors.map(monitor => {
     const row = document.createElement('tr');
     for (const text of [monitor.name, (${JSON.stringify(stateLabel)})[monitor.state], monitor.published ? 'Published' : 'Private']) {
@@ -203,6 +210,7 @@ form.addEventListener('submit', async event => {
   for (const field of Object.keys(timingDefaults)) body[field] = Number(byId(field).value);
   await run('/api/operator/monitors' + (editingId ? '/' + encodeURIComponent(editingId) : ''), editingId ? 'PATCH' : 'POST', body, cancelEdit);
 });
+webhook.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator/webhook', 'PUT', { url: byId('webhookUrl').value }); });
 pageForm.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator', 'PUT', { pageName: byId('pageName').value }); });
 byId('new-monitor').addEventListener('click', () => edit());
 byId('cancel-edit').addEventListener('click', cancelEdit);
