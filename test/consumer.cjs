@@ -26,7 +26,16 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
   const lock = JSON.parse(readFileSync('test/consumer/package-lock.json', 'utf8'));
   assert.equal(lock.packages['node_modules/irisbeat'].version, '0.1.0');
   assert.equal(lock.packages['node_modules/irisbeat'].integrity, 'sha512-' + createHash('sha512').update(readFileSync(artifact)).digest('base64'));
-  const script = (await build({ entryPoints: ['test/consumer/worker.ts'], bundle: true, write: false, format: 'esm', platform: 'neutral', external: ['cloudflare:workers'] })).outputFiles[0].text;
+  const script = (await build({ entryPoints: ['test/consumer/worker.ts'], bundle: true, write: false, format: 'esm', platform: 'neutral', external: ['cloudflare:workers'], plugins: [{
+    name: 'substitute-external-tcp-target',
+    setup(builder) {
+      builder.onResolve({ filter: /^cloudflare:sockets$/ }, () => ({ path: 'sockets', namespace: 'test-target' }));
+      builder.onLoad({ filter: /.*/, namespace: 'test-target' }, () => ({ contents: `export function connect(address) { return {
+        opened: fetch('https://tcp-target.example/' + encodeURIComponent(address.hostname) + '/' + address.port).then(response => { if (!response.ok) throw new Error('refused'); }),
+        closed: Promise.resolve(), close: async () => {},
+      }; }` }));
+    },
+  }] })).outputFiles[0].text;
   const deliveries = [], webhooks = [];
   let outcome = 503;
   let deliveryFails = false;
@@ -82,6 +91,18 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     assert.equal(JSON.stringify(reader).includes('private-token'), false);
     assert.equal((await request('a.example', rotationPath, 'POST', undefined, 'reader')).status, 403);
     assert.deepEqual(webhooks.slice(2), [{ text: 'Producer: Incident opened' }, { text: 'Producer: Incident recovered' }]);
-    console.log('PASS packed irisbeat@0.1.0: reproducible artifact, pinned integrity, consumer typecheck, isolated scheduling/Incidents, HTTP/heartbeat hooks, failure isolation, webhooks and rotated tenant credentials');
+    await request('a.example', '/api/operator/monitors/' + heartbeat.id, 'DELETE');
+    deliveryFails = false; outcome = 503;
+    const tcpResponse = await request('b.example', '/api/operator/monitors', 'POST', { name: 'Private database', kind: 'tcp', hostname: 'db.example', port: 5432, failureThreshold: 1, recoveryThreshold: 1, published: false });
+    assert.equal(tcpResponse.status, 201);
+    const tcp = (await tcpResponse.json()).monitors.at(-1);
+    assert.equal((await request('b.example', '/api/operator/monitors', 'POST', { name: 'Over allowance', kind: 'heartbeat' })).status, 409);
+    await tick(420_000);
+    outcome = 204; await tick(480_000);
+    const tcpEvents = deliveries.filter(event => event.incident.monitorId === tcp.id);
+    assert.deepEqual(tcpEvents.map(event => event.transition), ['opened', 'recovered']);
+    assert.notEqual(tcpEvents[0].contextId, deliveries[0].contextId);
+    assert.equal((await (await request('b.example', '/api/status')).json()).monitors.some(monitor => monitor.id === tcp.id), false);
+    console.log('PASS packed irisbeat@0.1.0: reproducible artifact, pinned integrity, consumer typecheck, isolated scheduling/Incidents, HTTP/TCP/heartbeat hooks, failure isolation, webhooks and rotated tenant credentials');
   } finally { await mf.dispose(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -12,11 +12,33 @@ const localRequire = createRequire(join(project, 'node_modules/@cloudflare/vites
 const { build } = localRequire('esbuild');
 const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
 const base = process.argv[2] || '6fb95ccec52d9c5c29b82f82c3d77ed3a7e356d3';
+const tcp = process.argv[3] === 'tcp';
 const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
 (async () => {
   for (const file of ['index.ts', 'ui.ts']) writeFileSync(join(temporary, file), execFileSync('git', ['show', `${base}:src/${file}`]));
   const wrapper = index => `import app from ${JSON.stringify(index)}; export {MonitoringContext} from ${JSON.stringify(index)}; export default { async fetch(request, env, ctx) { const url = new URL(request.url); if(url.pathname === '/test-tick') { await app.scheduled({scheduledTime:Number(url.searchParams.get('at'))}, env, ctx); return new Response('checked'); } const testAt = request.headers.get('x-test-at'); const now = Date.now; if (testAt) Date.now = () => Number(testAt); try { return await app.fetch(request, env, ctx); } finally { Date.now = now; } } };`;
-  const bundle = async index => (await build({stdin:{contents:wrapper(index), resolveDir:project, loader:'ts'}, bundle:true, write:false, format:'esm', platform:'neutral', external:['cloudflare:workers']})).outputFiles[0].text;
+  const socketTarget = {
+    name: 'substitute-tcp-target',
+    setup(builder) {
+      builder.onResolve({ filter: /^cloudflare:sockets$/ }, () => ({ path: 'sockets', namespace: 'test-target' }));
+      builder.onLoad({ filter: /.*/, namespace: 'test-target' }, () => ({
+        contents: `export function connect(address) {
+          return {
+            opened: fetch('https://tcp-target.example/' + encodeURIComponent(address.hostname) + '/' + address.port)
+              .then(response => { if (!response.ok) throw new Error('refused'); return {}; }),
+            closed: Promise.resolve(), close: async () => {}
+          };
+        }`,
+        loader: 'js',
+      }));
+    },
+  };
+  const bundle = async index => (await build({
+    stdin: { contents: wrapper(index), resolveDir: project, loader: 'ts' },
+    bundle: true, write: false, format: 'esm', platform: 'neutral',
+    external: ['cloudflare:workers', ...(tcp ? [] : ['cloudflare:sockets'])],
+    plugins: tcp ? [socketTarget] : [],
+  })).outputFiles[0].text;
   let outcome = 503;
   let attempts = 0;
   const deliveries = [];
@@ -71,7 +93,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     const webhookSave = await request('/api/operator/webhook','PUT',{url:destination});
     const supportsWebhook = webhookSave.status === 200;
     assert.ok(supportsWebhook || webhookSave.status === 404);
-    assert.equal((await request('/api/operator','PUT',{pageName:'Old page',name:'Legacy service',url:'https://target.example/health',timeoutSeconds:7})).status,200);
+    assert.equal((await request('/api/operator','PUT',{pageName:'Old page',name:'Legacy service',...(tcp ? {kind:'tcp',hostname:'db.example',port:5432} : {url:'https://target.example/health'}),timeoutSeconds:7})).status,200);
     await tick(start); await tick(start+60000);
     const before = await (await request('/api/status')).json();
     assert.equal(before.monitor.state,'down');
@@ -85,7 +107,8 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     assert.equal(after.pageName,'Old page');
     assert.equal(after.monitors[0].id,before.monitor.id);
     assert.equal(after.monitors[0].published,true);
-    assert.equal(after.monitors[0].url,'https://target.example/health');
+    if (tcp) { assert.equal(after.monitors[0].kind,'tcp'); assert.equal(after.monitors[0].hostname,'db.example'); assert.equal(after.monitors[0].port,5432); }
+    else { assert.equal(after.monitors[0].kind,'http'); assert.equal(after.monitors[0].url,'https://target.example/health'); }
     assert.equal(after.monitors[0].state,'down');
     assert.equal(after.monitors[0].intervalSeconds,60);
     assert.equal(after.monitors[0].timeoutSeconds,beforeTiming.monitor.timeoutSeconds ?? 10);
@@ -104,7 +127,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     ]);
     assert.equal(recovered.monitors[0].state,'up');
     assert.equal(recovered.incidents[0].closedAt,start+180000);
-    assert.equal((await request('/api/operator/monitors/'+before.monitor.id,'DELETE')).status,200);
+    assert.equal((await request('/api/operator/monitors/' + before.monitor.id,'DELETE')).status,200);
     assert.equal((await (await request('/api/status')).json()).incidents.length,0);
     assert.equal((await (await request('/api/operator')).json()).incidents[0].monitorName,'Legacy service');
     if (supportsWebhook) {
@@ -119,7 +142,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
       assert.equal((await request('/api/operator/monitors','POST',{name:'New service',url:'https://target.example/health'})).status,201);
       assert.equal((await (await request('/api/operator')).json()).webhookUrl,destination);
     }
-    console.log(`PASS: ${base} -> current; webhook preservation/delivery ${supportsWebhook ? 'verified' : 'not supported by old bundle'}`);
+    console.log(`PASS: ${base} (${tcp ? 'TCP' : 'HTTP'}) -> current; webhook preservation/delivery ${supportsWebhook ? 'verified' : 'not supported by old bundle'}`);
     console.log('PASS: real legacy Worker -> current Worker preserves identity, page, target, due time, open Incident, recovery streak, publication and retained deleted history');
   } finally { await mf.dispose(); rmSync(temporary,{recursive:true,force:true}); }
 })().catch(error => { console.error(error); process.exitCode=1; });

@@ -45,7 +45,11 @@ it('filters credentials for readers and confines heartbeat credentials to their 
   expect(rotated.status).toBe(200);
   const { secret } = await rotated.json() as { secret: string };
   expect(secret.length).toBeGreaterThanOrEqual(32);
-  expect((await request('a.example', '/heartbeat', 'POST', 'ignored', secret)).status).toBe(204);
+  let producer!: ReadableStreamDefaultController<Uint8Array>;
+  const body = new ReadableStream<Uint8Array>({ start(controller) { producer = controller; controller.enqueue(new Uint8Array([1])); } });
+  try {
+    expect((await app.fetch(new Request('https://a.example/heartbeat', { method: 'POST', headers: { authorization: 'Bearer ' + secret }, body }), env)).status).toBe(204);
+  } finally { producer.close(); }
   expect((await request('b.example', '/heartbeat', 'POST', undefined, secret)).status).toBe(401);
   expect((await request('a.example', '/heartbeat/' + editor.monitor.id, 'POST', undefined, 'test-installation-secret')).status).toBe(404);
   const replacement = await (await request('a.example', path, 'POST')).json() as { secret: string };

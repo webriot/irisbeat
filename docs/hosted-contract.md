@@ -87,7 +87,7 @@ Export a subclass of `MonitoringContext<YourEnv>` with
 Bind the consumer's MONITORING namespace to that exported subclass, with the same
 SQLite migration as the public app. The default hook does nothing. Each committed
 opening/recovery invokes it independently of publication, alongside the unchanged
-webhook path; HTTP and Heartbeat use the same detector. The event contains the
+webhook path; HTTP, TCP and Heartbeat use the same detector. The event contains the
 opaque Durable Object `contextId`, complete `incident`, `transition` and observation
 `at`. Map tenant names with `env.MONITORING.idFromName(name).toString()`; never
 infer identity from a Monitor name. Events omit targets and destination/heartbeat
@@ -99,7 +99,9 @@ transitions can arrive out of order. Use Incident ID plus transition for dedupin
 
 `src/index.ts` adds small seams around existing handlers, DO creation, heartbeat
 authorization and post-commit delivery. The detector and webhook transport remain
-owned here. TCP siblings should preserve the allowance argument on `create`,
+owned here. TCP integration retains the three-kind target union, atomic DO-side patch validation,
+first-Monitor identity pinned before reading legacy bodies and immutable kinds.
+Subsequent siblings should preserve the allowance argument on `create`,
 operator response metadata, secret-safe status views and this post-commit hook
 when merging their target union/atomic patch validation. Relevant paths are the
 existing collection API plus the two hosted heartbeat paths above.
@@ -108,5 +110,8 @@ Pause is **not implemented by this ticket**. #11 should extend this context adap
 and shared DO detector with the spec's explicit pause/resume semantics; merely
 omitting an ID from `contexts()` does not implement pause (receipts still detect
 and no paused banner/reset exists). No pause flag or claim is exposed here.
-Maintenance/history remain their own tickets. The release candidate must be
+Maintenance #8 must apply its suppression decision to both `deliverWebhook` and
+`onIncidentTransition` in `record`; the hosted hook must never bypass that guard.
+The hook observes committed detector transitions, not every raw observation.
+History remains its own ticket. The release candidate must be
 regenerated after integration changes, before #12 publishes anything.
