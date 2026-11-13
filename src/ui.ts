@@ -21,23 +21,19 @@ function document(title: string, body: string, operator = false) {
 export function statusPage(status: Status) {
   const time = (at: number) =>
     `<time datetime="${new Date(at).toISOString()}">${new Date(at).toISOString()}</time>`;
-  const banner = !status.monitor
-    ? "No Monitor configured"
-    : status.monitor.state === "down"
-      ? `${status.monitor.name} is unavailable`
-      : status.monitor.state === "up"
+  const banner = !status.monitors.length
+    ? "No Monitors published"
+    : status.monitors.some(monitor => monitor.state === "down")
+      ? "Services unavailable"
+      : status.monitors.every(monitor => monitor.state === "up")
         ? "All services operational"
         : "Awaiting check";
   return document(
     status.pageName,
     `<h1>${escape(status.pageName)}</h1>
     <section class="banner" aria-label="Current status"><h2>${escape(banner)}</h2></section>
-    ${
-      status.monitor
-        ? `<article aria-labelledby="monitor-name"><div class="ledger-row"><h2 id="monitor-name">${escape(status.monitor.name)}</h2><span class="status">${stateLabel[status.monitor.state]}</span></div></article>
-    <section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>${status.incidents.length ? `<ul class="incidents">${status.incidents.map((incident) => `<li><article class="incident"><strong>${incident.closedAt === null ? "Open" : "Recovered"}</strong><p>Unavailable since ${time(incident.openedAt)}${incident.closedAt === null ? " — Ongoing" : ` — Recovered ${time(incident.closedAt)}`}</p></article></li>`).join("")}</ul>` : "<p>No Incidents</p>"}</section>`
-        : ""
-    }`,
+    ${status.monitors.map((monitor, index) => `<article aria-labelledby="monitor-name${index || ""}"><div class="ledger-row"><h2 id="monitor-name${index || ""}">${escape(monitor.name)}</h2><span class="status">${stateLabel[monitor.state]}</span></div></article>`).join("")}
+    ${status.monitors.length ? `<section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>${status.incidents.length ? `<ul class="incidents">${status.incidents.map((incident) => `<li><article class="incident"><strong>${escape(status.monitors.find(monitor => monitor.id === incident.monitorId)?.name ?? incident.monitorId)} — ${incident.closedAt === null ? "Open" : "Recovered"}</strong><p>Unavailable since ${time(incident.openedAt)}${incident.closedAt === null ? " — Ongoing" : ` — Recovered ${time(incident.closedAt)}`}</p></article></li>`).join("")}</ul>` : "<p>No Incidents</p>"}</section>` : ""}`,
   );
 }
 
@@ -47,17 +43,20 @@ export function operatorPage() {
     `<h1>Monitors</h1>
     <form id="login"><label for="secret">Installation secret</label><input id="secret" type="password" required autocomplete="current-password"><button>Sign in</button></form>
     <section id="editor" hidden>
-      <table aria-label="Monitors"><thead><tr><th scope="col">Monitor</th><th scope="col">State</th></tr></thead><tbody><tr><td><button id="monitor-link" class="text-button" type="button">Configure website</button></td><td id="state"></td></tr></tbody></table>
-      <form id="configuration" class="configuration-layout">
-        <section aria-labelledby="monitor-settings"><h2 id="monitor-settings">Monitor configuration</h2>
+      <table aria-label="Monitors"><thead><tr><th scope="col">Monitor</th><th scope="col">State</th><th scope="col">Publication</th><th scope="col">Actions</th></tr></thead><tbody id="monitor-rows"></tbody></table>
+      <button id="new-monitor" type="button">New Monitor</button>
+      <div class="configuration-layout">
+        <form id="configuration" hidden aria-labelledby="monitor-settings">
+          <h2 id="monitor-settings">New Monitor</h2>
           <label for="name">Monitor name</label><input id="name" name="name" required maxlength="120">
           <label for="url">HTTP(S) target</label><input id="url" name="url" type="url" required maxlength="2048">
-        </section>
+          <label class="checkbox" for="published"><input id="published" name="published" type="checkbox" checked>Published</label>
+          <button>Save Monitor</button><button id="cancel-edit" type="button">Cancel</button>
+        </form>
         <aside aria-labelledby="page-settings"><h2 id="page-settings">Status page</h2>
-          <label for="pageName">Page name</label><input id="pageName" name="pageName" required maxlength="120">
+          <form id="page-configuration"><label for="pageName">Page name</label><input id="pageName" name="pageName" required maxlength="120"><button>Save page</button></form>
         </aside>
-        <div><button>Save configuration</button></div>
-      </form>
+      </div>
       <section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2><ul id="incidents" class="incidents"></ul></section>
       <div class="actions"><button id="refresh" type="button">Refresh</button><button id="logout" type="button">Sign out</button></div>
     </section>
@@ -89,6 +88,11 @@ aside { border-left: 1px solid var(--line); padding-left: 1.5rem; }
 label { display: block; margin: 1rem 0 .4rem; }
 input, button { font: inherit; min-height: 2.75rem; max-width: 100%; }
 input { width: 100%; padding: .5rem; }
+.checkbox { display: flex; align-items: center; gap: .5rem; }
+input[type="checkbox"] { width: auto; }
+td .actions { margin: 0; gap: .5rem; }
+button:disabled { cursor: wait; }
+[hidden] { display: none !important; }
 button { padding: .5rem .9rem; cursor: pointer; }
 form button { margin-top: 1rem; }
 .text-button { border: 0; background: transparent; color: inherit; padding-left: 0; text-decoration: underline; text-underline-offset: .2em; }
@@ -102,51 +106,99 @@ form button { margin-top: 1rem; }
 `;
 
 export const operatorScript = `
-const login = document.getElementById('login');
-const editor = document.getElementById('editor');
-const form = document.getElementById('configuration');
-const message = document.getElementById('message');
+const byId = id => document.getElementById(id);
+const login = byId('login');
+const editor = byId('editor');
+const form = byId('configuration');
+const pageForm = byId('page-configuration');
+const message = byId('message');
 let secret = '';
-async function load(method = 'GET') {
-  message.textContent = '';
+let editingId = null;
+let busy = false;
+function edit(monitor = null) {
+  editingId = monitor?.id || null;
+  form.reset();
+  byId('monitor-settings').textContent = monitor ? 'Edit Monitor' : 'New Monitor';
+  byId('name').value = monitor?.name || '';
+  byId('url').value = monitor?.url || '';
+  byId('published').checked = monitor?.published ?? true;
+  form.hidden = false;
+  byId('name').focus();
+}
+function cancelEdit() { editingId = null; form.reset(); form.hidden = true; }
+function signOut() {
+  secret = ''; cancelEdit(); pageForm.reset(); editor.hidden = true; login.hidden = false;
+  byId('monitor-rows').replaceChildren(); byId('incidents').replaceChildren();
+  message.textContent = ''; byId('secret').value = ''; byId('secret').focus();
+}
+function render(data) {
+  login.hidden = true; editor.hidden = false;
+  byId('pageName').value = data.pageName;
+  const rows = data.monitors.map(monitor => {
+    const row = document.createElement('tr');
+    for (const text of [monitor.name, (${JSON.stringify(stateLabel)})[monitor.state], monitor.published ? 'Published' : 'Private']) {
+      const cell = document.createElement('td'); cell.textContent = text; row.append(cell);
+    }
+    const actions = document.createElement('td');
+    const group = document.createElement('div'); group.className = 'actions';
+    const path = '/api/operator/monitors/' + encodeURIComponent(monitor.id);
+    for (const [label, action] of [
+      ['Edit', () => edit(monitor)],
+      [monitor.published ? 'Unpublish' : 'Publish', () => run(path, 'PATCH', { published: !monitor.published })],
+      ['Delete', () => { if (confirm('Delete ' + monitor.name + '?')) run(path, 'DELETE', undefined, () => { if (editingId === monitor.id) cancelEdit(); }); }]
+    ]) {
+      const button = document.createElement('button'); button.type = 'button'; button.textContent = label;
+      button.setAttribute('aria-label', label + ' ' + monitor.name);
+      button.addEventListener('click', action); group.append(button);
+    }
+    actions.append(group); row.append(actions); return row;
+  });
+  if (!rows.length) {
+    const row = document.createElement('tr'); const cell = document.createElement('td');
+    cell.colSpan = 4; cell.textContent = 'No Monitors'; row.append(cell); rows.push(row);
+  }
+  byId('monitor-rows').replaceChildren(...rows);
+  const incidents = data.incidents.map(incident => {
+    const item = document.createElement('li'); item.className = 'incident';
+    const monitor = data.monitors.find(monitor => monitor.id === incident.monitorId);
+    item.textContent = (monitor?.name || incident.monitorName || incident.monitorId) + (monitor ? '' : ' (deleted)') + ' — Unavailable since ' + new Date(incident.openedAt).toISOString() + (incident.closedAt === null ? ' — Ongoing' : ' — Recovered ' + new Date(incident.closedAt).toISOString());
+    return item;
+  });
+  if (!incidents.length) { const item = document.createElement('li'); item.textContent = 'No Incidents'; incidents.push(item); }
+  byId('incidents').replaceChildren(...incidents);
+}
+async function run(path = '/api/operator', method = 'GET', body, after) {
+  if (busy) return;
+  busy = true; message.textContent = '';
+  document.querySelectorAll('button, input').forEach(control => { control.disabled = true; });
   try {
-    const response = await fetch('/api/operator', {
+    const response = await fetch(path, {
       method, headers: { Authorization: 'Bearer ' + secret, 'Content-Type': 'application/json' },
-      ...(method === 'PUT' ? { body: JSON.stringify(Object.fromEntries(new FormData(form))) } : {})
+      ...(body === undefined ? {} : { body: JSON.stringify(body) })
     });
     const data = await response.json();
-    if (!response.ok) throw new Error(data.error || 'Request failed');
-    login.hidden = true;
-    editor.hidden = false;
-    document.getElementById('pageName').value = data.pageName;
-    document.getElementById('name').value = data.monitor?.name || '';
-    document.getElementById('url').value = data.monitor?.url || '';
-    document.getElementById('monitor-link').textContent = data.monitor?.name || 'Configure website';
-    document.getElementById('state').textContent = data.monitor ? (${JSON.stringify(stateLabel)})[data.monitor.state] : 'No Monitor configured';
-    const incidents = data.incidents.map(incident => {
-      const item = document.createElement('li');
-      item.className = 'incident';
-      item.textContent = 'Unavailable since ' + new Date(incident.openedAt).toISOString() + (incident.closedAt === null ? ' — Ongoing' : ' — Recovered ' + new Date(incident.closedAt).toISOString());
-      return item;
-    });
-    if (!incidents.length) { const item = document.createElement('li'); item.textContent = 'No Incidents'; incidents.push(item); }
-    document.getElementById('incidents').replaceChildren(...incidents);
-    if (method === 'PUT') message.textContent = 'Saved';
+    if (!response.ok) { if (response.status === 401) signOut(); throw new Error(data.error || 'Request failed'); }
+    render(data); if (after) after();
+    if (method !== 'GET') message.textContent = method === 'DELETE' ? 'Deleted' : 'Saved';
   } catch (error) { message.textContent = error.message; }
+  finally {
+    busy = false;
+    document.querySelectorAll('button, input').forEach(control => { control.disabled = false; });
+  }
 }
 login.addEventListener('submit', async event => {
-  event.preventDefault(); secret = document.getElementById('secret').value;
-  await load(); document.getElementById('secret').value = '';
-  if (!editor.hidden) document.getElementById('name').focus();
+  event.preventDefault(); secret = byId('secret').value;
+  await run(); byId('secret').value = '';
+  if (!editor.hidden) byId('new-monitor').focus();
 });
-form.addEventListener('submit', async event => { event.preventDefault(); await load('PUT'); });
-document.getElementById('monitor-link').addEventListener('click', () => document.getElementById('name').focus());
-document.getElementById('refresh').addEventListener('click', () => load());
-document.getElementById('logout').addEventListener('click', () => {
-  secret = ''; form.reset(); editor.hidden = true; login.hidden = false;
-  document.getElementById('monitor-link').textContent = 'Configure website';
-  document.getElementById('state').textContent = '';
-  document.getElementById('incidents').replaceChildren(); message.textContent = '';
-  document.getElementById('secret').focus();
+form.addEventListener('submit', async event => {
+  event.preventDefault();
+  const body = { name: byId('name').value, url: byId('url').value, published: byId('published').checked };
+  await run('/api/operator/monitors' + (editingId ? '/' + encodeURIComponent(editingId) : ''), editingId ? 'PATCH' : 'POST', body, cancelEdit);
 });
+pageForm.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator', 'PUT', { pageName: byId('pageName').value }); });
+byId('new-monitor').addEventListener('click', () => edit());
+byId('cancel-edit').addEventListener('click', cancelEdit);
+byId('refresh').addEventListener('click', () => run());
+byId('logout').addEventListener('click', signOut);
 `;

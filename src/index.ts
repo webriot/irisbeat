@@ -6,11 +6,13 @@ type Configuration = { pageName: string; name: string; url: string };
 export type Incident = {
   id: string;
   monitorId: string;
+  monitorName: string | null;
   openedAt: number;
   closedAt: number | null;
 };
 type CheckResult = { at: number; outcome: "success" | "failure" };
-type Monitor = Configuration & {
+type Monitor = Omit<Configuration, "pageName"> & {
+  published: boolean;
   id: string;
   state: "unknown" | "up" | "down";
   lastResult: CheckResult | null;
@@ -19,7 +21,8 @@ type Monitor = Configuration & {
   nextDue: number;
 };
 export type Status = ReturnType<MonitoringContext["status"]>;
-type StoredContext = { monitor: Monitor | null };
+type StoredContext = { pageName: string; monitors: Monitor[] };
+type LegacyContext = { monitor: (Omit<Monitor, "published"> & { pageName: string }) | null };
 
 export class MonitoringContext extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -27,35 +30,87 @@ export class MonitoringContext extends DurableObject<Env> {
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS incidents (
       id TEXT PRIMARY KEY, monitorId TEXT NOT NULL, openedAt INTEGER NOT NULL, closedAt INTEGER
     )`);
+    if (!ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(incidents)").toArray().some(column => column.name === "monitorName")) {
+      ctx.storage.sql.exec("ALTER TABLE incidents ADD COLUMN monitorName TEXT");
+    }
   }
   private read(): StoredContext {
-    return (
-      this.ctx.storage.kv.get<StoredContext>("context") ?? { monitor: null }
-    );
+    const stored = this.ctx.storage.kv.get<StoredContext | LegacyContext>("context");
+    if (!stored) return { pageName: "Irisbeat", monitors: [] };
+    if ("monitors" in stored) return stored;
+    const pageName = stored.monitor?.pageName ?? "Irisbeat";
+    const state: StoredContext = {
+      pageName,
+      monitors: [],
+    };
+    // Preserve the legacy ID, detector progress and Incident identity on upgrade.
+    if (stored.monitor) {
+      const { pageName: _pageName, ...monitor } = stored.monitor;
+      state.monitors.push({ ...monitor, published: true });
+    }
+    this.ctx.storage.transactionSync(() => {
+      if (stored.monitor) this.ctx.storage.sql.exec(
+        "UPDATE incidents SET monitorName = ? WHERE monitorId = ? AND monitorName IS NULL",
+        stored.monitor.name, stored.monitor.id,
+      );
+      this.ctx.storage.kv.put("context", state);
+    });
+    return state;
   }
 
-  configure(configuration: Configuration) {
+  configure(configuration: Configuration | { pageName: string }) {
     const state = this.read();
-    state.monitor = {
-      ...configuration,
-      id: "website",
-      state: state.monitor?.state ?? "unknown",
-      lastResult: state.monitor?.lastResult ?? null,
-      failures: state.monitor?.failures ?? 0,
-      successes: state.monitor?.successes ?? 0,
-      nextDue: state.monitor?.nextDue ?? 0,
-    };
+    state.pageName = configuration.pageName;
+    // Keep the original single-Monitor save contract for existing clients.
+    if ("name" in configuration) {
+      const monitor = state.monitors[0];
+      if (monitor) Object.assign(monitor, { name: configuration.name, url: configuration.url });
+      else state.monitors.push(this.newMonitor({ name: configuration.name, url: configuration.url }));
+    }
     this.ctx.storage.kv.put("context", state);
     return this.status(true);
   }
 
-  private checking = false;
+  private newMonitor(configuration: { name: string; url: string }): Monitor {
+    return { ...configuration, id: crypto.randomUUID(), published: true, state: "unknown", lastResult: null,
+      failures: 0, successes: 0, nextDue: 0 };
+  }
+
+  create(configuration: { name: string; url: string; published?: boolean }) {
+    const state = this.read();
+    state.monitors.push({ ...this.newMonitor(configuration), published: configuration.published ?? true });
+    this.ctx.storage.kv.put("context", state);
+    return this.status(true);
+  }
+
+  edit(id: string, patch: Partial<Pick<Monitor, "name" | "url" | "published">>) {
+    const state = this.read();
+    const monitor = state.monitors.find(monitor => monitor.id === id);
+    if (!monitor) return null;
+    Object.assign(monitor, patch);
+    this.ctx.storage.kv.put("context", state);
+    return this.status(true);
+  }
+
+  remove(id: string) {
+    const state = this.read();
+    if (!state.monitors.some(monitor => monitor.id === id)) return null;
+    state.monitors = state.monitors.filter(monitor => monitor.id !== id);
+    this.ctx.storage.kv.put("context", state);
+    return this.status(true);
+  }
+
+  private checking = new Set<string>();
 
   async check(at: number) {
+    await Promise.all(this.read().monitors.map(monitor => this.checkMonitor(monitor.id, at)));
+  }
+
+  private async checkMonitor(id: string, at: number) {
     const state = this.read();
-    const attempt = state.monitor;
-    if (!attempt || this.checking || at < attempt.nextDue) return;
-    this.checking = true;
+    const attempt = state.monitors.find(monitor => monitor.id === id);
+    if (!attempt || this.checking.has(id) || at < attempt.nextDue) return;
+    this.checking.add(id);
     attempt.nextDue = at + 60_000;
     this.ctx.storage.kv.put("context", state);
     const controller = new AbortController();
@@ -73,11 +128,11 @@ export class MonitoringContext extends DurableObject<Env> {
       success = false;
     } finally {
       clearTimeout(timeout);
-      this.checking = false;
+      this.checking.delete(id);
     }
     const current = this.read();
     // Record the executed attempt without overwriting newer configuration.
-    const monitor = current.monitor;
+    const monitor = current.monitors.find(monitor => monitor.id === attempt.id);
     if (!monitor) return;
     monitor.lastResult = { at, outcome: success ? "success" : "failure" };
     monitor.failures = success ? 0 : monitor.failures + 1;
@@ -85,16 +140,18 @@ export class MonitoringContext extends DurableObject<Env> {
     this.ctx.storage.transactionSync(() => {
       const open = this.ctx.storage.sql
         .exec<Incident>(
-          "SELECT * FROM incidents WHERE closedAt IS NULL LIMIT 1",
+          "SELECT * FROM incidents WHERE monitorId = ? AND closedAt IS NULL LIMIT 1",
+          monitor.id,
         )
         .toArray()[0];
       if (!open && monitor.failures >= 2) {
         monitor.state = "down";
         this.ctx.storage.sql.exec(
-          "INSERT INTO incidents (id, monitorId, openedAt) VALUES (?, ?, ?)",
+          "INSERT INTO incidents (id, monitorId, openedAt, monitorName) VALUES (?, ?, ?, ?)",
           crypto.randomUUID(),
           monitor.id,
           at,
+          monitor.name,
         );
       } else if (open && monitor.successes >= 2) {
         this.ctx.storage.sql.exec(
@@ -106,27 +163,23 @@ export class MonitoringContext extends DurableObject<Env> {
       } else if (!open && success) {
         monitor.state = "up";
       }
-      current.monitor = monitor;
       this.ctx.storage.kv.put("context", current);
     });
   }
 
   status(operator = false) {
     const state = this.read();
+    const monitors = state.monitors.filter(monitor => operator || monitor.published).map(monitor => ({
+      id: monitor.id, name: monitor.name, state: monitor.state, lastResult: monitor.lastResult,
+      ...(operator ? { url: monitor.url, published: monitor.published } : {}),
+    }));
     return {
-      pageName: state.monitor?.pageName ?? "Irisbeat",
-      monitor: state.monitor
-        ? {
-            id: state.monitor.id,
-            name: state.monitor.name,
-            state: state.monitor.state,
-            lastResult: state.monitor.lastResult,
-            ...(operator ? { url: state.monitor.url } : {}),
-          }
-        : null,
+      pageName: state.pageName,
+      monitors,
+      monitor: monitors[0] ?? null,
       incidents: this.ctx.storage.sql
         .exec<Incident>("SELECT * FROM incidents ORDER BY openedAt DESC, id")
-        .toArray(),
+        .toArray().filter(incident => operator || monitors.some(monitor => monitor.id === incident.monitorId)),
     };
   }
 }
@@ -171,6 +224,18 @@ function parseConfiguration(value: unknown): Configuration | null {
   } catch {
     return null;
   }
+}
+
+function parseMonitorPatch(value: unknown): Partial<Pick<Monitor, "name" | "url" | "published">> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const fields = value as Record<string, unknown>;
+  if (!Object.keys(fields).length || Object.keys(fields).some(key => !["name", "url", "published"].includes(key))) return null;
+  if ("published" in fields && typeof fields.published !== "boolean") return null;
+  const configuration = parseConfiguration({ pageName: "Irisbeat", name: "Monitor", url: "https://example.com", ...fields });
+  if (!configuration) return null;
+  return { ...("name" in fields ? { name: configuration.name } : {}),
+    ...("url" in fields ? { url: configuration.url } : {}),
+    ...("published" in fields ? { published: fields.published as boolean } : {}) };
 }
 
 export default {
@@ -224,12 +289,19 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         headers: { "Content-Type": "text/javascript; charset=utf-8" },
       });
   }
-  if (path === "/api/operator") {
+  const monitorMatch = path.match(/^\/api\/operator\/monitors\/([^/]+)$/);
+  if (path === "/api/operator" || path === "/api/operator/monitors" || monitorMatch) {
     if (!(await authorized(request, env.INSTALLATION_SECRET)))
       return Response.json({ error: "Unauthorized" }, { status: 401 });
-    if (request.method === "GET")
+    if (monitorMatch && request.method === "DELETE") {
+      const result = await context.remove(monitorMatch[1]);
+      return result ? Response.json(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
+    }
+    if (request.method === "GET" && !monitorMatch)
       return Response.json(await context.status(true));
-    if (request.method === "PUT") {
+    if ((path === "/api/operator" && request.method === "PUT") ||
+        (path === "/api/operator/monitors" && request.method === "POST") ||
+        (monitorMatch && request.method === "PATCH")) {
       if (!request.headers.get("Content-Type")?.startsWith("application/json"))
         return Response.json(
           { error: "Use application/json" },
@@ -264,18 +336,31 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       } catch {
         return Response.json({ error: "Invalid JSON" }, { status: 400 });
       }
+      if (monitorMatch) {
+        const patch = parseMonitorPatch(value);
+        if (!patch) return Response.json({ error: "Enter a Monitor name, HTTP(S) URL without credentials or publication boolean" }, { status: 400 });
+        const result = await context.edit(monitorMatch[1], patch);
+        return result ? Response.json(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
+      }
+      if (path === "/api/operator" && value && typeof value === "object" &&
+          Object.keys(value).length === 1 && "pageName" in value) {
+        const pageName = value.pageName;
+        if (typeof pageName !== "string" || !pageName.trim() || pageName.length > 120)
+          return Response.json({ error: "Enter a page name" }, { status: 400 });
+        return Response.json(await context.configure({ pageName: pageName.trim() }));
+      }
+      if (path === "/api/operator/monitors") {
+        const patch = parseMonitorPatch(value);
+        if (!patch || !patch.name || !patch.url)
+          return Response.json({ error: "Enter a Monitor name and HTTP(S) URL without credentials" }, { status: 400 });
+        return Response.json(await context.create({ name: patch.name, url: patch.url, published: patch.published }), { status: 201 });
+      }
       const configuration = parseConfiguration(value);
       if (!configuration)
-        return Response.json(
-          {
-            error:
-              "Enter a page name, Monitor name and HTTP(S) URL without credentials",
-          },
-          { status: 400 },
-        );
+        return Response.json({ error: "Enter a page name, Monitor name and HTTP(S) URL without credentials" }, { status: 400 });
       return Response.json(await context.configure(configuration));
     }
-    return new Response(null, { status: 405, headers: { Allow: "GET, PUT" } });
+    return new Response(null, { status: 405, headers: { Allow: monitorMatch ? "PATCH, DELETE" : path === "/api/operator/monitors" ? "GET, POST" : "GET, PUT" } });
   }
   if (path === "/api/status" && request.method === "GET")
     return Response.json(await context.status());

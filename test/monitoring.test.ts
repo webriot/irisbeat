@@ -105,7 +105,7 @@ it("opens on two observed failures, skips missing executions, and recovers on tw
   });
   await tick(600_000);
   const incident = {
-    monitorId: "website",
+    monitorId: (await status()).monitors[0].id,
     openedAt: start + 600_000,
     closedAt: null,
   };
@@ -147,7 +147,7 @@ it("renders accessible operator controls and escapes public configuration and In
   expect(operator).toContain('for="pageName"');
   expect(operator).toContain('for="url"');
   expect(operator).not.toContain(env.INSTALLATION_SECRET);
-  expect(await (await request("/")).text()).toContain("No Monitor configured");
+  expect(await (await request("/")).text()).toContain("No Monitors published");
   await request("/api/operator", {
     method: "PUT",
     headers: { authorization, "Content-Type": "application/json" },
@@ -415,3 +415,156 @@ it.each(["page name", "target"])(
     });
   },
 );
+
+const operatorRequest = (path: string, method = "GET", body?: unknown) =>
+  request(path, {
+    method,
+    headers: { authorization, "Content-Type": "application/json" },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+
+it("creates independent Monitors in creation order and saves page settings separately", async () => {
+  const first = await operatorRequest("/api/operator/monitors", "POST", { name: "Zebra", url: config.url });
+  expect(first.status).toBe(201);
+  const second = await operatorRequest("/api/operator/monitors", "POST", { name: "Alpha", url: "https://second.example/health" });
+  expect(second.status).toBe(201);
+  expect((await operatorRequest("/api/operator", "PUT", { pageName: "Fleet" })).status).toBe(200);
+  const data = await (await operatorRequest("/api/operator/monitors")).json<import("../src/index").Status>();
+  expect(data).toMatchObject({ pageName: "Fleet", monitors: [{ name: "Zebra", published: true, url: config.url }, { name: "Alpha", published: true }] });
+  expect(data.monitors[0].id).not.toBe(data.monitors[1].id);
+  expect(await status()).toMatchObject({ monitors: [{ name: "Zebra" }, { name: "Alpha" }] });
+});
+
+it("checks private Monitors independently and filters public rows and Incident history", async () => {
+  await configure();
+  const publicId = (await status()).monitors[0].id;
+  const created = await (await operatorRequest("/api/operator/monitors", "POST", { name: "Private", url: "https://private.example/health" })).json<import("../src/index").Status>();
+  const id = created.monitors[1].id;
+  const path = `/api/operator/monitors/${id}`;
+  expect((await operatorRequest(path, "PATCH", { published: false })).status).toBe(200);
+  let publicAttempts = 0;
+  let privateAttempts = 0;
+  network.use(
+    http.get(config.url, () => { publicAttempts++; return new HttpResponse(null, { status: 204 }); }),
+    http.get("https://private.example/health", () => { privateAttempts++; return new HttpResponse(null, { status: 503 }); }),
+  );
+  await tick(0);
+  await tick(60_000);
+  expect([publicAttempts, privateAttempts]).toEqual([2, 2]);
+  expect(await status()).toMatchObject({ monitors: [{ name: "Website", state: "up" }], incidents: [] });
+  const operator = await (await operatorRequest("/api/operator")).json<import("../src/index").Status>();
+  expect(operator.monitors).toHaveLength(2);
+  expect(operator.incidents).toMatchObject([{ monitorId: id, closedAt: null }]);
+  expect(await (await request("/")).text()).toContain("All services operational");
+  await operatorRequest(path, "PATCH", { published: true, name: "Published outage" });
+  expect((await status()).incidents).toHaveLength(1);
+  expect(await (await request("/")).text()).toContain("Services unavailable");
+  await operatorRequest(`/api/operator/monitors/${publicId}`, "PATCH", { published: false });
+  await operatorRequest(path, "PATCH", { published: false });
+  expect(await status()).toMatchObject({ monitors: [], incidents: [] });
+  const empty = await (await request("/")).text();
+  expect(empty).toContain("No Monitors published");
+  expect(empty).not.toContain("All services operational");
+  await operatorRequest(path, "PATCH", { published: true });
+  await operatorRequest(`/api/operator/monitors/${publicId}`, "PATCH", { published: true });
+  expect((await status()).monitors.map(m => m.name)).toEqual(["Website", "Published outage"]);
+});
+
+it("deletes configuration during an active check without resurrecting it or erasing authorized Incidents", async () => {
+  await configure();
+  network.use(http.get(config.url, () => new HttpResponse(null, { status: 503 })));
+  await tick(0);
+  await tick(60_000);
+  const id = (await status()).monitors[0].id;
+  const before = (await status()).incidents;
+  let deletedStatus = 0;
+  const outbound = vi.spyOn(globalThis, "fetch").mockImplementationOnce(async () => {
+    const deleted = await operatorRequest(`/api/operator/monitors/${id}`, "DELETE");
+    deletedStatus = deleted.status;
+    // Deleting while an attempt runs must not let a replacement inherit its result.
+    expect((await operatorRequest("/api/operator/monitors", "POST", { name: "Replacement", url: "https://replacement.example" })).status).toBe(201);
+    return new Response(null, { status: 204 });
+  });
+  await tick(120_000);
+  expect(outbound).toHaveBeenCalledTimes(1);
+  expect(deletedStatus).toBe(200);
+  vi.restoreAllMocks();
+  await evictDurableObject(env.MONITORING.getByName("personal"));
+  expect(await status()).toMatchObject({ monitors: [{ name: "Replacement", state: "unknown", lastResult: null }], incidents: [] });
+  const operator = await (await operatorRequest("/api/operator")).json<import("../src/index").Status>();
+  expect(operator.monitors).toHaveLength(1);
+  expect(operator.incidents).toEqual(before);
+  let replacementAttempts = 0;
+  network.use(http.get("https://replacement.example/", () => { replacementAttempts++; return new HttpResponse(null, { status: 204 }); }));
+  await tick(180_000);
+  expect(replacementAttempts).toBe(1);
+  expect(await status()).toMatchObject({ monitors: [{ state: "up" }], incidents: [] });
+  expect((await operatorRequest(`/api/operator/monitors/${id}`, "DELETE")).status).toBe(404);
+  expect((await operatorRequest(`/api/operator/monitors/${id}`, "PATCH", { published: true })).status).toBe(404);
+});
+
+it("validates and authenticates every collection mutation without exposing targets", async () => {
+  const create = { name: "<Private>", url: "https://private.example/health", published: false };
+  for (const [path, method, body] of [
+    ["/api/operator/monitors", "POST", create],
+    ["/api/operator/monitors", "GET", undefined],
+    ["/api/operator/monitors/unknown", "PATCH", { published: true }],
+    ["/api/operator/monitors/unknown", "DELETE", undefined],
+  ] as const) {
+    expect((await request(path, { method, ...(body ? { body: JSON.stringify(body) } : {}) })).status).toBe(401);
+  }
+  const saved = await operatorRequest("/api/operator/monitors", "POST", create);
+  expect(saved.status).toBe(201);
+  const id = (await saved.json<import("../src/index").Status>()).monitors[0].id;
+  expect((await status()).monitors).toEqual([]);
+  for (const body of [{}, { published: "false" }, { url: "https://u:p@private.example" }, { name: " " }, { kind: "tcp" }, { url: "ftp://private.example" }]) {
+    expect((await operatorRequest(`/api/operator/monitors/${id}`, "PATCH", body)).status).toBe(400);
+  }
+  for (const body of [{ ...create, published: "true" }, { ...create, kind: "tcp" }, { name: "Missing URL" }]) {
+    expect((await operatorRequest("/api/operator/monitors", "POST", body)).status).toBe(400);
+  }
+  expect((await operatorRequest(`/api/operator/monitors/${id}`, "PATCH", { url: "https://new.example/#fragment", name: "Renamed" })).status).toBe(200);
+  expect(await (await operatorRequest("/api/operator")).json()).toMatchObject({ monitors: [{ name: "Renamed", url: "https://new.example/", published: false }] });
+  const publicText = await (await request("/api/status")).text() + await (await request("/")).text();
+  expect(publicText).not.toContain(id);
+  expect(publicText).not.toContain("private.example");
+  expect(publicText).not.toContain("new.example");
+  expect(publicText).not.toContain(env.INSTALLATION_SECRET);
+  expect((await operatorRequest(`/api/operator/monitors/${id}`, "POST", create)).headers.get("Allow")).toBe("PATCH, DELETE");
+});
+
+it("serves collection controls with separate Monitor and page settings forms", async () => {
+  const html = await (await request("/operator")).text();
+  for (const control of ['id="new-monitor"', 'id="published"', 'id="cancel-edit"', 'id="page-configuration"', 'id="monitor-rows"']) {
+    expect(html).toContain(control);
+  }
+  const script = await (await request("/operator.js")).text();
+  expect(script).toContain("Publish");
+  expect(script).toContain("Unpublish");
+  expect(script).toContain("Delete");
+  expect(script).toContain("/api/operator/monitors");
+  expect(script).not.toContain("localStorage");
+});
+
+it("retains named Incidents independently when one unavailable Monitor recovers and the other is deleted", async () => {
+  await configure();
+  const other = await (await operatorRequest("/api/operator/monitors", "POST", { name: "Other", url: "https://other.example/health" })).json<import("../src/index").Status>();
+  const id = other.monitors[1].id;
+  network.use(
+    http.get(config.url, () => new HttpResponse(null, { status: 503 })),
+    http.get("https://other.example/health", () => new HttpResponse(null, { status: 500 })),
+  );
+  await tick(0);
+  await tick(60_000);
+  expect((await status()).incidents).toHaveLength(2);
+  network.use(http.get(config.url, () => new HttpResponse(null, { status: 204 })));
+  await tick(120_000);
+  await tick(180_000);
+  expect((await status()).monitors.map(monitor => monitor.state)).toEqual(["up", "down"]);
+  expect((await status()).incidents.find(incident => incident.monitorId === id)).toMatchObject({ monitorName: "Other", closedAt: null });
+  await operatorRequest(`/api/operator/monitors/${id}`, "DELETE");
+  await evictDurableObject(env.MONITORING.getByName("personal"));
+  const history = await (await operatorRequest("/api/operator")).json<import("../src/index").Status>();
+  expect(history.incidents.find(incident => incident.monitorId === id)).toMatchObject({ monitorName: "Other", closedAt: null });
+  expect((await status()).incidents).toMatchObject([{ closedAt: start + 180_000 }]);
+});
