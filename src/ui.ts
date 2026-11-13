@@ -122,7 +122,7 @@ async function load(method = 'GET') {
     document.getElementById('name').value = data.monitor?.name || '';
     document.getElementById('url').value = data.monitor?.url || '';
     document.getElementById('monitor-link').textContent = data.monitor?.name || 'Configure website';
-    document.getElementById('state').textContent = data.monitor ? ({ unknown: 'Awaiting check', up: 'Operational', down: 'Unavailable' })[data.monitor.state] : 'No Monitor configured';
+    document.getElementById('state').textContent = data.monitor ? (${JSON.stringify(stateLabel)})[data.monitor.state] : 'No Monitor configured';
     const incidents = data.incidents.map(incident => {
       const item = document.createElement('li');
       item.className = 'incident';
