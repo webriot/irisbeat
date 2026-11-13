@@ -23,7 +23,7 @@ function historyMarkup(history: AvailabilityHistory | null | undefined) {
   if (!history) return '<p class="history-unavailable">Bars unavailable</p>';
   return `<div class="availability"><span class="percentage" aria-label="Availability">${history.percentage === null ? "Unavailable" : history.percentage.toFixed(2) + "%"}</span><ol class="history" aria-label="90 UTC days of availability">${history.days.map(day => {
     const label = day.date + " UTC: " + (day.state === "maintenance" ? "Maintenance" : day.state) + "; " + day.successes + " successes, " + day.failures + " failures, " + day.maintenance + " Maintenance";
-    return `<li class="history-day ${day.state}" tabindex="0" aria-label="${label}" title="${label}"></li>`;
+    return `<li class="history-day ${day.state}" tabindex="0" aria-label="${label}"><span class="history-detail" aria-hidden="true">${label}</span></li>`;
   }).join("")}</ol></div>`;
 }
 
@@ -120,7 +120,10 @@ table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
 th, td { padding: 1rem .5rem; text-align: left; border-bottom: 1px solid var(--line); }
 .availability { padding: 1rem 0; min-width: 12rem; }
 .percentage { font-variant-numeric: tabular-nums; }
-.history { display: grid; grid-template-columns: repeat(90, minmax(0, 1fr)); gap: 2px; list-style: none; padding: 0; margin: .5rem 0; }
+.history { position: relative; display: grid; grid-template-columns: repeat(90, minmax(0, 1fr)); gap: 2px; list-style: none; padding: 0; margin: .5rem 0; }
+.history:has(.history-day:focus), .history:has(.history-day:hover) { padding-bottom: 5rem; }
+.history-detail { display: none; position: absolute; inset: 2.2rem 0 auto; font-size: .875rem; line-height: 1.4; }
+.history-day:focus .history-detail, .history:not(:has(.history-day:focus)) .history-day:hover .history-detail { display: block; }
 .history-day { height: 1.8rem; background: light-dark(#e6eae8, #35413c); }
 .history-day.up { background: light-dark(#19734b, #59c990); }
 .history-day.down { background: light-dark(#b52a34, #ff7880); }
