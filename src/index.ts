@@ -2,6 +2,22 @@
 import { operatorPage, operatorScript, statusPage, styleSheet } from "./ui";
 import { DurableObject } from "cloudflare:workers";
 
+export const CONTRACT_VERSION = "1" as const;
+export interface EngineEnv {
+  MONITORING: DurableObjectNamespace<MonitoringContext>;
+  INSTALLATION_SECRET?: string;
+}
+export type ResolvedContext = {
+  id: string;
+  permission: "editor" | "reader" | null;
+  monitorLimit: number;
+};
+export interface HostedAdapter<E extends EngineEnv = EngineEnv> {
+  contractVersion: string;
+  resolve(request: Request, env: E): ResolvedContext | null | Promise<ResolvedContext | null>;
+  contexts(env: E): string[] | Promise<string[]>;
+}
+
 const timingDefaults = {
   intervalSeconds: 60,
   timeoutSeconds: 10,
@@ -28,6 +44,12 @@ export type Incident = {
   openedAt: number;
   closedAt: number | null;
 };
+export type IncidentTransition = {
+  contextId: string;
+  incident: Incident;
+  transition: "opened" | "recovered";
+  at: number;
+};
 type CheckResult = { at: number; outcome: "success" | "failure" };
 type Monitor = Omit<Configuration, "pageName"> & Timing & {
   published: boolean;
@@ -40,13 +62,14 @@ type Monitor = Omit<Configuration, "pageName"> & Timing & {
   createdAt: number;
   lastSeen: number | null;
   recoveryReceiptAt: number | null;
+  heartbeatDigest?: ArrayBuffer;
 };
 export type Status = ReturnType<MonitoringContext["status"]>;
 type StoredContext = { pageName: string; monitors: Monitor[]; webhookUrl?: string | null };
 type LegacyContext = { webhookUrl?: string | null; monitor: (Omit<Monitor, "published" | keyof Timing> & Partial<Timing> & { pageName: string }) | null };
 
-export class MonitoringContext extends DurableObject<Env> {
-  constructor(ctx: DurableObjectState, env: Env) {
+export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableObject<E> {
+  constructor(ctx: DurableObjectState, env: E) {
     super(ctx, env);
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS incidents (
       id TEXT PRIMARY KEY, monitorId TEXT NOT NULL, openedAt INTEGER NOT NULL, closedAt INTEGER
@@ -105,8 +128,10 @@ export class MonitoringContext extends DurableObject<Env> {
       failures: 0, successes: 0, nextDue: 0, createdAt: Date.now(), lastSeen: null, recoveryReceiptAt: null };
   }
 
-  create(configuration: MonitorConfiguration) {
+  create(configuration: MonitorConfiguration, limit?: number) {
     const state = this.read();
+    // No await between allowance check and synchronous persistence: concurrent RPCs serialize.
+    if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0 || state.monitors.length >= limit)) return null;
     state.monitors.push(this.newMonitor(configuration));
     this.ctx.storage.kv.put("context", state);
     return this.status(true);
@@ -193,6 +218,7 @@ export class MonitoringContext extends DurableObject<Env> {
     monitor.failures = success ? 0 : monitor.failures + 1;
     monitor.successes = success ? monitor.successes + 1 : 0;
     let transition: "opened" | "recovered" | undefined;
+    let transitionedIncident: Incident | undefined;
     this.ctx.storage.transactionSync(() => {
       const open = this.ctx.storage.sql
         .exec<Incident>(
@@ -203,9 +229,11 @@ export class MonitoringContext extends DurableObject<Env> {
       if (!open && monitor.failures >= failureThreshold) {
         transition = "opened";
         monitor.state = "down";
+        const incidentId = crypto.randomUUID();
+        transitionedIncident = { id: incidentId, monitorId: monitor.id, monitorName: monitor.name, openedAt: at, closedAt: null };
         this.ctx.storage.sql.exec(
           "INSERT INTO incidents (id, monitorId, openedAt, monitorName) VALUES (?, ?, ?, ?)",
-          crypto.randomUUID(),
+          incidentId,
           monitor.id,
           at,
           monitor.name,
@@ -217,6 +245,7 @@ export class MonitoringContext extends DurableObject<Env> {
           open.id,
         );
         transition = "recovered";
+        transitionedIncident = { ...open, closedAt: at };
         monitor.state = "up";
       } else if (!open && success) {
         monitor.state = "up";
@@ -226,7 +255,16 @@ export class MonitoringContext extends DurableObject<Env> {
     // Delivery follows the committed transition; transport failure cannot undo detection.
     if (transition && current.webhookUrl)
       await this.deliverWebhook(current.webhookUrl, monitor.name, transition);
+    if (transition && transitionedIncident) {
+      try {
+        await this.onIncidentTransition({ contextId: this.ctx.id.toString(), incident: transitionedIncident, transition, at });
+      } catch {
+        console.error(JSON.stringify({ event: "transition_delivery_failed" }));
+      }
+    }
   }
+
+  protected async onIncidentTransition(_event: IncidentTransition): Promise<void> {}
 
   private async deliverWebhook(
     url: string,
@@ -269,7 +307,25 @@ export class MonitoringContext extends DurableObject<Env> {
     return true;
   }
 
-  status(operator = false) {
+  async rotateHeartbeatSecret(id: string) {
+    const secret = crypto.randomUUID() + crypto.randomUUID();
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`Bearer ${secret}`));
+    const state = this.read();
+    const monitor = state.monitors.find(monitor => monitor.id === id && monitor.kind === "heartbeat");
+    if (!monitor) return null;
+    monitor.heartbeatDigest = digest;
+    this.ctx.storage.kv.put("context", state);
+    return { secret };
+  }
+
+  async hostedHeartbeat(authorization: string, at: number) {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(authorization));
+    // Read after hashing; rotation and deletion cannot interleave before heartbeat's synchronous commit.
+    const monitor = this.read().monitors.find(monitor => monitor.kind === "heartbeat" && monitor.heartbeatDigest && crypto.subtle.timingSafeEqual(digest, monitor.heartbeatDigest));
+    return monitor ? this.heartbeat(monitor.id, at) : false;
+  }
+
+  status(operator = false, secrets = operator) {
     const state = this.read();
     const monitors = state.monitors.filter(monitor => operator || monitor.published).map(monitor => ({
       id: monitor.id, name: monitor.name, kind: monitor.kind,
@@ -282,7 +338,7 @@ export class MonitoringContext extends DurableObject<Env> {
       } : {}),
     }));
     return {
-      ...(operator ? { webhookUrl: state.webhookUrl ?? null } : {}),
+      ...(secrets ? { webhookUrl: state.webhookUrl ?? null } : {}),
       pageName: state.pageName,
       monitors,
       monitor: monitors[0] ?? null,
@@ -381,13 +437,19 @@ function parseWebhook(value: unknown): string | null | undefined {
   }
 }
 
-export default {
-  async scheduled(controller, env) {
-    await env.MONITORING.getByName("personal").check(controller.scheduledTime);
+function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E>) { return {
+  async scheduled(controller: ScheduledController, env: E) {
+    const ids = adapter ? await adapter.contexts(env) : ["personal"];
+    await Promise.all([...new Set(ids)].map(id => env.MONITORING.getByName(id).check(controller.scheduledTime)));
   },
-  async fetch(request, env) {
+  async fetch(request: Request, env: E) {
     try {
-      const response = await handleRequest(request, env);
+      const resolved = adapter ? await adapter.resolve(request, env) : undefined;
+      if (resolved && (typeof resolved.id !== "string" || !resolved.id ||
+          !["editor", "reader", null].includes(resolved.permission) ||
+          !Number.isSafeInteger(resolved.monitorLimit) || resolved.monitorLimit < 0))
+        throw new Error("Invalid hosted context");
+      const response = adapter && !resolved ? new Response("Not found", { status: 404 }) : await handleRequest(request, env, resolved ?? undefined);
       response.headers.set("Cache-Control", "no-store");
       response.headers.set("X-Content-Type-Options", "nosniff");
       response.headers.set("Referrer-Policy", "no-referrer");
@@ -409,11 +471,25 @@ export default {
       );
     }
   },
-} satisfies ExportedHandler<Env>;
+} satisfies ExportedHandler<E>; }
 
-async function handleRequest(request: Request, env: Env): Promise<Response> {
+export default createWorker();
+
+export function createHostedWorker<E extends EngineEnv = EngineEnv>(adapter: HostedAdapter<E>) {
+  if (adapter.contractVersion !== CONTRACT_VERSION) throw new Error("Unsupported Irisbeat contract version");
+  return createWorker(adapter);
+}
+
+async function handleRequest(request: Request, env: EngineEnv, resolved?: ResolvedContext): Promise<Response> {
+  const operatorResponse = (result: Status | null, status = 200) => Response.json(result && { ...result, ...(resolved ? { hosted: true, permission: resolved.permission } : {}) }, { status });
   const path = new URL(request.url).pathname;
-  const context = env.MONITORING.getByName("personal");
+  const context = env.MONITORING.getByName(resolved?.id ?? "personal");
+  if (resolved && path === "/heartbeat") {
+    if (request.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST" } });
+    const accepted = await context.hostedHeartbeat(request.headers.get("authorization") ?? "", Date.now());
+    return new Response(null, { status: accepted ? 204 : 401 });
+  }
+  if (resolved && path.startsWith("/heartbeat/")) return new Response(null, { status: 404 });
   if (path.startsWith("/heartbeat/")) {
     if (!(await authorized(request, env.INSTALLATION_SECRET)))
       return Response.json({ error: "Unauthorized" }, { status: 401 });
@@ -428,7 +504,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         headers: { "Content-Type": "text/html; charset=utf-8" },
       });
     if (path === "/operator")
-      return new Response(operatorPage(), {
+      return new Response(operatorPage(!!resolved), {
         headers: { "Content-Type": "text/html; charset=utf-8" },
       });
     if (path === "/app.css")
@@ -440,16 +516,23 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         headers: { "Content-Type": "text/javascript; charset=utf-8" },
       });
   }
+  const rotationMatch = resolved ? path.match(/^\/api\/operator\/monitors\/([^/]+)\/heartbeat-secret$/) : null;
   const monitorMatch = path.match(/^\/api\/operator\/monitors\/([^/]+)$/);
-  if (path === "/api/operator" || path === "/api/operator/webhook" || path === "/api/operator/monitors" || monitorMatch) {
-    if (!(await authorized(request, env.INSTALLATION_SECRET)))
-      return Response.json({ error: "Unauthorized" }, { status: 401 });
+  if (path === "/api/operator" || path === "/api/operator/webhook" || path === "/api/operator/monitors" || monitorMatch || rotationMatch) {
+    const permission = resolved ? resolved.permission : await authorized(request, env.INSTALLATION_SECRET) ? "editor" : null;
+    if (!permission) return Response.json({ error: "Unauthorized" }, { status: 401 });
+    if (permission !== "editor" && request.method !== "GET") return Response.json({ error: "Forbidden" }, { status: 403 });
+    if (rotationMatch) {
+      if (request.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST" } });
+      const result = await context.rotateHeartbeatSecret(rotationMatch[1]);
+      return result ? Response.json(result) : new Response(null, { status: 404 });
+    }
     if (monitorMatch && request.method === "DELETE") {
       const result = await context.remove(monitorMatch[1]);
-      return result ? Response.json(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
+      return result ? operatorResponse(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
     }
     if (request.method === "GET" && !monitorMatch)
-      return Response.json(await context.status(true));
+      return operatorResponse(await context.status(true, permission === "editor"));
     if (((path === "/api/operator" || path === "/api/operator/webhook") && request.method === "PUT") ||
         (path === "/api/operator/monitors" && request.method === "POST") ||
         (monitorMatch && request.method === "PATCH")) {
@@ -497,7 +580,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
             { error: "Enter an HTTPS webhook URL" },
             { status: 400 },
           );
-        return Response.json(await context.configureWebhook(destination));
+        return operatorResponse(await context.configureWebhook(destination));
       }
       if (monitorMatch) {
         const existing = (await context.status(true)).monitors.find(monitor => monitor.id === monitorMatch[1]);
@@ -505,27 +588,29 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         const patch = parseMonitorPatch(value, existing.kind);
         if (!patch || (patch.kind !== undefined && patch.kind !== existing.kind)) return Response.json({ error: "Use a valid name, publication boolean and integer timing; kind cannot change. HTTP requires a credential-free HTTP(S) URL" }, { status: 400 });
         const result = await context.edit(monitorMatch[1], patch);
-        return result ? Response.json(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
+        return result ? operatorResponse(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
       }
       if (path === "/api/operator" && value && typeof value === "object" &&
           Object.keys(value).length === 1 && "pageName" in value) {
         const pageName = value.pageName;
         if (typeof pageName !== "string" || !pageName.trim() || pageName.length > 120)
           return Response.json({ error: "Enter a page name" }, { status: 400 });
-        return Response.json(await context.configure({ pageName: pageName.trim() }));
+        return operatorResponse(await context.configure({ pageName: pageName.trim() }));
       }
       if (path === "/api/operator/monitors") {
         const patch = parseMonitorPatch(value);
         if (!patch || !patch.name || (patch.kind !== "heartbeat" && !patch.url))
           return Response.json({ error: "Enter a name, valid integer timing and an HTTP(S) target or Heartbeat kind" }, { status: 400 });
-        return Response.json(await context.create({ ...patch, kind: patch.kind ?? "http", name: patch.name, url: patch.kind === "heartbeat" ? "" : patch.url! }), { status: 201 });
+        const result = await context.create({ ...patch, kind: patch.kind ?? "http", name: patch.name, url: patch.kind === "heartbeat" ? "" : patch.url! }, resolved?.monitorLimit);
+        return result ? operatorResponse(result, 201) : Response.json({ error: "Monitor allowance reached" }, { status: 409 });
       }
+      if (resolved) return Response.json({ error: "Use the Monitor collection" }, { status: 400 });
       const existing = (await context.status(true)).monitor;
       const configuration = parseConfiguration(value, existing?.kind);
       if (!configuration || (existing && configuration.kind !== existing.kind))
         return Response.json({ error: "Enter page/Monitor names and valid timing; kind cannot change. HTTP requires a credential-free HTTP(S) URL" }, { status: 400 });
       const result = await context.configure(configuration, existing?.id ?? null);
-      return result ? Response.json(result) : Response.json({ error: "Monitor changed; reload before saving" }, { status: 409 });
+      return result ? operatorResponse(result) : Response.json({ error: "Monitor changed; reload before saving" }, { status: 409 });
     }
     return new Response(null, { status: 405, headers: { Allow: monitorMatch ? "PATCH, DELETE" : path === "/api/operator/monitors" ? "GET, POST" : "GET, PUT" } });
   }
