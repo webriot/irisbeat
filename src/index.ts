@@ -501,7 +501,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         const existing = (await context.status(true)).monitors.find(monitor => monitor.id === monitorMatch[1]);
         if (!existing) return Response.json({ error: "Monitor not found" }, { status: 404 });
         const patch = parseMonitorPatch(value, existing.kind);
-        if (!patch || (patch.kind !== undefined && patch.kind !== existing.kind)) return Response.json({ error: "Enter a Monitor name, HTTP(S) URL without credentials or publication boolean" }, { status: 400 });
+        if (!patch || (patch.kind !== undefined && patch.kind !== existing.kind)) return Response.json({ error: "Use a valid name, publication boolean and integer timing; kind cannot change. HTTP requires a credential-free HTTP(S) URL" }, { status: 400 });
         const result = await context.edit(monitorMatch[1], patch);
         return result ? Response.json(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
       }
@@ -515,13 +515,13 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       if (path === "/api/operator/monitors") {
         const patch = parseMonitorPatch(value);
         if (!patch || !patch.name || (patch.kind !== "heartbeat" && !patch.url))
-          return Response.json({ error: "Enter a Monitor name and HTTP(S) URL without credentials" }, { status: 400 });
+          return Response.json({ error: "Enter a name, valid integer timing and an HTTP(S) target or Heartbeat kind" }, { status: 400 });
         return Response.json(await context.create({ ...patch, kind: patch.kind ?? "http", name: patch.name, url: patch.kind === "heartbeat" ? "" : patch.url! }), { status: 201 });
       }
       const existing = (await context.status(true)).monitor;
       const configuration = parseConfiguration(value, existing?.kind);
       if (!configuration || (existing && configuration.kind !== existing.kind))
-        return Response.json({ error: "Enter a page name, Monitor name and HTTP(S) URL without credentials" }, { status: 400 });
+        return Response.json({ error: "Enter page/Monitor names and valid timing; kind cannot change. HTTP requires a credential-free HTTP(S) URL" }, { status: 400 });
       return Response.json(await context.configure(configuration));
     }
     return new Response(null, { status: 405, headers: { Allow: monitorMatch ? "PATCH, DELETE" : path === "/api/operator/monitors" ? "GET, POST" : "GET, PUT" } });
