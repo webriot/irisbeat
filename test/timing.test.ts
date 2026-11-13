@@ -108,6 +108,16 @@ it("reschedules later attempts from the last dispatch without replaying gaps or 
 });
 
 it("applies threshold edits only on later observations while preserving streaks and Incident timestamps", async () => {
+  const messages: unknown[] = [];
+  expect((await request("/api/operator/webhook", {
+    method: "PUT",
+    headers: { authorization, "Content-Type": "application/json" },
+    body: JSON.stringify({ url: "https://hooks.example/timing" }),
+  })).status).toBe(200);
+  network.use(http.post("https://hooks.example/timing", async ({ request }) => {
+    messages.push(await request.json());
+    return new HttpResponse(null, { status: 204 });
+  }));
   await configure({ ...config, failureThreshold: 3, recoveryThreshold: 3 });
   network.use(http.get(config.url, () => new HttpResponse(null, { status: 503 })));
   await tick(0);
@@ -116,7 +126,9 @@ it("applies threshold edits only on later observations while preserving streaks 
   expect(observed.incidents).toEqual([]);
   await configure({ ...config, failureThreshold: 1 });
   expect(await status()).toEqual(observed);
+  expect(messages).toEqual([]);
   await tick(120_000);
+  expect(messages).toEqual([{ text: "Website: Incident opened" }]);
   const opened = await status();
   expect(opened).toMatchObject({ monitor: { state: "down" }, incidents: [{ openedAt: start + 120_000, closedAt: null }] });
   network.use(http.get(config.url, () => new HttpResponse(null, { status: 204 })));
@@ -126,6 +138,7 @@ it("applies threshold edits only on later observations while preserving streaks 
   expect(recovering.monitor?.state).toBe("down");
   await configure({ ...config, recoveryThreshold: 2 });
   expect(await status()).toEqual(recovering);
+  expect(messages).toEqual([{ text: "Website: Incident opened" }]);
   await tick(300_000);
   expect(await status()).toMatchObject({ monitor: { state: "up" }, incidents: [{ ...opened.incidents[0], closedAt: start + 300_000 }] });
   const recovered = await status();
@@ -133,9 +146,20 @@ it("applies threshold edits only on later observations while preserving streaks 
   expect(await status()).toEqual(recovered);
   await evictDurableObject(env.MONITORING.getByName("personal"));
   expect(await status()).toEqual(recovered);
+  expect(messages).toEqual([{ text: "Website: Incident opened" }, { text: "Website: Incident recovered" }]);
 });
 
 it("finishes active failure and recovery attempts with their starting thresholds and retains newer settings", async () => {
+  const messages: unknown[] = [];
+  expect((await request("/api/operator/webhook", {
+    method: "PUT",
+    headers: { authorization, "Content-Type": "application/json" },
+    body: JSON.stringify({ url: "https://hooks.example/timing" }),
+  })).status).toBe(200);
+  network.use(http.post("https://hooks.example/timing", async ({ request }) => {
+    messages.push(await request.json());
+    return new HttpResponse(null, { status: 204 });
+  }));
   await configure();
   network.use(http.get(config.url, () => new HttpResponse(null, { status: 503 })));
   await tick(0);
@@ -146,6 +170,7 @@ it("finishes active failure and recovery attempts with their starting thresholds
   });
   await tick(60_000);
   expect(await status()).toMatchObject({ monitor: { state: "down", lastResult: { at: start + 60_000 } }, incidents: [{ openedAt: start + 60_000, closedAt: null }] });
+  expect(messages).toEqual([{ text: "Website: Incident opened" }]);
   vi.restoreAllMocks();
   network.use(http.get(config.url, () => new HttpResponse(null, { status: 204 })));
   await tick(120_000);
@@ -164,6 +189,8 @@ it("finishes active failure and recovery attempts with their starting thresholds
   await tick(420_000);
   await tick(540_000);
   expect((await status()).incidents).toEqual(recovered.incidents);
+  expect(messages).toEqual([{ text: "Website: Incident opened" }, { text: "Website: Incident recovered" }]);
+  expect(await (await request("/api/operator", { headers: { authorization } })).json()).toMatchObject({ webhookUrl: "https://hooks.example/timing" });
 });
 
 it("uses the configured timeout snapshot while saving a different deadline for the next attempt", async () => {
