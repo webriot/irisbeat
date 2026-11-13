@@ -7,3 +7,6 @@
 .wrangler/
 *.pem
 *.key
+node_modules/
+dist/
+worker-configuration.d.ts

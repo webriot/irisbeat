@@ -1,0 +1,33 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "irisbeat",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-13",
+  "workers_dev": true,
+  "triggers": {
+    "crons": ["* * * * *"],
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MONITORING",
+        "class_name": "MonitoringContext",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["MonitoringContext"],
+    },
+  ],
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": true,
+    },
+  },
+  "secrets": {
+    "required": ["INSTALLATION_SECRET"],
+  },
+}
