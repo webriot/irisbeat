@@ -28,11 +28,11 @@ async function tick(offset: number) {
     env,
   );
 }
-async function configure() {
+async function configure(configuration = config) {
   return request("/api/operator", {
     method: "PUT",
     headers: { authorization, "Content-Type": "application/json" },
-    body: JSON.stringify(config),
+    body: JSON.stringify(configuration),
   });
 }
 async function status(): Promise<import("../src/index").Status> {
@@ -338,3 +338,80 @@ it("presents the selected Status ledger with Monitor configuration beside page s
     "text/css",
   );
 });
+
+
+it.each(["page name", "Monitor name", "unchanged"])(
+  "preserves detection progress when saving %s",
+  async (change) => {
+    await configure();
+    network.use(http.get(config.url, () => new HttpResponse(null, { status: 503 })));
+    await tick(0);
+    const updated = {
+      ...config,
+      ...(change === "page name"
+        ? { pageName: "Renamed page" }
+        : change === "Monitor name" ? { name: "Renamed website" } : {}),
+    };
+    expect((await configure(updated)).status).toBe(200);
+    await tick(60_000);
+    expect(await status()).toMatchObject({
+      monitor: { state: "down" },
+      incidents: [{ openedAt: start + 60_000, closedAt: null }],
+    });
+    network.use(http.get(config.url, () => new HttpResponse(null, { status: 204 })));
+    await tick(120_000);
+    await configure(updated);
+    await tick(180_000);
+    expect(await status()).toMatchObject({
+      monitor: { state: "up" },
+      incidents: [{ openedAt: start + 60_000, closedAt: start + 180_000 }],
+    });
+  },
+);
+
+it.each(["page name", "target"])(
+  "records an in-flight check while saving %s for later attempts",
+  async (change) => {
+    await configure();
+    network.use(http.get(config.url, () => new HttpResponse(null, { status: 503 })));
+    await tick(0);
+    const updated = {
+      ...config,
+      ...(change === "target"
+        ? { url: "https://new-target.example/health" }
+        : { pageName: "Renamed during check" }),
+    };
+    let savedStatus = 0;
+    const outbound = vi.spyOn(globalThis, "fetch").mockImplementationOnce(async () => {
+      savedStatus = (await configure(updated)).status;
+      return new Response(null, { status: 503 });
+    });
+    await tick(60_000);
+    expect(savedStatus).toBe(200);
+    expect(outbound).toHaveBeenCalledWith(
+      config.url, expect.objectContaining({ method: "GET" }),
+    );
+    expect(await status()).toMatchObject({
+      pageName: updated.pageName,
+      monitor: {
+        state: "down",
+        lastResult: { at: start + 60_000, outcome: "failure" },
+      },
+      incidents: [{ openedAt: start + 60_000, closedAt: null }],
+    });
+    expect(
+      await (await request("/api/operator", { headers: { authorization } })).json(),
+    ).toMatchObject({
+      pageName: updated.pageName,
+      monitor: { url: updated.url },
+    });
+    vi.restoreAllMocks();
+    network.use(http.get(updated.url, () => new HttpResponse(null, { status: 204 })));
+    await tick(120_000);
+    await tick(180_000);
+    expect(await status()).toMatchObject({
+      monitor: { state: "up" },
+      incidents: [{ openedAt: start + 60_000, closedAt: start + 180_000 }],
+    });
+  },
+);

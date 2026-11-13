@@ -17,7 +17,6 @@ type Monitor = Configuration & {
   failures: number;
   successes: number;
   nextDue: number;
-  revision: string;
 };
 export type Status = ReturnType<MonitoringContext["status"]>;
 type StoredContext = { monitor: Monitor | null };
@@ -42,10 +41,9 @@ export class MonitoringContext extends DurableObject<Env> {
       id: "website",
       state: state.monitor?.state ?? "unknown",
       lastResult: state.monitor?.lastResult ?? null,
-      failures: 0,
-      successes: 0,
+      failures: state.monitor?.failures ?? 0,
+      successes: state.monitor?.successes ?? 0,
       nextDue: state.monitor?.nextDue ?? 0,
-      revision: crypto.randomUUID(),
     };
     this.ctx.storage.kv.put("context", state);
     return this.status(true);
@@ -55,16 +53,16 @@ export class MonitoringContext extends DurableObject<Env> {
 
   async check(at: number) {
     const state = this.read();
-    const monitor = state.monitor;
-    if (!monitor || this.checking || at < monitor.nextDue) return;
+    const attempt = state.monitor;
+    if (!attempt || this.checking || at < attempt.nextDue) return;
     this.checking = true;
-    monitor.nextDue = at + 60_000;
+    attempt.nextDue = at + 60_000;
     this.ctx.storage.kv.put("context", state);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10_000);
     let success = false;
     try {
-      const response = await fetch(monitor.url, {
+      const response = await fetch(attempt.url, {
         method: "GET",
         signal: controller.signal,
         redirect: "follow",
@@ -78,8 +76,9 @@ export class MonitoringContext extends DurableObject<Env> {
       this.checking = false;
     }
     const current = this.read();
-    // Configuration saved during a request applies to later attempts only.
-    if (current.monitor?.revision !== monitor.revision) return;
+    // Record the executed attempt without overwriting newer configuration.
+    const monitor = current.monitor;
+    if (!monitor) return;
     monitor.lastResult = { at, outcome: success ? "success" : "failure" };
     monitor.failures = success ? 0 : monitor.failures + 1;
     monitor.successes = success ? monitor.successes + 1 : 0;
