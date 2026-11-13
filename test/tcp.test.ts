@@ -161,7 +161,7 @@ it("offers HTTP and TCP targets within the Status ledger operator configuration"
   expect(html).toContain('<label for="port">Port</label>');
   expect(html).toContain('id="port" name="port" type="number" min="1" max="65535"');
   const script = await (await request("/operator.js")).text();
-  expect(script).toContain("configuration.port = Number(configuration.port)");
+  expect(script).toContain("body.port = Number(byId('port').value)");
 });
 
 it("records synchronous connection errors and tolerates rejected socket cleanup before the next attempt", async () => {
@@ -262,4 +262,164 @@ it.each(["2001:db8::1", "[2001:db8::1]"])("connects an IPv6 target supplied as %
   expect(await status()).toMatchObject({ monitor: { state: "up", lastResult: { outcome: "success" } } });
   expect(await (await request("/api/operator", { headers: { authorization } })).json())
     .toMatchObject({ monitor: { hostname: "2001:db8::1", port: 5432 } });
+});
+
+const mutate = (path: string, method: string, body?: unknown) => request(path, {
+  method, headers: { authorization, "Content-Type": "application/json" },
+  ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+});
+const operator = async (): Promise<import("../src/index").Status> => (await request("/api/operator", { headers: { authorization } })).json();
+
+it("creates mixed targets in order, edits only the selected ID and retains settings across eviction", async () => {
+  await mutate("/api/operator/webhook", "PUT", { url: "https://alerts.example/mixed" });
+  expect((await mutate("/api/operator/monitors", "POST", { name: "Web", url: "https://web.example/health" })).status).toBe(201);
+  expect((await mutate("/api/operator/monitors", "POST", { name: "Database", kind: "tcp", hostname: "db.example", port: 5432, published: false })).status).toBe(201);
+  const [web, tcp] = (await operator()).monitors;
+  expect((await mutate('/api/operator/monitors/' + tcp.id, 'PATCH', { port: 6432, intervalSeconds: 120 })).status).toBe(200);
+  expect((await mutate('/api/operator/monitors/' + web.id, 'PATCH', { url: 'https://next.example/health' })).status).toBe(200);
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  expect(await operator()).toMatchObject({ webhookUrl: 'https://alerts.example/mixed', monitors: [
+    { id: web.id, kind: 'http', url: 'https://next.example/health', intervalSeconds: 60 },
+    { id: tcp.id, kind: 'tcp', hostname: 'db.example', port: 6432, intervalSeconds: 120, published: false },
+  ] });
+  expect((await status()).monitors.map(m => m.id)).toEqual([web.id]);
+  expect((await mutate('/api/operator/monitors/' + tcp.id, 'PATCH', { published: true })).status).toBe(200);
+  expect((await status()).monitors.map(m => m.id)).toEqual([web.id, tcp.id]);
+  for (const path of ['/', '/api/status']) {
+    const body = await (await request(path)).text();
+    for (const hidden of ['db.example', '6432', 'next.example', 'alerts.example']) expect(body).not.toContain(hidden);
+  }
+});
+
+it("keeps mixed failures, recoveries and webhook identities independent, including private Monitors", async () => {
+  await mutate('/api/operator/webhook', 'PUT', { url: 'https://alerts.example/mixed' });
+  await mutate('/api/operator/monitors', 'POST', { name: 'Web', url: 'https://web.example/health' });
+  await mutate('/api/operator/monitors', 'POST', { name: 'Database', kind: 'tcp', hostname: 'db.example', port: 5432, published: false });
+  const [web, tcp] = (await operator()).monitors;
+  let webUp = false;
+  let tcpUp = true;
+  const messages: unknown[] = [];
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+    if (init?.method === 'POST') {
+      expect(url).toBe('https://alerts.example/mixed');
+      messages.push(JSON.parse(String(init.body)));
+      return new Response(null, { status: 204 });
+    }
+    expect(url).toBe('https://web.example/health');
+    return new Response(null, { status: webUp ? 204 : 503 });
+  });
+  vi.mocked(connect).mockImplementation(address => {
+    expect(address).toEqual({ hostname: 'db.example', port: 5432 });
+    return { opened: tcpUp ? Promise.resolve({}) : Promise.reject(new Error('refused')), closed: Promise.resolve(), close: async () => {} } as Socket;
+  });
+  await tick(0); await tick(60_000);
+  expect(await operator()).toMatchObject({ monitors: [{ id: web.id, state: 'down' }, { id: tcp.id, state: 'up' }], incidents: [{ monitorId: web.id, closedAt: null }] });
+  webUp = true; tcpUp = false;
+  await tick(120_000); await tick(180_000);
+  expect(await operator()).toMatchObject({ monitors: [{ id: web.id, state: 'up' }, { id: tcp.id, state: 'down' }], incidents: [
+    { monitorId: tcp.id, openedAt: start + 180_000, closedAt: null },
+    { monitorId: web.id, openedAt: start + 60_000, closedAt: start + 180_000 },
+  ] });
+  expect((await status()).incidents.map(i => i.monitorId)).toEqual([web.id]);
+  expect(await (await request('/')).text()).toContain('All services operational');
+  await mutate('/api/operator/monitors/' + tcp.id, 'PATCH', { published: true, name: 'Primary database' });
+  expect(await (await request('/')).text()).toContain('Services unavailable');
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  tcpUp = true;
+  await tick(240_000); await tick(300_000);
+  expect((await status()).monitors.map(m => m.state)).toEqual(['up', 'up']);
+  expect(messages).toHaveLength(4);
+  expect(messages).toEqual(expect.arrayContaining([
+    { text: 'Web: Incident opened' },
+    { text: 'Web: Incident recovered' },
+    { text: 'Database: Incident opened' },
+    { text: 'Primary database: Incident recovered' },
+  ]));
+  await mutate('/api/operator/monitors/' + tcp.id, 'DELETE');
+  expect((await status()).incidents.map(i => i.monitorId)).toEqual([web.id]);
+  expect((await operator()).incidents[0]).toMatchObject({ monitorId: tcp.id, monitorName: 'Database', closedAt: start + 300_000 });
+});
+
+it("discards a deleted TCP Monitor's pending result while other IDs keep checking and alerting", async () => {
+  await mutate('/api/operator/webhook', 'PUT', { url: 'https://alerts.example/deletion' });
+  await mutate('/api/operator/monitors', 'POST', { name: 'Database', kind: 'tcp', hostname: 'db.example', port: 5432, failureThreshold: 1 });
+  await mutate('/api/operator/monitors', 'POST', { name: 'Web', url: 'https://web.example/health', failureThreshold: 1, recoveryThreshold: 1 });
+  const [tcp, web] = (await operator()).monitors;
+  let closed = false;
+  vi.mocked(connect).mockImplementation(() => ({
+    opened: (async (): Promise<SocketInfo> => {
+      await mutate('/api/operator/monitors/' + tcp.id, 'DELETE');
+      await tick(60_000);
+      webUp = true;
+      await tick(120_000);
+      throw new Error('late refusal');
+    })(),
+    closed: Promise.resolve(), close: async () => { closed = true; },
+  } as Socket));
+  let webUp = false;
+  const messages: unknown[] = [];
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+    if (init?.method === 'POST') {
+      messages.push(JSON.parse(String(init.body)));
+      return new Response(null, { status: 204 });
+    }
+    return new Response(null, { status: webUp ? 204 : 503 });
+  });
+  await tick(0);
+  expect(closed).toBe(true);
+  expect(await operator()).toMatchObject({ monitors: [{ id: web.id, state: 'up' }], incidents: [{ monitorId: web.id, closedAt: start + 120_000 }] });
+  expect((await operator()).monitors).toHaveLength(1);
+  expect((await operator()).incidents).toHaveLength(1);
+  expect(messages).toEqual([{ text: 'Web: Incident opened' }, { text: 'Web: Incident recovered' }]);
+  await tick(180_000);
+  expect(vi.mocked(connect)).toHaveBeenCalledTimes(1);
+});
+
+it("snapshots a TCP target per ID while HTTP continues and later TCP attempts use saved edits", async () => {
+  await mutate('/api/operator/monitors', 'POST', { name: 'Database', kind: 'tcp', hostname: 'db.example', port: 5432, failureThreshold: 1 });
+  await mutate('/api/operator/monitors', 'POST', { name: 'Web', url: 'https://web.example/health' });
+  const [tcp, web] = (await operator()).monitors;
+  const addresses: unknown[] = [];
+  let httpAttempts = 0;
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async url => {
+    expect(url).toBe('https://web.example/health'); httpAttempts++;
+    return new Response(null, { status: 204 });
+  });
+  vi.mocked(connect).mockImplementation(address => {
+    addresses.push(address);
+    return { opened: (async () => {
+      if (addresses.length === 1) {
+        await mutate('/api/operator/monitors/' + tcp.id, 'PATCH', { hostname: 'next.example', port: 6432, intervalSeconds: 120, failureThreshold: 100 });
+        await tick(120_000);
+        throw new Error('starting target refused');
+      }
+      return {};
+    })(), closed: Promise.resolve(), close: async () => {} } as Socket;
+  });
+  await tick(0);
+  expect(await operator()).toMatchObject({ monitors: [{ id: tcp.id, state: 'down', hostname: 'next.example', port: 6432 }, { id: web.id, state: 'up' }], incidents: [{ monitorId: tcp.id, openedAt: start, closedAt: null }] });
+  expect(addresses).toEqual([{ hostname: 'db.example', port: 5432 }]);
+  expect(httpAttempts).toBe(2);
+  await tick(120_000); await tick(240_000);
+  expect(addresses).toEqual([{ hostname: 'db.example', port: 5432 }, { hostname: 'next.example', port: 6432 }, { hostname: 'next.example', port: 6432 }]);
+  expect((await operator()).incidents[0]).toMatchObject({ monitorId: tcp.id, closedAt: start + 240_000 });
+});
+
+it("validates per-ID TCP edits atomically and preserves existing kind-change compatibility", async () => {
+  await mutate('/api/operator/monitors', 'POST', { name: 'Database', kind: 'tcp', hostname: 'db.example', port: 5432 });
+  const tcp = (await operator()).monitors[0];
+  const path = '/api/operator/monitors/' + tcp.id;
+  const saved = await operator();
+  for (const patch of [{ port: '6432' }, { port: 65536 }, { hostname: 'host:port' }, { kind: 'udp' }, { intervalSeconds: 59 }, { timeoutSeconds: 0 }, { failureThreshold: 101 }, { recoveryThreshold: 1.5 }]) {
+    expect((await mutate(path, 'PATCH', patch)).status).toBe(400);
+    expect(await operator()).toEqual(saved);
+  }
+  expect((await mutate('/api/operator/monitors', 'POST', { name: 'Invalid', kind: 'tcp', hostname: 'db.example', port: 0 })).status).toBe(400);
+  expect(await operator()).toEqual(saved);
+  expect((await mutate(path, 'PATCH', { kind: 'http', url: 'https://web.example' })).status).toBe(200);
+  expect((await operator()).monitors).toEqual([expect.objectContaining({ id: tcp.id, kind: 'http', url: 'https://web.example/' })]);
+  expect((await operator()).monitors[0]).not.toHaveProperty('hostname');
+  expect((await mutate(path, 'PATCH', { kind: 'tcp', hostname: 'next.example', port: 6432 })).status).toBe(200);
+  expect((await operator()).monitors[0]).toMatchObject({ id: tcp.id, kind: 'tcp', hostname: 'next.example', port: 6432 });
+  expect((await operator()).monitors[0]).not.toHaveProperty('url');
 });
