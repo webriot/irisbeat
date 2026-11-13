@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { operatorPage, operatorScript, statusPage } from "./ui";
+import { operatorPage, operatorScript, statusPage, styleSheet } from "./ui";
 import { DurableObject } from "cloudflare:workers";
 
 type Configuration = { pageName: string; name: string; url: string };
@@ -186,7 +186,7 @@ export default {
       response.headers.set("Referrer-Policy", "no-referrer");
       response.headers.set(
         "Content-Security-Policy",
-        "default-src 'none'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
       );
       return response;
     } catch {
@@ -215,6 +215,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     if (path === "/operator")
       return new Response(operatorPage(), {
         headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    if (path === "/app.css")
+      return new Response(styleSheet, {
+        headers: { "Content-Type": "text/css; charset=utf-8" },
       });
     if (path === "/operator.js")
       return new Response(operatorScript, {

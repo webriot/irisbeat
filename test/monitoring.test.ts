@@ -309,3 +309,32 @@ it("resets consecutive streaks and accepts HTTP 299 without replaying duplicate 
     incidents: [{ openedAt: start + 180_000, closedAt: start + 420_000 }],
   });
 });
+
+it("presents the selected Status ledger with Monitor configuration beside page settings", async () => {
+  const operator = await (await request("/operator")).text();
+  expect(operator).toContain('<table aria-label="Monitors">');
+  expect(operator).toContain('<th scope="col">Monitor</th>');
+  expect(operator).toContain('<th scope="col">State</th>');
+  expect(operator).toContain('<aside aria-labelledby="page-settings">');
+  expect(operator).toContain('id="page-settings">Status page</h2>');
+  expect(operator).not.toContain("Schedule Maintenance");
+  expect(operator).not.toContain("Save webhook");
+  await configure();
+  network.use(
+    http.get(config.url, () => new HttpResponse(null, { status: 200 })),
+  );
+  await tick(0);
+  const page = await (await request("/")).text();
+  expect(page).toContain("All services operational");
+  expect(page).toContain('<article aria-labelledby="monitor-name">');
+  expect(page.indexOf("All services operational")).toBeLessThan(
+    page.indexOf('id="monitor-name"'),
+  );
+  expect(page.indexOf('id="monitor-name"')).toBeLessThan(
+    page.indexOf('id="incident-heading"'),
+  );
+  expect(page).not.toContain("90 UTC-day");
+  expect((await request("/app.css")).headers.get("Content-Type")).toContain(
+    "text/css",
+  );
+});
