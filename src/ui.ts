@@ -49,9 +49,11 @@ export function operatorPage() {
         <form id="configuration" hidden aria-labelledby="monitor-settings">
           <h2 id="monitor-settings">New Monitor</h2>
           <label for="name">Monitor name</label><input id="name" name="name" required maxlength="120">
-          <label for="kind">Kind</label><select id="kind" name="kind"><option value="http">HTTP(S)</option><option value="heartbeat">Heartbeat</option></select>
+          <label for="kind">Check type</label><select id="kind" name="kind"><option value="http">HTTP(S)</option><option value="tcp">TCP</option><option value="heartbeat">Heartbeat</option></select>
           <output id="heartbeat-path"></output>
-          <label for="url">HTTP(S) target</label><input id="url" name="url" type="url" required maxlength="2048">
+          <fieldset id="http-target"><label for="url">HTTP(S) target</label><input id="url" name="url" type="url" required maxlength="2048"></fieldset>
+          <fieldset id="tcp-target" hidden disabled><label for="hostname">Hostname</label><input id="hostname" name="hostname" required maxlength="253" autocapitalize="none" spellcheck="false">
+          <label for="port">Port</label><input id="port" name="port" type="number" min="1" max="65535" step="1" required></fieldset>
           <label for="intervalSeconds">Interval (seconds)</label><input id="intervalSeconds" name="intervalSeconds" type="number" min="60" max="86400" step="1" value="60" required>
           <label for="timeoutSeconds">Timeout (seconds)</label><input id="timeoutSeconds" name="timeoutSeconds" type="number" min="1" max="60" step="1" value="10" required>
           <label for="failureThreshold">Consecutive failures</label><input id="failureThreshold" name="failureThreshold" type="number" min="1" max="100" step="1" value="2" required>
@@ -98,6 +100,7 @@ table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
 th, td { padding: 1rem .5rem; text-align: left; border-bottom: 1px solid var(--line); }
 .configuration-layout { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 2.5rem; margin: 2rem 0; }
 aside { border-left: 1px solid var(--line); padding-left: 1.5rem; }
+fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 label { display: block; margin: 1rem 0 .4rem; }
 input, select, button { font: inherit; min-height: 2.75rem; max-width: 100%; }
 input, select { width: 100%; padding: .5rem; }
@@ -135,10 +138,13 @@ function edit(monitor = null) {
   form.reset();
   byId('monitor-settings').textContent = monitor ? 'Edit Monitor' : 'New Monitor';
   byId('name').value = monitor?.name || '';
+  byId('kind').value = monitor?.kind || 'http';
+  byId('kind').disabled = editingId !== null;
   byId('url').value = monitor?.url || '';
+  byId('hostname').value = monitor?.hostname || '';
+  byId('port').value = monitor?.port || '';
   byId('published').checked = monitor?.published ?? true;
   for (const [field, value] of Object.entries(timingDefaults)) byId(field).value = monitor?.[field] ?? value;
-  byId('kind').value = monitor?.kind || 'http';
   byId('heartbeat-path').textContent = monitor?.kind === 'heartbeat' ? 'POST /heartbeat/' + monitor.id : '';
   updateKind();
   form.hidden = false;
@@ -208,9 +214,14 @@ async function run(path = '/api/operator', method = 'GET', body, after) {
   }
 }
 function updateKind() {
-  const heartbeat = document.getElementById('kind').value === 'heartbeat';
+  const kind = byId('kind').value;
+  const heartbeat = kind === 'heartbeat';
+  for (const target of ['http', 'tcp']) {
+    byId(target + '-target').hidden = kind !== target;
+    byId(target + '-target').disabled = kind !== target;
+  }
   byId('kind').disabled = !!editingId;
-  for (const field of ['url', 'timeoutSeconds', 'failureThreshold', 'silenceSeconds', 'recoverySpacingSeconds']) {
+  for (const field of ['timeoutSeconds', 'failureThreshold', 'silenceSeconds', 'recoverySpacingSeconds']) {
     const input = document.getElementById(field);
     const hidden = ['silenceSeconds', 'recoverySpacingSeconds'].includes(field) ? !heartbeat : heartbeat;
     input.disabled = hidden; input.hidden = hidden;
@@ -228,9 +239,9 @@ login.addEventListener('submit', async event => {
 });
 form.addEventListener('submit', async event => {
   event.preventDefault();
-  const body = { name: byId('name').value, published: byId('published').checked };
-  if (!editingId) body.kind = byId('kind').value;
-  if (byId('kind').value === 'http') body.url = byId('url').value;
+  const body = { name: byId('name').value, kind: byId('kind').value, published: byId('published').checked };
+  if (body.kind === 'tcp') { body.hostname = byId('hostname').value; body.port = Number(byId('port').value); }
+  else if (body.kind === 'http') body.url = byId('url').value;
   for (const field of Object.keys(timingDefaults)) { if (!byId(field).disabled) body[field] = Number(byId(field).value); }
   await run('/api/operator/monitors' + (editingId ? '/' + encodeURIComponent(editingId) : ''), editingId ? 'PATCH' : 'POST', body, cancelEdit);
 });
