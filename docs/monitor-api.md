@@ -30,7 +30,7 @@ All `/api/operator` routes require the installation Bearer secret. JSON mutation
 }
 ```
 
-For compatibility, the foundation `PUT /api/operator` body `{ pageName, name, url, intervalSeconds?, timeoutSeconds?, failureThreshold?, recoveryThreshold? }` still edits the first active Monitor (or creates one when empty). New clients should use the ID-specific routes; the operator UI does. The `monitor` alias is likewise retained for existing clients. New clients must use `monitors[]`.
+For compatibility, the foundation `PUT /api/operator` body `{ pageName, name, url, intervalSeconds?, timeoutSeconds?, failureThreshold?, recoveryThreshold? }` still edits the first active Monitor (or creates one when empty). A legacy save pins the first Monitor before reading the request body; if that identity changes before mutation, it returns 409 without saving Monitor or page settings. Reload before retrying. New clients should use the ID-specific routes; the operator UI does. The `monitor` alias is likewise retained for existing clients. New clients must use `monitors[]`.
 
 The Monitor array contains active configuration only. Deleted Monitor names remain on Incidents; the operator UI marks Incidents whose Monitor is absent as deleted. The public banner uses only visible Monitors: an unavailable Monitor takes precedence, all up is operational, otherwise awaiting check; an empty collection says no Monitors published. Maintenance/pause precedence belongs to their later tickets. History bars and later Monitor kinds are absent; HTTP and TCP share the same ledger and detection path.
 

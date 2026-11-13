@@ -83,16 +83,18 @@ export class MonitoringContext extends DurableObject<Env> {
     return state;
   }
 
-  configure(configuration: Configuration | { pageName: string }) {
+  configure(configuration: Configuration | { pageName: string }, expectedMonitorId: string | null = null) {
     const state = this.read();
-    state.pageName = configuration.pageName;
     // Keep the original single-Monitor save contract for existing clients.
     if ("name" in configuration) {
       const monitor = state.monitors[0];
+      // A legacy save must never move to a sibling while the request is in flight.
+      if ((monitor?.id ?? null) !== expectedMonitorId) return null;
       const { pageName: _pageName, ...settings } = configuration;
       if (monitor) this.applyEdit(monitor, settings);
       else state.monitors.push(this.newMonitor(settings));
     }
+    state.pageName = configuration.pageName;
     this.ctx.storage.kv.put("context", state);
     return this.status(true);
   }
@@ -459,6 +461,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         );
       if (Number(request.headers.get("Content-Length")) > 4096)
         return new Response(null, { status: 413 });
+      const expectedMonitorId = path === "/api/operator" ? (await context.status(true)).monitor?.id ?? null : null;
       let value: unknown;
       const reader = request.body?.getReader();
       let body = "";
@@ -521,7 +524,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       const configuration = parseConfiguration(value);
       if (!configuration)
         return Response.json({ error: "Enter a page name, Monitor name and HTTP(S) or TCP target" }, { status: 400 });
-      return Response.json(await context.configure(configuration));
+      const result = await context.configure(configuration, expectedMonitorId);
+      return result ? Response.json(result) : Response.json({ error: "Monitor changed; reload before saving" }, { status: 409 });
     }
     return new Response(null, { status: 405, headers: { Allow: monitorMatch ? "PATCH, DELETE" : path === "/api/operator/monitors" ? "GET, POST" : "GET, PUT" } });
   }

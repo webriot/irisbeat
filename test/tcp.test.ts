@@ -423,3 +423,29 @@ it("validates per-ID TCP edits atomically and preserves existing kind-change com
   expect((await operator()).monitors[0]).toMatchObject({ id: tcp.id, kind: 'tcp', hostname: 'next.example', port: 6432 });
   expect((await operator()).monitors[0]).not.toHaveProperty('url');
 });
+
+it('does not retarget a legacy save to a TCP sibling during deletion', async () => {
+  await mutate('/api/operator/monitors', 'POST', { name: 'First HTTP', url: 'https://first.example/' });
+  await mutate('/api/operator/monitors', 'POST', { name: 'TCP sibling', kind: 'tcp', hostname: 'db.example', port: 5432 });
+  const [first, sibling] = (await operator()).monitors;
+  let reading!: () => void;
+  const bodyRead = new Promise<void>(resolve => { reading = resolve; });
+  let bodyController!: ReadableStreamDefaultController<Uint8Array>;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) { bodyController = controller; },
+    pull() { reading(); },
+  }, { highWaterMark: 0 });
+  const pendingSave = worker.fetch(new Request('https://irisbeat.example/api/operator', {
+    method: 'PUT', headers: { authorization, 'Content-Type': 'application/json' }, body,
+  }), env);
+  await bodyRead;
+  const removed = await mutate('/api/operator/monitors/' + first.id, 'DELETE');
+  bodyController.enqueue(new TextEncoder().encode(JSON.stringify({ pageName: 'Changed', name: 'Edited HTTP', url: 'https://edited.example/' })));
+  bodyController.close();
+  const saved = await pendingSave;
+  expect(removed.status).toBe(200);
+  expect(saved.status).toBe(409);
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  expect((await operator()).monitors).toEqual([sibling]);
+  expect((await operator()).pageName).toBe('Irisbeat');
+});
