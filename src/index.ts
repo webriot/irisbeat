@@ -2,7 +2,20 @@
 import { operatorPage, operatorScript, statusPage, styleSheet } from "./ui";
 import { DurableObject } from "cloudflare:workers";
 
-type Configuration = { pageName: string; name: string; url: string };
+const timingDefaults = {
+  intervalSeconds: 60,
+  timeoutSeconds: 10,
+  failureThreshold: 2,
+  recoveryThreshold: 2,
+};
+const timingBounds = {
+  intervalSeconds: [60, 86_400],
+  timeoutSeconds: [1, 60],
+  failureThreshold: [1, 100],
+  recoveryThreshold: [1, 100],
+} as const;
+type Timing = typeof timingDefaults;
+type Configuration = { pageName: string; name: string; url: string } & Partial<Timing>;
 export type Incident = {
   id: string;
   monitorId: string;
@@ -10,7 +23,7 @@ export type Incident = {
   closedAt: number | null;
 };
 type CheckResult = { at: number; outcome: "success" | "failure" };
-type Monitor = Configuration & {
+type Monitor = Configuration & Timing & {
   id: string;
   state: "unknown" | "up" | "down";
   lastResult: CheckResult | null;
@@ -29,21 +42,26 @@ export class MonitoringContext extends DurableObject<Env> {
     )`);
   }
   private read(): StoredContext {
-    return (
-      this.ctx.storage.kv.get<StoredContext>("context") ?? { monitor: null }
-    );
+    const state = this.ctx.storage.kv.get<StoredContext>("context") ?? { monitor: null };
+    if (state.monitor) state.monitor = { ...timingDefaults, ...state.monitor };
+    return state;
   }
 
   configure(configuration: Configuration) {
     const state = this.read();
     state.monitor = {
+      ...timingDefaults,
+      ...state.monitor,
       ...configuration,
       id: "website",
       state: state.monitor?.state ?? "unknown",
       lastResult: state.monitor?.lastResult ?? null,
       failures: state.monitor?.failures ?? 0,
       successes: state.monitor?.successes ?? 0,
-      nextDue: state.monitor?.nextDue ?? 0,
+      // Keep the last dispatch as the anchor when the interval changes.
+      nextDue: state.monitor?.nextDue
+        ? state.monitor.nextDue + ((configuration.intervalSeconds ?? state.monitor.intervalSeconds) - state.monitor.intervalSeconds) * 1000
+        : 0,
     };
     this.ctx.storage.kv.put("context", state);
     return this.status(true);
@@ -56,10 +74,10 @@ export class MonitoringContext extends DurableObject<Env> {
     const attempt = state.monitor;
     if (!attempt || this.checking || at < attempt.nextDue) return;
     this.checking = true;
-    attempt.nextDue = at + 60_000;
+    attempt.nextDue = at + attempt.intervalSeconds * 1000;
     this.ctx.storage.kv.put("context", state);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10_000);
+    const timeout = setTimeout(() => controller.abort(), attempt.timeoutSeconds * 1000);
     let success = false;
     try {
       const response = await fetch(attempt.url, {
@@ -88,7 +106,7 @@ export class MonitoringContext extends DurableObject<Env> {
           "SELECT * FROM incidents WHERE closedAt IS NULL LIMIT 1",
         )
         .toArray()[0];
-      if (!open && monitor.failures >= 2) {
+      if (!open && monitor.failures >= attempt.failureThreshold) {
         monitor.state = "down";
         this.ctx.storage.sql.exec(
           "INSERT INTO incidents (id, monitorId, openedAt) VALUES (?, ?, ?)",
@@ -96,7 +114,7 @@ export class MonitoringContext extends DurableObject<Env> {
           monitor.id,
           at,
         );
-      } else if (open && monitor.successes >= 2) {
+      } else if (open && monitor.successes >= attempt.recoveryThreshold) {
         this.ctx.storage.sql.exec(
           "UPDATE incidents SET closedAt = ? WHERE id = ?",
           at,
@@ -121,7 +139,13 @@ export class MonitoringContext extends DurableObject<Env> {
             name: state.monitor.name,
             state: state.monitor.state,
             lastResult: state.monitor.lastResult,
-            ...(operator ? { url: state.monitor.url } : {}),
+            ...(operator ? {
+              url: state.monitor.url,
+              intervalSeconds: state.monitor.intervalSeconds,
+              timeoutSeconds: state.monitor.timeoutSeconds,
+              failureThreshold: state.monitor.failureThreshold,
+              recoveryThreshold: state.monitor.recoveryThreshold,
+            } : {}),
           }
         : null,
       incidents: this.ctx.storage.sql
@@ -167,7 +191,16 @@ function parseConfiguration(value: unknown): Configuration | null {
     )
       return null;
     target.hash = "";
-    return { pageName: pageName.trim(), name: name.trim(), url: target.href };
+    const timing: Partial<Timing> = {};
+    for (const key of Object.keys(timingDefaults) as (keyof Timing)[]) {
+      if (!(key in value)) continue;
+      const input = (value as Record<string, unknown>)[key];
+      const [min, max] = timingBounds[key];
+      if (typeof input !== "number" || !Number.isInteger(input) || input < min || input > max)
+        return null;
+      timing[key] = input;
+    }
+    return { pageName: pageName.trim(), name: name.trim(), url: target.href, ...timing };
   } catch {
     return null;
   }
@@ -269,7 +302,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         return Response.json(
           {
             error:
-              "Enter a page name, Monitor name and HTTP(S) URL without credentials",
+              "Enter names, an HTTP(S) URL without credentials, and integer timing: interval 60–86400 seconds, timeout 1–60 seconds, thresholds 1–100",
           },
           { status: 400 },
         );
