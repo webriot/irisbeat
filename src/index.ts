@@ -258,19 +258,19 @@ function parseConfiguration(value: unknown, existingKind: Configuration["kind"] 
     typeof name !== "string" ||
     !name.trim() ||
     name.length > 120 ||
-    !["http", "heartbeat"].includes(String(kind)) ||
+    (kind !== "http" && kind !== "heartbeat") ||
     (kind !== "heartbeat" && (typeof url !== "string" || url.length > 2048))
   )
     return null;
   try {
-    const target = new URL(kind === "heartbeat" ? "https://unused.invalid" : url as string);
+    const target = kind === "http" ? new URL(url as string) : null;
     if (
-      !["http:", "https:"].includes(target.protocol) ||
+      target && (!["http:", "https:"].includes(target.protocol) ||
       target.username ||
-      target.password
+      target.password)
     )
       return null;
-    target.hash = "";
+    if (target) target.hash = "";
     const timing: Partial<Timing> = {};
     for (const key of Object.keys(timingDefaults) as (keyof Timing)[]) {
       if (!(key in value)) continue;
@@ -280,7 +280,7 @@ function parseConfiguration(value: unknown, existingKind: Configuration["kind"] 
         return null;
       timing[key] = input;
     }
-    return { pageName: pageName.trim(), name: name.trim(), url: kind === "heartbeat" ? "" : target.href, kind: kind as Configuration["kind"], ...timing };
+    return { pageName: pageName.trim(), name: name.trim(), url: target?.href ?? "", kind: kind as Configuration["kind"], ...timing };
   } catch {
     return null;
   }
@@ -427,7 +427,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         return Response.json(
           {
             error:
-              "Enter names, an HTTP(S) URL without credentials, and integer timing: interval 60–86400 seconds, timeout 1–60 seconds, thresholds 1–100",
+              "Enter names and a valid Monitor kind (unchanged on edits). HTTP requires a credential-free HTTP(S) URL. Use integer seconds: interval, silence and recovery spacing 60–86400; timeout 1–60; thresholds 1–100",
           },
           { status: 400 },
         );
