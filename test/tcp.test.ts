@@ -209,3 +209,57 @@ it("delivers named TCP Incident transitions through the context webhook while ed
   expect(messages).toEqual([{ text: "Database: Incident opened" }, { text: "Database: Incident recovered" }]);
   expect(await (await request("/api/operator", { headers: { authorization } })).json()).toMatchObject({ webhookUrl: "https://alerts.example/tcp" });
 });
+
+it("records timeouts and dispatches later checks while socket cleanup remains pending", async () => {
+  await configure({ ...config, timeoutSeconds: 1, failureThreshold: 1, recoveryThreshold: 1 });
+  const realTimeout = globalThis.setTimeout;
+  vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, milliseconds, ...args) =>
+    realTimeout(callback, milliseconds === 1000 ? 0 : milliseconds, ...args));
+  let releaseCleanup!: () => void;
+  const cleanup = new Promise<void>(resolve => { releaseCleanup = resolve; });
+  vi.mocked(connect).mockImplementationOnce(() => ({
+    opened: new Promise(() => {}), closed: cleanup, close: () => cleanup,
+  } as Socket)).mockImplementation(() => ({
+    opened: Promise.resolve({}), closed: Promise.resolve(), close: async () => {},
+  } as Socket));
+  const pending = tick(0);
+  let guard: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const completed = await Promise.race([
+      pending.then(() => true),
+      new Promise<boolean>(resolve => { guard = realTimeout(() => resolve(false), 100); }),
+    ]);
+    expect(completed).toBe(true);
+    expect(await status()).toMatchObject({ monitor: { state: "down", lastResult: { at: start, outcome: "failure" } } });
+    await tick(60_000);
+    expect(await status()).toMatchObject({ monitor: { state: "up" }, incidents: [{ openedAt: start, closedAt: start + 60_000 }] });
+  } finally {
+    clearTimeout(guard);
+    releaseCleanup();
+    await pending;
+  }
+});
+
+it("records observations even when socket cleanup throws synchronously", async () => {
+  await configure();
+  vi.mocked(connect).mockImplementation(() => ({
+    opened: Promise.resolve({}), closed: Promise.resolve(),
+    close: (): Promise<void> => { throw new Error("cleanup failed"); },
+  } as Socket));
+  await tick(0);
+  await tick(60_000);
+  expect(await status()).toMatchObject({ monitor: { state: "up", lastResult: { at: start + 60_000, outcome: "success" } } });
+});
+
+it.each(["2001:db8::1", "[2001:db8::1]"])("connects an IPv6 target supplied as %s using a bracketed authority", async hostname => {
+  expect((await configure({ ...config, hostname })).status).toBe(200);
+  vi.mocked(connect).mockImplementation(address => {
+    // Native CONNECT builds hostname:port, so an IPv6 hostname needs brackets.
+    if (typeof address === "string" || address.hostname !== "[2001:db8::1]") throw new Error("invalid CONNECT authority");
+    return { opened: Promise.resolve({}), closed: Promise.resolve(), close: async () => {} } as Socket;
+  });
+  await tick(0);
+  expect(await status()).toMatchObject({ monitor: { state: "up", lastResult: { outcome: "success" } } });
+  expect(await (await request("/api/operator", { headers: { authorization } })).json())
+    .toMatchObject({ monitor: { hostname: "2001:db8::1", port: 5432 } });
+});

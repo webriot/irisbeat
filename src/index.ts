@@ -98,7 +98,8 @@ export class MonitoringContext extends DurableObject<Env> {
     let socket: Socket | undefined;
     try {
       if (attempt.kind === "tcp") {
-        socket = connect({ hostname: attempt.hostname, port: attempt.port });
+        const hostname = attempt.hostname.includes(":") ? `[${attempt.hostname}]` : attempt.hostname;
+        socket = connect({ hostname, port: attempt.port });
         void socket.closed.catch(() => {});
         await Promise.race([
           socket.opened,
@@ -120,7 +121,11 @@ export class MonitoringContext extends DurableObject<Env> {
       success = false;
     } finally {
       clearTimeout(timeout);
-      if (socket) await socket.close().catch(() => {});
+      if (socket) {
+        // Native close can wait for connection establishment past our observation deadline.
+        const closing = socket;
+        this.ctx.waitUntil(Promise.resolve().then(() => closing.close()).catch(() => {}));
+      }
       this.checking = false;
     }
     const current = this.read();
