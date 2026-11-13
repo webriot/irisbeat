@@ -90,6 +90,7 @@ export class MonitoringContext extends DurableObject<Env> {
       const monitor = state.monitors[0];
       // A legacy save must never move to a sibling while the request is in flight.
       if ((monitor?.id ?? null) !== expectedMonitorId) return null;
+      if (monitor && monitor.kind !== configuration.kind) return undefined;
       const { pageName: _pageName, ...settings } = configuration;
       if (monitor) this.applyEdit(monitor, settings);
       else state.monitors.push(this.newMonitor(settings));
@@ -353,7 +354,7 @@ function parseMonitorPatch(value: unknown, current?: MonitorConfiguration): Part
   if (!Object.keys(fields).length || Object.keys(fields).some(key => !["name", "kind", "url", "hostname", "port", "published", ...Object.keys(timingDefaults)].includes(key))) return null;
   if ("published" in fields && typeof fields.published !== "boolean") return null;
   const configuration = parseConfiguration({ pageName: "Irisbeat", name: "Monitor", url: "https://example.com", ...current, ...fields });
-  if (!configuration) return null;
+  if (!configuration || (current && configuration.kind !== current.kind)) return null;
   const patch: Record<string, unknown> = {};
   for (const key of ["name", "published", ...Object.keys(timingDefaults)]) {
     if (key in fields) patch[key] = key === "published" ? fields[key] : configuration[key as keyof Configuration];
@@ -461,7 +462,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         );
       if (Number(request.headers.get("Content-Length")) > 4096)
         return new Response(null, { status: 413 });
-      const expectedMonitorId = path === "/api/operator" ? (await context.status(true)).monitor?.id ?? null : null;
+      const selectedMonitor = path === "/api/operator" ? (await context.status(true)).monitor : null;
       let value: unknown;
       const reader = request.body?.getReader();
       let body = "";
@@ -503,7 +504,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       }
       if (monitorMatch) {
         const result = await context.edit(monitorMatch[1], value);
-        if (result === undefined) return Response.json({ error: "Enter valid Monitor settings and an HTTP(S) or TCP target" }, { status: 400 });
+        if (result === undefined) return Response.json({ error: "Enter valid Monitor settings and an HTTP(S) or TCP target; type cannot change" }, { status: 400 });
         return result ? Response.json(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
       }
       if (path === "/api/operator" && value && typeof value === "object" &&
@@ -524,7 +525,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       const configuration = parseConfiguration(value);
       if (!configuration)
         return Response.json({ error: "Enter a page name, Monitor name and HTTP(S) or TCP target" }, { status: 400 });
-      const result = await context.configure(configuration, expectedMonitorId);
+      const result = await context.configure(configuration, selectedMonitor?.id ?? null);
+      if (result === undefined) return Response.json({ error: "Monitor type cannot change" }, { status: 400 });
       return result ? Response.json(result) : Response.json({ error: "Monitor changed; reload before saving" }, { status: 409 });
     }
     return new Response(null, { status: 405, headers: { Allow: monitorMatch ? "PATCH, DELETE" : path === "/api/operator/monitors" ? "GET, POST" : "GET, PUT" } });

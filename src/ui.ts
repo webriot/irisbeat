@@ -142,6 +142,7 @@ function edit(monitor = null) {
   byId('monitor-settings').textContent = monitor ? 'Edit Monitor' : 'New Monitor';
   byId('name').value = monitor?.name || '';
   byId('kind').value = monitor?.kind || 'http';
+  byId('kind').disabled = editingId !== null;
   byId('url').value = monitor?.url || '';
   byId('hostname').value = monitor?.hostname || '';
   byId('port').value = monitor?.port || '';
@@ -211,6 +212,7 @@ async function run(path = '/api/operator', method = 'GET', body, after) {
   finally {
     busy = false;
     document.querySelectorAll('button, input, select').forEach(control => { control.disabled = false; });
+    byId('kind').disabled = editingId !== null;
   }
 }
 login.addEventListener('submit', async event => {

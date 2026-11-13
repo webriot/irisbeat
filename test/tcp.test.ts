@@ -113,8 +113,8 @@ it("rejects malformed TCP targets and timings atomically and keeps HTTP configur
     expect((await configure({ ...config, ...change })).status, JSON.stringify(change)).toBe(400);
     expect(await (await request("/api/operator", { headers: { authorization } })).json()).toEqual(saved);
   }
-  expect(await (await configure({ pageName: "Web", name: "Website", url: "https://web.example" })).json())
-    .toMatchObject({ monitor: { kind: "http", url: "https://web.example/" } });
+  expect((await configure({ pageName: "Web", name: "Website", url: "https://web.example" })).status).toBe(400);
+  expect(await (await request("/api/operator", { headers: { authorization } })).json()).toEqual(saved);
   expect(await (await configure()).json()).toMatchObject({ monitor: { kind: "tcp", hostname: "db.example" } });
 });
 
@@ -405,7 +405,7 @@ it("snapshots a TCP target per ID while HTTP continues and later TCP attempts us
   expect((await operator()).incidents[0]).toMatchObject({ monitorId: tcp.id, closedAt: start + 240_000 });
 });
 
-it("validates per-ID TCP edits atomically and preserves existing kind-change compatibility", async () => {
+it("validates per-ID edits atomically and keeps Monitor kind fixed after creation", async () => {
   await mutate('/api/operator/monitors', 'POST', { name: 'Database', kind: 'tcp', hostname: 'db.example', port: 5432 });
   const tcp = (await operator()).monitors[0];
   const path = '/api/operator/monitors/' + tcp.id;
@@ -416,12 +416,20 @@ it("validates per-ID TCP edits atomically and preserves existing kind-change com
   }
   expect((await mutate('/api/operator/monitors', 'POST', { name: 'Invalid', kind: 'tcp', hostname: 'db.example', port: 0 })).status).toBe(400);
   expect(await operator()).toEqual(saved);
-  expect((await mutate(path, 'PATCH', { kind: 'http', url: 'https://web.example' })).status).toBe(200);
-  expect((await operator()).monitors).toEqual([expect.objectContaining({ id: tcp.id, kind: 'http', url: 'https://web.example/' })]);
-  expect((await operator()).monitors[0]).not.toHaveProperty('hostname');
-  expect((await mutate(path, 'PATCH', { kind: 'tcp', hostname: 'next.example', port: 6432 })).status).toBe(200);
+  expect((await mutate(path, 'PATCH', { kind: 'http', url: 'https://web.example' })).status).toBe(400);
+  expect(await operator()).toEqual(saved);
+  expect((await mutate(path, 'PATCH', { hostname: 'next.example', port: 6432 })).status).toBe(200);
   expect((await operator()).monitors[0]).toMatchObject({ id: tcp.id, kind: 'tcp', hostname: 'next.example', port: 6432 });
-  expect((await operator()).monitors[0]).not.toHaveProperty('url');
+  await mutate('/api/operator/monitors', 'POST', { name: 'Web', url: 'https://web.example' });
+  const web = (await operator()).monitors[1];
+  const before = await operator();
+  expect((await mutate('/api/operator/monitors/' + web.id, 'PATCH', { kind: 'tcp', hostname: 'db.example', port: 5432 })).status).toBe(400);
+  expect(await operator()).toEqual(before);
+  expect((await configure({ ...config, kind: 'http', url: 'https://web.example' })).status).toBe(400);
+  expect(await operator()).toEqual(before);
+  expect((await configure({ pageName: 'Status', name: 'Database', kind: 'tcp', hostname: 'later.example', port: 6432 })).status).toBe(200);
+  expect((await operator()).monitors[0]).toMatchObject({ id: tcp.id, kind: 'tcp', hostname: 'later.example' });
+
 });
 
 it('does not retarget a legacy save to a TCP sibling during deletion', async () => {
