@@ -117,5 +117,5 @@ cannot mutate windows. See [Maintenance handoff](maintenance-api.md) for status
 fields, observation retention, and the #11 precedence seam. Installed-consumer
 coverage verifies suppression of both delivery paths for all three check kinds.
 The hook observes committed detector transitions, not every raw observation.
-History remains its own ticket. The release candidate must be
+[History #9](history-api.md) adds the same filtered per-Monitor series to personal and hosted status, including readers; it does not change credentials, permissions, allowances or delivery. The release candidate must be
 regenerated after integration changes, before #12 publishes anything.

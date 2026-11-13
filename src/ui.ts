@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import type { Status } from "./index";
+import type { AvailabilityHistory, Status } from "./index";
 
 const escape = (value: string) =>
   value.replace(
@@ -17,6 +17,14 @@ const stateLabel = {
 };
 function document(title: string, body: string, operator = false) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(title)}</title><link rel="stylesheet" href="/app.css">${operator ? "" : '<meta http-equiv="refresh" content="60">'}</head><body><header><a class="brand" href="/">irisbeat</a><nav aria-label="Application"><a href="/"${operator ? "" : ' aria-current="page"'}>Status page</a><a href="/operator"${operator ? ' aria-current="page"' : ""}>Operator</a></nav></header><main>${body}</main></body></html>`;
+}
+
+function historyMarkup(history: AvailabilityHistory | null | undefined) {
+  if (!history) return '<p class="history-unavailable">Bars unavailable</p>';
+  return `<div class="availability"><span class="percentage" aria-label="Availability">${history.percentage === null ? "Unavailable" : history.percentage.toFixed(2) + "%"}</span><ol class="history" aria-label="90 UTC days of availability">${history.days.map(day => {
+    const label = day.date + " UTC: " + (day.state === "maintenance" ? "Maintenance" : day.state) + "; " + day.successes + " successes, " + day.failures + " failures, " + day.maintenance + " Maintenance";
+    return `<li class="history-day ${day.state}" tabindex="0" aria-label="${label}" title="${label}"></li>`;
+  }).join("")}</ol></div>`;
 }
 
 export function statusPage(status: Status) {
@@ -37,7 +45,7 @@ export function statusPage(status: Status) {
     status.pageName,
     `<h1>${escape(status.pageName)}</h1>
     <section class="banner" aria-label="Current status"><h2>${escape(banner)}</h2></section>
-    ${status.monitors.map((monitor, index) => `<article aria-labelledby="monitor-name${index || ""}"><div class="ledger-row"><h2 id="monitor-name${index || ""}">${escape(monitor.name)}</h2><span class="status">${stateLabel[monitor.state]}</span></div></article>`).join("")}
+    ${status.monitors.map((monitor, index) => `<article aria-labelledby="monitor-name${index || ""}"><div class="ledger-row"><h2 id="monitor-name${index || ""}">${escape(monitor.name)}</h2><span class="status">${stateLabel[monitor.state]}</span></div>${historyMarkup(monitor.history)}</article>`).join("")}
     ${status.monitors.length ? `<section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>${status.incidents.length ? `<ul class="incidents">${status.incidents.map((incident) => `<li><article class="incident"><strong>${escape(status.monitors.find(monitor => monitor.id === incident.monitorId)?.name ?? incident.monitorId)} — ${incident.closedAt === null ? "Open" : "Recovered"}</strong><p>Unavailable since ${time(incident.openedAt)}${incident.closedAt === null ? " — Ongoing" : ` — Recovered ${time(incident.closedAt)}`}</p></article></li>`).join("")}</ul>` : "<p>No Incidents</p>"}</section>` : ""}`,
   );
 }
@@ -110,6 +118,16 @@ h2 { font-size: 1.25rem; }
 .ledger-row { padding: 1rem 0; border-bottom: 1px solid var(--line); }
 table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
 th, td { padding: 1rem .5rem; text-align: left; border-bottom: 1px solid var(--line); }
+.availability { padding: 1rem 0; min-width: 12rem; }
+.percentage { font-variant-numeric: tabular-nums; }
+.history { display: grid; grid-template-columns: repeat(90, minmax(0, 1fr)); gap: 2px; list-style: none; padding: 0; margin: .5rem 0; }
+.history-day { height: 1.8rem; background: light-dark(#e6eae8, #35413c); }
+.history-day.up { background: light-dark(#19734b, #59c990); }
+.history-day.down { background: light-dark(#b52a34, #ff7880); }
+.history-day.degraded { background: light-dark(#986500, #e6b64d); }
+.history-day.maintenance { background: light-dark(#5454a6, #a4a4ef); }
+.history-day.empty { border: 1px dashed var(--line); background: transparent; }
+@media (max-width: 44rem) { table, thead, tbody, tr, td { display: block; } thead { position: absolute; clip-path: inset(100%); } td { border: 0; padding: .4rem 0; } tr { border-bottom: 1px solid var(--line); padding: 1rem 0; } }
 .configuration-layout { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 2.5rem; margin: 2rem 0; }
 aside { border-left: 1px solid var(--line); padding-left: 1.5rem; }
 fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
@@ -134,6 +152,7 @@ form button { margin-top: 1rem; }
 `;
 
 export const operatorScript = `
+const historyMarkup = ${historyMarkup.toString()};
 const byId = id => document.getElementById(id);
 const login = byId('login');
 const editor = byId('editor');
@@ -188,7 +207,7 @@ function render(data) {
   byId('new-monitor').hidden = !canEdit; pageForm.closest('aside').hidden = !canEdit; webhook.hidden = !canEdit;
   byId('pageName').value = data.pageName;
   byId('webhookUrl').value = data.webhookUrl || '';
-  const rows = data.monitors.map(monitor => {
+  const rows = data.monitors.flatMap(monitor => {
     const row = document.createElement('tr');
     for (const text of [monitor.name, (${JSON.stringify(stateLabel)})[monitor.state], monitor.published ? 'Published' : 'Private']) {
       const cell = document.createElement('td'); cell.textContent = text; row.append(cell);
@@ -207,7 +226,12 @@ function render(data) {
       button.setAttribute('aria-label', label + ' ' + monitor.name);
       button.addEventListener('click', action); group.append(button);
     }
-    actions.append(group); row.append(actions); return row;
+    actions.append(group); row.append(actions);
+    const historyRow = document.createElement('tr');
+    const availability = document.createElement('td'); availability.colSpan = 4;
+    availability.setAttribute('aria-label', monitor.name + ' availability');
+    availability.innerHTML = historyMarkup(monitor.history); historyRow.append(availability);
+    return [row, historyRow];
   });
   if (!rows.length) {
     const row = document.createElement('tr'); const cell = document.createElement('td');

@@ -72,6 +72,17 @@ type Monitor = MonitorConfiguration & Timing & {
   recoveryReceiptAt: number | null;
   heartbeatDigest?: ArrayBuffer;
 };
+const DAY = 86_400_000;
+const historyStart = (at: number) => Math.floor(at / DAY) * DAY - 89 * DAY;
+export type HistoryDay = {
+  date: string;
+  state: "up" | "down" | "degraded" | "maintenance" | "empty";
+  successes: number;
+  failures: number;
+  maintenance: number;
+};
+export type AvailabilityHistory = { days: HistoryDay[]; percentage: number | null };
+type DailyCounts = { day: number; successes: number; failures: number; maintenance: number };
 export type Status = ReturnType<MonitoringContext["status"]>;
 type StoredContext = { pageName: string; monitors: Monitor[]; webhookUrl?: string | null };
 type LegacyContext = { webhookUrl?: string | null; monitor: (Monitor & { pageName: string }) | null };
@@ -85,6 +96,9 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS observations (
       id INTEGER PRIMARY KEY, monitorId TEXT NOT NULL, at INTEGER NOT NULL, outcome TEXT NOT NULL
     )`);
+    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS observations_monitor_at ON observations (monitorId, at)");
+    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS observations_at ON observations (at)");
+    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS incidents_opened ON incidents (openedAt DESC, id)");
     if (!ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(incidents)").toArray().some(column => column.name === "monitorName")) {
       ctx.storage.sql.exec("ALTER TABLE incidents ADD COLUMN monitorName TEXT");
     }
@@ -287,6 +301,11 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   private async record(current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number, maintenance = !!monitor.maintenance) {
     monitor.lastResult = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" };
     this.ctx.storage.sql.exec("INSERT INTO observations (monitorId, at, outcome) VALUES (?, ?, ?)", monitor.id, at, monitor.lastResult.outcome);
+    // Bounded cleanup keeps the entire current UTC day and never touches Incidents.
+    this.ctx.storage.sql.exec(
+      "DELETE FROM observations WHERE id IN (SELECT id FROM observations WHERE at < ? ORDER BY at LIMIT 1000)",
+      historyStart(Math.max(at, Date.now())),
+    );
     if (maintenance) {
       this.ctx.storage.kv.put("context", current);
       return;
@@ -404,10 +423,43 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return monitor ? this.heartbeat(monitor.id, at) : false;
   }
 
+  // Separate series reads so their failure never hides current state or Incidents.
+  protected queryHistory(id: string, start: number, end: number): DailyCounts[] | null {
+    return this.ctx.storage.sql.exec<DailyCounts>(
+      `SELECT CAST(at / ${DAY} AS INTEGER) AS day,
+        SUM(outcome = 'success') AS successes, SUM(outcome = 'failure') AS failures,
+        SUM(outcome = 'maintenance') AS maintenance
+       FROM observations WHERE monitorId = ? AND at >= ? AND at < ? GROUP BY day`,
+      id, start, end,
+    ).toArray();
+  }
+
+  private history(id: string, start: number): AvailabilityHistory | null {
+    try {
+      const rows = this.queryHistory(id, start, start + 90 * DAY);
+      if (!rows) return null;
+      const counts = new Map(rows.map(row => [row.day, row]));
+      const days: HistoryDay[] = Array.from({ length: 90 }, (_, index) => {
+        const at = start + index * DAY;
+        const { successes = 0, failures = 0, maintenance = 0 } = counts.get(at / DAY) ?? {};
+        return { date: new Date(at).toISOString().slice(0, 10),
+          state: successes && failures ? "degraded" : successes ? "up" : failures ? "down" : maintenance ? "maintenance" : "empty",
+          successes, failures, maintenance };
+      });
+      const successes = days.reduce((total, day) => total + day.successes, 0);
+      const failures = days.reduce((total, day) => total + day.failures, 0);
+      return { days, percentage: successes + failures ? successes / (successes + failures) * 100 : null };
+    } catch {
+      console.error(JSON.stringify({ event: "history_query_failed" }));
+      return null;
+    }
+  }
+
   status(operator = false, secrets = operator) {
+    const start = historyStart(Date.now());
     const state = this.read();
     const monitors = state.monitors.filter(monitor => operator || monitor.published).map(monitor => ({
-      id: monitor.id, name: monitor.name, kind: monitor.kind,
+      id: monitor.id, name: monitor.name, kind: monitor.kind, history: this.history(monitor.id, start),
       ...(monitor.kind === "heartbeat" ? { lastSeen: monitor.lastSeen } : {}), state: monitor.maintenance ? "maintenance" as const : monitor.state, maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult,
       ...(operator ? {
         kind: monitor.kind,
@@ -425,7 +477,9 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       monitors,
       monitor: monitors[0] ?? null,
       incidents: this.ctx.storage.sql
-        .exec<Incident>("SELECT * FROM incidents ORDER BY openedAt DESC, id")
+        .exec<Incident>(operator ? "SELECT * FROM incidents ORDER BY openedAt DESC, id"
+          : "SELECT * FROM incidents WHERE openedAt < ? AND (closedAt IS NULL OR closedAt > ?) ORDER BY openedAt DESC, id",
+          ...(operator ? [] : [start + 90 * DAY, start]))
         .toArray().filter(incident => operator || monitors.some(monitor => monitor.id === incident.monitorId)),
     };
   }

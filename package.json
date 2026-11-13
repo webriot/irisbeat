@@ -35,6 +35,7 @@
     "LICENSE",
     "README.md",
     "docs/hosted-contract.md",
-    "docs/maintenance-api.md"
+    "docs/maintenance-api.md",
+    "docs/history-api.md"
   ]
 }
