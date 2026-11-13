@@ -51,11 +51,15 @@ export function operatorPage() {
       <form id="configuration" class="configuration-layout">
         <section aria-labelledby="monitor-settings"><h2 id="monitor-settings">Monitor configuration</h2>
           <label for="name">Monitor name</label><input id="name" name="name" required maxlength="120">
+          <label for="kind">Kind</label><select id="kind" name="kind"><option value="http">HTTP(S)</option><option value="heartbeat">Heartbeat</option></select>
+          <output id="heartbeat-path"></output>
           <label for="url">HTTP(S) target</label><input id="url" name="url" type="url" required maxlength="2048">
           <label for="intervalSeconds">Interval (seconds)</label><input id="intervalSeconds" name="intervalSeconds" type="number" min="60" max="86400" step="1" value="60" required>
           <label for="timeoutSeconds">Timeout (seconds)</label><input id="timeoutSeconds" name="timeoutSeconds" type="number" min="1" max="60" step="1" value="10" required>
           <label for="failureThreshold">Consecutive failures</label><input id="failureThreshold" name="failureThreshold" type="number" min="1" max="100" step="1" value="2" required>
           <label for="recoveryThreshold">Consecutive successes</label><input id="recoveryThreshold" name="recoveryThreshold" type="number" min="1" max="100" step="1" value="2" required>
+          <label for="silenceSeconds">Silence (seconds)</label><input id="silenceSeconds" name="silenceSeconds" type="number" min="60" max="86400" step="1" value="180" required>
+          <label for="recoverySpacingSeconds">Recovery spacing (seconds)</label><input id="recoverySpacingSeconds" name="recoverySpacingSeconds" type="number" min="60" max="86400" step="1" value="60" required>
         </section>
         <aside aria-labelledby="page-settings"><h2 id="page-settings">Status page</h2>
           <label for="pageName">Page name</label><input id="pageName" name="pageName" required maxlength="120">
@@ -91,8 +95,8 @@ th, td { padding: 1rem .5rem; text-align: left; border-bottom: 1px solid var(--l
 .configuration-layout { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 2.5rem; margin: 2rem 0; }
 aside { border-left: 1px solid var(--line); padding-left: 1.5rem; }
 label { display: block; margin: 1rem 0 .4rem; }
-input, button { font: inherit; min-height: 2.75rem; max-width: 100%; }
-input { width: 100%; padding: .5rem; }
+input, select, button { font: inherit; min-height: 2.75rem; max-width: 100%; }
+input, select { width: 100%; padding: .5rem; }
 button { padding: .5rem .9rem; cursor: pointer; }
 form button { margin-top: 1rem; }
 .text-button { border: 0; background: transparent; color: inherit; padding-left: 0; text-decoration: underline; text-underline-offset: .2em; }
@@ -111,12 +115,15 @@ const editor = document.getElementById('editor');
 const form = document.getElementById('configuration');
 const message = document.getElementById('message');
 let secret = '';
-const timingDefaults = { intervalSeconds: 60, timeoutSeconds: 10, failureThreshold: 2, recoveryThreshold: 2 };
+const timingDefaults = { intervalSeconds: 60, timeoutSeconds: 10, failureThreshold: 2, recoveryThreshold: 2, silenceSeconds: 180, recoverySpacingSeconds: 60 };
 async function load(method = 'GET') {
   message.textContent = '';
   try {
     const configuration = Object.fromEntries(new FormData(form));
-    for (const field of Object.keys(timingDefaults)) configuration[field] = Number(configuration[field]);
+    configuration.kind = document.getElementById('kind').value;
+    for (const field of Object.keys(timingDefaults)) {
+      if (field in configuration) configuration[field] = Number(configuration[field]);
+    }
     const response = await fetch('/api/operator', {
       method, headers: { Authorization: 'Bearer ' + secret, 'Content-Type': 'application/json' },
       ...(method === 'PUT' ? { body: JSON.stringify(configuration) } : {})
@@ -128,6 +135,10 @@ async function load(method = 'GET') {
     document.getElementById('pageName').value = data.pageName;
     document.getElementById('name').value = data.monitor?.name || '';
     document.getElementById('url').value = data.monitor?.url || '';
+    document.getElementById('kind').value = data.monitor?.kind || 'http';
+    document.getElementById('kind').disabled = !!data.monitor;
+    document.getElementById('heartbeat-path').textContent = data.monitor?.kind === 'heartbeat' ? 'POST /heartbeat/' + data.monitor.id : '';
+    updateKind();
     for (const [field, value] of Object.entries(timingDefaults)) {
       document.getElementById(field).value = data.monitor?.[field] ?? value;
     }
@@ -144,6 +155,19 @@ async function load(method = 'GET') {
     if (method === 'PUT') message.textContent = 'Saved';
   } catch (error) { message.textContent = error.message; }
 }
+function updateKind() {
+  const heartbeat = document.getElementById('kind').value === 'heartbeat';
+  for (const field of ['url', 'timeoutSeconds', 'failureThreshold', 'silenceSeconds', 'recoverySpacingSeconds']) {
+    const input = document.getElementById(field);
+    const hidden = ['silenceSeconds', 'recoverySpacingSeconds'].includes(field) ? !heartbeat : heartbeat;
+    input.disabled = hidden; input.hidden = hidden;
+    document.querySelector('label[for="' + field + '"]').hidden = hidden;
+  }
+  document.querySelector('label[for="intervalSeconds"]').textContent = heartbeat ? 'Expectation (seconds)' : 'Interval (seconds)';
+  document.querySelector('label[for="recoveryThreshold"]').textContent = heartbeat ? 'Recovery receipts' : 'Consecutive successes';
+}
+document.getElementById('kind').addEventListener('change', updateKind);
+updateKind();
 login.addEventListener('submit', async event => {
   event.preventDefault(); secret = document.getElementById('secret').value;
   await load(); document.getElementById('secret').value = '';
