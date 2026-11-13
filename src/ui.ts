@@ -49,7 +49,8 @@ export function operatorPage() {
         <form id="configuration" hidden aria-labelledby="monitor-settings">
           <h2 id="monitor-settings">New Monitor</h2>
           <label for="name">Monitor name</label><input id="name" name="name" required maxlength="120">
-          <label for="kind">Check type</label><select id="kind" name="kind"><option value="http">HTTP(S)</option><option value="tcp">TCP</option></select>
+          <label for="kind">Check type</label><select id="kind" name="kind"><option value="http">HTTP(S)</option><option value="tcp">TCP</option><option value="heartbeat">Heartbeat</option></select>
+          <output id="heartbeat-path"></output>
           <fieldset id="http-target"><label for="url">HTTP(S) target</label><input id="url" name="url" type="url" required maxlength="2048"></fieldset>
           <fieldset id="tcp-target" hidden disabled><label for="hostname">Hostname</label><input id="hostname" name="hostname" required maxlength="253" autocapitalize="none" spellcheck="false">
           <label for="port">Port</label><input id="port" name="port" type="number" min="1" max="65535" step="1" required></fieldset>
@@ -57,6 +58,8 @@ export function operatorPage() {
           <label for="timeoutSeconds">Timeout (seconds)</label><input id="timeoutSeconds" name="timeoutSeconds" type="number" min="1" max="60" step="1" value="10" required>
           <label for="failureThreshold">Consecutive failures</label><input id="failureThreshold" name="failureThreshold" type="number" min="1" max="100" step="1" value="2" required>
           <label for="recoveryThreshold">Consecutive successes</label><input id="recoveryThreshold" name="recoveryThreshold" type="number" min="1" max="100" step="1" value="2" required>
+          <label for="silenceSeconds">Silence (seconds)</label><input id="silenceSeconds" name="silenceSeconds" type="number" min="60" max="86400" step="1" value="180" required>
+          <label for="recoverySpacingSeconds">Recovery spacing (seconds)</label><input id="recoverySpacingSeconds" name="recoverySpacingSeconds" type="number" min="60" max="86400" step="1" value="60" required>
           <label class="checkbox" for="published"><input id="published" name="published" type="checkbox" checked>Published</label>
           <button>Save Monitor</button><button id="cancel-edit" type="button">Cancel</button>
         </form>
@@ -126,16 +129,10 @@ const form = byId('configuration');
 const pageForm = byId('page-configuration');
 const webhook = byId('webhook');
 const message = byId('message');
-const timingDefaults = { intervalSeconds: 60, timeoutSeconds: 10, failureThreshold: 2, recoveryThreshold: 2 };
+const timingDefaults = { intervalSeconds: 60, timeoutSeconds: 10, failureThreshold: 2, recoveryThreshold: 2, silenceSeconds: 180, recoverySpacingSeconds: 60 };
 let secret = '';
 let editingId = null;
 let busy = false;
-function showTarget() {
-  const tcp = byId('kind').value === 'tcp';
-  byId('http-target').hidden = tcp; byId('http-target').disabled = tcp;
-  byId('tcp-target').hidden = !tcp; byId('tcp-target').disabled = !tcp;
-}
-byId('kind').addEventListener('change', showTarget);
 function edit(monitor = null) {
   editingId = monitor?.id || null;
   form.reset();
@@ -146,9 +143,10 @@ function edit(monitor = null) {
   byId('url').value = monitor?.url || '';
   byId('hostname').value = monitor?.hostname || '';
   byId('port').value = monitor?.port || '';
-  showTarget();
   byId('published').checked = monitor?.published ?? true;
   for (const [field, value] of Object.entries(timingDefaults)) byId(field).value = monitor?.[field] ?? value;
+  byId('heartbeat-path').textContent = monitor?.kind === 'heartbeat' ? 'POST /heartbeat/' + monitor.id : '';
+  updateKind();
   form.hidden = false;
   byId('name').focus();
 }
@@ -212,9 +210,28 @@ async function run(path = '/api/operator', method = 'GET', body, after) {
   finally {
     busy = false;
     document.querySelectorAll('button, input, select').forEach(control => { control.disabled = false; });
-    byId('kind').disabled = editingId !== null;
+    updateKind();
   }
 }
+function updateKind() {
+  const kind = byId('kind').value;
+  const heartbeat = kind === 'heartbeat';
+  for (const target of ['http', 'tcp']) {
+    byId(target + '-target').hidden = kind !== target;
+    byId(target + '-target').disabled = kind !== target;
+  }
+  byId('kind').disabled = !!editingId;
+  for (const field of ['timeoutSeconds', 'failureThreshold', 'silenceSeconds', 'recoverySpacingSeconds']) {
+    const input = document.getElementById(field);
+    const hidden = ['silenceSeconds', 'recoverySpacingSeconds'].includes(field) ? !heartbeat : heartbeat;
+    input.disabled = hidden; input.hidden = hidden;
+    document.querySelector('label[for="' + field + '"]').hidden = hidden;
+  }
+  document.querySelector('label[for="intervalSeconds"]').textContent = heartbeat ? 'Expectation (seconds)' : 'Interval (seconds)';
+  document.querySelector('label[for="recoveryThreshold"]').textContent = heartbeat ? 'Recovery receipts' : 'Consecutive successes';
+}
+document.getElementById('kind').addEventListener('change', updateKind);
+updateKind();
 login.addEventListener('submit', async event => {
   event.preventDefault(); secret = byId('secret').value;
   await run(); byId('secret').value = '';
@@ -224,8 +241,8 @@ form.addEventListener('submit', async event => {
   event.preventDefault();
   const body = { name: byId('name').value, kind: byId('kind').value, published: byId('published').checked };
   if (body.kind === 'tcp') { body.hostname = byId('hostname').value; body.port = Number(byId('port').value); }
-  else body.url = byId('url').value;
-  for (const field of Object.keys(timingDefaults)) body[field] = Number(byId(field).value);
+  else if (body.kind === 'http') body.url = byId('url').value;
+  for (const field of Object.keys(timingDefaults)) { if (!byId(field).disabled) body[field] = Number(byId(field).value); }
   await run('/api/operator/monitors' + (editingId ? '/' + encodeURIComponent(editingId) : ''), editingId ? 'PATCH' : 'POST', body, cancelEdit);
 });
 webhook.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator/webhook', 'PUT', { url: byId('webhookUrl').value }); });

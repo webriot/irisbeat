@@ -457,3 +457,113 @@ it('does not retarget a legacy save to a TCP sibling during deletion', async () 
   expect((await operator()).monitors).toEqual([sibling]);
   expect((await operator()).pageName).toBe('Irisbeat');
 });
+
+it('rejects cross-kind changes and target fields atomically for every Monitor kind', async () => {
+  const configurations = [
+    { name: 'Web', kind: 'http', url: 'https://web.example/' },
+    { name: 'Database', kind: 'tcp', hostname: 'db.example', port: 5432 },
+    { name: 'Producer', kind: 'heartbeat' },
+  ];
+  for (const configuration of configurations) expect((await mutate('/api/operator/monitors', 'POST', configuration)).status).toBe(201);
+  const saved = await operator();
+  for (const monitor of saved.monitors) {
+    for (const other of configurations.filter(c => c.kind !== monitor.kind)) {
+      expect((await mutate('/api/operator/monitors/' + monitor.id, 'PATCH', { ...other, published: false })).status).toBe(400);
+      const { kind: _kind, name: _name, ...target } = other;
+      if (Object.keys(target).length) {
+        expect((await mutate('/api/operator/monitors/' + monitor.id, 'PATCH', { ...target, name: 'Rejected' })).status).toBe(400);
+      }
+    }
+  }
+  for (const body of [
+    { name: 'Mixed', kind: 'http', url: 'https://web.example/', hostname: 'db.example', port: 5432 },
+    { name: 'Mixed', kind: 'tcp', hostname: 'db.example', port: 5432, url: 'https://web.example/' },
+    { name: 'Mixed', kind: 'heartbeat', url: 'https://web.example/' },
+    { name: 'Mixed', kind: 'heartbeat', hostname: 'db.example', port: 5432 },
+  ]) expect((await mutate('/api/operator/monitors', 'POST', body)).status).toBe(400);
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  expect(await operator()).toEqual(saved);
+});
+
+it('keeps HTTP, private TCP and Heartbeat detection, receipts, alerts and retained history independent', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+  await mutate('/api/operator/webhook', 'PUT', { url: 'https://alerts.example/three' });
+  for (const body of [
+    { name: 'Web', url: 'https://web.example/health', failureThreshold: 1, recoveryThreshold: 1 },
+    { name: 'Private database', kind: 'tcp', hostname: 'db.example', port: 5432, published: false, failureThreshold: 1, recoveryThreshold: 1 },
+    { name: 'Producer', kind: 'heartbeat', silenceSeconds: 60, recoverySpacingSeconds: 120 },
+  ]) expect((await mutate('/api/operator/monitors', 'POST', body)).status).toBe(201);
+  const [web, tcp, heartbeat] = (await operator()).monitors;
+  expect(new Set([web.id, tcp.id, heartbeat.id]).size).toBe(3);
+  let webUp = false;
+  let tcpUp = true;
+  const messages: unknown[] = [];
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+    if (init?.method === 'POST') {
+      expect(url).toBe('https://alerts.example/three');
+      messages.push(JSON.parse(String(init.body)));
+      return new Response(null, { status: 204 });
+    }
+    expect(url).toBe('https://web.example/health');
+    return new Response(null, { status: webUp ? 204 : 503 });
+  });
+  vi.mocked(connect).mockImplementation(address => {
+    expect(address).toEqual({ hostname: 'db.example', port: 5432 });
+    return { opened: tcpUp ? Promise.resolve({}) : Promise.reject(new Error('refused')), closed: Promise.resolve(), close: async () => {} } as Socket;
+  });
+  const receipt = (id: string) => request('/heartbeat/' + id, { method: 'POST', headers: { authorization }, body: 'ignored' });
+  await tick(0);
+  webUp = true; tcpUp = false;
+  await tick(60_000);
+  expect((await operator()).monitors.map(m => [m.id, m.state])).toEqual([[web.id, 'up'], [tcp.id, 'down'], [heartbeat.id, 'down']]);
+  const beforeRejectedReceipts = await operator();
+  expect((await receipt(web.id)).status).toBe(404);
+  expect((await receipt(tcp.id)).status).toBe(404);
+  expect(await operator()).toEqual(beforeRejectedReceipts);
+  clock.mockReturnValue(start + 80_000); expect((await receipt(heartbeat.id)).status).toBe(204);
+  await mutate('/api/operator/monitors/' + heartbeat.id, 'PATCH', { silenceSeconds: 300 });
+  clock.mockReturnValue(start + 199_999); await receipt(heartbeat.id);
+  expect((await operator()).monitors[2].state).toBe('down');
+  clock.mockReturnValue(start + 200_000); await receipt(heartbeat.id);
+  tcpUp = true; await tick(200_000);
+  expect((await operator()).monitors.map(m => m.state)).toEqual(['up', 'up', 'up']);
+  expect(messages).toHaveLength(6);
+  expect(messages).toEqual(expect.arrayContaining([
+    { text: 'Web: Incident opened' }, { text: 'Web: Incident recovered' },
+    { text: 'Private database: Incident opened' }, { text: 'Private database: Incident recovered' },
+    { text: 'Producer: Incident opened' }, { text: 'Producer: Incident recovered' },
+  ]));
+  expect((await status()).monitors.map(m => m.id)).toEqual([web.id, heartbeat.id]);
+  expect((await status()).incidents.map(i => i.monitorId)).not.toContain(tcp.id);
+  const anonymous = JSON.stringify(await status()) + await (await request('/')).text();
+  for (const hidden of ['db.example', '5432', 'web.example', 'alerts.example', 'Private database', 'test-installation-secret']) expect(anonymous).not.toContain(hidden);
+  const beforePageSave = await operator();
+  expect((await mutate('/api/operator', 'PUT', { pageName: 'Three services' })).status).toBe(200);
+  expect((await operator()).monitors).toEqual(beforePageSave.monitors);
+  const retained = (await operator()).incidents;
+  await mutate('/api/operator/monitors/' + heartbeat.id, 'DELETE');
+  await mutate('/api/operator/monitors/' + tcp.id, 'DELETE');
+  expect((await receipt(heartbeat.id)).status).toBe(404);
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  expect((await operator()).incidents).toEqual(retained);
+  expect((await operator()).monitors.map(m => m.id)).toEqual([web.id]);
+  expect((await status()).incidents.map(i => i.monitorId)).toEqual([web.id]);
+  expect(messages).toHaveLength(6);
+});
+
+it('validates and serializes only timing controls supported by each kind', async () => {
+  for (const body of [
+    { name: 'Web', url: 'https://web.example/' },
+    { name: 'Database', kind: 'tcp', hostname: 'db.example', port: 5432 },
+    { name: 'Producer', kind: 'heartbeat' },
+  ]) expect((await mutate('/api/operator/monitors', 'POST', body)).status).toBe(201);
+  const saved = await operator();
+  for (const monitor of saved.monitors) {
+    const unsupported = monitor.kind === 'heartbeat' ? ['timeoutSeconds', 'failureThreshold'] : ['silenceSeconds', 'recoverySpacingSeconds'];
+    for (const field of unsupported) {
+      expect(monitor).not.toHaveProperty(field);
+      expect((await mutate('/api/operator/monitors/' + monitor.id, 'PATCH', { [field]: 60, name: 'Rejected' })).status).toBe(400);
+    }
+  }
+  expect(await operator()).toEqual(saved);
+});
