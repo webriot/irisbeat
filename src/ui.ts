@@ -52,6 +52,10 @@ export function operatorPage() {
         <section aria-labelledby="monitor-settings"><h2 id="monitor-settings">Monitor configuration</h2>
           <label for="name">Monitor name</label><input id="name" name="name" required maxlength="120">
           <label for="url">HTTP(S) target</label><input id="url" name="url" type="url" required maxlength="2048">
+          <label for="intervalSeconds">Interval (seconds)</label><input id="intervalSeconds" name="intervalSeconds" type="number" min="60" max="86400" step="1" value="60" required>
+          <label for="timeoutSeconds">Timeout (seconds)</label><input id="timeoutSeconds" name="timeoutSeconds" type="number" min="1" max="60" step="1" value="10" required>
+          <label for="failureThreshold">Consecutive failures</label><input id="failureThreshold" name="failureThreshold" type="number" min="1" max="100" step="1" value="2" required>
+          <label for="recoveryThreshold">Consecutive successes</label><input id="recoveryThreshold" name="recoveryThreshold" type="number" min="1" max="100" step="1" value="2" required>
         </section>
         <aside aria-labelledby="page-settings"><h2 id="page-settings">Status page</h2>
           <label for="pageName">Page name</label><input id="pageName" name="pageName" required maxlength="120">
@@ -107,12 +111,15 @@ const editor = document.getElementById('editor');
 const form = document.getElementById('configuration');
 const message = document.getElementById('message');
 let secret = '';
+const timingDefaults = { intervalSeconds: 60, timeoutSeconds: 10, failureThreshold: 2, recoveryThreshold: 2 };
 async function load(method = 'GET') {
   message.textContent = '';
   try {
+    const configuration = Object.fromEntries(new FormData(form));
+    for (const field of Object.keys(timingDefaults)) configuration[field] = Number(configuration[field]);
     const response = await fetch('/api/operator', {
       method, headers: { Authorization: 'Bearer ' + secret, 'Content-Type': 'application/json' },
-      ...(method === 'PUT' ? { body: JSON.stringify(Object.fromEntries(new FormData(form))) } : {})
+      ...(method === 'PUT' ? { body: JSON.stringify(configuration) } : {})
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'Request failed');
@@ -121,6 +128,9 @@ async function load(method = 'GET') {
     document.getElementById('pageName').value = data.pageName;
     document.getElementById('name').value = data.monitor?.name || '';
     document.getElementById('url').value = data.monitor?.url || '';
+    for (const [field, value] of Object.entries(timingDefaults)) {
+      document.getElementById(field).value = data.monitor?.[field] ?? value;
+    }
     document.getElementById('monitor-link').textContent = data.monitor?.name || 'Configure website';
     document.getElementById('state').textContent = data.monitor ? (${JSON.stringify(stateLabel)})[data.monitor.state] : 'No Monitor configured';
     const incidents = data.incidents.map(incident => {
