@@ -29,15 +29,23 @@ Start owner evaluation with A. It exposes each published Monitor's current state
 - Publication changes do not delete operator data. Deletion removes public visibility and retains operator Incidents. Maintenance does not close the existing Incident. Monitor configuration is not a simulated detection engine.
 - Public rendering omits private Monitor names, target URLs, webhook destinations and secrets; Prototype state reflects the visible Monitors. All source data is intentionally fake.
 
-## Unresolved owner choices
+## Owner decision
+
+On 2026-11-13, the owner selected **A — Status ledger** for Irisbeat, including the public and operator layouts. Production code should implement that direction; this prototype remains on its throwaway branch as the primary source. No prototype code should be merged into the integration branch.
+
+## Questions presented
 
 1. Public hierarchy: simultaneous service comparison (A), Incident priority (B), or selection-driven detail (C).
 2. Operator editing: below a Monitor table (A), beside the operational view (B), or through a persistent selector (C).
 3. Whether public Incident history should always follow all Monitors or dominate the page during an outage.
-4. Which elements to combine after owner evaluation. No decision is validated yet.
+4. Which elements to combine after owner evaluation. The owner selected A; no mixed layout was requested.
 
 The shared typography/colors deliberately stay consistent so the choice is structural. Renderer theme variables have fallbacks; there is no html/body background, viewport-height layout, or enclosing outer card. Mobile CSS stacks columns without changing creation order.
 
 ## Verification
 
 An ephemeral Node VM/DOM-stub check exercised all 36 combinations of three variants, six examples and two authenticated surfaces. It verified 90 bars per public Monitor, public exclusion of private Monitor names, empty publication, history failure retaining Incidents, arrow wraparound, deletion to an empty operator view and absence of external assets. Inline JavaScript parses. Browser layout, keyboard focus and inline renderer behavior still require owner/parent visual review; no browser render was requested in this child task.
+
+## Review corrections
+
+PR #13 review findings were corrected: focus restoration across rerenders; public selection reset after settings; an All Incidents path in C for retained history; in-memory webhook configuration; and a banner derived from the renamed Monitor. Five regression checks and all 36 render combinations pass using an ephemeral Node DOM stub. Actual browser keyboard behavior is not claimed.
