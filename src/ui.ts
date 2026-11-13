@@ -47,11 +47,14 @@ export function operatorPage() {
     `<h1>Monitors</h1>
     <form id="login"><label for="secret">Installation secret</label><input id="secret" type="password" required autocomplete="current-password"><button>Sign in</button></form>
     <section id="editor" hidden>
-      <table aria-label="Monitors"><thead><tr><th scope="col">Monitor</th><th scope="col">State</th></tr></thead><tbody><tr><td><button id="monitor-link" class="text-button" type="button">Configure website</button></td><td id="state"></td></tr></tbody></table>
+      <table aria-label="Monitors"><thead><tr><th scope="col">Monitor</th><th scope="col">State</th></tr></thead><tbody><tr><td><button id="monitor-link" class="text-button" type="button">Configure Monitor</button></td><td id="state"></td></tr></tbody></table>
       <form id="configuration" class="configuration-layout">
         <section aria-labelledby="monitor-settings"><h2 id="monitor-settings">Monitor configuration</h2>
           <label for="name">Monitor name</label><input id="name" name="name" required maxlength="120">
-          <label for="url">HTTP(S) target</label><input id="url" name="url" type="url" required maxlength="2048">
+          <label for="kind">Check type</label><select id="kind" name="kind"><option value="http">HTTP(S)</option><option value="tcp">TCP</option></select>
+          <fieldset id="http-target"><label for="url">HTTP(S) target</label><input id="url" name="url" type="url" required maxlength="2048"></fieldset>
+          <fieldset id="tcp-target" hidden disabled><label for="hostname">Hostname</label><input id="hostname" name="hostname" required maxlength="253" autocapitalize="none" spellcheck="false">
+          <label for="port">Port</label><input id="port" name="port" type="number" min="1" max="65535" step="1" required></fieldset>
           <label for="intervalSeconds">Interval (seconds)</label><input id="intervalSeconds" name="intervalSeconds" type="number" min="60" max="86400" step="1" value="60" required>
           <label for="timeoutSeconds">Timeout (seconds)</label><input id="timeoutSeconds" name="timeoutSeconds" type="number" min="1" max="60" step="1" value="10" required>
           <label for="failureThreshold">Consecutive failures</label><input id="failureThreshold" name="failureThreshold" type="number" min="1" max="100" step="1" value="2" required>
@@ -90,9 +93,10 @@ table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
 th, td { padding: 1rem .5rem; text-align: left; border-bottom: 1px solid var(--line); }
 .configuration-layout { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 2.5rem; margin: 2rem 0; }
 aside { border-left: 1px solid var(--line); padding-left: 1.5rem; }
+fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 label { display: block; margin: 1rem 0 .4rem; }
-input, button { font: inherit; min-height: 2.75rem; max-width: 100%; }
-input { width: 100%; padding: .5rem; }
+input, select, button { font: inherit; min-height: 2.75rem; max-width: 100%; }
+input, select { width: 100%; padding: .5rem; }
 button { padding: .5rem .9rem; cursor: pointer; }
 form button { margin-top: 1rem; }
 .text-button { border: 0; background: transparent; color: inherit; padding-left: 0; text-decoration: underline; text-underline-offset: .2em; }
@@ -111,11 +115,20 @@ const editor = document.getElementById('editor');
 const form = document.getElementById('configuration');
 const message = document.getElementById('message');
 let secret = '';
+function showTarget() {
+  const tcp = document.getElementById('kind').value === 'tcp';
+  for (const [id, active] of [['http-target', !tcp], ['tcp-target', tcp]]) {
+    const fields = document.getElementById(id);
+    fields.hidden = !active; fields.disabled = !active;
+  }
+}
+document.getElementById('kind').addEventListener('change', showTarget);
 const timingDefaults = { intervalSeconds: 60, timeoutSeconds: 10, failureThreshold: 2, recoveryThreshold: 2 };
 async function load(method = 'GET') {
   message.textContent = '';
   try {
     const configuration = Object.fromEntries(new FormData(form));
+    if (configuration.kind === 'tcp') configuration.port = Number(configuration.port);
     for (const field of Object.keys(timingDefaults)) configuration[field] = Number(configuration[field]);
     const response = await fetch('/api/operator', {
       method, headers: { Authorization: 'Bearer ' + secret, 'Content-Type': 'application/json' },
@@ -127,11 +140,15 @@ async function load(method = 'GET') {
     editor.hidden = false;
     document.getElementById('pageName').value = data.pageName;
     document.getElementById('name').value = data.monitor?.name || '';
+    document.getElementById('kind').value = data.monitor?.kind || 'http';
     document.getElementById('url').value = data.monitor?.url || '';
+    document.getElementById('hostname').value = data.monitor?.hostname || '';
+    document.getElementById('port').value = data.monitor?.port || '';
+    showTarget();
     for (const [field, value] of Object.entries(timingDefaults)) {
       document.getElementById(field).value = data.monitor?.[field] ?? value;
     }
-    document.getElementById('monitor-link').textContent = data.monitor?.name || 'Configure website';
+    document.getElementById('monitor-link').textContent = data.monitor?.name || 'Configure Monitor';
     document.getElementById('state').textContent = data.monitor ? (${JSON.stringify(stateLabel)})[data.monitor.state] : 'No Monitor configured';
     const incidents = data.incidents.map(incident => {
       const item = document.createElement('li');
@@ -153,8 +170,8 @@ form.addEventListener('submit', async event => { event.preventDefault(); await l
 document.getElementById('monitor-link').addEventListener('click', () => document.getElementById('name').focus());
 document.getElementById('refresh').addEventListener('click', () => load());
 document.getElementById('logout').addEventListener('click', () => {
-  secret = ''; form.reset(); editor.hidden = true; login.hidden = false;
-  document.getElementById('monitor-link').textContent = 'Configure website';
+  secret = ''; form.reset(); showTarget(); editor.hidden = true; login.hidden = false;
+  document.getElementById('monitor-link').textContent = 'Configure Monitor';
   document.getElementById('state').textContent = '';
   document.getElementById('incidents').replaceChildren(); message.textContent = '';
   document.getElementById('secret').focus();

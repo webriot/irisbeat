@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { operatorPage, operatorScript, statusPage, styleSheet } from "./ui";
+import { connect } from "cloudflare:sockets";
 import { DurableObject } from "cloudflare:workers";
 
 const timingDefaults = {
@@ -15,7 +16,10 @@ const timingBounds = {
   recoveryThreshold: [1, 100],
 } as const;
 type Timing = typeof timingDefaults;
-type Configuration = { pageName: string; name: string; url: string } & Partial<Timing>;
+type Target =
+  | { kind: "http"; url: string; hostname?: never; port?: never }
+  | { kind: "tcp"; hostname: string; port: number; url?: never };
+type Configuration = { pageName: string; name: string } & Target & Partial<Timing>;
 export type Incident = {
   id: string;
   monitorId: string;
@@ -43,15 +47,20 @@ export class MonitoringContext extends DurableObject<Env> {
   }
   private read(): StoredContext {
     const state = this.ctx.storage.kv.get<StoredContext>("context") ?? { monitor: null };
-    if (state.monitor) state.monitor = { ...timingDefaults, ...state.monitor };
+    if (state.monitor) {
+      state.monitor = { ...timingDefaults, ...state.monitor };
+      state.monitor.kind ??= "http";
+    }
     return state;
   }
 
   configure(configuration: Configuration) {
     const state = this.read();
     state.monitor = {
-      ...timingDefaults,
-      ...state.monitor,
+      intervalSeconds: state.monitor?.intervalSeconds ?? timingDefaults.intervalSeconds,
+      timeoutSeconds: state.monitor?.timeoutSeconds ?? timingDefaults.timeoutSeconds,
+      failureThreshold: state.monitor?.failureThreshold ?? timingDefaults.failureThreshold,
+      recoveryThreshold: state.monitor?.recoveryThreshold ?? timingDefaults.recoveryThreshold,
       ...configuration,
       id: "website",
       state: state.monitor?.state ?? "unknown",
@@ -79,18 +88,32 @@ export class MonitoringContext extends DurableObject<Env> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), attempt.timeoutSeconds * 1000);
     let success = false;
+    let socket: Socket | undefined;
     try {
-      const response = await fetch(attempt.url, {
-        method: "GET",
-        signal: controller.signal,
-        redirect: "follow",
-      });
-      success = response.status >= 200 && response.status < 300;
-      await response.body?.cancel();
+      if (attempt.kind === "tcp") {
+        socket = connect({ hostname: attempt.hostname, port: attempt.port });
+        void socket.closed.catch(() => {});
+        await Promise.race([
+          socket.opened,
+          new Promise<never>((_resolve, reject) => {
+            controller.signal.addEventListener("abort", () => reject(new Error("TCP timeout")), { once: true });
+          }),
+        ]);
+        success = true;
+      } else {
+        const response = await fetch(attempt.url, {
+          method: "GET",
+          signal: controller.signal,
+          redirect: "follow",
+        });
+        success = response.status >= 200 && response.status < 300;
+        await response.body?.cancel();
+      }
     } catch {
       success = false;
     } finally {
       clearTimeout(timeout);
+      if (socket) await socket.close().catch(() => {});
       this.checking = false;
     }
     const current = this.read();
@@ -140,7 +163,10 @@ export class MonitoringContext extends DurableObject<Env> {
             state: state.monitor.state,
             lastResult: state.monitor.lastResult,
             ...(operator ? {
-              url: state.monitor.url,
+              kind: state.monitor.kind,
+              ...(state.monitor.kind === "tcp"
+                ? { hostname: state.monitor.hostname, port: state.monitor.port }
+                : { url: state.monitor.url }),
               intervalSeconds: state.monitor.intervalSeconds,
               timeoutSeconds: state.monitor.timeoutSeconds,
               failureThreshold: state.monitor.failureThreshold,
@@ -170,27 +196,37 @@ async function authorized(request: Request, secret: string | undefined) {
 
 function parseConfiguration(value: unknown): Configuration | null {
   if (!value || typeof value !== "object") return null;
-  const { pageName, name, url } = value as Record<string, unknown>;
+  const { pageName, name, url, kind = "http", hostname, port } = value as Record<string, unknown>;
   if (
-    typeof pageName !== "string" ||
-    !pageName.trim() ||
-    pageName.length > 120 ||
-    typeof name !== "string" ||
-    !name.trim() ||
-    name.length > 120 ||
-    typeof url !== "string" ||
-    url.length > 2048
-  )
-    return null;
+    typeof pageName !== "string" || !pageName.trim() || pageName.length > 120 ||
+    typeof name !== "string" || !name.trim() || name.length > 120
+  ) return null;
   try {
-    const target = new URL(url);
-    if (
-      !["http:", "https:"].includes(target.protocol) ||
-      target.username ||
-      target.password
-    )
-      return null;
-    target.hash = "";
+    let target: Target;
+    if (kind === "tcp") {
+      if (typeof hostname !== "string" || !hostname || hostname.length > 253 ||
+          !Number.isInteger(port) || typeof port !== "number" || port < 1 || port > 65535)
+        return null;
+      const host = hostname.toLowerCase();
+      if (host.includes(":")) {
+        if (host.startsWith("[") && !host.endsWith("]")) return null;
+        const literal = host.startsWith("[") ? host.slice(1, -1) : host;
+        if (!/^[0-9a-f:.]+$/.test(literal)) return null;
+        const parsed = new URL(`http://[${literal}]/`);
+        target = { kind, hostname: parsed.hostname.slice(1, -1), port, url: undefined };
+      } else {
+        if (!/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.?$/.test(host))
+          return null;
+        target = { kind, hostname: host, port, url: undefined };
+      }
+    } else if (kind === "http") {
+      if (typeof url !== "string" || url.length > 2048) return null;
+      const parsed = new URL(url);
+      if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password)
+        return null;
+      parsed.hash = "";
+      target = { kind, url: parsed.href, hostname: undefined, port: undefined };
+    } else return null;
     const timing: Partial<Timing> = {};
     for (const key of Object.keys(timingDefaults) as (keyof Timing)[]) {
       if (!(key in value)) continue;
@@ -200,7 +236,7 @@ function parseConfiguration(value: unknown): Configuration | null {
         return null;
       timing[key] = input;
     }
-    return { pageName: pageName.trim(), name: name.trim(), url: target.href, ...timing };
+    return { pageName: pageName.trim(), name: name.trim(), ...target, ...timing };
   } catch {
     return null;
   }
@@ -302,7 +338,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         return Response.json(
           {
             error:
-              "Enter names, an HTTP(S) URL without credentials, and integer timing: interval 60–86400 seconds, timeout 1–60 seconds, thresholds 1–100",
+              "Enter names, an HTTP(S) URL without credentials or a TCP hostname and port (1–65535), and integer timing: interval 60–86400 seconds, timeout 1–60 seconds, thresholds 1–100",
           },
           { status: 400 },
         );
