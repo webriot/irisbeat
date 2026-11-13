@@ -84,16 +84,18 @@ export class MonitoringContext extends DurableObject<Env> {
     return state;
   }
 
-  configure(configuration: Configuration | { pageName: string }) {
+  configure(configuration: Configuration | { pageName: string }, expectedMonitorId: string | null = null) {
     const state = this.read();
-    state.pageName = configuration.pageName;
     // Keep the original single-Monitor save contract for existing clients.
     if ("name" in configuration) {
       const monitor = state.monitors[0];
+      // A legacy save must never move to a sibling after validation.
+      if ((monitor?.id ?? null) !== expectedMonitorId || (monitor && monitor.kind !== configuration.kind)) return null;
       const { pageName: _pageName, ...settings } = configuration;
       if (monitor) this.applyEdit(monitor, settings);
       else state.monitors.push(this.newMonitor(settings));
     }
+    state.pageName = configuration.pageName;
     this.ctx.storage.kv.put("context", state);
     return this.status(true);
   }
@@ -522,7 +524,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       const configuration = parseConfiguration(value, existing?.kind);
       if (!configuration || (existing && configuration.kind !== existing.kind))
         return Response.json({ error: "Enter page/Monitor names and valid timing; kind cannot change. HTTP requires a credential-free HTTP(S) URL" }, { status: 400 });
-      return Response.json(await context.configure(configuration));
+      const result = await context.configure(configuration, existing?.id ?? null);
+      return result ? Response.json(result) : Response.json({ error: "Monitor changed; reload before saving" }, { status: 409 });
     }
     return new Response(null, { status: 405, headers: { Allow: monitorMatch ? "PATCH, DELETE" : path === "/api/operator/monitors" ? "GET, POST" : "GET, PUT" } });
   }

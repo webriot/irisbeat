@@ -214,3 +214,17 @@ it('edits heartbeat collection timing prospectively without changing kind, sibli
   await request('/heartbeat/' + a.id, { method: 'POST', headers: { authorization } });
   expect((await operatorStatus()).monitors.find(m => m.id === b.id)?.lastSeen).toBeNull();
 });
+
+it('never redirects a concurrent legacy save to a sibling after its target is deleted', async () => {
+  const first = await create({ name: 'HTTP first', url: 'https://first.example/' });
+  const sibling = await create({ name: 'Heartbeat sibling', kind: 'heartbeat' });
+  const [saved, removed] = await Promise.all([
+    mutate('/api/operator', 'PUT', { pageName: 'Changed', name: 'Edited HTTP', kind: 'http', url: 'https://edited.example/' }),
+    mutate('/api/operator/monitors/' + first.id, 'DELETE'),
+  ]);
+  expect(removed.status).toBe(200);
+  expect([200, 400, 409]).toContain(saved.status);
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  expect((await operatorStatus()).monitors).toEqual([sibling]);
+  expect((await request('/heartbeat/' + sibling.id, { method: 'POST', headers: { authorization } })).status).toBe(204);
+});
