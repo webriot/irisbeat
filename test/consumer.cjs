@@ -39,10 +39,14 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
   const deliveries = [], webhooks = [];
   let outcome = 503;
   let deliveryFails = false;
+  let releaseWebhook, webhookStarted;
+  let holdWebhook = false;
   let now = 0;
   const mf = new Miniflare(convertV4MiniflareOptions({ name: 'consumer', modules: true, script, compatibilityDate: '2026-11-13', durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } }, outboundService: async request => {
     if (request.url.startsWith('https://delivery.example/')) { deliveries.push(await request.json()); return new Response(null, { status: deliveryFails ? 503 : 204 }); }
-    if (request.url.startsWith('https://webhook.example/')) { webhooks.push(await request.json()); return new Response(null, { status: 204 }); }
+    if (request.url.startsWith('https://webhook.example/')) { webhooks.push(await request.json());
+      if (holdWebhook) { await new Promise(resolve => { releaseWebhook = resolve; webhookStarted(); }); }
+      return new Response(null, { status: 204 }); }
     return new Response(null, { status: outcome });
   } }));
   const request = (host, path, method = 'GET', body, token = 'editor') => mf.dispatchFetch('https://' + host + path, { method, headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', 'x-test-at': String(now) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
@@ -148,6 +152,20 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       assert.equal(deliveries.at(-1).transition, 'recovered');
       await request('a.example', path, 'DELETE');
     }
+    // A delivery already submitted before declaration cannot be recalled; a later hook must still be suppressed.
+    now += 60_000; outcome = 503;
+    const pending = await (await request('a.example', '/api/operator/monitors', 'POST', { name: 'Committed before window', url: 'https://target.example/', failureThreshold: 1 })).json();
+    const pendingId = pending.monitors.at(-1).id;
+    const hookCount = deliveries.length;
+    holdWebhook = true;
+    const submitted = new Promise(resolve => { webhookStarted = resolve; });
+    const dispatch = tick(now);
+    await submitted;
+    await request('a.example', '/api/operator/monitors/' + pendingId + '/maintenance', 'PUT', { endsAt: now + 180_000 });
+    releaseWebhook();
+    await dispatch;
+    holdWebhook = false;
+    assert.equal(deliveries.length, hookCount, 'a hook waiting behind an earlier webhook cannot start during Maintenance');
     console.log('PASS packed irisbeat@0.1.0: reproducible artifact, pinned integrity, consumer typecheck, isolated scheduling/Incidents, HTTP/TCP/heartbeat hooks, failure isolation, webhooks rotated tenant credentials and three-kind Maintenance suppression of both delivery paths');
   } finally { await mf.dispose(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

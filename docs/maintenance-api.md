@@ -56,8 +56,18 @@ heartbeat credential rotation. Suppression returns from shared `record` before
 Incident mutation or post-commit delivery; both `deliverWebhook` and
 `onIncidentTransition` remain downstream of it. Installed-consumer tests cover
 both delivery paths for HTTP, TCP and Heartbeat. There are no Maintenance
-transition alert events.
+transition alert events. A webhook submitted before declaration cannot be recalled;
+a hosted hook still waiting behind that delivery is suppressed if Maintenance is
+active when it would start.
 
 #11 must make pause override Maintenance for checking/recording/display and retain
 unexpired windows for resume. Do not infer subscriptions or hosted identity from
 Maintenance. This ticket adds no pause flag or commercial policy.
+
+## Pending owner decision
+
+The classification of an outbound attempt that crosses a Maintenance boundary is
+still awaiting the owner: any overlap as Maintenance, or completion time only.
+Neither is claimed as implemented/accepted by this draft. In particular, starting
+before declaration, completing after expiry/early end, or spanning replacement
+needs the final boundary slice and request-level regression before this PR is ready.

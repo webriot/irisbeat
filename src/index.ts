@@ -327,7 +327,8 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     // Delivery follows the committed transition; transport failure cannot undo detection.
     if (transition && current.webhookUrl)
       await this.deliverWebhook(current.webhookUrl, monitor.name, transition);
-    if (transition && transitionedIncident) {
+    // A declaration can interleave while the already-submitted webhook is awaiting its response.
+    if (transition && transitionedIncident && !this.read().monitors.some(candidate => candidate.id === monitor.id && candidate.maintenance)) {
       try {
         await this.onIncidentTransition({ contextId: this.ctx.id.toString(), incident: transitionedIncident, transition, at });
       } catch {
