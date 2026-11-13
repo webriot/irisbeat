@@ -180,3 +180,32 @@ it("records synchronous connection errors and tolerates rejected socket cleanup 
   expect(html).toContain("Recovered");
   expect(html).not.toContain("db.example");
 });
+
+it("delivers named TCP Incident transitions through the context webhook while edits emit no alerts", async () => {
+  await request("/api/operator/webhook", { method: "PUT", headers: { authorization, "Content-Type": "application/json" }, body: JSON.stringify({ url: "https://alerts.example/tcp" }) });
+  await configure();
+  const messages: unknown[] = [];
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+    expect(url).toBe("https://alerts.example/tcp");
+    expect(init?.method).toBe("POST");
+    messages.push(JSON.parse(String(init?.body)));
+    return new Response(null, { status: 204 });
+  });
+  let success = false;
+  vi.mocked(connect).mockImplementation(() => ({
+    opened: success ? Promise.resolve({}) : Promise.reject(new Error("refused")),
+    closed: Promise.resolve(), close: async () => {},
+  } as Socket));
+  await tick(0);
+  expect(messages).toEqual([]);
+  await tick(60_000);
+  await tick(120_000);
+  expect(messages).toEqual([{ text: "Database: Incident opened" }]);
+  await configure({ ...config, intervalSeconds: 120 });
+  expect(messages).toHaveLength(1);
+  success = true;
+  await tick(240_000);
+  await tick(360_000);
+  expect(messages).toEqual([{ text: "Database: Incident opened" }, { text: "Database: Incident recovered" }]);
+  expect(await (await request("/api/operator", { headers: { authorization } })).json()).toMatchObject({ webhookUrl: "https://alerts.example/tcp" });
+});
