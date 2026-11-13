@@ -424,14 +424,21 @@ const operatorRequest = (path: string, method = "GET", body?: unknown) =>
   });
 
 it("creates independent Monitors in creation order and saves page settings separately", async () => {
-  const first = await operatorRequest("/api/operator/monitors", "POST", { name: "Zebra", url: config.url });
+  const first = await operatorRequest("/api/operator/monitors", "POST", { name: "Zebra", url: config.url, intervalSeconds: 120, timeoutSeconds: 5, failureThreshold: 3, recoveryThreshold: 4 });
   expect(first.status).toBe(201);
   const second = await operatorRequest("/api/operator/monitors", "POST", { name: "Alpha", url: "https://second.example/health" });
   expect(second.status).toBe(201);
   expect((await operatorRequest("/api/operator", "PUT", { pageName: "Fleet" })).status).toBe(200);
   const data = await (await operatorRequest("/api/operator/monitors")).json<import("../src/index").Status>();
-  expect(data).toMatchObject({ pageName: "Fleet", monitors: [{ name: "Zebra", published: true, url: config.url }, { name: "Alpha", published: true }] });
+  expect(data).toMatchObject({ pageName: "Fleet", monitors: [{ name: "Zebra", published: true, url: config.url, intervalSeconds: 120, timeoutSeconds: 5, failureThreshold: 3, recoveryThreshold: 4 }, { name: "Alpha", published: true, intervalSeconds: 60, timeoutSeconds: 10, failureThreshold: 2, recoveryThreshold: 2 }] });
   expect(data.monitors[0].id).not.toBe(data.monitors[1].id);
+  await operatorRequest(`/api/operator/monitors/${data.monitors[0].id}`, "PATCH", { timeoutSeconds: 9 });
+  await evictDurableObject(env.MONITORING.getByName("personal"));
+  const persisted = await (await operatorRequest("/api/operator")).json<import("../src/index").Status>();
+  expect(persisted.monitors).toMatchObject([
+    { intervalSeconds: 120, timeoutSeconds: 9, failureThreshold: 3, recoveryThreshold: 4 },
+    { intervalSeconds: 60, timeoutSeconds: 10, failureThreshold: 2, recoveryThreshold: 2 },
+  ]);
   expect(await status()).toMatchObject({ monitors: [{ name: "Zebra" }, { name: "Alpha" }] });
 });
 
@@ -517,10 +524,10 @@ it("validates and authenticates every collection mutation without exposing targe
   expect(saved.status).toBe(201);
   const id = (await saved.json<import("../src/index").Status>()).monitors[0].id;
   expect((await status()).monitors).toEqual([]);
-  for (const body of [{}, { published: "false" }, { url: "https://u:p@private.example" }, { name: " " }, { kind: "tcp" }, { url: "ftp://private.example" }]) {
+  for (const body of [{ intervalSeconds: 59 }, { timeoutSeconds: null }, { failureThreshold: "2" }, { recoveryThreshold: 101 }, {}, { published: "false" }, { url: "https://u:p@private.example" }, { name: " " }, { kind: "tcp" }, { url: "ftp://private.example" }]) {
     expect((await operatorRequest(`/api/operator/monitors/${id}`, "PATCH", body)).status).toBe(400);
   }
-  for (const body of [{ ...create, published: "true" }, { ...create, kind: "tcp" }, { name: "Missing URL" }]) {
+  for (const body of [{ ...create, intervalSeconds: 59 }, { ...create, timeoutSeconds: null }, { ...create, failureThreshold: "2" }, { ...create, recoveryThreshold: 101 }, { ...create, published: "true" }, { ...create, kind: "tcp" }, { name: "Missing URL" }]) {
     expect((await operatorRequest("/api/operator/monitors", "POST", body)).status).toBe(400);
   }
   expect((await operatorRequest(`/api/operator/monitors/${id}`, "PATCH", { url: "https://new.example/#fragment", name: "Renamed" })).status).toBe(200);

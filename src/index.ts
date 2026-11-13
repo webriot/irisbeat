@@ -2,7 +2,21 @@
 import { operatorPage, operatorScript, statusPage, styleSheet } from "./ui";
 import { DurableObject } from "cloudflare:workers";
 
-type Configuration = { pageName: string; name: string; url: string };
+const timingDefaults = {
+  intervalSeconds: 60,
+  timeoutSeconds: 10,
+  failureThreshold: 2,
+  recoveryThreshold: 2,
+};
+const timingBounds = {
+  intervalSeconds: [60, 86_400],
+  timeoutSeconds: [1, 60],
+  failureThreshold: [1, 100],
+  recoveryThreshold: [1, 100],
+} as const;
+type Timing = typeof timingDefaults;
+type Configuration = { pageName: string; name: string; url: string } & Partial<Timing>;
+type MonitorConfiguration = Omit<Configuration, "pageName"> & { published?: boolean };
 export type Incident = {
   id: string;
   monitorId: string;
@@ -11,7 +25,7 @@ export type Incident = {
   closedAt: number | null;
 };
 type CheckResult = { at: number; outcome: "success" | "failure" };
-type Monitor = Omit<Configuration, "pageName"> & {
+type Monitor = Omit<Configuration, "pageName"> & Timing & {
   published: boolean;
   id: string;
   state: "unknown" | "up" | "down";
@@ -22,7 +36,7 @@ type Monitor = Omit<Configuration, "pageName"> & {
 };
 export type Status = ReturnType<MonitoringContext["status"]>;
 type StoredContext = { pageName: string; monitors: Monitor[] };
-type LegacyContext = { monitor: (Omit<Monitor, "published"> & { pageName: string }) | null };
+type LegacyContext = { monitor: (Omit<Monitor, "published" | keyof Timing> & Partial<Timing> & { pageName: string }) | null };
 
 export class MonitoringContext extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -37,7 +51,10 @@ export class MonitoringContext extends DurableObject<Env> {
   private read(): StoredContext {
     const stored = this.ctx.storage.kv.get<StoredContext | LegacyContext>("context");
     if (!stored) return { pageName: "Irisbeat", monitors: [] };
-    if ("monitors" in stored) return stored;
+    if ("monitors" in stored) {
+      stored.monitors = stored.monitors.map(monitor => ({ ...timingDefaults, ...monitor }));
+      return stored;
+    }
     const pageName = stored.monitor?.pageName ?? "Irisbeat";
     const state: StoredContext = {
       pageName,
@@ -46,7 +63,7 @@ export class MonitoringContext extends DurableObject<Env> {
     // Preserve the legacy ID, detector progress and Incident identity on upgrade.
     if (stored.monitor) {
       const { pageName: _pageName, ...monitor } = stored.monitor;
-      state.monitors.push({ ...monitor, published: true });
+      state.monitors.push({ ...timingDefaults, ...monitor, published: true });
     }
     this.ctx.storage.transactionSync(() => {
       if (stored.monitor) this.ctx.storage.sql.exec(
@@ -64,32 +81,40 @@ export class MonitoringContext extends DurableObject<Env> {
     // Keep the original single-Monitor save contract for existing clients.
     if ("name" in configuration) {
       const monitor = state.monitors[0];
-      if (monitor) Object.assign(monitor, { name: configuration.name, url: configuration.url });
-      else state.monitors.push(this.newMonitor({ name: configuration.name, url: configuration.url }));
+      const { pageName: _pageName, ...settings } = configuration;
+      if (monitor) this.applyEdit(monitor, settings);
+      else state.monitors.push(this.newMonitor(settings));
     }
     this.ctx.storage.kv.put("context", state);
     return this.status(true);
   }
 
-  private newMonitor(configuration: { name: string; url: string }): Monitor {
-    return { ...configuration, id: crypto.randomUUID(), published: true, state: "unknown", lastResult: null,
+  private newMonitor(configuration: MonitorConfiguration): Monitor {
+    return { ...timingDefaults, ...configuration, id: crypto.randomUUID(), published: configuration.published ?? true, state: "unknown", lastResult: null,
       failures: 0, successes: 0, nextDue: 0 };
   }
 
-  create(configuration: { name: string; url: string; published?: boolean }) {
+  create(configuration: MonitorConfiguration) {
     const state = this.read();
-    state.monitors.push({ ...this.newMonitor(configuration), published: configuration.published ?? true });
+    state.monitors.push(this.newMonitor(configuration));
     this.ctx.storage.kv.put("context", state);
     return this.status(true);
   }
 
-  edit(id: string, patch: Partial<Pick<Monitor, "name" | "url" | "published">>) {
+  edit(id: string, patch: Partial<MonitorConfiguration>) {
     const state = this.read();
     const monitor = state.monitors.find(monitor => monitor.id === id);
     if (!monitor) return null;
-    Object.assign(monitor, patch);
+    this.applyEdit(monitor, patch);
     this.ctx.storage.kv.put("context", state);
     return this.status(true);
+  }
+
+  private applyEdit(monitor: Monitor, patch: Partial<MonitorConfiguration>) {
+    // Preserve #3's last-dispatch anchor, including a running attempt.
+    if (monitor.nextDue && patch.intervalSeconds !== undefined)
+      monitor.nextDue += (patch.intervalSeconds - monitor.intervalSeconds) * 1000;
+    Object.assign(monitor, patch);
   }
 
   remove(id: string) {
@@ -111,10 +136,10 @@ export class MonitoringContext extends DurableObject<Env> {
     const attempt = state.monitors.find(monitor => monitor.id === id);
     if (!attempt || this.checking.has(id) || at < attempt.nextDue) return;
     this.checking.add(id);
-    attempt.nextDue = at + 60_000;
+    attempt.nextDue = at + attempt.intervalSeconds * 1000;
     this.ctx.storage.kv.put("context", state);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10_000);
+    const timeout = setTimeout(() => controller.abort(), attempt.timeoutSeconds * 1000);
     let success = false;
     try {
       const response = await fetch(attempt.url, {
@@ -144,7 +169,7 @@ export class MonitoringContext extends DurableObject<Env> {
           monitor.id,
         )
         .toArray()[0];
-      if (!open && monitor.failures >= 2) {
+      if (!open && monitor.failures >= attempt.failureThreshold) {
         monitor.state = "down";
         this.ctx.storage.sql.exec(
           "INSERT INTO incidents (id, monitorId, openedAt, monitorName) VALUES (?, ?, ?, ?)",
@@ -153,7 +178,7 @@ export class MonitoringContext extends DurableObject<Env> {
           at,
           monitor.name,
         );
-      } else if (open && monitor.successes >= 2) {
+      } else if (open && monitor.successes >= attempt.recoveryThreshold) {
         this.ctx.storage.sql.exec(
           "UPDATE incidents SET closedAt = ? WHERE id = ?",
           at,
@@ -171,7 +196,11 @@ export class MonitoringContext extends DurableObject<Env> {
     const state = this.read();
     const monitors = state.monitors.filter(monitor => operator || monitor.published).map(monitor => ({
       id: monitor.id, name: monitor.name, state: monitor.state, lastResult: monitor.lastResult,
-      ...(operator ? { url: monitor.url, published: monitor.published } : {}),
+      ...(operator ? {
+        url: monitor.url, published: monitor.published,
+        intervalSeconds: monitor.intervalSeconds, timeoutSeconds: monitor.timeoutSeconds,
+        failureThreshold: monitor.failureThreshold, recoveryThreshold: monitor.recoveryThreshold,
+      } : {}),
     }));
     return {
       pageName: state.pageName,
@@ -220,20 +249,30 @@ function parseConfiguration(value: unknown): Configuration | null {
     )
       return null;
     target.hash = "";
-    return { pageName: pageName.trim(), name: name.trim(), url: target.href };
+    const timing: Partial<Timing> = {};
+    for (const key of Object.keys(timingDefaults) as (keyof Timing)[]) {
+      if (!(key in value)) continue;
+      const input = (value as Record<string, unknown>)[key];
+      const [min, max] = timingBounds[key];
+      if (typeof input !== "number" || !Number.isInteger(input) || input < min || input > max)
+        return null;
+      timing[key] = input;
+    }
+    return { pageName: pageName.trim(), name: name.trim(), url: target.href, ...timing };
   } catch {
     return null;
   }
 }
 
-function parseMonitorPatch(value: unknown): Partial<Pick<Monitor, "name" | "url" | "published">> | null {
+function parseMonitorPatch(value: unknown): Partial<MonitorConfiguration> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const fields = value as Record<string, unknown>;
-  if (!Object.keys(fields).length || Object.keys(fields).some(key => !["name", "url", "published"].includes(key))) return null;
+  if (!Object.keys(fields).length || Object.keys(fields).some(key => !["name", "url", "published", ...Object.keys(timingDefaults)].includes(key))) return null;
   if ("published" in fields && typeof fields.published !== "boolean") return null;
   const configuration = parseConfiguration({ pageName: "Irisbeat", name: "Monitor", url: "https://example.com", ...fields });
   if (!configuration) return null;
-  return { ...("name" in fields ? { name: configuration.name } : {}),
+  const { pageName: _pageName, name: _name, url: _url, ...timing } = configuration;
+  return { ...timing, ...("name" in fields ? { name: configuration.name } : {}),
     ...("url" in fields ? { url: configuration.url } : {}),
     ...("published" in fields ? { published: fields.published as boolean } : {}) };
 }
@@ -353,7 +392,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         const patch = parseMonitorPatch(value);
         if (!patch || !patch.name || !patch.url)
           return Response.json({ error: "Enter a Monitor name and HTTP(S) URL without credentials" }, { status: 400 });
-        return Response.json(await context.create({ name: patch.name, url: patch.url, published: patch.published }), { status: 201 });
+        return Response.json(await context.create({ ...patch, name: patch.name, url: patch.url }), { status: 201 });
       }
       const configuration = parseConfiguration(value);
       if (!configuration)

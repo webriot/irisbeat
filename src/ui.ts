@@ -50,6 +50,10 @@ export function operatorPage() {
           <h2 id="monitor-settings">New Monitor</h2>
           <label for="name">Monitor name</label><input id="name" name="name" required maxlength="120">
           <label for="url">HTTP(S) target</label><input id="url" name="url" type="url" required maxlength="2048">
+          <label for="intervalSeconds">Interval (seconds)</label><input id="intervalSeconds" name="intervalSeconds" type="number" min="60" max="86400" step="1" value="60" required>
+          <label for="timeoutSeconds">Timeout (seconds)</label><input id="timeoutSeconds" name="timeoutSeconds" type="number" min="1" max="60" step="1" value="10" required>
+          <label for="failureThreshold">Consecutive failures</label><input id="failureThreshold" name="failureThreshold" type="number" min="1" max="100" step="1" value="2" required>
+          <label for="recoveryThreshold">Consecutive successes</label><input id="recoveryThreshold" name="recoveryThreshold" type="number" min="1" max="100" step="1" value="2" required>
           <label class="checkbox" for="published"><input id="published" name="published" type="checkbox" checked>Published</label>
           <button>Save Monitor</button><button id="cancel-edit" type="button">Cancel</button>
         </form>
@@ -112,6 +116,7 @@ const editor = byId('editor');
 const form = byId('configuration');
 const pageForm = byId('page-configuration');
 const message = byId('message');
+const timingDefaults = { intervalSeconds: 60, timeoutSeconds: 10, failureThreshold: 2, recoveryThreshold: 2 };
 let secret = '';
 let editingId = null;
 let busy = false;
@@ -122,6 +127,7 @@ function edit(monitor = null) {
   byId('name').value = monitor?.name || '';
   byId('url').value = monitor?.url || '';
   byId('published').checked = monitor?.published ?? true;
+  for (const [field, value] of Object.entries(timingDefaults)) byId(field).value = monitor?.[field] ?? value;
   form.hidden = false;
   byId('name').focus();
 }
@@ -194,6 +200,7 @@ login.addEventListener('submit', async event => {
 form.addEventListener('submit', async event => {
   event.preventDefault();
   const body = { name: byId('name').value, url: byId('url').value, published: byId('published').checked };
+  for (const field of Object.keys(timingDefaults)) body[field] = Number(byId(field).value);
   await run('/api/operator/monitors' + (editingId ? '/' + encodeURIComponent(editingId) : ''), editingId ? 'PATCH' : 'POST', body, cancelEdit);
 });
 pageForm.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator', 'PUT', { pageName: byId('pageName').value }); });

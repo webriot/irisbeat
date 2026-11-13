@@ -11,7 +11,7 @@ const project = process.cwd();
 const localRequire = createRequire(join(project, 'node_modules/@cloudflare/vitest-plugin/package.json'));
 const { build } = localRequire('esbuild');
 const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
-const base = '6fb95ccec52d9c5c29b82f82c3d77ed3a7e356d3';
+const base = process.argv[2] || '6fb95ccec52d9c5c29b82f82c3d77ed3a7e356d3';
 const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
 (async () => {
   for (const file of ['index.ts', 'ui.ts']) writeFileSync(join(temporary, file), execFileSync('git', ['show', `${base}:src/${file}`]));
@@ -25,10 +25,11 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
   const tick = at => request('/test-tick?at='+at);
   const start = Date.UTC(2026,10,13);
   try {
-    assert.equal((await request('/api/operator','PUT',{pageName:'Old page',name:'Legacy service',url:'https://target.example/health'})).status,200);
+    assert.equal((await request('/api/operator','PUT',{pageName:'Old page',name:'Legacy service',url:'https://target.example/health',timeoutSeconds:7})).status,200);
     await tick(start); await tick(start+60000);
     const before = await (await request('/api/status')).json();
     assert.equal(before.monitor.state,'down');
+    const beforeTiming = await (await request('/api/operator')).json();
     // One recovery observation before replacing the actual Worker bundle.
     outcome = 204; await tick(start+120000);
     await mf.setOptions(options(await bundle(join(project,'src/index.ts'))));
@@ -38,6 +39,10 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     assert.equal(after.monitors[0].published,true);
     assert.equal(after.monitors[0].url,'https://target.example/health');
     assert.equal(after.monitors[0].state,'down');
+    assert.equal(after.monitors[0].intervalSeconds,60);
+    assert.equal(after.monitors[0].timeoutSeconds,beforeTiming.monitor.timeoutSeconds ?? 10);
+    assert.equal(after.monitors[0].failureThreshold,2);
+    assert.equal(after.monitors[0].recoveryThreshold,2);
     assert.equal(after.incidents[0].id,before.incidents[0].id);
     assert.equal(after.incidents[0].monitorName,'Legacy service');
     assert.equal(after.incidents[0].closedAt,null);
