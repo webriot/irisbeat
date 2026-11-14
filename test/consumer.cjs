@@ -37,6 +37,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     },
   }] })).outputFiles[0].text;
   const deliveries = [], webhooks = [];
+  const policyGates = new Map();
   let targetCount = 0;
   let outcome = 503;
   let deliveryFails = false;
@@ -45,6 +46,11 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
   let overlapAction;
   let now = 0;
   const workerOptions = { name: 'consumer', modules: true, script, compatibilityDate: '2026-11-13', durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } }, outboundService: async request => {
+    if (request.url.startsWith('https://policy-gate.example/')) {
+      const gate = policyGates.get(new URL(request.url).pathname.slice(1));
+      gate.captured(); await gate.released;
+      return new Response(null, { status: 204 });
+    }
     if (request.url.startsWith('https://delivery.example/')) { deliveries.push(await request.json()); return new Response(null, { status: deliveryFails ? 503 : 204 }); }
     if (request.url.startsWith('https://webhook.example/')) { webhooks.push(await request.json());
       if (holdWebhook) { await new Promise(resolve => { releaseWebhook = resolve; webhookStarted(); }); }
@@ -54,9 +60,119 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     return new Response(null, { status: outcome });
   } };
   const mf = new Miniflare(convertV4MiniflareOptions(workerOptions));
-  const request = (host, path, method = 'GET', body, token = 'editor') => mf.dispatchFetch('https://' + host + path, { method, headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', 'x-test-at': String(now) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+  let nextPolicyRevision = 0;
+  const request = (host, path, method = 'GET', body, token = 'editor') => {
+    // This single test driver models the trusted policy source, outside Worker isolate lifetimes.
+    if (path.startsWith('/test-pause?') && !path.includes('value=omit') && !path.includes('policyRevision='))
+      path += '&policyRevision=' + ++nextPolicyRevision;
+    return mf.dispatchFetch('https://' + host + path, { method, headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', 'x-test-at': String(now) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+  };
   const tick = at => { now = at; return request('a.example', '/test-tick?at=' + at); };
   try {
+    {
+      const evidence = [];
+      for (const newerPaused of [true, false]) for (const source of ['request', 'schedule']) {
+        // Gate a substituted external dependency after the adapter captured its trusted policy.
+        let captured, release;
+        const started = new Promise(resolve => { captured = resolve; });
+        const released = new Promise(resolve => { release = resolve; });
+        policyGates.set(source, { captured, released });
+        await request('ordering.example', '/test-pause?value=' + !newerPaused);
+        const created = await (await request('ordering.example', '/api/operator/monitors', 'POST', { name: 'Delayed ' + source, url: 'https://target.example/', failureThreshold: 100 })).json();
+        if (source === 'schedule') await request('ordering.example', '/test-delay-contexts');
+        const delayed = source === 'request'
+          ? request('ordering.example', '/api/status?test-delay-resolve=1')
+          : tick(now);
+        await started;
+        await request('ordering.example', '/test-pause?value=' + newerPaused);
+        const newer = await (await request('ordering.example', '/api/status')).json();
+        assert.equal(newer.paused, newerPaused, 'new trusted policy applied before releasing old snapshot');
+        const beforeTargets = targetCount;
+        release(); await delayed;
+        // Omit further propagation to observe persisted state through requests and a legacy-ID schedule.
+        await request('ordering.example', '/test-pause?value=omit');
+        await tick(now + 60_000);
+        const current = await (await request('ordering.example', '/api/status')).json();
+        const observed = { source, newerPaused: newer.paused, finalPaused: current.paused, newlyDispatched: targetCount - beforeTargets };
+        console.log('PAUSE ORDERING ' + JSON.stringify(observed));
+        evidence.push(observed);
+        await request('ordering.example', '/api/operator/monitors/' + created.monitor.id, 'DELETE');
+      }
+      assert.deepEqual(evidence, [
+        { source: 'request', newerPaused: true, finalPaused: true, newlyDispatched: 0 },
+        { source: 'schedule', newerPaused: true, finalPaused: true, newlyDispatched: 0 },
+        { source: 'request', newerPaused: false, finalPaused: false, newlyDispatched: 1 },
+        { source: 'schedule', newerPaused: false, finalPaused: false, newlyDispatched: 2 },
+      ], 'older adapter snapshots must not undo a newer pause or dispatch outbound attempts');
+      now = 0;
+    }
+    {
+      const host = 'ordering.example';
+      const apply = metadata => request(host, '/api/status?test-policy=' + encodeURIComponent(JSON.stringify(metadata)));
+      const read = async () => (await request(host, '/api/status')).json();
+      const schedule = entries => request(host, '/test-contexts?value=' + encodeURIComponent(JSON.stringify(entries)));
+      const rejectedTick = () => request(host, '/test-tick?at=' + now + '&expect-reject=1');
+      const revision = nextPolicyRevision + 1000;
+      nextPolicyRevision = revision + 100;
+      const beforeTargets = targetCount;
+      const beforeMalformed = await read();
+      for (const metadata of [
+        { paused: true }, { policyRevision: revision },
+        ...[null, -1, 1.5, '1', 9007199254740992].map(policyRevision => ({ paused: true, policyRevision })),
+        { paused: 'false', policyRevision: revision }, { paused: null, policyRevision: revision },
+      ]) {
+        assert.equal((await apply(metadata)).status, 500, 'malformed request policy rejected');
+        await schedule([{ id: host, ...metadata }]);
+        assert.equal((await rejectedTick()).status, 409, 'malformed scheduled policy rejected');
+        assert.deepEqual(await read(), beforeMalformed, 'malformed policy leaves status and history unchanged');
+      }
+      assert.equal(targetCount, beforeTargets);
+      await request(host, '/test-contexts');
+      assert.equal((await apply({ paused: true, policyRevision: revision })).status, 200);
+      assert.equal((await apply({ paused: true, policyRevision: revision })).status, 200, 'equal revision and state idempotent');
+      assert.equal((await apply({ paused: false, policyRevision: revision })).status, 500, 'equal revision conflicting state rejected');
+      assert.equal((await read()).paused, true);
+      await schedule([{ id: host, paused: false, policyRevision: revision }]);
+      assert.equal((await rejectedTick()).status, 409, 'persisted revision conflict rejects schedules too');
+      await request(host, '/test-contexts');
+      await mf.setOptions(convertV4MiniflareOptions({ ...workerOptions, script: script + '\n// Restart policy ordering' }));
+      assert.equal((await (await apply({ paused: false, policyRevision: revision - 1 })).json()).paused, true, 'older resume ignored after restart');
+      assert.equal((await apply({ paused: false, policyRevision: revision })).status, 500, 'equal revision conflict persists after restart');
+      assert.equal((await read()).paused, true, 'omission preserves persisted policy');
+      assert.equal((await (await apply({ paused: false, policyRevision: revision + 1 })).json()).paused, false, 'newer resume applies');
+      const created = await (await request(host, '/api/operator/monitors', 'POST', { name: 'Ordering counts', url: 'https://target.example/' })).json();
+      await tick(60_000);
+      await apply({ paused: false, policyRevision: revision + 2 });
+      await apply({ paused: true, policyRevision: revision + 1 });
+      assert.equal((await read()).paused, false, 'higher same-state revision advances ordering');
+      await tick(120_000);
+      const current = await (await request(host, '/api/operator')).json();
+      assert.ok(current.incidents.some(row => row.monitorId === created.monitor.id), 'higher same-state revision preserves consecutive counts');
+      await request(host, '/api/operator/monitors/' + created.monitor.id, 'DELETE');
+      const duplicate = { id: host, paused: true, policyRevision: revision + 3 };
+      await schedule([duplicate, duplicate]);
+      assert.equal((await rejectedTick()).status, 200, 'identical scheduled descriptors accepted');
+      assert.equal((await read()).paused, true);
+      await schedule([duplicate, { ...duplicate, paused: false }]);
+      assert.equal((await rejectedTick()).status, 409, 'conflicting duplicates fail closed');
+      await schedule([duplicate, { ...duplicate, policyRevision: revision + 4 }]);
+      assert.equal((await rejectedTick()).status, 409, 'different-revision duplicates rejected before dispatch');
+      await request(host, '/test-contexts');
+      await apply({ paused: false, policyRevision: revision + 3 }); // Conflict cannot change the stored true.
+      assert.equal((await read()).paused, true);
+      const concurrent = await Promise.all([
+        apply({ paused: false, policyRevision: revision + 4 }),
+        apply({ paused: true, policyRevision: revision + 6 }),
+        apply({ paused: false, policyRevision: revision + 5 }),
+        apply({ paused: true, policyRevision: revision + 6 }),
+      ]);
+      assert.deepEqual(concurrent.map(response => response.status), [200, 200, 200, 200]);
+      assert.equal((await read()).paused, true, 'concurrent arrivals retain highest trusted revision');
+      await apply({ paused: false, policyRevision: revision + 7 });
+      now = 0;
+      console.log('PASS installed policy revisions: malformed metadata, equal-revision conflicts/idempotence, persisted ordering, omission, higher same-state counts, duplicate descriptors and concurrent arrivals');
+    }
+    deliveries.length = 0; webhooks.length = 0;
     assert.equal((await request('a.example', '/test-unsupported-version')).status, 409);
     new (require('node:vm').Script)(await (await request('a.example', '/operator.js')).text());
     await request('a.example', '/api/operator/monitors', 'POST', { name: 'Private API', url: 'https://target.example/', published: false });
@@ -275,6 +391,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       assert.equal((await read()).incidents.find(row => row.id === incident.id).closedAt, null);
       if (credential) await receipt(); else await tick(now);
       assert.equal((await read()).incidents.find(row => row.id === incident.id).closedAt, null, 'one post-resume success is insufficient');
+      if (credential) { await policy('false', 'request'); await read(); }
       now = base + 360_000;
       if (credential) await receipt(); else await tick(now);
       assert.equal((await read()).incidents.find(row => row.id === incident.id).closedAt, now, 'repeated explicit resume is idempotent');

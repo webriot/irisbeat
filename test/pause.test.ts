@@ -5,14 +5,20 @@ import { reset, evictDurableObject } from 'cloudflare:test';
 import { afterEach, expect, it, vi } from 'vitest';
 
 const pause = new Map<string, boolean>();
+const revisions = new Map<string, { paused: boolean; policyRevision: number }>();
 const app = createHostedWorker({
   contractVersion: '1',
   resolve(request) {
     const id = new URL(request.url).hostname;
     if (!['a.example', 'b.example'].includes(id)) return null;
     const token = request.headers.get('authorization');
-    return { id, permission: token === 'Bearer editor' ? 'editor' as const : token === 'Bearer reader' ? 'reader' as const : null, monitorLimit: 10,
-      ...(pause.has(id) ? { paused: pause.get(id) } : {}) };
+    const identity = { id, permission: token === 'Bearer editor' ? 'editor' as const : token === 'Bearer reader' ? 'reader' as const : null, monitorLimit: 10 };
+    const paused = pause.get(id);
+    if (paused === undefined) return identity;
+    const prior = revisions.get(id);
+    const policy = prior?.paused === paused ? prior : { paused, policyRevision: (prior?.policyRevision ?? -1) + 1 };
+    revisions.set(id, policy);
+    return { ...identity, ...policy };
   },
   contexts: () => ['a.example', 'b.example'],
 });
@@ -22,7 +28,7 @@ const request = (path: string, method = 'GET', body?: unknown, host = 'a.example
 }), env);
 const status = async (host = 'a.example') => await (await request('/api/operator', 'GET', undefined, host)).json() as Status;
 const tick = (at: number) => app.scheduled({ scheduledTime: at } as ScheduledController, env);
-afterEach(async () => { pause.clear(); vi.restoreAllMocks(); await reset(); });
+afterEach(async () => { pause.clear(); revisions.clear(); vi.restoreAllMocks(); await reset(); });
 
 it('pauses trusted contexts without outbound observations, preserves history and resumes with zero counts', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(0);
@@ -127,9 +133,9 @@ it('fails closed on invalid trusted pause metadata before changing state or chec
     const invalid = createHostedWorker({
       contractVersion: '1',
       // @ts-expect-error invalid consumer metadata must fail closed at runtime
-      resolve: () => ({ id: 'a.example', permission: 'editor', monitorLimit: 10, paused: value }),
+      resolve: () => ({ id: 'a.example', permission: 'editor', monitorLimit: 10, paused: value, policyRevision: 0 }),
       // @ts-expect-error invalid consumer metadata must fail closed at runtime
-      contexts: () => [{ id: 'a.example', paused: false }, { id: 'b.example', paused: value }],
+      contexts: () => [{ id: 'a.example', paused: false, policyRevision: 0 }, { id: 'b.example', paused: value, policyRevision: 0 }],
     });
     expect((await invalid.fetch(new Request('https://a.example/api/status'), env)).status).toBe(500);
     await expect(invalid.scheduled({ scheduledTime: 60_000 } as ScheduledController, env)).rejects.toThrow('Invalid hosted context');

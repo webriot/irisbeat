@@ -30,13 +30,13 @@ No Accounts, Stripe, hostname provisioning or email transport is included.
 `createHostedWorker(adapter)` returns Worker `fetch` and `scheduled` handlers.
 The adapter supplies just:
 
-- `resolve(request, env)`: return `{ id, permission, monitorLimit, paused? }` or `null` for
+- `resolve(request, env)`: return `{ id, permission, monitorLimit, paused?, policyRevision? }` or `null` for
   an unrecognized host. `id` is the stable Durable Object name; `permission` is
   `editor`, `reader`, or `null` for an anonymous visitor. `monitorLimit` is a
   nonnegative safe integer. Invalid resolved contexts fail closed with 500.
-- `contexts(env)`: return stable context names or `{ id, paused? }` descriptors for
+- `contexts(env)`: return stable context names or `{ id, paused?, policyRevision? }` descriptors for
   this scheduled invocation. Identical duplicates are removed; conflicting pause
-  metadata for the same ID rejects the invocation before dispatch. The consumer owns context discovery and
+  state/revision metadata for the same ID rejects the invocation before dispatch. The consumer owns context discovery and
   batching; large fleets need bounded enumeration by the consumer.
 
 The adapter must authenticate the actor and validate the actual tenant host using
@@ -110,16 +110,60 @@ existing collection API plus the two hosted heartbeat paths above.
 ## Pause and resume
 
 [#11](https://github.com/webriot/irisbeat/issues/11) extends contract 1 additively.
-`ResolvedContext` and exported `ScheduledContext` accept optional `paused: boolean`.
-Explicit `true` persists pause; explicit `false` resumes; omitted/undefined metadata
-preserves stored state. Legacy string scheduled IDs preserve state too. Supplied
-nonbooleans fail closed (request 500; scheduled invocation rejects before any
-context dispatch). Repeating the current state is idempotent and does not reset
-recovery. Both adapter paths must use the same trusted source of policy; callers'
-headers, bodies and operator permissions cannot pause/resume a context. An anonymous
-request can carry trusted adapter policy without acquiring editing permission.
-The consumer must send policy changes on a resolved request or enumerate that
-context with explicit metadata; removing it from enumeration does not pause it.
+`ResolvedContext` and exported `ScheduledContext` accept either omitted policy or
+`{ paused: boolean, policyRevision: number }`. Each explicit pause/resume requires
+both fields. `policyRevision` is a nonnegative safe integer from the trusted
+per-context policy source, atomically read with `paused`. Missing, null, fractional,
+negative, unsafe or nonnumeric revisions, nonboolean state, and revision without
+state fail closed (request 500; scheduled invocation rejects). Undefined/omitted
+**both** fields and legacy string scheduled IDs preserve persisted policy.
+
+The consumer owns one durable increasing revision sequence per context ID, shared
+by request resolution and scheduled discovery across all isolates. Advance it when
+publishing a new policy snapshot; never reuse a revision for another state, reset
+it on process/deployment restart, or derive it from wallclock time, request order,
+cron timestamps or an isolate-local counter. Both fields must come from one atomic
+source record; reading them separately can produce a conflicting pair. Gaps are
+allowed. Policy revisions order policy snapshots, independently of Monitor edits,
+permissions, scheduling time and the engine's internal delivery generation.
+
+The DO compares and persists revision plus state synchronously in one operation:
+
+- Older revision: ignore the stale policy; continue using persisted state.
+- Same revision/same state: idempotent, with no detector reset.
+- Same revision/conflicting state: reject without changing stored policy (request
+  500; scheduled invocation rejects before that context's check).
+- Higher revision/same state: advance the revision without resetting counts,
+  recovery spacing or in-flight delivery generation.
+- Higher revision/changed state: apply it. Only actual resume resets counts/spacing.
+
+After trusted host/actor resolution, a consumer can return these shapes from one
+policy record (example revision 42). The next actual resume must use a higher
+source revision, such as 43:
+
+```ts
+// resolve(request, env), after trusted identity/permission/allowance resolution:
+return { id, permission, monitorLimit, paused: policy.paused, policyRevision: policy.revision };
+// contexts(env), for the same trusted context and source record:
+return [{ id, paused: policy.paused, policyRevision: policy.revision }];
+// To omit policy propagation, retain the other resolved fields or a legacy ID:
+return { id, permission, monitorLimit }; // resolve
+return [id]; // contexts
+```
+
+Identical scheduled descriptors are deduplicated; duplicates with differing state,
+revision, or omission reject the invocation before any context dispatch. Other
+contexts are independent; a persisted-policy conflict in one context cannot roll
+back already accepted work in another. Already captured stale snapshots may finish
+in either order: the persisted source revision protects against stale request
+resolution, scheduled discovery and concurrent arrivals, including after restart.
+
+Callers' headers, bodies and operator permissions cannot pause/resume a context.
+An anonymous request can carry trusted adapter policy without acquiring editing
+permission. The test fixture's policy queries and external resolution gates are
+absent from the engine artifact. Send policy changes on a resolved request or
+enumerate that context with explicit metadata; removing it from enumeration does
+not pause it. The engine cannot enforce a policy change it has not yet received.
 
 Pause state survives eviction/restart. Status and mutation responses add context
 `paused: boolean`; visible Monitor `state` becomes `paused`, overriding Maintenance

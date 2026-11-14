@@ -8,7 +8,13 @@ export interface EngineEnv {
   MONITORING: DurableObjectNamespace<MonitoringContext>;
   INSTALLATION_SECRET?: string;
 }
-export type ScheduledContext = { id: string; paused?: boolean };
+type PausePolicy = { paused: boolean; policyRevision: number } | { paused?: undefined; policyRevision?: undefined };
+export type ScheduledContext = { id: string } & PausePolicy;
+function validPolicy(value: { paused?: unknown; policyRevision?: unknown }) {
+  return value.paused === undefined ? value.policyRevision === undefined
+    : typeof value.paused === "boolean" && typeof value.policyRevision === "number" &&
+      Number.isSafeInteger(value.policyRevision) && value.policyRevision >= 0;
+}
 export type ResolvedContext = ScheduledContext & {
   permission: "editor" | "reader" | null;
   monitorLimit: number;
@@ -84,7 +90,7 @@ export type HistoryDay = {
 export type AvailabilityHistory = { days: HistoryDay[]; percentage: number | null };
 type DailyCounts = { day: number; successes: number; failures: number; maintenance: number };
 export type Status = ReturnType<MonitoringContext["status"]>;
-type StoredContext = { pageName: string; monitors: Monitor[]; webhookUrl?: string | null; paused?: boolean; pauseGeneration?: number };
+type StoredContext = { pageName: string; monitors: Monitor[]; webhookUrl?: string | null; paused?: boolean; policyRevision?: number; pauseGeneration?: number };
 type LegacyContext = { webhookUrl?: string | null; monitor: (Monitor & { pageName: string }) | null };
 
 export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableObject<E> {
@@ -141,10 +147,23 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return state;
   }
 
-  setPaused(paused: boolean) {
-    if (typeof paused !== "boolean") throw new Error("Invalid pause state");
+  setPaused(paused: boolean, policyRevision: number) {
+    if (!validPolicy({ paused, policyRevision }) || typeof paused !== "boolean") throw new Error("Invalid pause policy");
+    const prior = this.ctx.storage.kv.get<StoredContext>("context");
+    if (prior?.policyRevision !== undefined) {
+      if (policyRevision < prior.policyRevision) return;
+      if (policyRevision === prior.policyRevision) {
+        if (!!prior.paused !== paused) throw new Error("Conflicting pause policy");
+        return;
+      }
+    }
+    // Compare and persist policy together, without awaiting external I/O or another RPC.
     const state = this.read();
-    if (!!state.paused === paused) return;
+    state.policyRevision = policyRevision;
+    if (!!state.paused === paused) {
+      this.ctx.storage.kv.put("context", state);
+      return;
+    }
     state.paused = paused;
     state.pauseGeneration = (state.pauseGeneration ?? 0) + 1;
     if (paused) {
@@ -631,14 +650,14 @@ function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E
     for (const value of contexts) {
       const context = typeof value === "string" ? { id: value } : value;
       if (!context || typeof context.id !== "string" || !context.id ||
-          (context.paused !== undefined && typeof context.paused !== "boolean")) throw new Error("Invalid hosted context");
+          !validPolicy(context)) throw new Error("Invalid hosted context");
       const prior = unique.get(context.id);
-      if (prior && prior.paused !== context.paused) throw new Error("Conflicting hosted context");
+      if (prior && (prior.paused !== context.paused || prior.policyRevision !== context.policyRevision)) throw new Error("Conflicting hosted context");
       unique.set(context.id, context);
     }
-    await Promise.all([...unique.values()].map(async ({ id, paused }) => {
-      const context = env.MONITORING.getByName(id);
-      if (paused !== undefined) await context.setPaused(paused);
+    await Promise.all([...unique.values()].map(async (policy) => {
+      const context = env.MONITORING.getByName(policy.id);
+      if (policy.paused !== undefined) await context.setPaused(policy.paused, policy.policyRevision);
       await context.check(controller.scheduledTime);
     }));
   },
@@ -648,7 +667,7 @@ function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E
       if (resolved && (typeof resolved.id !== "string" || !resolved.id ||
           !["editor", "reader", null].includes(resolved.permission) ||
           !Number.isSafeInteger(resolved.monitorLimit) || resolved.monitorLimit < 0 ||
-          (resolved.paused !== undefined && typeof resolved.paused !== "boolean")))
+          !validPolicy(resolved)))
         throw new Error("Invalid hosted context");
       const response = adapter && !resolved ? new Response("Not found", { status: 404 }) : await handleRequest(request, env, resolved ?? undefined);
       response.headers.set("Cache-Control", "no-store");
@@ -685,7 +704,7 @@ async function handleRequest(request: Request, env: EngineEnv, resolved?: Resolv
   const operatorResponse = (result: Status | null, status = 200) => Response.json(result && { ...result, ...(resolved ? { hosted: true, permission: resolved.permission } : {}) }, { status });
   const path = new URL(request.url).pathname;
   const context = env.MONITORING.getByName(resolved?.id ?? "personal");
-  if (resolved?.paused !== undefined) await context.setPaused(resolved.paused);
+  if (resolved?.paused !== undefined) await context.setPaused(resolved.paused, resolved.policyRevision);
   if (resolved && path === "/heartbeat") {
     if (request.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST" } });
     const accepted = await context.hostedHeartbeat(request.headers.get("authorization") ?? "", Date.now());
