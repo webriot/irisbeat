@@ -3,7 +3,7 @@
 Implements [ticket #10](https://github.com/webriot/irisbeat/issues/10) under
 [spec #1](https://github.com/webriot/irisbeat/issues/1). Product decisions remain in
 those issues. This is an AGPL-3.0-only release candidate, not a registry publication
-or production deployment. Final release/distribution belongs to #12.
+or production deployment. Final release/distribution remains pending under #12; see [release operations](install.md).
 
 ## Consumption
 
@@ -13,8 +13,7 @@ SHA-256, resolves the exact local version in `test/consumer/package.json`, verif
 lockfile SHA-512 integrity, installs with offline `npm ci`, typechecks the installed
 package and bundles its package import into a separate real workerd consumer.
 The temporary consumer lockfile changes with the candidate artifact and is ignored.
-A released consumer must retain its exact version and integrity lock; #12 should
-attach the final tarball/checksum to the release without silently replacing it.
+A released consumer must retain its exact version and integrity lock; release operations attach the final tarball/checksum and exact source to the release without silently replacing it.
 
 The package exports TypeScript source and includes its UI and license. A
 TypeScript-aware Workers bundler (including Wrangler/esbuild) is required; it is
@@ -22,7 +21,7 @@ not a Node.js runtime library. Import `createHostedWorker`, `MonitoringContext`,
 `HostedAdapter`, `EngineEnv`, `Status` and `IncidentTransition` from `irisbeat`.
 Pin the artifact version **and literal `contractVersion: '1'`**; unsupported
 versions throw during factory construction, before requests or scheduling run.
-`private: true` prevents accidental registry publication while #12 is pending.
+`private: true` prevents accidental registry publication; versioned GitHub release tarballs are the supported distribution path.
 No Accounts, Stripe, hostname provisioning or email transport is included.
 
 ## Trusted adapter

@@ -1,0 +1,2 @@
+# Generate a unique installation secret; replace this empty value in Cloudflare's setup form.
+INSTALLATION_SECRET=
