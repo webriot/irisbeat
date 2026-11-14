@@ -148,7 +148,7 @@ that records only received JSON. The parent provisions these separately; this
 public repository supplies no infrastructure. Restrict test use to those
 explicit destinations, bounded to this drill. Never point at real Slack/Discord
 channels or arbitrary public sites. Use default one-minute intervals, thresholds
-2/2, and a Heartbeat with 60-second silence/recovery spacing and recovery count 2.
+2/2, and a Heartbeat with 180-second silence, 60-second recovery spacing and recovery count 2.
 
 1. Install through the reviewed source CLI path. After main publication, repeat
    through the button into another unused Worker and record the installed revision.

@@ -76,7 +76,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     for (const configuration of [
       { name: 'HTTP', kind: 'http', url: 'https://http-target.example/controlled' },
       { name: 'TCP', kind: 'tcp', hostname: 'controlled.example', port: 5432 },
-      { name: 'Producer', kind: 'heartbeat', silenceSeconds: 60 },
+      { name: 'Producer', kind: 'heartbeat', silenceSeconds: 180 },
     ]) assert.equal((await request('/api/operator/monitors', 'POST', configuration)).status, 201);
     const monitors = (await status()).monitors;
     const heartbeat = '/heartbeat/' + monitors[2].id;

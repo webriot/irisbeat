@@ -16,7 +16,7 @@
     "release:prepare": "node scripts/release.cjs",
     "test:release": "node test/release.cjs",
     "test:deployment": "node test/deployment.cjs",
-    "release:verify": "npm run check && npm test && npm run test:consumer && npm run build && npm run test:release && npm run test:deployment"
+    "release:verify": "npm run check && npm test && npm run build && npm run test:release && npm run test:consumer -- --prepared && npm run test:deployment"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.8.2",

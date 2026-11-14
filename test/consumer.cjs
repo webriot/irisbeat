@@ -10,12 +10,16 @@ const localRequire = createRequire(join(project, 'node_modules/@cloudflare/vites
 const { build } = localRequire('esbuild');
 const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
 (async () => {
-  execFileSync('npm', ['run', 'pack:engine'], { stdio: 'inherit' });
+  const prepared = process.argv.includes('--prepared');
+  if (!prepared) execFileSync('npm', ['run', 'pack:engine'], { stdio: 'inherit' });
   const artifact = 'dist/irisbeat-0.1.0.tgz';
   const checksum = createHash('sha256').update(readFileSync(artifact)).digest('hex');
-  execFileSync('npm', ['run', 'pack:engine'], { stdio: 'pipe' });
+  if (!prepared) execFileSync('npm', ['run', 'pack:engine'], { stdio: 'pipe' });
   assert.equal(createHash('sha256').update(readFileSync(artifact)).digest('hex'), checksum, 'packing the same revision is reproducible');
-  writeFileSync('dist/SHA256SUMS', checksum + '  irisbeat-0.1.0.tgz\n');
+  if (prepared) {
+    const release = JSON.parse(readFileSync('dist/release.json'));
+    assert.equal(checksum, release.sha256['irisbeat-0.1.0.tgz'], 'consume the exact prepared release artifact');
+  } else writeFileSync('dist/SHA256SUMS', checksum + '  irisbeat-0.1.0.tgz\n');
   rmSync('test/consumer/node_modules', { recursive: true, force: true });
   rmSync('test/consumer/package-lock.json', { force: true });
   execFileSync('npm', ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: join(project, 'test/consumer'), stdio: 'inherit' });
