@@ -1,8 +1,12 @@
 # Irisbeat
 
-Irisbeat is being built as a complete, self-hostable Cloudflare monitoring application. Its planned scope includes HTTP, TCP and heartbeat checks, incidents, maintenance, status pages, webhook alerts and an operator UI.
+Irisbeat is an open source (AGPL-3.0-only), self-hostable Cloudflare monitoring application with HTTP, TCP and Heartbeat checks, Incidents, Maintenance, availability history, webhook alerts and an operator UI.
 
-The application supports multiple personal HTTP(S), TCP and Heartbeat Monitors, authenticated operator configuration, publication controls, and an anonymous Status page with automatic Incidents. The remaining planned features are tracked in [spec #1](https://github.com/Webriot/irisbeat/issues/1).
+The application supports multiple personal HTTP(S), TCP and Heartbeat Monitors, authenticated operator configuration, publication controls, and an anonymous Status page with automatic Incidents. Release acceptance is tracked in [spec #1](https://github.com/Webriot/irisbeat/issues/1).
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/webriot/irisbeat)
+
+See [installation, operation and release acceptance](docs/install.md). This candidate is unpublished; the button uses main and becomes release-ready only after reviewed publication and a real install drill. The exact-source CLI path supports candidate verification.
 
 ## Local development
 
@@ -64,11 +68,11 @@ Hosted adapters may supply optional pause policy in resolved request contexts an
 
 The harness follows Cloudflare's [Vitest setup](https://developers.cloudflare.com/workers/testing/vitest-integration/write-your-first-test/), [request mocking](https://developers.cloudflare.com/workers/testing/vitest-integration/mock-outbound-requests/) and [test APIs](https://developers.cloudflare.com/workers/testing/vitest-integration/test-apis/). `npm run check` regenerates binding/runtime types from `wrangler.jsonc` and checks TypeScript; generated declarations are ignored. `npm run build` bundles locally with `wrangler deploy --dry-run` and does not deploy.
 
-The configuration declares the public application runtime only: one Worker, a one-minute cron, a SQLite Durable Object migration and the required `INSTALLATION_SECRET` name. Actual deployments, secret values and account infrastructure belong outside this repository. A Deploy to Cloudflare flow remains a later ticket. Hosted contract 1 is prepared as a local release candidate; it has not been published or deployed. No real deployment or browser interaction automation has been performed.
+The configuration declares the public application runtime only: one Worker, a one-minute cron, a SQLite Durable Object migration and the required `INSTALLATION_SECRET` name. Actual deployments, secret values and account infrastructure belong outside this repository. The Deploy to Cloudflare flow declares its installation-secret prompt and deployment command. Versioned source and engine artifacts with integrity/exact revision metadata are prepared by `npm run release:prepare`; `npm run release:verify` assembles all local acceptance checks. This release candidate has not been published or live-deployed; local checks do not establish live installation acceptance. See [the parent-owned publication and deployment gates](docs/install.md).
 
 ## Repository boundary
 
-The public application owns the monitoring engine and hosted extension interfaces. Private hosted consumers integrate versioned public releases rather than duplicate the engine. [Hosted contract 1](docs/hosted-contract.md) documents trusted context/permission/allowance resolution, tenant heartbeat issuance/rotation and post-commit delivery hooks. `npm run test:consumer` prepares a reproducible local `irisbeat@0.1.0` tarball and verifies a separately installed, integrity-pinned consumer in workerd. Final publication belongs to #12; context pause remains #11.
+The public application owns the monitoring engine and hosted extension interfaces. Private hosted consumers integrate versioned public releases rather than duplicate the engine. [Hosted contract 1](docs/hosted-contract.md) documents trusted context/permission/allowance resolution, tenant heartbeat issuance/rotation and post-commit delivery hooks. `npm run test:consumer` prepares a reproducible local `irisbeat@0.1.0` tarball and verifies a separately installed, integrity-pinned consumer in workerd. Context pause/resume is included, with durable trusted policy revisions. Final publication and live deployment acceptance remain parent-owned under #12.
 
 Hosted consumers own account integration, organization roles, entitlements, subscription provisioning, monitor allowances, email delivery, custom hostnames and hosted deployment. The public application remains independently self-hostable. Infrastructure and secrets belong outside this repository.
 

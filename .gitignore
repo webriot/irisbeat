@@ -12,3 +12,5 @@ dist/
 worker-configuration.d.ts
 
 test/consumer/package-lock.json
+
+.tmp/

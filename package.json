@@ -11,7 +11,12 @@
     "test": "vitest run",
     "build": "wrangler deploy --dry-run",
     "pack:engine": "mkdir -p dist && npm pack --pack-destination dist",
-    "test:consumer": "node test/consumer.cjs"
+    "test:consumer": "node test/consumer.cjs",
+    "deploy": "wrangler deploy",
+    "release:prepare": "node scripts/release.cjs",
+    "test:release": "node test/release.cjs",
+    "test:deployment": "node test/deployment.cjs",
+    "release:verify": "npm run check && npm test && npm run build && npm run test:release && npm run test:consumer -- --prepared && npm run test:deployment"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.8.2",
@@ -36,6 +41,15 @@
     "README.md",
     "docs/hosted-contract.md",
     "docs/maintenance-api.md",
-    "docs/history-api.md"
-  ]
+    "docs/history-api.md",
+    "docs/install.md",
+    "NOTICE"
+  ],
+  "cloudflare": {
+    "bindings": {
+      "INSTALLATION_SECRET": {
+        "description": "Generate a unique random installation secret (for example, `openssl rand -hex 32`). It protects operator administration and personal Heartbeats. Keep it private."
+      }
+    }
+  }
 }

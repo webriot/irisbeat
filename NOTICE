@@ -1,0 +1,15 @@
+Irisbeat 0.1.0
+Irisbeat's own code is open source under AGPL-3.0-only. See LICENSE.
+
+Corresponding Source is distributed as irisbeat-0.1.0-source.tar.gz alongside
+irisbeat-0.1.0.tgz, SHA256SUMS and release.json. release.json identifies the exact
+Git revision and source archive integrity. Source includes application code,
+installation/build scripts, configuration, tests and the dependency lockfile.
+Network users can use the Source link on public and operator pages. Operators
+serving modified versions must provide their version's Corresponding Source and
+update that link in src/ui.ts before building; see docs/install.md.
+
+No third-party runtime library code is vendored in the source engine package.
+Cloudflare's Workers runtime is supplied by the platform, not distributed here.
+Development/build dependencies retain their respective licenses and notices in
+the packages installed by npm ci. Preserve those notices if redistributing them.
