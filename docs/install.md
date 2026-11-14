@@ -50,16 +50,40 @@ npx wrangler whoami
 Select the intended account using `CLOUDFLARE_ACCOUNT_ID` in the shell, outside
 this repository, if more than one account is available. Set `IRISBEAT_WORKER_NAME` in the shell to an unused Worker name; keep the
 reviewed `wrangler.jsonc`, bindings and migrations unchanged. Before a disposable
-acceptance install, the parent must verify `irisbeat-acceptance` is absent in that
+acceptance install, verify that your chosen Worker name is absent in that
 account; never overwrite an existing Worker. Do not use a temporary claim account.
 
-For the first upload, obtain a protected JSON file outside the source directory
-containing only the `INSTALLATION_SECRET` key and a newly generated value. The
-parent obtains credentials through private `request_secret`, never chat. With
-`IRISBEAT_SECRET_FILE` pointing to that file, deploy code and secret together:
+For the first upload, create a private temporary directory and generate the
+installation secret into a JSON file readable only by your user. These commands
+use Node's cryptographic random generator and do not print the secret:
+
+```sh
+IRISBEAT_SECRET_DIR="$(mktemp -d)"
+export IRISBEAT_SECRET_FILE="$IRISBEAT_SECRET_DIR/installation.json"
+node --input-type=module <<'NODE'
+import { randomBytes } from 'node:crypto';
+import { writeFileSync } from 'node:fs';
+writeFileSync(process.env.IRISBEAT_SECRET_FILE,
+  JSON.stringify({ INSTALLATION_SECRET: randomBytes(32).toString('hex') }),
+  { mode: 0o600, flag: 'wx' });
+NODE
+```
+
+Open that file locally and save the `INSTALLATION_SECRET` value in your password
+manager; you need it to sign in and configure producers. Keep it out of terminal
+recordings, source control and shell command arguments. Deploy code and secret together:
 
 ```sh
 npm run deploy -- --name "$IRISBEAT_WORKER_NAME" --secrets-file "$IRISBEAT_SECRET_FILE"
+```
+
+After deployment succeeds and the secret is saved in your password manager,
+remove the temporary copy:
+
+```sh
+rm -- "$IRISBEAT_SECRET_FILE"
+rmdir -- "$IRISBEAT_SECRET_DIR"
+unset IRISBEAT_SECRET_FILE IRISBEAT_SECRET_DIR
 ```
 
 Use the pinned local Wrangler; `--secrets-file` is supported by its installed help.
@@ -136,17 +160,17 @@ prevents accidental registry publication; consumers install the versioned tarbal
 See [hosted contract 1](hosted-contract.md) for exact version/integrity pinning,
 trusted identity, permissions, allowance, hook and policyRevision requirements.
 
-## Live acceptance gate (parent-owned, pending)
+## Live acceptance gate (pending)
 
 Use only a new disposable Worker in the selected account, the exact reviewed
 source archive above, and one task-specific controlled target service. Before
 any upload, record the revision and hashes, verify Worker-name absence, confirm
-account selection and obtain private secret delivery. Do not log credentials,
+account selection and prepare the secret file as described above. Do not log credentials,
 full target/webhook URLs or bearer values in public evidence.
 
 The controlled service needs an HTTPS health path switchable between 204 and 503,
 a plain TCP listener switchable between accept/refuse, and an HTTPS webhook sink
-that records only received JSON. The parent provisions these separately; this
+that records only received JSON. Provision these separately; this
 public repository supplies no infrastructure. Restrict test use to those
 explicit destinations, bounded to this drill. Never point at real Slack/Discord
 channels or arbitrary public sites. Use default one-minute intervals, thresholds
@@ -158,7 +182,7 @@ channels or arbitrary public sites. Use default one-minute intervals, thresholds
 2. Verify anonymous operator API writes and wrong-secret heartbeat POSTs return 401;
    correct Bearer configuration works. Name the page, add all three kinds, and prove
    anonymous HTML/JSON omit targets, destinations and credentials. Confirm the named
-   anonymous ledger and Source download link. Keep any browser work parent-owned.
+   anonymous ledger and Source download link.
 3. With HTTP 204/TCP accepting and spaced receipts, wait for scheduled observations.
    Switch HTTP to 503/TCP to refuse, withhold Heartbeats past silence; observe one
    Incident and one opening webhook per Monitor after the required observations.
@@ -174,7 +198,7 @@ channels or arbitrary public sites. Use default one-minute intervals, thresholds
    actual Cloudflare socket/cron/secret/resource behavior.
 6. Stop producers, remove webhook configuration, delete only drill Monitors, then
    remove only the disposable Worker using `npx wrangler delete <drill-name>`
-   after parent cleanup approval. Worker deletion destroys its associated DO data;
+   after verifying its name and account. Worker deletion destroys its associated DO data;
    never run against production. Confirm deletion, remove any separate controlled
    target service and cloned test build/repository connection, and remove private
    local credential files. Retain only sanitized evidence and artifact hashes.
@@ -185,15 +209,15 @@ do not widen destinations or call dry-run/local evidence a live pass.
 
 ## Publication gate and Corresponding Source
 
-The parent independently reviews the draft PR and full spec, finishes live gates,
-and coordinates main/tag/release publication. None of these has happened here.
+Release maintainers review the PR and full spec, finish live acceptance,
+and coordinate main/tag/release publication. These release gates remain pending.
 After review, regenerate artifacts from the **final** clean release revision and
 repeat `npm run release:verify`; integration candidate bytes do not represent a
 later merge commit. Set version/source links together for future releases.
 
 Only after authorization, create tag `v0.1.0` on that exact revision and a draft
 GitHub release, attach all four artifacts, verify downloaded hashes, then publish.
-For example, after the parent creates/pushes the reviewed tag:
+For example, after creating and pushing the reviewed tag:
 
 ```sh
 gh release create v0.1.0 --verify-tag --draft --title 'Irisbeat 0.1.0' --notes-file <reviewed-notes-file> dist/irisbeat-0.1.0.tgz dist/irisbeat-0.1.0-source.tar.gz dist/release.json dist/SHA256SUMS --repo Webriot/irisbeat
