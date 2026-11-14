@@ -43,7 +43,7 @@ Rows survive eviction and Monitor deletion; the last result is also observable i
 normal status responses. Maintenance replaces the raw outcome so it cannot enter
 the success/failure denominator. There is no public raw-history endpoint.
 
-#9 owns 90-day aggregation, query/filter contracts, indexes and retention cleanup.
+[History #9](history-api.md) implements aggregation, query/filter contracts, indexes and bounded observation cleanup.
 Prior historical observations cannot be reconstructed from the single last result;
 this change does not synthesize them. Existing Incident history is unchanged.
 

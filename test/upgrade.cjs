@@ -102,7 +102,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     // One recovery observation before replacing the actual Worker bundle.
     outcome = 204; await tick(start+120000);
     await mf.setOptions(options(await bundle(join(project,'src/index.ts'))));
-    const after = await (await request('/api/operator')).json();
+    const after = await (await request('/api/operator', 'GET', undefined, start + 120000)).json();
     if (supportsWebhook) assert.equal(after.webhookUrl,destination);
     assert.equal(after.pageName,'Old page');
     assert.equal(after.monitors[0].id,before.monitor.id);
@@ -118,6 +118,15 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     assert.equal(after.incidents[0].monitorName,'Legacy service');
     assert.equal(after.incidents[0].closedAt,null);
     assert.deepEqual(after.monitors[0].lastResult,{at:start+120000,outcome:'success'});
+    assert.equal(after.monitors[0].history.days.length, 90);
+    if (process.argv.includes('--history')) {
+      assert.equal(after.monitors[0].history.days.at(-1).successes, 1);
+      assert.equal(after.monitors[0].history.days.at(-1).failures, 2);
+      assert.ok(Math.abs(after.monitors[0].history.percentage - 100 / 3) < 1e-10);
+    } else if (base === '6fb95ccec52d9c5c29b82f82c3d77ed3a7e356d3') {
+      assert.equal(after.monitors[0].history.percentage, null, 'lastResult must not fabricate earlier observations');
+      assert.ok(after.monitors[0].history.days.every(day => day.state === 'empty'));
+    }
     await tick(start+120000); assert.equal(attempts,3);
     await tick(start+180000);
     const recovered = await (await request('/api/status')).json();
