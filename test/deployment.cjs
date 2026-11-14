@@ -30,7 +30,14 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       let now = ${Date.UTC(2026, 10, 14)};
       Date.now = () => now;
       export default {
-        fetch(request, env) { now = Number(request.headers.get('x-acceptance-time')); return worker.fetch(request, env); },
+        async fetch(request, env) {
+          now = Number(request.headers.get('x-acceptance-time'));
+          if (new URL(request.url).pathname === '/__acceptance_tick') {
+            await worker.scheduled({ scheduledTime: now, cron: '* * * * *' }, env);
+            return new Response(null, { status: 204 });
+          }
+          return worker.fetch(request, env);
+        },
         scheduled(controller, env) { now = controller.scheduledTime; return worker.scheduled(controller, env); }
       };`, resolveDir: source }, bundle: true, write: false, format: 'esm', platform: 'neutral', external: ['cloudflare:workers'], plugins: [{
       name: 'controlled-tcp-target',
@@ -60,7 +67,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       method, headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', 'x-acceptance-time': String(now) },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
-    const tick = async offset => { now = start + offset; await mf.dispatchScheduled({ scheduledTime: now, cron: '* * * * *' }); };
+    const tick = async offset => { now = start + offset; assert.equal((await request('/__acceptance_tick')).status, 204); };
     const status = async (path = '/api/operator') => (await request(path)).json();
     assert.equal((await request('/api/operator', 'GET', undefined, '')).status, 401);
     assert.equal((await request('/api/operator', 'PUT', { pageName: 'Forbidden' }, 'wrong')).status, 401);
