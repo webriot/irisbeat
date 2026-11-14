@@ -59,8 +59,8 @@ transition alert events. A webhook submitted before declaration cannot be recall
 a hosted hook still waiting behind that delivery is suppressed if Maintenance is
 active when it would start.
 
-#11 must make pause override Maintenance for checking/recording/display and retain
-unexpired windows for resume. Do not infer subscriptions or hosted identity from
+#11 makes pause override Maintenance for checking/recording/display and retains
+unexpired windows for resume. See the [hosted pause contract](hosted-contract.md#pause-and-resume). Do not infer subscriptions or hosted identity from
 Maintenance. This ticket adds no pause flag or commercial policy.
 
 ## In-flight attempts
