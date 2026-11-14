@@ -145,7 +145,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
       assert.equal((await request('/api/operator/webhook','PUT',{url:destination})).status,200);
       await mf.setOptions(options(await bundle(join(project,'src/index.ts')), 'webhook-only'));
       assert.deepEqual(await (await request('/api/operator')).json(),{
-        pageName:'Irisbeat', webhookUrl:destination, monitors:[], monitor:null, incidents:[],
+        pageName:'Irisbeat', webhookUrl:destination, paused:false, monitors:[], monitor:null, incidents:[],
       });
       assert.equal((await request('/api/operator','PUT',{pageName:'New page'})).status,200);
       assert.equal((await request('/api/operator/monitors','POST',{name:'New service',url:'https://target.example/health'})).status,201);
