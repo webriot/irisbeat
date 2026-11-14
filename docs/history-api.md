@@ -61,10 +61,11 @@ required. There is no older raw-observation API or configurable retention policy
 
 ## Pause #11 and distribution #12
 
-Pause must prevent calls to the shared observation writer while retaining
+Pause prevents calls to the shared observation writer while retaining
 Heartbeat freshness. No row means no bar count or percentage denominator; do not
-record a failure, Maintenance, or synthetic paused observation. Resume must retain
-existing observations. This ticket adds no subscription policy or pause controls.
+record a failure, Maintenance, or synthetic paused observation. Resume retains
+existing observations. [Hosted pause contract](hosted-contract.md#pause-and-resume)
+describes the additive adapter metadata. There are no subscription policies or pause controls.
 Preserve the #8 any-overlap classification before the history writer.
 
 Regenerate the local candidate artifact after integrating this change. The package

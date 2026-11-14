@@ -30,12 +30,13 @@ No Accounts, Stripe, hostname provisioning or email transport is included.
 `createHostedWorker(adapter)` returns Worker `fetch` and `scheduled` handlers.
 The adapter supplies just:
 
-- `resolve(request, env)`: return `{ id, permission, monitorLimit }` or `null` for
+- `resolve(request, env)`: return `{ id, permission, monitorLimit, paused? }` or `null` for
   an unrecognized host. `id` is the stable Durable Object name; `permission` is
   `editor`, `reader`, or `null` for an anonymous visitor. `monitorLimit` is a
   nonnegative safe integer. Invalid resolved contexts fail closed with 500.
-- `contexts(env)`: return the stable context names to check for this scheduled
-  invocation. Duplicates are removed. The consumer owns context discovery and
+- `contexts(env)`: return stable context names or `{ id, paused? }` descriptors for
+  this scheduled invocation. Identical duplicates are removed; conflicting pause
+  metadata for the same ID rejects the invocation before dispatch. The consumer owns context discovery and
   batching; large fleets need bounded enumeration by the consumer.
 
 The adapter must authenticate the actor and validate the actual tenant host using
@@ -106,10 +107,47 @@ operator response metadata, secret-safe status views and this post-commit hook
 when merging their target union/atomic patch validation. Relevant paths are the
 existing collection API plus the two hosted heartbeat paths above.
 
-Pause is **not implemented by this ticket**. #11 should extend this context adapter
-and shared DO detector with the spec's explicit pause/resume semantics; merely
-omitting an ID from `contexts()` does not implement pause (receipts still detect
-and no paused banner/reset exists). No pause flag or claim is exposed here.
+## Pause and resume
+
+[#11](https://github.com/webriot/irisbeat/issues/11) extends contract 1 additively.
+`ResolvedContext` and exported `ScheduledContext` accept optional `paused: boolean`.
+Explicit `true` persists pause; explicit `false` resumes; omitted/undefined metadata
+preserves stored state. Legacy string scheduled IDs preserve state too. Supplied
+nonbooleans fail closed (request 500; scheduled invocation rejects before any
+context dispatch). Repeating the current state is idempotent and does not reset
+recovery. Both adapter paths must use the same trusted source of policy; callers'
+headers, bodies and operator permissions cannot pause/resume a context. An anonymous
+request can carry trusted adapter policy without acquiring editing permission.
+The consumer must send policy changes on a resolved request or enumerate that
+context with explicit metadata; removing it from enumeration does not pause it.
+
+Pause state survives eviction/restart. Status and mutation responses add context
+`paused: boolean`; visible Monitor `state` becomes `paused`, overriding Maintenance
+while retaining the window, prior last result, history and configuration. Public
+and operator ledgers show “Monitoring paused”, including an empty collection.
+No personal pause endpoint, subscription state or pause button is added.
+
+Paused HTTP/TCP schedules dispatch no attempts. Paused scheduled Heartbeat silence
+evaluations produce nothing. Authorized Heartbeat receipts still return 204 and
+persist last-seen, without changing last result, detector progress, observations,
+bars, percentage or Incidents. Existing credentials, rotation, tenant isolation,
+publication and editing rules remain in force. Previously recorded history remains
+unchanged; a day with only paused activity is empty.
+
+Resume zeros failure/success counts and Heartbeat recovery count/spacing; it retains
+due times, last-seen, prior results and Incidents. No synthetic result or replay is
+created. A fresh Heartbeat stays free of a new outage; an existing Incident still
+requires normal recovery receipts. A stale producer opens through the next normal
+silence evaluation. Unexpired Maintenance takes effect again; expired windows do
+not resume. Checks wholly after resume follow existing due-time rules.
+
+Any pending HTTP/TCP attempt touched by pause is discarded even if resumed before
+completion. Its original due-time anchor and in-flight guard remain in force.
+Already submitted target requests/webhooks/consumer hooks cannot be recalled;
+their transport remains bounded by the existing attempt/delivery contract. A hook
+waiting behind a submitted webhook is suppressed if pause intervenes, even after
+resume. No missed alert is replayed. Pause alone emits no transition event and
+never fabricates Incident recovery.
 Maintenance #8 returns from shared `record` before Incident mutation and both
 `deliverWebhook` and `onIncidentTransition`; the hosted hook must never bypass that
 guard. Editors use `PUT`/`DELETE /api/operator/monitors/:id/maintenance`; readers

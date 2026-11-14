@@ -14,6 +14,7 @@ const stateLabel = {
   up: "Operational",
   down: "Unavailable",
   maintenance: "Maintenance",
+  paused: "Monitoring paused",
 };
 function document(title: string, body: string, operator = false) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(title)}</title><link rel="stylesheet" href="/app.css">${operator ? "" : '<meta http-equiv="refresh" content="60">'}</head><body><header><a class="brand" href="/">irisbeat</a><nav aria-label="Application"><a href="/"${operator ? "" : ' aria-current="page"'}>Status page</a><a href="/operator"${operator ? ' aria-current="page"' : ""}>Operator</a></nav></header><main>${body}</main></body></html>`;
@@ -30,7 +31,7 @@ function historyMarkup(history: AvailabilityHistory | null | undefined) {
 export function statusPage(status: Status) {
   const time = (at: number) =>
     `<time datetime="${new Date(at).toISOString()}">${new Date(at).toISOString()}</time>`;
-  const banner = !status.monitors.length
+  const banner = status.paused ? "Monitoring paused" : !status.monitors.length
     ? "No Monitors published"
     : status.incidents.some(incident => incident.closedAt === null) || status.monitors.some(monitor => monitor.state === "down")
       ? "Services unavailable"
@@ -56,6 +57,7 @@ export function operatorPage(hosted = false) {
     `<h1>Monitors</h1>
     <form id="login"><label for="secret">${hosted ? "Access token" : "Installation secret"}</label><input id="secret" type="password" required autocomplete="current-password"><button>Sign in</button></form>
     <section id="editor" hidden>
+      <h2 id="paused" hidden>Monitoring paused</h2>
       <table aria-label="Monitors"><thead><tr><th scope="col">Monitor</th><th scope="col">State</th><th scope="col">Publication</th><th scope="col">Actions</th></tr></thead><tbody id="monitor-rows"></tbody></table>
       <form id="maintenance" hidden aria-labelledby="maintenance-heading">
         <h2 id="maintenance-heading">Maintenance</h2>
@@ -205,6 +207,7 @@ function signOut() {
 function render(data) {
   login.hidden = true; editor.hidden = false;
   hosted = !!data.hosted;
+  byId('paused').hidden = !data.paused;
   const canEdit = data.permission !== 'reader';
   if (!canEdit) { cancelEdit(); maintenanceForm.hidden = true; }
   byId('new-monitor').hidden = !canEdit; pageForm.closest('aside').hidden = !canEdit; webhook.hidden = !canEdit;

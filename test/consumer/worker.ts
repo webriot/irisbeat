@@ -8,15 +8,17 @@ export class MonitoringContext extends EngineContext {
     if (!response.ok) throw new Error('consumer transport failed');
   }
 }
+const requestPause = new Map<string, boolean>();
+const schedulePause = new Map<string, boolean>();
 const app = createHostedWorker({
   contractVersion: '1',
   resolve(request) {
     const host = new URL(request.url).hostname;
     if (!['a.example', 'b.example'].includes(host)) return null;
     const token = request.headers.get('authorization');
-    return { id: host, permission: token === 'Bearer editor' ? 'editor' : token === 'Bearer reader' ? 'reader' : null, monitorLimit: 2 };
+    return { id: host, permission: token === 'Bearer editor' ? 'editor' : token === 'Bearer reader' ? 'reader' : null, monitorLimit: 2, ...(requestPause.has(host) ? { paused: requestPause.get(host) } : {}) };
   },
-  contexts: () => ['a.example', 'b.example'],
+  contexts: () => ['a.example', 'b.example'].map(id => schedulePause.has(id) ? { id, paused: schedulePause.get(id) } : id),
 });
 export default {
   async fetch(request: Request, env: Parameters<typeof app.fetch>[1]) {
@@ -28,6 +30,16 @@ export default {
         try { createHostedWorker({ contractVersion: '2', resolve: () => null, contexts: () => [] }); }
         catch { return new Response(null, { status: 409 }); }
         return new Response(null, { status: 200 });
+      }
+      if (url.pathname === '/test-pause') {
+        const source = url.searchParams.get('source');
+        for (const [name, policy] of [['request', requestPause], ['schedule', schedulePause]] as const) {
+          if (source && source !== name) continue;
+          const value = url.searchParams.get('value');
+          if (value === 'omit') policy.delete(url.hostname);
+          else policy.set(url.hostname, value === 'true');
+        }
+        return new Response(null, { status: 204 });
       }
       if (url.pathname === '/test-tick') {
         await app.scheduled({ scheduledTime: Number(url.searchParams.get('at')) } as ScheduledController, env);
