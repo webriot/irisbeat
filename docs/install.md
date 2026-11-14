@@ -34,6 +34,8 @@ real install drill. Do not put a credential in Wrangler vars or a repository.
 Requires Node >=22.12, npm, a Cloudflare account and its workers.dev subdomain.
 Download `irisbeat-0.1.0-source.tar.gz`, `release.json` and `SHA256SUMS` from the
 reviewed release, verifying that the manifest's full revision is the intended one.
+For an unpublished candidate, use the artifacts produced by `release:prepare`
+from its reviewed Git revision instead of a release download.
 Download the engine tarball too if checking the entire checksum file.
 
 ```sh
@@ -160,7 +162,7 @@ prevents accidental registry publication; consumers install the versioned tarbal
 See [hosted contract 1](hosted-contract.md) for exact version/integrity pinning,
 trusted identity, permissions, allowance, hook and policyRevision requirements.
 
-## Live acceptance gate (pending)
+## Candidate runtime acceptance (before publication, pending)
 
 Use only a new disposable Worker in the selected account, the exact reviewed
 source archive above, and one task-specific controlled target service. Before
@@ -176,13 +178,13 @@ explicit destinations, bounded to this drill. Never point at real Slack/Discord
 channels or arbitrary public sites. Use default one-minute intervals, thresholds
 2/2, and a Heartbeat with 180-second silence, 60-second recovery spacing and recovery count 2.
 
-1. Install through the reviewed source CLI path. After main publication, repeat
-   through the button into another unused Worker and record the installed revision.
+1. Install the candidate artifacts through the exact-source CLI path.
    Confirm a workers.dev URL, binding and cron; no Accounts, Stripe, email or custom DNS.
 2. Verify anonymous operator API writes and wrong-secret heartbeat POSTs return 401;
    correct Bearer configuration works. Name the page, add all three kinds, and prove
    anonymous HTML/JSON omit targets, destinations and credentials. Confirm the named
-   anonymous ledger and Source download link.
+   anonymous ledger. Record that the versioned Source download is pending release
+   publication; verify its availability in the post-publication gate below.
 3. With HTTP 204/TCP accepting and spaced receipts, wait for scheduled observations.
    Switch HTTP to 503/TCP to refuse, withhold Heartbeats past silence; observe one
    Incident and one opening webhook per Monitor after the required observations.
@@ -209,9 +211,10 @@ do not widen destinations or call dry-run/local evidence a live pass.
 
 ## Publication gate and Corresponding Source
 
-Release maintainers review the PR and full spec, finish live acceptance,
-and coordinate main/tag/release publication. These release gates remain pending.
-After review, regenerate artifacts from the **final** clean release revision and
+Release maintainers first review the PR and full implementation, complete local
+release verification and the candidate runtime acceptance above, then merge the
+reviewed source to main. Keep #12 open and its publication acceptance incomplete.
+Regenerate artifacts from the **final** clean release revision and
 repeat `npm run release:verify`; integration candidate bytes do not represent a
 later merge commit. Set version/source links together for future releases.
 
@@ -231,3 +234,19 @@ NOTICE in both archives. Provide Corresponding Source to network users of your
 running version. If modified, publish its complete corresponding source/build
 instructions and update `src/ui.ts`'s Source link before serving it; the upstream
 release link is insufficient for modifications. Preserve third-party notices.
+
+## Post-publication acceptance (pending)
+
+After the reviewed code is on main and the tag, release and artifacts are public:
+
+1. Download all four release artifacts, verify their checksums and manifest revision,
+   and confirm the public/operator Source link downloads the matching source archive.
+2. Use the Deploy to Cloudflare button to install into another unused Worker. Record
+   the installed revision, verify the secret prompt and build/deploy configuration,
+   and run the runtime acceptance steps above against that installation.
+3. Remove the disposable installation and controlled targets using the cleanup step
+   above. Record sanitized evidence for both the candidate CLI and published button
+   installations. Close #12 only after both gates and source-download verification pass.
+
+A failed post-publication check leaves #12 open. Correct the deployment instructions
+or publish a new version as needed; never replace an existing version's artifacts.
