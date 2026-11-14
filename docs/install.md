@@ -48,8 +48,8 @@ npx wrangler whoami
 ```
 
 Select the intended account using `CLOUDFLARE_ACCOUNT_ID` in the shell, outside
-this repository, if more than one account is available. Choose an unused Worker
-name in `wrangler.jsonc` (preserve bindings and migrations). Before a disposable
+this repository, if more than one account is available. Set `IRISBEAT_WORKER_NAME` in the shell to an unused Worker name; keep the
+reviewed `wrangler.jsonc`, bindings and migrations unchanged. Before a disposable
 acceptance install, the parent must verify `irisbeat-acceptance` is absent in that
 account; never overwrite an existing Worker. Do not use a temporary claim account.
 
@@ -59,12 +59,12 @@ parent obtains credentials through private `request_secret`, never chat. With
 `IRISBEAT_SECRET_FILE` pointing to that file, deploy code and secret together:
 
 ```sh
-npm run deploy -- --secrets-file "$IRISBEAT_SECRET_FILE"
+npm run deploy -- --name "$IRISBEAT_WORKER_NAME" --secrets-file "$IRISBEAT_SECRET_FILE"
 ```
 
 Use the pinned local Wrangler; `--secrets-file` is supported by its installed help.
 `.dev.vars` is for local development and is not uploaded as a deployed secret.
-For later rotation, `npx wrangler secret put INSTALLATION_SECRET` prompts privately
+For later rotation, `npx wrangler secret put INSTALLATION_SECRET --name "$IRISBEAT_WORKER_NAME"` prompts privately
 and immediately deploys a version. Rotation affects all personal producers and
 operator sessions at once; update them together. A missing/empty installation
 secret fails closed for administration and receipts.
@@ -75,7 +75,8 @@ Open `/operator`, sign in, save the Status page name and add HTTP(S), TCP or
 Heartbeat Monitors. Publish selected rows. The anonymous `/` and `/api/status`
 show published rows only. HTTP/TCP targets must be reachable from Cloudflare;
 TCP is plain connection establishment, not TLS/protocol verification. Cloudflare
-socket restrictions still apply (including prohibited ports/addresses).
+[socket restrictions](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/)
+still apply (including prohibited ports/addresses).
 POST `/heartbeat/<id>` with `Authorization: Bearer <installation secret>` from a
 producer. Bodies are ignored. Never place the secret in a query string.
 
@@ -87,7 +88,7 @@ and alerts are suppressed, Incidents retained. History shows 90 UTC calendar day
 Maintenance is excluded from availability. Delete stops checking but retains
 operator Incidents. Detailed bounds and semantics are in README and the API handoffs.
 
-Cron runs each minute; propagation after deploying a new trigger can take time.
+Cron runs each minute; [new trigger propagation](https://developers.cloudflare.com/workers/configuration/cron-triggers/) can take up to 15 minutes.
 Do not expect a live `/__scheduled` endpoint: it is a Wrangler-local test route.
 Monitor Workers Logs for sanitized `webhook_delivery_failed` events and cron
 errors; check actual public/operator responses. Alerts are best effort, without
@@ -101,7 +102,8 @@ compatibility before rollback. Never delete/recreate a production namespace to u
 
 ## Prepare and verify a release (no publication)
 
-Commit all tracked changes first. From that exact clean revision:
+Commit all tracked changes first. From a Git checkout of that exact clean revision (release preparation requires
+Git history; an extracted source archive alone supports installation, not repacking):
 
 ```sh
 npm ci
@@ -171,7 +173,7 @@ channels or arbitrary public sites. Use default one-minute intervals, thresholds
    persists. Local suites cover exact timing/UTC boundaries; live evidence covers
    actual Cloudflare socket/cron/secret/resource behavior.
 6. Stop producers, remove webhook configuration, delete only drill Monitors, then
-   remove only the disposable Worker using `npx wrangler delete --name <drill-name>`
+   remove only the disposable Worker using `npx wrangler delete <drill-name>`
    after parent cleanup approval. Worker deletion destroys its associated DO data;
    never run against production. Confirm deletion, remove any separate controlled
    target service and cloned test build/repository connection, and remove private
