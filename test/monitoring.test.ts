@@ -310,7 +310,7 @@ it("resets consecutive streaks and accepts HTTP 299 without replaying duplicate 
   });
 });
 
-it("presents the selected Status ledger with Monitor configuration beside page settings", async () => {
+it("presents the selected Status ledger with inline Monitor configuration and separate Settings", async () => {
   const operator = await (await request("/operator")).text();
   expect(operator).toContain('<table aria-label="Monitors">');
   expect(operator).toContain('<th scope="col">Monitor</th>');
