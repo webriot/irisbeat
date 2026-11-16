@@ -35,7 +35,7 @@ it('rejects invalid grammar, impossible dates, zones and unauthenticated preview
   }
   expect((await preview('* * * * *', 'Invalid/Zone')).status).toBe(400);
   expect((await request('/api/operator/schedule-preview', 'POST', { cron: '* * * * *' }, false)).status).toBe(401);
-  expect((await create({ kind: 'tcp', url: undefined, hostname: 'db.example', port: 443 })).status).toBe(400);
+  expect((await create({ kind: 'heartbeat', url: undefined })).status).toBe(400);
 });
 
 it('supports lists, ranges, steps, Sunday 7 and OR day semantics with explicit explanations', async () => {

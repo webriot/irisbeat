@@ -683,10 +683,10 @@ async function run(path = '/api/operator', method = 'GET', body, after) {
 function updateKind() {
   const kind = byId('kind').value;
   const heartbeat = kind === 'heartbeat';
-  const calendar = kind === 'http' && byId('scheduleMode').value === 'calendar';
-  byId('schedule-mode').hidden = kind !== 'http';
-  byId('schedule-mode').disabled = kind !== 'http';
-  byId('scheduleMode').disabled = kind !== 'http';
+  const calendar = !heartbeat && byId('scheduleMode').value === 'calendar';
+  byId('schedule-mode').hidden = heartbeat;
+  byId('schedule-mode').disabled = heartbeat;
+  byId('scheduleMode').disabled = heartbeat;
   byId('calendar-schedule').hidden = !calendar;
   byId('calendar-schedule').disabled = !calendar;
   for (const field of ['cron', 'timezone']) byId(field).disabled = !calendar;
@@ -721,7 +721,7 @@ async function previewSchedule() {
   byId('cron').setCustomValidity('');
   byId('schedule-explanation').textContent = '';
   byId('schedule-occurrences').replaceChildren();
-  if (byId('kind').value !== 'http' || byId('scheduleMode').value !== 'calendar' || !secret) return;
+  if (byId('kind').value === 'heartbeat' || byId('scheduleMode').value !== 'calendar' || !secret) return;
   const cron = byId('cron').value;
   const timezone = byId('timezone').value;
   previewTimer = setTimeout(async () => {
@@ -763,8 +763,9 @@ form.addEventListener('submit', async event => {
   if (editingId && !monitorIds.has(editingId)) return;
   const body = { name: byId('name').value, kind: byId('kind').value, published: byId('published').checked };
   if (body.kind === 'tcp') { body.hostname = byId('hostname').value; body.port = Number(byId('port').value); }
-  else if (body.kind === 'http') {
-    body.url = byId('url').value; body.scheduleMode = byId('scheduleMode').value;
+  else if (body.kind === 'http') body.url = byId('url').value;
+  if (body.kind !== 'heartbeat') {
+    body.scheduleMode = byId('scheduleMode').value;
     if (body.scheduleMode === 'calendar') { body.cron = byId('cron').value; body.timezone = byId('timezone').value; }
   }
   for (const field of Object.keys(timingDefaults)) {

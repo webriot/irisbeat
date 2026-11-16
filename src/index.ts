@@ -622,7 +622,7 @@ function parseConfiguration(value: unknown, existingKind: Configuration["kind"] 
       schedule.scheduleMode = fields.scheduleMode as Schedule["scheduleMode"];
     }
     if (fields.scheduleMode === "calendar") {
-      if (kind !== "http") return null;
+      if (kind === "heartbeat") return null;
       const parsed = calendar(fields.cron, fields.timezone === undefined ? "UTC" : fields.timezone);
       parsed.next(Date.now());
       schedule.cron = parsed.cron; schedule.timezone = parsed.timezone;
