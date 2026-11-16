@@ -76,7 +76,7 @@ for (const settings of [
           await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
           await expect(strip.locator('[tabindex="0"]')).toHaveAttribute('data-date', '2026-03-08');
           await expect(detail.locator('details')).toHaveAttribute('open', '');
-          await monitorAction(page, 'Declare Maintenance Website');
+          await monitorAction(page, 'Maintenance Website');
           await expect(page.getByLabel('End time (' + settings.timezoneId + ')', { exact: true })).toBeVisible();
           await page.locator('#maintenance-end').fill('2026-11-17T12:00');
           const write = page.waitForRequest(req => req.url().endsWith('/web/maintenance') && req.method() === 'PUT');
@@ -175,12 +175,12 @@ test('Maintenance preserves an unchanged fold instant and rejects gap or ambiguo
   await page.goto('/operator');
   await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-  await monitorAction(page, 'Replace Maintenance Website');
+  await monitorAction(page, 'Maintenance Website');
   await expect(page.locator('#maintenance-end')).toHaveValue('2027-11-07T01:30');
   await page.locator('#save-maintenance').click();
   await expect(page.locator('#maintenance')).toBeHidden();
   expect(writes).toEqual([{ endsAt: Date.parse('2027-11-07T09:30:25Z') }]);
-  await monitorAction(page, 'Replace Maintenance Website');
+  await monitorAction(page, 'Maintenance Website');
   for (const value of ['2027-03-14T02:30', '2027-11-07T01:45']) {
     await page.locator('#maintenance-end').fill(value);
     await page.locator('#save-maintenance').click();

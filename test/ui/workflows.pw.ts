@@ -21,7 +21,6 @@ for (const kind of ['http', 'tcp', 'heartbeat']) {
     }
     await page.getByLabel('Published', { exact: true }).uncheck();
     await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
-    await page.getByLabel('Actions ' + ('Publish ' + name).replace(/^(Publish|Unpublish|End Maintenance) /, ''), { exact: true }).click();
     await expect(page.getByRole('button', { name: 'Publish ' + name, exact: true })).toBeVisible();
     const historyDay = page.getByRole('cell', { name: name + ' availability', exact: true }).getByRole('listitem').first();
     await historyDay.focus();
@@ -33,13 +32,11 @@ for (const kind of ['http', 'tcp', 'heartbeat']) {
     await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
     const edited = name + ' edited';
     await monitorAction(page, 'Publish ' + edited);
-    await page.getByLabel('Actions ' + ('Unpublish ' + edited).replace(/^(Publish|Unpublish|End Maintenance) /, ''), { exact: true }).click();
     await expect(page.getByRole('button', { name: 'Unpublish ' + edited, exact: true })).toBeVisible();
-    await monitorAction(page, 'Declare Maintenance ' + edited);
-    await page.getByRole('button', { name: 'Declare Maintenance', exact: true }).click();
-    await page.getByLabel('Actions ' + ('End Maintenance ' + edited).replace(/^(Publish|Unpublish|End Maintenance) /, ''), { exact: true }).click();
-    await expect(page.getByRole('button', { name: 'End Maintenance ' + edited, exact: true })).toBeVisible();
-    await monitorAction(page, 'End Maintenance ' + edited);
+    await monitorAction(page, 'Maintenance ' + edited);
+    await page.getByRole('button', { name: 'Start Maintenance', exact: true }).click();
+    await monitorAction(page, 'Maintenance ' + edited);
+    await page.getByRole('button', { name: 'End Maintenance', exact: true }).click();
     await expect(page.locator('#message')).toHaveText('Maintenance ended');
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     await page.getByLabel('Page name', { exact: true }).fill('Workflow status');
@@ -90,7 +87,7 @@ test('hosted editor rotates Heartbeat credentials and reader sees a read-only le
     await page.getByLabel('Access token', { exact: true }).fill('ui-reader');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
     await expect(page.getByRole('cell', { name: 'Hosted producer', exact: true })).toBeVisible();
-    for (const label of ['New Monitor', 'Save page', 'Save webhook', 'Edit Hosted producer', 'Delete Hosted producer']) {
+    for (const label of ['New Monitor', 'Save page', 'Save webhook', 'Edit Hosted producer', 'Publish Hosted producer', 'Maintenance Hosted producer', 'Delete Hosted producer']) {
       await expect(page.getByRole('button', { name: label, exact: true })).toBeHidden();
     }
     await expect(page.locator('#heartbeat-credential')).toHaveText('');

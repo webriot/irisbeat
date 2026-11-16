@@ -89,7 +89,7 @@ test('failed reconnect attempts back off without postponing visible fallback pol
   await expect(page.getByText('Polling', { exact: true })).toBeVisible();
 });
 
-test('real operator private notifications preserve unsaved drafts, focus, menus and history', async ({ page, request }) => {
+test('real operator private notifications preserve unsaved drafts, focus, actions and history', async ({ page, request }) => {
   const headers = { Authorization: 'Bearer ui-test-secret' };
   const saved = await (await request.post('/api/operator/monitors', { headers, data: { name: 'Operator socket', kind: 'heartbeat', published: false } })).json();
   const monitor = saved.monitors.at(-1); const path = '/api/operator/monitors/' + monitor.id;
@@ -100,7 +100,6 @@ test('real operator private notifications preserve unsaved drafts, focus, menus 
     await page.locator('#secret').fill('ui-test-secret');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
     await expect.poll(() => connected).toBe(true);
-    await page.getByLabel('Actions Operator socket', { exact: true }).click();
     await page.getByRole('button', { name: 'Edit Operator socket', exact: true }).click();
     await page.locator('#name').fill('Unsaved socket draft');
     const draft = await page.locator('#configuration').elementHandle();
@@ -111,14 +110,14 @@ test('real operator private notifications preserve unsaved drafts, focus, menus 
     expect(await draft!.evaluate(element => element.isConnected)).toBe(true);
     const day = page.locator('.history[data-monitor="' + monitor.id + '"] li').nth(88);
     await day.focus(); const selected = await day.getAttribute('data-date');
-    await page.getByLabel('Actions Remote private name', { exact: true }).click();
-    const menu = page.locator('details.menu').filter({ has: page.getByLabel('Actions Remote private name', { exact: true }) });
+    const actions = page.getByRole('group', { name: 'Actions Remote private name', exact: true });
     const publish = page.getByRole('button', { name: 'Publish Remote private name', exact: true });
     await publish.focus();
     await request.patch(path, { headers, data: { silenceSeconds: 600 } });
     await request.put(path + '/maintenance', { headers, data: { endsAt: Date.now() + 3600000 } });
-    await expect(page.getByRole('button', { name: 'End Maintenance Remote private name', exact: true })).toBeVisible();
-    await expect(menu).toHaveAttribute('open', ''); await expect(publish).toBeFocused();
+    await expect(page.locator('#monitor-rows .status').filter({ hasText: 'Maintenance' })).toBeVisible();
+    await expect(actions.getByRole('button')).toHaveCount(4);
+    await expect(publish).toBeFocused();
     await expect(page.locator('.history[data-monitor="' + monitor.id + '"] [aria-current="true"]')).toHaveAttribute('data-date', selected!);
     await expect(page.locator('#name')).toHaveValue('Unsaved socket draft');
     await page.locator('#logout').click();
