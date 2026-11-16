@@ -279,3 +279,73 @@ it('ignores obsolete sign-in completion while a newer session edits a Monitor', 
   expect(doc.activeElement).toBe(name);
   expect(name.value).toBe('New draft');
 });
+
+it('resynchronizes public subscriptions, bounds duplicate reads, and polls only while disconnected and visible', async () => {
+  const window = new Window({ url: 'https://status.example/' }); windows.push(window);
+  const doc = window.document; doc.write(statusPage(snapshot() as unknown as Status));
+  const sockets: { onopen?: () => void; onmessage?: (event: { data: string }) => void; onclose?: () => void; onerror?: () => void; readyState: number; send: (value: string) => void; close: () => void }[] = [];
+  const sent: string[] = [];
+  class Socket {
+    readyState = 0;
+    constructor(readonly url: string) { expect(url).toBe('wss://status.example/api/status/subscribe'); sockets.push(this); }
+    send(value: string) { sent.push(value); }
+    close() { this.readyState = 3; }
+  }
+  Object.defineProperty(window, 'WebSocket', { value: Socket });
+  const timers = new Map<number, { callback: () => void; delay: number }>(); let timerId = 0;
+  window.setTimeout = ((callback: () => void, delay: number) => { timers.set(++timerId, { callback, delay }); return timerId; }) as unknown as typeof window.setTimeout;
+  window.clearTimeout = ((id: number) => timers.delete(id)) as unknown as typeof window.clearTimeout;
+  let reads = 0; let release: (() => void) | undefined;
+  window.fetch = (async () => { reads++; if (release) await new Promise<void>(resolve => { release = resolve; }); return new window.Response(JSON.stringify(snapshot({ pageName: 'Live' }))); }) as typeof window.fetch;
+  window.eval(presentationScript); window.eval(statusScript);
+  expect(sockets).toHaveLength(1);
+  sockets[0].readyState = 1; sockets[0].onopen!(); await settle();
+  expect(reads).toBe(1); expect(doc.title).toBe('Live'); expect([...timers.values()].filter(t => t.delay === 60000)).toHaveLength(0);
+  release = () => {};
+  for (let i = 0; i < 100; i++) sockets[0].onmessage!({ data: '{"type":"status-changed"}' });
+  expect(reads).toBe(2);
+  const finish = release!; release = undefined; finish(); await settle();
+  expect(reads).toBeLessThanOrEqual(3);
+  [...timers.values()].find(t => t.delay === 250)!.callback(); expect(sent).toContain('resync');
+  sockets[0].readyState = 3; sockets[0].onclose!();
+  expect(doc.querySelector('#stale')!.hasAttribute('hidden')).toBe(true);
+  const [fallbackId, fallback] = [...timers].find(([, t]) => t.delay === 60000)!; timers.delete(fallbackId); fallback.callback(); await settle();
+  expect(reads).toBeGreaterThanOrEqual(3);
+  Object.defineProperty(doc, 'hidden', { configurable: true, value: true }); doc.dispatchEvent(new window.Event('visibilitychange'));
+  expect([...timers.values()].filter(t => t.delay === 60000)).toHaveLength(0);
+  const reconnect = [...timers.values()].find(t => t.delay < 60000)!; reconnect.callback();
+  expect(sockets).toHaveLength(2); sockets[1].readyState = 1; sockets[1].onopen!(); await settle();
+  expect([...timers.values()].filter(t => t.delay === 60000)).toHaveLength(0);
+  expect(doc.title).toBe('Live');
+  window.fetch = (async () => { throw new Error('snapshot unavailable'); }) as typeof window.fetch;
+  sockets[1].onmessage!({ data: '{"type":"status-changed"}' }); await settle();
+  expect(doc.querySelector('#stale')!.hasAttribute('hidden')).toBe(false);
+  expect(sockets[1].readyState).toBe(3);
+  window.fetch = (async () => new window.Response(JSON.stringify(snapshot({ pageName: 'Recovered' })))) as typeof window.fetch;
+  // A failed snapshot must remain eligible for recovery even if no further public change occurs.
+  [...timers.values()].filter(t => t.delay === 1000).at(-1)!.callback();
+  sockets[2].readyState = 1; sockets[2].onopen!(); await settle();
+  expect(doc.title).toBe('Recovered'); expect(doc.querySelector('#stale')!.hasAttribute('hidden')).toBe(true);
+});
+
+it('caps reconnect backoff without postponing the visible fallback and cleans up on page exit', async () => {
+  const window = new Window({ url: 'https://status.example/' }); windows.push(window);
+  window.document.write(statusPage(snapshot() as unknown as Status));
+  Object.defineProperty(window, 'WebSocket', { value: class { constructor() { throw new Error('unavailable'); } } });
+  const timers = new Map<number, { callback: () => void; delay: number }>(); let id = 0;
+  window.setTimeout = ((callback: () => void, delay: number) => { timers.set(++id, { callback, delay }); return id; }) as unknown as typeof window.setTimeout;
+  window.clearTimeout = ((id: number) => timers.delete(id)) as unknown as typeof window.clearTimeout;
+  let reads = 0;
+  window.fetch = (async () => { reads++; return new window.Response(JSON.stringify(snapshot())); }) as typeof window.fetch;
+  window.eval(presentationScript); window.eval(statusScript);
+  const poll = [...timers].find(([, timer]) => timer.delay === 60000)!;
+  for (const delay of [1000, 2000, 4000, 8000, 16000, 30000, 30000]) {
+    const [key, timer] = [...timers].find(([, timer]) => timer.delay === delay)!;
+    timers.delete(key); timer.callback();
+    expect(timers.get(poll[0])).toBe(poll[1]);
+  }
+  timers.delete(poll[0]); poll[1].callback(); await settle(); expect(reads).toBe(1);
+  window.dispatchEvent(new window.Event('pagehide')); expect(timers.size).toBe(0);
+  window.dispatchEvent(new window.Event('pageshow')); await settle();
+  expect(reads).toBe(2); expect([...timers.values()].some(timer => timer.delay === 60000)).toBe(true);
+});

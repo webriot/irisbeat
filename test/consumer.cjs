@@ -479,6 +479,25 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     assert.equal(deliveries.length, hookBefore, 'pause generation suppresses delayed hosted hook after resume');
     await request('a.example', '/api/operator/monitors/' + queued.monitor.id, 'DELETE');
     await policy('omit');
+    // The installed consumer subclass inherits subscription handlers without adapter changes.
+    const subscribe = async host => {
+      const response = await mf.dispatchFetch('https://' + host + '/api/status/subscribe', { headers: { Upgrade: 'websocket', 'x-test-at': String(now) } });
+      assert.equal(response.status, 101);
+      const socket = response.webSocket; socket.accept();
+      const messages = []; socket.addEventListener('message', event => { messages.push(event.data); });
+      return { socket, messages };
+    };
+    const aSubscription = await subscribe('a.example');
+    const bSubscription = await subscribe('b.example');
+    try {
+      const privateMonitor = await (await request('a.example', '/api/operator/monitors', 'POST', { name: 'Private subscription test', kind: 'heartbeat', published: false })).json();
+      await request('a.example', '/api/operator', 'PUT', { pageName: 'Live hosted page' });
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.deepEqual(aSubscription.messages, ['{"type":"status-changed"}']);
+      assert.deepEqual(bSubscription.messages, [], 'subscription identity comes from the hosted adapter');
+      assert.equal((await (await request('a.example', '/api/status')).json()).pageName, 'Live hosted page');
+      await request('a.example', '/api/operator/monitors/' + privateMonitor.monitors.at(-1).id, 'DELETE');
+    } finally { aSubscription.socket.close(1000); bSubscription.socket.close(1000); }
     console.log('PASS packed irisbeat@0.1.0: reproducible artifact, pinned integrity, consumer typecheck, isolated scheduling/Incidents, HTTP/TCP/heartbeat hooks, failure isolation, webhooks rotated tenant credentials and three-kind Maintenance suppression and HTTP/TCP boundary overlap of both delivery paths, persisted pause/resume and omission, paused history, Maintenance precedence, in-flight checks and delivery suppression');
   } finally { await mf.dispose(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });
