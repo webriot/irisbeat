@@ -21,7 +21,7 @@ function Document({ title, operator = false, children }: { title: string; operat
       <a href="/" aria-current={operator ? undefined : "page"}>Status page</a>
       <a href="/operator" aria-current={operator ? "page" : undefined}>Operator</a>
     </nav></header>
-    <main>{children}<span id="stale" role="status" hidden>Updates unavailable</span>{!operator && <button id="refresh" type="button">Refresh</button>}</main>
+    <main>{children}<span id="stale" role="status" hidden>Updates unavailable</span>{!operator && <><span id="updates-mode" role="status">Polling</span><button id="refresh" type="button">Refresh</button></>}</main>
     <footer><a href="https://github.com/webriot/irisbeat/releases/download/v0.1.0/irisbeat-0.1.0-source.tar.gz">Source (AGPL-3.0-only)</a>
       <label class="theme-control">Theme <select id="theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
     </footer>
@@ -271,25 +271,83 @@ document.documentElement.dataset.theme = theme;
 document.addEventListener('DOMContentLoaded', () => {
   initializeDisplay();
   if (document.getElementById('public-status')) {
-    let version = 0;
+    let running = false, queued = false, ackSocket;
+    let socket, retry, handshake, polling, stopped = false, delay = 1000;
+    function pollingMode() {
+      const connected = !!socket && socket.readyState === WebSocket.OPEN;
+      document.getElementById('updates-mode').hidden = connected;
+      if (connected || document.hidden || stopped) { clearInterval(polling); polling = undefined; }
+      else if (!polling) polling = setInterval(sync, 60000);
+    }
     async function sync() {
-      const current = ++version;
+      if (running) { queued = true; return; }
+      running = true;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
       try {
-        const response = await fetch('/api/status');
+        const response = await fetch('/api/status', { signal: controller.signal });
         if (!response.ok) throw new Error('Request failed');
         const data = await response.json();
-        if (current !== version) return;
-        const next = document.createElement('div');
-        next.innerHTML = publicMarkup(data, ${historyMarkup.toString()}, ${statusBanner.toString()});
-        reconcile(document.getElementById('public-status'), next);
-        document.title = data.pageName;
-        initializeDisplay(); document.getElementById('stale').hidden = true;
+        if (!queued) {
+          const next = document.createElement('div');
+          next.innerHTML = publicMarkup(data, ${historyMarkup.toString()}, ${statusBanner.toString()});
+          reconcile(document.getElementById('public-status'), next);
+          document.title = data.pageName;
+          initializeDisplay(); document.getElementById('stale').hidden = true;
+          if (socket && socket.readyState === WebSocket.OPEN) delay = 1000;
+        }
       } catch {
-        if (current === version) document.getElementById('stale').hidden = false;
+        document.getElementById('stale').hidden = false;
+        socket?.close();
+      } finally {
+        clearTimeout(timeout); running = false;
+        if (queued && !stopped) { queued = false; sync(); }
+        else if (ackSocket) {
+          if (ackSocket === socket && socket.readyState === WebSocket.OPEN) socket.send('ack');
+          ackSocket = undefined;
+        }
       }
     }
+    function connect() {
+      if (stopped) return;
+      clearTimeout(retry);
+      try {
+        const url = new URL('/api/status/events', location.href);
+        url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const current = socket = new WebSocket(url);
+        handshake = setTimeout(() => current.close(), 10000);
+        current.onopen = () => {
+          if (current !== socket) return;
+          clearTimeout(handshake); pollingMode(); sync();
+        };
+        current.onmessage = event => {
+          if (current !== socket || event.data !== 'changed') return;
+          ackSocket = current; sync();
+        };
+        current.onerror = () => current.close();
+        current.onclose = () => {
+          if (current !== socket) return;
+          clearTimeout(handshake); socket = undefined; ackSocket = undefined;
+          pollingMode(); reconnect();
+        };
+      } catch { pollingMode(); reconnect(); }
+    }
+    function reconnect() {
+      if (stopped) return;
+      retry = setTimeout(connect, delay + Math.random() * delay * 0.2);
+      delay = Math.min(delay * 2, 25000);
+    }
     document.getElementById('refresh').addEventListener('click', sync);
-    pollSnapshots(sync);
+    document.addEventListener('visibilitychange', () => {
+      pollingMode();
+      if (!document.hidden) sync();
+    });
+    window.addEventListener('pagehide', () => {
+      stopped = true; clearTimeout(retry); clearTimeout(handshake); clearInterval(polling); polling = undefined;
+      socket?.close();
+    });
+    window.addEventListener('pageshow', () => { if (stopped) { stopped = false; pollingMode(); connect(); } });
+    pollingMode(); connect();
   }
   const control = document.getElementById('theme');
   control.value = theme;
@@ -331,6 +389,7 @@ a { color: inherit; text-underline-offset: 4px; }
 nav a { padding: 8px 10px; border-radius: 6px; color: var(--muted); text-decoration: none; }
 nav a[aria-current="page"] { background: var(--secondary); color: var(--foreground); font-weight: 600; }
 #stale { color: var(--warning); margin-right: 12px; }
+#updates-mode { color: var(--muted); margin-right: 12px; }
 h1 { margin: 28px 0 24px; font-size: 28px; line-height: 1.2; letter-spacing: -.8px; font-weight: 650; }
 h2 { margin: 0; font-size: 16px; font-weight: 650; }
 .banner { padding: 18px 20px; margin-bottom: 24px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); color: var(--info); }

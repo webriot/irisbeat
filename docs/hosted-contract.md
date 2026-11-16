@@ -206,3 +206,50 @@ regenerated after integration changes, before #12 publishes anything.
 ### HTTP Calendar compatibility
 
 Contract 1 also accepts HTTP `scheduleMode`, `cron` and `timezone` through the same authorized collection routes as personal installations. Existing consumers and omitted fields remain Interval-compatible. `/api/operator/schedule-preview` requires editor permission and returns authoritative explanation/three future instants without mutation. Calendar configuration is operator-only; private/public visibility and allowances are unchanged. Persisted pause skips occurrences, and resume anchors at the next future occurrence without catch-up Checks or observations. Calendar Maintenance uses the existing observation exclusion and transition suppression. See [HTTP Calendar API](monitor-api.md#http-calendar-schedules).
+
+## Public subscriptions
+
+Contract 1 adds `GET /api/status/events` with `Upgrade: websocket`. Hono resolves
+it through the same trusted `HostedAdapter.resolve` and context binding as
+`/api/status`. Anonymous access is intentional; operator subscriptions and
+credentials are outside this endpoint. The browser `Origin` must exactly match
+the resolved application URL's origin, including scheme and port. Forwarded host
+headers do not override it. Use HTTPS/WSS in production; HTTP/WS is accepted only
+on localhost and loopback for development. Serve the engine at the trusted
+application URL, and keep the existing context resolution validation.
+
+The existing `MonitoringContext` accepts the connection through Cloudflare's
+Hibernation WebSocket API. Its fixed text message `changed` means fetch the current
+`/api/status` snapshot. There are no snapshots, fields, identifiers, revisions or
+credentials on the socket. Only public projection changes notify: published
+Monitor results/history (including Calendar Checks), publication, names, visible
+Incidents, Maintenance and pause. Target/timing-only settings, webhook destinations,
+private Monitor activity and other contexts remain silent. Notification comparison
+and send happen synchronously after persistence and before external alert delivery.
+
+After processing a notice and completing its snapshot read, send exactly `ack`.
+This acknowledges delivery only and cannot mutate monitoring data. Each socket
+retains one pending notice plus one dirty bit; changes while pending collapse into
+one further `changed` after acknowledgment. Attachments and the public subscription
+tag survive hibernation. Unexpected messages, including unsolicited acknowledgments
+and binary messages, close with 1008. The context accepts at most 128 connections;
+excess upgrades return 503. No-origin/cross-origin or insecure nonlocal requests
+return 403; requests without an upgrade return 426. Closed sockets are removed by
+the runtime. Public Maintenance expiry and UTC history rollover use a storage alarm
+while published Monitors have subscribers; no permanent server timer is needed.
+
+Clients must subscribe **before** fetching a fresh snapshot, and repeat that read
+on every reconnect. Notifications are hints, not a replay log. The public UI bounds
+reads to one active request and one queued refresh, ignores an intermediate response
+when another refresh is queued, and aborts reads after ten seconds. It preserves
+existing row nodes, history selection and focus. Reconnect delays increase from
+one second to at most thirty seconds (including jitter), with a ten-second handshake
+deadline. Disconnected visible pages poll every sixty seconds and show Polling;
+connected pages stop fallback polling. A failed read retains the last snapshot and
+shows Updates unavailable. Visibility return and manual Refresh fetch immediately.
+Page exit closes the connection, and returning from the browser page cache resubscribes.
+All mutations continue through existing HTTP routes. JSON shapes and contract version
+remain unchanged.
+
+Implementation references: [Cloudflare Hibernation WebSockets](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)
+and [Hono upgrade middleware caveat](https://hono.dev/docs/helpers/websocket).

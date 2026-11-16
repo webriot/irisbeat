@@ -74,6 +74,24 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
   const tick = at => { now = at; return request('a.example', '/test-tick?at=' + at); };
   try {
     {
+      const response = await mf.dispatchFetch('https://a.example/api/status/events', { headers: { Upgrade: 'websocket', Origin: 'https://a.example', 'x-test-at': String(now) } });
+      assert.equal(response.status, 101, 'packed consumer routes public upgrades');
+      const socket = response.webSocket;
+      socket.accept();
+      const messages = [];
+      socket.addEventListener('message', event => { messages.push(event.data); });
+      const settle = () => new Promise(resolve => setTimeout(resolve, 30));
+      await request('b.example', '/api/operator', 'PUT', { pageName: 'Other context' });
+      const created = await (await request('a.example', '/api/operator/monitors', 'POST', { name: 'Private socket producer', kind: 'heartbeat', published: false })).json();
+      await settle(); assert.deepEqual(messages, [], 'private changes and other contexts remain silent');
+      await request('a.example', '/api/operator/monitors/' + created.monitor.id, 'DELETE');
+      await request('a.example', '/api/operator', 'PUT', { pageName: 'Public consumer' });
+      await settle(); assert.deepEqual(messages, ['changed'], 'only a fixed public invalidation crosses the consumer boundary');
+      assert.equal((await (await request('a.example', '/api/status')).json()).pageName, 'Public consumer');
+      const closed = new Promise(resolve => socket.addEventListener('close', resolve, { once: true }));
+      socket.close(); await closed;
+    }
+    {
       const evidence = [];
       for (const newerPaused of [true, false]) for (const source of ['request', 'schedule']) {
         // Gate a substituted external dependency after the adapter captured its trusted policy.
