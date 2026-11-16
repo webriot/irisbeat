@@ -281,9 +281,9 @@ function render(data) {
   byId('paused').hidden = !data.paused;
   canEdit = data.permission !== 'reader';
   monitors = data.monitors;
-  if (!canEdit) { cancelEdit(); maintenanceForm.hidden = true; }
+  if (!canEdit) { cancelEdit(); maintenanceForm.reset(); delete maintenanceForm.dataset.monitorId; maintenanceForm.hidden = true; webhook.reset(); pageForm.reset(); hydrated = false; }
   byId('new-monitor').hidden = !canEdit; pageForm.closest('aside').hidden = !canEdit; webhook.hidden = !canEdit;
-  if (!hydrated) { byId('pageName').value = data.pageName; byId('webhookUrl').value = data.webhookUrl || ''; hydrated = true; }
+  if (canEdit && !hydrated) { byId('pageName').value = data.pageName; byId('webhookUrl').value = data.webhookUrl || ''; hydrated = true; }
   updateMissing();
   const rows = data.monitors.flatMap(monitor => {
     const row = document.createElement('tr'); row.dataset.key = monitor.id;
@@ -296,7 +296,13 @@ function render(data) {
     for (const [label, action] of (canEdit ? [
       ['Edit', () => edit(monitor)],
       [monitor.maintenance ? 'Replace Maintenance' : 'Declare Maintenance', () => declareMaintenance(monitor)],
-      ...(monitor.maintenance ? [['End Maintenance', () => run(path + '/maintenance', 'DELETE', undefined, () => { maintenanceForm.hidden = true; })]] : []),
+      ...(monitor.maintenance ? [['End Maintenance', () => {
+        const submittedId = maintenanceForm.dataset.monitorId;
+        const draft = byId('maintenance-end').value;
+        run(path + '/maintenance', 'DELETE', undefined, () => {
+          if (submittedId === monitor.id && submittedId === maintenanceForm.dataset.monitorId && draft === byId('maintenance-end').value) maintenanceForm.hidden = true;
+        });
+      }]] : []),
       [monitor.published ? 'Unpublish' : 'Publish', () => run(path, 'PATCH', { published: !monitor.published })],
       ['Delete', () => { if (confirm('Delete ' + monitor.name + '?')) run(path, 'DELETE'); }]
     ] : [])) {
@@ -391,7 +397,10 @@ document.getElementById('kind').addEventListener('change', updateKind);
 updateKind();
 login.addEventListener('submit', async event => {
   event.preventDefault(); session++; secret = byId('secret').value;
-  await run(); byId('secret').value = '';
+  const submittedSession = session;
+  await run();
+  if (submittedSession !== session) return;
+  byId('secret').value = '';
   if (!editor.hidden) byId(byId('new-monitor').hidden ? 'refresh' : 'new-monitor').focus();
 });
 form.addEventListener('submit', async event => {

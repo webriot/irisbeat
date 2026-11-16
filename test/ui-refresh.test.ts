@@ -234,3 +234,44 @@ it('keeps public last-known data on failure and ignores older overlapping reads'
   expect(doc.querySelector('h1')!.textContent).toBe('Newest');
   expect(doc.querySelector('#stale')!.hasAttribute('hidden')).toBe(true);
 });
+
+it('clears editor-only values on reader downgrade and rehydrates on restored permission', async () => {
+  const { doc, set, refresh } = await mount();
+  set(snapshot({ permission: 'reader', webhookUrl: undefined })); await refresh();
+  expect(doc.querySelector<HTMLInputElement>('#webhookUrl')!.value).toBe('');
+  set(snapshot({ webhookUrl: 'https://restored.example' })); await refresh();
+  expect(doc.querySelector<HTMLInputElement>('#webhookUrl')!.value).toBe('https://restored.example');
+});
+
+it('keeps another Maintenance draft when an earlier End Maintenance finishes', async () => {
+  const { window, doc, set, refresh } = await mount();
+  const other = { ...monitor, id: 'two', name: 'Other' };
+  set(snapshot({ monitors: [{ ...monitor, maintenance: { endsAt: 2000000000000 } }, other] })); await refresh();
+  let resolve!: (response: InstanceType<typeof window.Response>) => void;
+  window.fetch = (() => new Promise(done => { resolve = done; })) as typeof window.fetch;
+  doc.querySelector<HTMLButtonElement>('button[aria-label="End Maintenance Website"]')!.click();
+  doc.querySelector<HTMLButtonElement>('button[aria-label="Declare Maintenance Other"]')!.click();
+  const end = doc.querySelector<HTMLInputElement>('#maintenance-end')!;
+  end.value = '2030-11-16T12:30'; end.focus();
+  resolve(new window.Response(JSON.stringify(snapshot({ monitors: [monitor, other] })))); await settle();
+  expect(doc.querySelector('#maintenance')!.hasAttribute('hidden')).toBe(false);
+  expect(end.value).toBe('2030-11-16T12:30');
+  expect(doc.activeElement).toBe(end);
+});
+
+it('ignores obsolete sign-in completion while a newer session edits a Monitor', async () => {
+  const { window, doc } = await mount();
+  doc.querySelector<HTMLButtonElement>('#logout')!.click();
+  let resolve!: (response: InstanceType<typeof window.Response>) => void;
+  window.fetch = (() => new Promise(done => { resolve = done; })) as typeof window.fetch;
+  doc.querySelector<HTMLInputElement>('#secret')!.value = 'old';
+  doc.querySelector('#login')!.dispatchEvent(new window.Event('submit', { cancelable: true }));
+  window.fetch = (async () => new window.Response(JSON.stringify(snapshot()))) as typeof window.fetch;
+  doc.querySelector<HTMLInputElement>('#secret')!.value = 'new';
+  doc.querySelector('#login')!.dispatchEvent(new window.Event('submit', { cancelable: true })); await settle();
+  doc.querySelector<HTMLButtonElement>('button[aria-label="Edit Website"]')!.click();
+  const name = doc.querySelector<HTMLInputElement>('#name')!; name.value = 'New draft'; name.focus();
+  resolve(new window.Response('{}', { status: 401 })); await settle();
+  expect(doc.activeElement).toBe(name);
+  expect(name.value).toBe('New draft');
+});
