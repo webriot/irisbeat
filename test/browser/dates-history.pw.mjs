@@ -322,3 +322,24 @@ test('reader downgrade and sign-out clear Settings, inline and Heartbeat values 
   await expect(page.locator('#monitor-rows tr, #monitor-rows-after tr')).toHaveCount(0);
   await expect(page.getByLabel('Installation secret', { exact: true })).toBeFocused();
 });
+
+test('delayed End Maintenance returns focus from the closing draft to its Monitor', async ({ page }) => {
+  const data = snapshot();
+  await serve(page, data, true);
+  const trigger = page.getByLabel('Actions for Website', { exact: true });
+  await trigger.click();
+  await page.getByRole('button', { name: 'Replace Maintenance Website', exact: true }).click();
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  await page.route('**/api/operator/monitors/website/maintenance', async route => {
+    await pending;
+    data.monitors[0].maintenance = null;
+    await route.fulfill({ json: data });
+  });
+  await trigger.click();
+  await page.getByRole('button', { name: 'End Maintenance Website', exact: true }).click();
+  await page.locator('#maintenance-end').focus();
+  release();
+  await expect(page.locator('#maintenance')).toBeHidden();
+  await expect(trigger).toBeFocused();
+});
