@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+import { expect, test } from '@playwright/test';
+
+for (const kind of ['http', 'tcp', 'heartbeat']) {
+test(kind + ' refresh preserves rows, drafts, and focus while reconciling collection changes', async ({ page }) => {
+  const data = { pageName: 'Original', webhookUrl: 'https://example.com/hook', monitors: [
+    { id: 'web', name: 'Website', kind, url: 'https://example.com', state: 'up', published: true, history: null },
+  ], incidents: [] };
+  await page.route('**/api/operator', route => route.fulfill({ json: data }));
+  await page.goto('/operator');
+  await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await page.getByRole('button', { name: 'Edit Website', exact: true }).click();
+  await page.locator('#name').fill('Draft');
+  if (kind === 'http') await page.locator('#url').fill('https://draft.example.com');
+  if (kind === 'tcp') { await page.locator('#hostname').fill('draft.internal'); await page.locator('#port').fill('8443'); }
+  await page.locator('#intervalSeconds-unit').selectOption('minutes');
+  await page.locator('#intervalSeconds').fill('2.5');
+  await page.getByRole('button', { name: 'Declare Maintenance Website', exact: true }).click();
+  await page.locator('#maintenance-end').fill('2027-01-01T12:00');
+  await page.locator('#pageName').fill('Draft page');
+  await page.locator('#webhookUrl').fill('https://example.com/draft');
+  const row = await page.locator('#monitor-rows tr').first().elementHandle();
+  data.pageName = 'Remote';
+  await page.locator('#refresh').click();
+  await expect(page.locator('#pageName')).toHaveValue('Draft page');
+  await expect(page.locator('#intervalSeconds-unit')).toHaveValue('minutes');
+  await expect(page.locator('#intervalSeconds')).toHaveValue('2.5');
+  await expect(page.locator('#maintenance-end')).toHaveValue('2027-01-01T12:00');
+  if (kind === 'http') await expect(page.locator('#url')).toHaveValue('https://draft.example.com');
+  if (kind === 'tcp') { await expect(page.locator('#hostname')).toHaveValue('draft.internal'); await expect(page.locator('#port')).toHaveValue('8443'); }
+  await expect(page.locator('#webhookUrl')).toHaveValue('https://example.com/draft');
+  expect(await row!.evaluate(node => node === document.querySelector('#monitor-rows tr'))).toBe(true);
+  data.pageName = 'Saved page';
+  await page.getByRole('button', { name: 'Save page', exact: true }).click();
+  await expect(page.locator('#pageName')).toHaveValue('Saved page');
+  await expect(page.locator('#webhookUrl')).toHaveValue('https://example.com/draft');
+  await expect(page.locator('#name')).toHaveValue('Draft');
+  await page.locator('#name').focus();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await expect(page.locator('#name')).toBeFocused();
+  data.monitors = [];
+  await page.locator('#refresh').click();
+  await expect(page.locator('#name')).toHaveValue('Draft');
+  await expect(page.locator('#configuration')).toContainText('This Monitor was deleted.');
+  await expect(page.getByRole('button', { name: 'Save Monitor', exact: true })).toBeDisabled();
+  await expect(page.locator('#save-maintenance')).toBeDisabled();
+  await expect(page.locator('#maintenance-end')).toHaveValue('2027-01-01T12:00');
+});
+}
+
+for (const path of ['/', '/operator']) {
+  test(`${path} polls only while visible, recovers from failures and rejects stale responses`, async ({ page, request, baseURL }) => {
+    const data = { pageName: 'Refresh status', paused: false, webhookUrl: null, monitors: [
+      { id: 'one', name: 'First', kind: 'http', url: 'https://example.com', state: 'up', published: true,
+        history: { percentage: 100, days: [
+          { date: '2026-11-15', state: 'up', successes: 1, failures: 0, maintenance: 0 },
+          { date: '2026-11-16', state: 'up', successes: 1, failures: 0, maintenance: 0 },
+        ] } },
+    ], incidents: [] as { monitorId: string; openedAt: number; closedAt: number | null }[] };
+    await page.clock.install();
+    await page.addInitScript(() => {
+      Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+    });
+    if (path === '/') await page.route(baseURL! + '/', async route => {
+      const response = await request.post('/__ui/status', { data });
+      await route.fulfill({ response });
+    });
+    let reads = 0;
+    let failure = false;
+    let hold: (() => Promise<void>) | undefined;
+    const api = path === '/' ? '**/api/status' : '**/api/operator';
+    await page.route(api, async route => {
+      ++reads;
+      if (hold) {
+        const deferred = hold; hold = undefined;
+        const obsolete = structuredClone(data); obsolete.pageName = 'Obsolete'; obsolete.monitors[0].name = 'Obsolete';
+        await deferred(); return route.fulfill({ json: obsolete });
+      }
+      await route.fulfill(failure ? { status: 503, json: { error: 'Unavailable' } } : { json: data });
+    });
+    await page.goto(path);
+    if (path === '/operator') {
+      await page.locator('#secret').fill('ui-test-secret');
+      await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+    }
+    const row = await page.locator(path === '/' ? '.ledger article' : '#monitor-rows tr').first().elementHandle();
+    const day = page.locator('[data-date="2026-11-15"]');
+    await day.click();
+    await page.clock.fastForward(60000);
+    await expect.poll(() => reads).toBe(path === '/' ? 1 : 2);
+    await expect(day).toBeFocused();
+    expect(await row!.evaluate(node => node.isConnected)).toBe(true);
+    await page.evaluate(() => {
+      Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    const before = reads;
+    await page.clock.fastForward(180000);
+    expect(reads).toBe(before);
+    failure = true;
+    await page.evaluate(() => {
+      Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await expect(page.locator('#stale')).toBeVisible();
+    await expect(day).toBeFocused();
+    failure = false;
+    data.paused = true;
+    data.monitors[0].state = 'paused';
+    data.monitors[0].name = 'Renamed';
+    data.monitors[0].published = false;
+    data.incidents.push({ monitorId: 'one', openedAt: Date.parse('2026-11-16T10:00Z'), closedAt: null });
+    await page.locator('#refresh').click();
+    await expect(page.locator('#stale')).toBeHidden();
+    await expect(page.getByText('Renamed', { exact: true })).toBeVisible();
+    if (path === '/operator') await expect(page.getByRole('button', { name: 'Publish Renamed', exact: true })).toBeVisible();
+    await expect(page.locator('[data-date="2026-11-15"]')).toHaveAttribute('aria-current', 'true');
+    expect(await row!.evaluate(node => node.isConnected)).toBe(true);
+    let release!: () => void;
+    hold = () => new Promise<void>(resolve => { release = resolve; });
+    await page.locator('#refresh').click();
+    await expect.poll(() => !!release).toBe(true);
+    data.monitors.push({ ...data.monitors[0], id: 'two', name: 'Second' });
+    await page.locator('#refresh').click();
+    await expect(page.getByText('Second', { exact: true })).toBeVisible();
+    const obsolete = page.waitForResponse(async response => response.url().includes('/api/') && (await response.text()).includes('Obsolete'));
+    release();
+    await obsolete;
+    await expect(page.getByText('Obsolete', { exact: true })).toHaveCount(0);
+    await expect(page.getByText('Second', { exact: true })).toBeVisible();
+    const secondDay = page.locator('.history').last().locator('[data-date="2026-11-15"]');
+    await secondDay.focus();
+    data.monitors.shift();
+    data.incidents = [];
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await expect(page.getByText('Renamed', { exact: true })).toHaveCount(0);
+    await expect(secondDay).toBeFocused();
+    await expect(page.locator('time')).toHaveCount(0);
+  });
+}
+
+test('authorization loss clears private drafts and ignores an earlier in-flight snapshot', async ({ page }) => {
+  const data = { pageName: 'Private page', webhookUrl: 'https://example.com/private-hook', monitors: [
+    { id: 'private', name: 'Private monitor', kind: 'tcp', hostname: 'private.internal', port: 443, state: 'up', published: false, history: null },
+  ], incidents: [] };
+  await page.route('**/api/operator', route => route.fulfill({ json: data }));
+  await page.goto('/operator');
+  await page.locator('#secret').fill('ui-test-secret');
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await page.getByRole('button', { name: 'Edit Private monitor', exact: true }).click();
+  let release!: () => void;
+  await page.route('**/api/operator', async route => {
+    if (!release) { await new Promise<void>(resolve => { release = resolve; }); return route.fulfill({ json: data }); }
+    return route.fulfill({ status: 401, json: { error: 'Unauthorized' } });
+  });
+  await page.locator('#refresh').click();
+  await expect.poll(() => !!release).toBe(true);
+  await page.locator('#refresh').click();
+  await expect(page.locator('#login')).toBeVisible();
+  release();
+  await expect(page.locator('#editor')).toBeHidden();
+  await expect(page.locator('#hostname')).toHaveValue('');
+  await expect(page.locator('#webhookUrl')).toHaveValue('');
+  await expect(page.locator('#monitor-rows')).toBeEmpty();
+  expect(await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }))).not.toContain('ui-test-secret');
+});

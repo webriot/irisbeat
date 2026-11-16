@@ -131,14 +131,14 @@ test('empty, unavailable, and result states stay distinct through refresh and re
   await expect(strip.locator('[tabindex="0"]')).toHaveAttribute('data-date', '2026-04-01');
 });
 
-test('fall daylight-saving repeated hours retain distinct exact instants', async ({ browser }) => {
+test('fall daylight-saving repeated hours retain distinct exact instants', async ({ browser, baseURL }) => {
   const context = await browser.newContext({ locale: 'en-US', timezoneId: 'America/Los_Angeles' });
   const page = await context.newPage();
   const request = context.request;
   const data = snapshot();
   data.incidents[0].openedAt = Date.parse('2026-11-01T08:30:00Z');
   data.incidents[0].closedAt = Date.parse('2026-11-01T09:30:00Z');
-  await page.route('http://127.0.0.1:8787/', async route => {
+  await page.route(baseURL! + '/', async route => {
     const response = await request.post('/__ui/status', { data });
     await route.fulfill({ response });
   });
