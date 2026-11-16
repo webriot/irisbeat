@@ -194,32 +194,67 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     this.ctx.storage.kv.put("context", state);
   }
 
-  configure(value: unknown, expectedMonitorId: string | null = null) {
-    if (!value || typeof value !== "object") return undefined;
-    const fields = value as Record<string, unknown>;
-    const state = this.read();
-    let configuration: Configuration | { pageName: string };
-    if (Object.keys(fields).length === 1 && "pageName" in fields) {
-      if (typeof fields.pageName !== "string" || !fields.pageName.trim() || fields.pageName.length > 120) return undefined;
-      configuration = { pageName: fields.pageName.trim() };
-    } else {
-      // Keep the original single-Monitor save contract for existing clients.
-      const monitor = state.monitors[0];
-      // A legacy save must never move to a sibling while the request is in flight.
-      if ((monitor?.id ?? null) !== expectedMonitorId) return null;
-      const schedule = monitor?.scheduleMode === "calendar" && fields.scheduleMode === undefined
-        ? { scheduleMode: monitor.scheduleMode, cron: monitor.cron, timezone: monitor.timezone } : {};
-      const grace = monitor?.kind === "heartbeat" && (fields.scheduleMode ?? monitor.scheduleMode) === "calendar" ? { graceSeconds: monitor.graceSeconds } : {};
-      const parsed = parseConfiguration({ ...schedule, ...grace, ...fields }, monitor?.kind, monitor);
-      if (!parsed || !validKindFields({ ...fields, scheduleMode: parsed.scheduleMode ?? "interval" }, parsed.kind) || (monitor && monitor.kind !== parsed.kind)) return undefined;
-      configuration = parsed;
-      const { pageName: _pageName, ...settings } = parsed;
-      if (monitor) this.applyEdit(monitor, settings);
-      else state.monitors.push(this.newMonitor(settings));
+  async previewSchedule(input: unknown) {
+    try {
+      const value = input as Record<string, unknown>;
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Enter a valid Calendar Schedule");
+      const after = value.after === undefined ? Date.now() : value.after;
+      if (typeof after !== "number" || !Number.isSafeInteger(after) || after < 0 || after > Date.UTC(9990, 0, 1)) throw new Error("Enter a valid preview timestamp");
+      const parsed = calendar(value.cron, value.timezone === undefined ? "UTC" : value.timezone);
+      if ("graceSeconds" in value && (typeof value.graceSeconds !== "number" || !Number.isInteger(value.graceSeconds) || value.graceSeconds < 1 || value.graceSeconds > 86400 || !await parsed.acceptsGraceAsync(value.graceSeconds, after)))
+        throw new Error("Grace must be 1–86400 whole seconds and shorter than every occurrence gap");
+      return { cron: parsed.cron, timezone: parsed.timezone, explanation: parsed.explanation, occurrences: parsed.next(after, 3) };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : "Enter a valid Calendar Schedule" };
     }
-    state.pageName = configuration.pageName;
-    this.ctx.storage.kv.put("context", state);
-    return this.status(true);
+  }
+
+  private graceProof(configuration: Pick<MonitorConfiguration, "kind" | "scheduleMode" | "cron" | "timezone" | "graceSeconds">, current?: MonitorConfiguration) {
+    if (configuration.kind !== "heartbeat" || configuration.scheduleMode !== "calendar") return null;
+    const key = JSON.stringify([configuration.cron, configuration.timezone, configuration.graceSeconds ?? timingDefaults.graceSeconds]);
+    return current?.scheduleMode === "calendar" && key === JSON.stringify([current.cron, current.timezone, current.graceSeconds]) ? null : key;
+  }
+
+  private async acceptsProof(configuration: Pick<MonitorConfiguration, "cron" | "timezone" | "graceSeconds">) {
+    return calendar(configuration.cron, configuration.timezone).acceptsGraceAsync(configuration.graceSeconds ?? timingDefaults.graceSeconds, Date.now());
+  }
+
+  async configure(value: unknown, expectedMonitorId: string | null = null) {
+    // Validation yields: re-read and reparse before committing, retaining this request’s proofs.
+    const proofs = new Set<string>();
+    for (;;) {
+      if (!value || typeof value !== "object") return undefined;
+      const fields = value as Record<string, unknown>;
+      const state = this.read();
+      let configuration: Configuration | { pageName: string };
+      if (Object.keys(fields).length === 1 && "pageName" in fields) {
+        if (typeof fields.pageName !== "string" || !fields.pageName.trim() || fields.pageName.length > 120) return undefined;
+        configuration = { pageName: fields.pageName.trim() };
+      } else {
+        // Keep the original single-Monitor save contract for existing clients.
+        const monitor = state.monitors[0];
+        // A legacy save must never move to a sibling while the request is in flight.
+        if ((monitor?.id ?? null) !== expectedMonitorId) return null;
+        const schedule = monitor?.scheduleMode === "calendar" && fields.scheduleMode === undefined
+          ? { scheduleMode: monitor.scheduleMode, cron: monitor.cron, timezone: monitor.timezone } : {};
+        const grace = monitor?.kind === "heartbeat" && (fields.scheduleMode ?? monitor.scheduleMode) === "calendar" ? { graceSeconds: monitor.graceSeconds } : {};
+        const parsed = parseConfiguration({ ...schedule, ...grace, ...fields }, monitor?.kind, monitor);
+        if (!parsed || !validKindFields({ ...fields, scheduleMode: parsed.scheduleMode ?? "interval" }, parsed.kind) || (monitor && monitor.kind !== parsed.kind)) return undefined;
+        const proof = this.graceProof(parsed, monitor);
+        if (proof && !proofs.has(proof)) {
+          if (!await this.acceptsProof(parsed)) return undefined;
+          proofs.add(proof);
+          continue;
+        }
+        configuration = parsed;
+        const { pageName: _pageName, ...settings } = parsed;
+        if (monitor) this.applyEdit(monitor, settings);
+        else state.monitors.push(this.newMonitor(settings));
+      }
+      state.pageName = configuration.pageName;
+      this.ctx.storage.kv.put("context", state);
+      return this.status(true);
+    }
   }
 
   private newMonitor(configuration: MonitorConfiguration): Monitor {
@@ -227,7 +262,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       failures: 0, successes: 0, nextDue: configuration.scheduleMode === "calendar" ? calendar(configuration.cron, configuration.timezone).next(Date.now())[0] : 0, createdAt: Date.now(), lastSeen: null, recoveryReceiptAt: null };
   }
 
-  create(configuration: MonitorConfiguration, limit?: number) {
+  async create(value: unknown, limit?: number) {
+    const configuration = parseMonitorPatch(value);
+    if (!configuration) return undefined;
+    if (this.graceProof(configuration) && !await this.acceptsProof(configuration)) return undefined;
     const state = this.read();
     // No await between allowance check and synchronous persistence: concurrent RPCs serialize.
     if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0 || state.monitors.length >= limit)) return null;
@@ -243,15 +281,26 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return this.status(true);
   }
 
-  edit(id: string, value: unknown) {
-    const state = this.read();
-    const monitor = state.monitors.find(monitor => monitor.id === id);
-    if (!monitor) return null;
-    const patch = parseMonitorPatch(value, monitor);
-    if (!patch) return undefined;
-    this.applyEdit(monitor, patch);
-    this.ctx.storage.kv.put("context", state);
-    return this.status(true);
+  async edit(id: string, value: unknown) {
+    // Validation yields: re-read and reparse before committing, retaining this request’s proofs.
+    const proofs = new Set<string>();
+    for (;;) {
+      const state = this.read();
+      const monitor = state.monitors.find(monitor => monitor.id === id);
+      if (!monitor) return null;
+      const patch = parseMonitorPatch(value, monitor);
+      if (!patch) return undefined;
+      const configuration = { ...monitor, ...patch };
+      const proof = this.graceProof(configuration, monitor);
+      if (proof && !proofs.has(proof)) {
+        if (!await this.acceptsProof(configuration)) return undefined;
+        proofs.add(proof);
+        continue;
+      }
+      this.applyEdit(monitor, patch);
+      this.ctx.storage.kv.put("context", state);
+      return this.status(true);
+    }
   }
 
   private endMaintenance(monitor: Monitor) {
@@ -711,7 +760,6 @@ function parseConfiguration(value: unknown, existingKind: Configuration["kind"] 
       } else {
         const parsed = calendar(fields.cron, fields.timezone === undefined ? "UTC" : fields.timezone);
         parsed.next(Date.now());
-        if (kind === "heartbeat" && !parsed.acceptsGrace(timing.graceSeconds ?? timingDefaults.graceSeconds, Date.now())) return null;
         schedule.cron = parsed.cron; schedule.timezone = parsed.timezone;
       }
     } else if ("cron" in fields || "timezone" in fields) return null;
@@ -990,19 +1038,9 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     if (result === undefined) return Response.json({ error: "Enter a future end time in epoch milliseconds" }, { status: 400 });
     return result ? operatorResponse(c, result) : Response.json({ error: "Monitor not found" }, { status: 404 });
   });
-  app.post(previewPath, readBody, (c: Context<HttpEnv<E>>) => {
-    try {
-      const value = c.get("value") as Record<string, unknown>;
-      if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Enter a valid Calendar Schedule");
-      const after = value.after === undefined ? Date.now() : value.after;
-      if (typeof after !== "number" || !Number.isSafeInteger(after) || after < 0 || after > Date.UTC(9990, 0, 1)) throw new Error("Enter a valid preview timestamp");
-      const parsed = calendar(value.cron, value.timezone === undefined ? "UTC" : value.timezone);
-      if ("graceSeconds" in value && (typeof value.graceSeconds !== "number" || !Number.isInteger(value.graceSeconds) || value.graceSeconds < 1 || value.graceSeconds > 86400 || !parsed.acceptsGrace(value.graceSeconds, after)))
-        throw new Error("Grace must be 1–86400 whole seconds and shorter than every occurrence gap");
-      return Response.json({ cron: parsed.cron, timezone: parsed.timezone, explanation: parsed.explanation, occurrences: parsed.next(after, 3) });
-    } catch (error) {
-      return Response.json({ error: error instanceof Error ? error.message : "Enter a valid Calendar Schedule" }, { status: 400 });
-    }
+  app.post(previewPath, readBody, async (c: Context<HttpEnv<E>>) => {
+    const result = await c.get("context").previewSchedule(c.get("value"));
+    return Response.json(result, { status: "error" in result ? 400 : 200 });
   });
   app.patch(monitorPath, readBody, async (c: Context<HttpEnv<E>>) => {
     const result = await c.get("context").edit(monitorId(c), c.get("value"));
@@ -1011,10 +1049,9 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   });
   app.post("/api/operator/monitors", readBody, async (c: Context<HttpEnv<E>>) => {
     const value = c.get("value");
-    const configuration = parseMonitorPatch(value);
-    if (!configuration)
+    const result = await c.get("context").create(value, c.get("resolved")?.monitorLimit);
+    if (result === undefined)
       return Response.json({ error: "Enter a Monitor name and HTTP(S)/TCP target or Heartbeat settings" }, { status: 400 });
-    const result = await c.get("context").create(configuration, c.get("resolved")?.monitorLimit);
     return result ? operatorResponse(c, result, 201) : Response.json({ error: "Monitor allowance reached" }, { status: 409 });
   });
   app.put("/api/operator", readBody, async (c: Context<HttpEnv<E>>) => {

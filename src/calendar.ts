@@ -70,9 +70,17 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
     }
     throw new Error('No future calendar occurrence');
   };
-  const acceptsGrace = (seconds: number, after: number) => {
+  function* graceSteps(seconds: number, after: number): Generator<void, boolean> {
     // Future cron instants are minute-aligned; sub-minute windows cannot overlap.
     if (seconds < 60) return true;
+    const offsetFormatter = new Intl.DateTimeFormat('en-US', { timeZone: formatter.resolvedOptions().timeZone, hour: 'numeric', timeZoneName: 'longOffset' });
+    const zoneOffset = (at: number) => {
+      const name = offsetFormatter.formatToParts(at).find(part => part.type === 'timeZoneName')!.value;
+      const match = /^GMT([+-])(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(name);
+      if (name === 'GMT') return 0;
+      if (!match) throw new Error('Unsupported timezone offset');
+      return (match[1] === '+' ? 1 : -1) * (Number(match[2]) * 3600 + Number(match[3]) * 60 + Number(match[4] ?? 0)) * 1000;
+    };
     const limit = seconds * 1000;
     const minutes = fields[1].flatMap(hour => fields[0].map(minute => hour * 60 + minute));
     const insideGap = Math.min(...minutes.slice(1).map((minute, i) => (minute - minutes[i]) * 60_000));
@@ -82,30 +90,39 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
     const offsetAt = (day: number) => {
       if (!offsets.has(day)) {
         const sample = day + DAY / 2;
-        offsets.set(day, local(sample) - sample);
+        offsets.set(day, zoneOffset(sample));
       }
       return offsets.get(day)!;
     };
-    const separated = new Map<string, boolean>();
-    const safelySeparated = (candidates: number[]) => {
-      const key = candidates.join(',');
-      if (!separated.has(key)) {
-        // This superset includes even nonexistent/repeated wall times. Its circular gaps
-        // bound every positive actual gap within this day.
-        const residues = [...new Set(candidates.flatMap(offset => minutes.map(minute =>
-          ((minute * 60_000 - offset) % DAY + DAY) % DAY)))].sort((a, b) => a - b);
-        separated.set(key, residues.every((at, i) =>
-          (i ? at - residues[i - 1] : at + DAY - residues[residues.length - 1]) > limit));
+    // Prefix counts let each valid wall-time range check all its internal gaps in O(1).
+    const close = [0];
+    for (let i = 1; i < minutes.length; i++) close.push(close[i - 1] + Number((minutes[i] - minutes[i - 1]) * 60_000 <= limit));
+    const lower = (minute: number) => {
+      let lo = 0, hi = minutes.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (minutes[mid] < minute) lo = mid + 1; else hi = mid;
       }
-      return separated.get(key)!;
+      return lo;
     };
-    const instant = (day: number, minute: number, candidates: number[]) => {
-      const wall = day + minute * 60_000;
-      return Math.min(...candidates.map(offset => wall - offset).filter(at => local(at) === wall));
+    const transitions = new Map<number, number>();
+    const transitionAt = (day: number) => {
+      if (!transitions.has(day)) {
+        let lo = day + DAY / 2, hi = lo + DAY;
+        const offset = offsetAt(day);
+        // Find the exact changed minute between adjacent daily offset observations.
+        while (hi - lo > 60_000) {
+          const mid = lo + Math.floor((hi - lo) / 120_000) * 60_000;
+          if (zoneOffset(mid) === offset) lo = mid; else hi = mid;
+        }
+        transitions.set(day, hi);
+      }
+      return transitions.get(day)!;
     };
     let previous: number | undefined;
-    // Keep the full Gregorian horizon; cache proofs by offset set, not sampled years.
+    // Keep every date in the full horizon; offset and transition caches cover only nearby days.
     for (let day = start; day <= start + 400 * 366 * DAY; day += DAY) {
+      if ((day - start) % (512 * DAY) === 0) yield;
       if (!matchesDay(new Date(day))) continue;
       const candidates = fixedUTC ? [0] : [...new Set([-2, -1, 0, 1, 2].map(delta => offsetAt(day + delta * DAY)))];
       let first: number;
@@ -114,29 +131,57 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
         if (insideGap <= limit) return false;
         first = day + minutes[0] * 60_000 - candidates[0];
         last = day + minutes[minutes.length - 1] * 60_000 - candidates[0];
-      } else if (safelySeparated(candidates)) {
-        // Only the actual endpoints are needed when the superset proves internal safety.
+      } else {
         first = Infinity; last = Infinity;
-        for (const minute of minutes) {
-          first = instant(day, minute, candidates);
-          if (Number.isFinite(first)) break;
+        let wallEnd = day;
+        let from = day - 2 * DAY + DAY / 2;
+        // Map UTC offset runs to wall-time ranges. Trim repeated wall times so only
+        // their first occurrence remains; spring gaps have no range at all.
+        for (let sample = day - 2 * DAY; sample < day + 2 * DAY; sample += DAY) {
+          const offset = offsetAt(sample);
+          const changed = offset !== offsetAt(sample + DAY);
+          const boundary = changed ? transitionAt(sample) : sample + 1.5 * DAY;
+          const ranges = changed
+            ? [[from, boundary, offset], [boundary, sample + 1.5 * DAY, offsetAt(sample + DAY)]]
+            : [[from, boundary, offset]];
+          for (const [begin, end, delta] of ranges) {
+            const left = Math.max(day, wallEnd, begin + delta);
+            const right = Math.min(day + DAY, end + delta);
+            if (left >= right) continue;
+            wallEnd = right;
+            const lo = lower((left - day) / 60_000), hi = lower((right - day) / 60_000);
+            if (lo === hi) continue;
+            if (close[hi - 1] !== close[lo]) return false;
+            const at = day + minutes[lo] * 60_000 - delta;
+            if (Number.isFinite(last) && at - last <= limit) return false;
+            if (!Number.isFinite(first)) first = at;
+            last = day + minutes[hi - 1] * 60_000 - delta;
+          }
+          from = sample + 1.5 * DAY;
         }
         if (!Number.isFinite(first)) continue;
-        for (let i = minutes.length - 1; i >= 0; i--) {
-          last = instant(day, minutes[i], candidates);
-          if (Number.isFinite(last)) break;
-        }
-      } else {
-        const instants = minutes.map(minute => instant(day, minute, candidates)).filter(Number.isFinite).sort((a, b) => a - b);
-        if (!instants.length) continue;
-        if (instants.slice(1).some((at, i) => at - instants[i] <= limit)) return false;
-        first = instants[0]; last = instants[instants.length - 1];
       }
       if (previous !== undefined && first - previous <= limit) return false;
       previous = last;
       for (const cached of offsets.keys()) if (cached < day - 2 * DAY) offsets.delete(cached);
+      for (const cached of transitions.keys()) if (cached < day - 2 * DAY) transitions.delete(cached);
     }
     return true;
+  };
+  const acceptsGrace = (seconds: number, after: number) => {
+    const steps = graceSteps(seconds, after);
+    let step = steps.next();
+    while (!step.done) step = steps.next();
+    return step.value;
+  };
+  const acceptsGraceAsync = async (seconds: number, after: number) => {
+    const steps = graceSteps(seconds, after);
+    let step = steps.next();
+    while (!step.done) {
+      await scheduler.wait(0);
+      step = steps.next();
+    }
+    return step.value;
   };
   const names = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
   const list = (index: number) => fields[index].join(', ');
@@ -149,5 +194,5 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
   const allDow = fields[4].length === 7;
   const days = dayOr ? dom + ' OR ' + dow
     : allDom && allDow ? 'every day' : allDom ? dow : allDow ? dom : dom + ' AND ' + dow;
-  return { cron: sources.join(' '), timezone, next, acceptsGrace, explanation: `${time}; ${days}; ${sources[3] === '*' ? 'every month' : 'months ' + list(3)} (${timezone}).` };
+  return { cron: sources.join(' '), timezone, next, acceptsGrace, acceptsGraceAsync, explanation: `${time}; ${days}; ${sources[3] === '*' ? 'every month' : 'months ' + list(3)} (${timezone}).` };
 }

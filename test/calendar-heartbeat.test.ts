@@ -377,6 +377,23 @@ it('bounds dense named-zone grace validation over the full Gregorian horizon', (
   expect(calls).toBeLessThan(160_000);
 });
 
+it.each([
+  ['0-28/2,31-57/2 * * * *', 60, 120],
+  ['*/4 * * * *', 180, 240],
+] as const)('bounds exact half-hour DST validation for %s', (cron, grace, gap) => {
+  const format = Intl.DateTimeFormat.prototype.formatToParts;
+  let calls = 0;
+  vi.spyOn(Intl.DateTimeFormat.prototype, 'formatToParts').mockImplementation(function (this: Intl.DateTimeFormat, at) {
+    if (++calls > 200_000) throw new Error('Calendar validation exceeded 200000 timezone conversions');
+    return format.call(this, at);
+  });
+  const schedule = calendar(cron, 'Australia/Lord_Howe');
+  expect(schedule.acceptsGrace(grace, start)).toBe(true);
+  expect(calls).toBeLessThan(200_000);
+  calls = 0;
+  expect(schedule.acceptsGrace(gap, start)).toBe(false);
+});
+
 it('validates creation once and saves unchanged Calendar settings without rescanning the horizon', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(start);
   const format = Intl.DateTimeFormat.prototype.formatToParts;
@@ -423,4 +440,61 @@ it('retains sparse Gregorian-cycle dates and does not mistake residue proximity 
     Date.parse('2128-02-28T19:15:00Z'), Date.parse('2156-02-28T19:15:00Z'), Date.parse('2184-02-28T19:15:00Z'),
   ]);
   expect(schedule.acceptsGrace(86_400, start)).toBe(true);
+});
+
+it.each([
+  ['0-28/2,31-57/2 * * * *', 60, 120],
+  ['*/4 * * * *', 180, 240],
+] as const)('validates dense Lord Howe schedules through preview, create and edits: %s', async (cron, graceSeconds, gap) => {
+  vi.spyOn(Date, 'now').mockReturnValue(start);
+  const settings = { cron, timezone: 'Australia/Lord_Howe', graceSeconds };
+  expect((await request('/api/operator/schedule-preview', 'POST', { ...settings, after: start })).status).toBe(200);
+  expect((await create(settings)).status).toBe(201);
+  const id = (await read()).monitor!.id;
+  const path = '/api/operator/monitors/' + id;
+  expect((await request(path, 'PATCH', { graceSeconds: gap - 1 })).status).toBe(200);
+  const before = await read();
+  expect((await request(path, 'PATCH', { graceSeconds: gap })).status).toBe(400);
+  expect(await read()).toEqual(before);
+  expect((await create({ ...settings, graceSeconds: gap })).status).toBe(400);
+  expect((await request('/api/operator/schedule-preview', 'POST', { ...settings, graceSeconds: gap, after: start })).status).toBe(400);
+});
+
+it('interleaves receipts and ordinary edits with grace validation without restoring stale state', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(start);
+  await create({ cron: '*/5 * * * *', graceSeconds: 90 });
+  const id = (await read()).monitor!.id;
+  const path = '/api/operator/monitors/' + id;
+  const format = Intl.DateTimeFormat.prototype.formatToParts;
+  let calls = 0;
+  vi.spyOn(Intl.DateTimeFormat.prototype, 'formatToParts').mockImplementation(function (this: Intl.DateTimeFormat, at) {
+    ++calls;
+    if (calls > 200_000) throw new Error('Repeated validation after concurrent changes');
+    return format.call(this, at);
+  });
+  const edit = request(path, 'PATCH', { cron: '0-28/2,31-57/2 * * * *', timezone: 'Australia/Lord_Howe', graceSeconds: 60 });
+  while (calls < 1024) await scheduler.wait(0);
+  expect((await request('/heartbeat/' + id, 'POST')).status).toBe(204);
+  expect((await request(path, 'PATCH', { name: 'Concurrent', published: false })).status).toBe(200);
+  expect(calls).toBeLessThan(10_000);
+  expect((await edit).status).toBe(200);
+  expect((await read()).monitor).toMatchObject({ name: 'Concurrent', published: false, lastSeen: start, cron: '0-28/2,31-57/2 * * * *', graceSeconds: 60 });
+});
+
+it('bounds work between yields as well as total exact validation work', async () => {
+  const format = Intl.DateTimeFormat.prototype.formatToParts;
+  let total = 0, chunk = 0, maximum = 0;
+  vi.spyOn(Intl.DateTimeFormat.prototype, 'formatToParts').mockImplementation(function (this: Intl.DateTimeFormat, at) {
+    total++; chunk++;
+    return format.call(this, at);
+  });
+  const wait = scheduler.wait.bind(scheduler);
+  vi.spyOn(scheduler, 'wait').mockImplementation(async (delay, options) => {
+    maximum = Math.max(maximum, chunk);
+    chunk = 0;
+    await wait(delay, options);
+  });
+  expect(await calendar('0-28/2,31-57/2 * * * *', 'Australia/Lord_Howe').acceptsGraceAsync(60, start)).toBe(true);
+  expect(total).toBeLessThan(160_000);
+  expect(Math.max(maximum, chunk)).toBeLessThan(600);
 });
