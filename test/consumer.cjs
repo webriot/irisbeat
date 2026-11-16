@@ -12,23 +12,23 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
 (async () => {
   const prepared = process.argv.includes('--prepared');
   if (!prepared) execFileSync('npm', ['run', 'pack:engine'], { stdio: 'inherit' });
-  const artifact = 'dist/irisbeat-0.2.0.tgz';
+  const artifact = 'dist/irisbeat-0.2.1.tgz';
   const checksum = createHash('sha256').update(readFileSync(artifact)).digest('hex');
   if (!prepared) execFileSync('npm', ['run', 'pack:engine'], { stdio: 'pipe' });
   assert.equal(createHash('sha256').update(readFileSync(artifact)).digest('hex'), checksum, 'packing the same revision is reproducible');
   if (prepared) {
     const release = JSON.parse(readFileSync('dist/release.json'));
-    assert.equal(checksum, release.sha256['irisbeat-0.2.0.tgz'], 'consume the exact prepared release artifact');
-  } else writeFileSync('dist/SHA256SUMS', checksum + '  irisbeat-0.2.0.tgz\n');
+    assert.equal(checksum, release.sha256['irisbeat-0.2.1.tgz'], 'consume the exact prepared release artifact');
+  } else writeFileSync('dist/SHA256SUMS', checksum + '  irisbeat-0.2.1.tgz\n');
   rmSync('test/consumer/node_modules', { recursive: true, force: true });
   rmSync('test/consumer/package-lock.json', { force: true });
   execFileSync('npm', ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: join(project, 'test/consumer'), stdio: 'inherit' });
   execFileSync('npm', ['ci', '--ignore-scripts', '--offline', '--no-audit', '--no-fund'], { cwd: join(project, 'test/consumer'), stdio: 'inherit' });
   execFileSync(join(project, 'node_modules/.bin/tsc'), ['--noEmit', '--project', 'test/consumer/tsconfig.json'], { stdio: 'inherit' });
   const installed = JSON.parse(readFileSync('test/consumer/node_modules/irisbeat/package.json', 'utf8'));
-  assert.equal(installed.version, '0.2.0');
+  assert.equal(installed.version, '0.2.1');
   const lock = JSON.parse(readFileSync('test/consumer/package-lock.json', 'utf8'));
-  assert.equal(lock.packages['node_modules/irisbeat'].version, '0.2.0');
+  assert.equal(lock.packages['node_modules/irisbeat'].version, '0.2.1');
   assert.equal(lock.packages['node_modules/irisbeat'].integrity, 'sha512-' + createHash('sha512').update(readFileSync(artifact)).digest('base64'));
   const script = (await build({ entryPoints: ['test/consumer/worker.ts'], bundle: true, write: false, format: 'esm', platform: 'neutral', external: ['cloudflare:workers'], plugins: [{
     name: 'substitute-external-tcp-target',
@@ -650,6 +650,6 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     assert.deepEqual(deliveries.filter(event => event.incident.monitorId === overlapJob.id).map(event => event.transition), ['opened', 'recovered'], 'later Maintenance must not suppress earlier non-overlapping occurrence hooks');
     await request('a.example', overlapPath, 'DELETE');
     console.log('PASS packed Calendar Heartbeat: occurrence deadlines, durable evidence/restart, credential rotation, ignored bodies, tenant permissions, privacy, recovery and transition hooks');
-    console.log('PASS packed irisbeat@0.2.0: reproducible artifact, pinned integrity, consumer typecheck, isolated scheduling/Incidents, HTTP/TCP/heartbeat hooks, failure isolation, webhooks rotated tenant credentials and three-kind Maintenance suppression and HTTP/TCP boundary overlap of both delivery paths, persisted pause/resume and omission, paused history, Maintenance precedence, in-flight checks and delivery suppression');
+    console.log('PASS packed irisbeat@0.2.1: reproducible artifact, pinned integrity, consumer typecheck, isolated scheduling/Incidents, HTTP/TCP/heartbeat hooks, failure isolation, webhooks rotated tenant credentials and three-kind Maintenance suppression and HTTP/TCP boundary overlap of both delivery paths, persisted pause/resume and omission, paused history, Maintenance precedence, in-flight checks and delivery suppression');
   } finally { await mf.dispose(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });
