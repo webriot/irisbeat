@@ -19,7 +19,8 @@ issues; this document describes integration points.
   and Incident identity remain intact. `lastResult.outcome` adds `maintenance`.
   Public status still filters private Monitors and omits targets/destinations.
 - The existing ledger exposes declare/replace/end actions. The end input uses the
-  operator's local time and sends epoch milliseconds. Public rows show Maintenance;
+  operator's local time, names the browser timezone, and sends epoch milliseconds.
+  Public rows show Maintenance;
   open published Incidents take banner precedence, then all-Maintenance, then mixed
   operational/Maintenance, operational, or awaiting checks.
 

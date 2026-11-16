@@ -2,7 +2,7 @@
 import { Window, type HTMLInputElement, type HTMLButtonElement } from 'happy-dom';
 import { afterEach, expect, it } from 'vitest';
 import type { Status } from '../src/index';
-import { operatorPage, operatorScript, statusPage, statusScript } from '../src/ui';
+import { operatorPage, operatorScript, presentationScript, statusPage, statusScript } from '../src/ui';
 
 const windows: Window[] = [];
 const monitor = { id: 'one', name: 'Website', kind: 'http', url: 'https://private.example', published: true, state: 'up', history: null };
@@ -12,6 +12,7 @@ async function mount() {
   window.document.write(operatorPage());
   let data = snapshot();
   window.fetch = (async () => new window.Response(JSON.stringify(data))) as typeof window.fetch;
+  window.eval(presentationScript);
   window.eval(operatorScript);
   const doc = window.document;
   doc.querySelector<HTMLInputElement>('#secret')!.value = 'secret';
@@ -114,6 +115,7 @@ it('polls only visible pages every minute and immediately resynchronizes on retu
   window.document.write(operatorPage());
   let reads = 0;
   window.fetch = (async () => { reads++; return new window.Response(JSON.stringify(snapshot())); }) as typeof window.fetch;
+  window.eval(presentationScript);
   window.eval(operatorScript);
   const doc = window.document;
   doc.querySelector<HTMLInputElement>('#secret')!.value = 'secret';
@@ -138,6 +140,7 @@ it('refreshes the public ledger, history and Incidents in place without a docume
   expect(doc.querySelector('meta[http-equiv="refresh"]')).toBeNull();
   let next = snapshot({ pageName: 'Updated', monitors: [{ ...monitor, history: { ...history, percentage: 50, days: [{ ...history.days[0], failures: 1, state: 'degraded' }] }, state: 'down' }], incidents: [{ id: 'incident', monitorId: 'one', openedAt: 1, closedAt: null }] });
   window.fetch = (async () => new window.Response(JSON.stringify(next))) as typeof window.fetch;
+  window.eval(presentationScript);
   window.eval(statusScript);
   const row = doc.querySelector('#public-monitors article');
   const day = doc.querySelector<import('happy-dom').HTMLElement>('.history-day')!;
@@ -220,6 +223,7 @@ it('keeps public last-known data on failure and ignores older overlapping reads'
   const doc = window.document;
   doc.write(statusPage(snapshot() as unknown as Status));
   window.fetch = (async () => { throw new Error('offline'); }) as typeof window.fetch;
+  window.eval(presentationScript);
   window.eval(statusScript);
   const refresh = () => doc.querySelector<HTMLButtonElement>('#refresh')!.click();
   refresh(); await settle();
