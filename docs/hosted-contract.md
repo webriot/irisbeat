@@ -17,7 +17,9 @@ A released consumer must retain its exact version and integrity lock; release op
 
 The package exports TypeScript source and includes its UI and license. A
 TypeScript-aware Workers bundler (including Wrangler/esbuild) is required; it is
-not a Node.js runtime library. Import `createHostedWorker`, `MonitoringContext`,
+not a Node.js runtime library. Hono is an installed runtime dependency. For consumer
+TypeScript checks, enable `"jsx": "react-jsx"` and `"jsxImportSource": "hono/jsx"`;
+the packaged page source also declares its JSX runtime for bundlers. Import `createHostedWorker`, `MonitoringContext`,
 `HostedAdapter`, `EngineEnv`, `Status` and `IncidentTransition` from `irisbeat`.
 Pin the artifact version **and literal `contractVersion: '1'`**; unsupported
 versions throw during factory construction, before requests or scheduling run.

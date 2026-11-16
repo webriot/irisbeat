@@ -234,7 +234,7 @@ it("serves labeled timing controls inside the existing Monitor configuration", a
   ]) {
     expect(html).toContain(`<label for="${field}">${label}</label>`);
     const duration = String(field).endsWith("Seconds");
-    expect(html).toContain(`<input id="${field}" name="${field}" type="number" min="${min}" max="${max}" step="${duration ? "any" : "1"}" value="${value}"${duration ? " data-duration" : ""} required>`);
+    expect(html.replace(/=""/g, "").replace(/\s*\/>/g, ">" )).toContain(`<input id="${field}" name="${field}" type="number" min="${min}" max="${max}" step="${duration ? "any" : "1"}" value="${value}"${duration ? " data-duration" : ""} required>`);
     if (duration) expect(html).toContain(`aria-label="${label} unit"`);
     expect(html.indexOf(`id="${field}"`)).toBeLessThan(html.indexOf('<aside aria-labelledby="page-settings">'));
   }

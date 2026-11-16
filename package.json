@@ -53,5 +53,8 @@
         "description": "Generate a unique random installation secret (for example, `openssl rand -hex 32`). It protects operator administration and personal Heartbeats. Keep it private."
       }
     }
+  },
+  "dependencies": {
+    "hono": "^4.13.19"
   }
 }

@@ -115,3 +115,29 @@ it('restricts Maintenance to context editors and preserves hosted metadata and r
   expect(await (await request('a.example', '/api/status')).json()).toMatchObject({ monitors: [] });
   expect(await (await request('a.example', path, 'DELETE')).json()).toMatchObject({ hosted: true, permission: 'editor', monitor: { maintenance: null } });
 });
+
+it('preserves hosted method responses and reader authorization before dispatch', async () => {
+  for (const [path, method, token, status, allow] of [
+    ['/heartbeat', 'GET', 'unknown', 405, 'POST'],
+    ['/heartbeat/', 'POST', 'editor', 404, null],
+    ['/heartbeat/missing', 'GET', 'unknown', 404, null],
+    ['/api/operator', 'HEAD', 'reader', 403, null],
+    ['/api/operator/monitors/missing/heartbeat-secret', 'GET', 'reader', 405, 'POST'],
+    ['/api/operator/monitors/missing/heartbeat-secret', 'POST', 'unknown', 401, null],
+    ['/api/operator/monitors/missing/heartbeat-secret', 'PUT', 'editor', 405, 'POST'],
+  ] as const) {
+    const response = await request('a.example', path, method, undefined, token);
+    expect({ path, method, status: response.status, allow: response.headers.get('Allow') }).toEqual({ path, method, status, allow });
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
+  }
+});
+
+it('returns the existing sanitized failure for adapter exceptions', async () => {
+  for (const thrown of [new Error('private adapter detail'), 'private adapter detail']) {
+    const failing = createHostedWorker({ contractVersion: '1', resolve: () => { throw thrown; }, contexts: () => [] });
+    const response = await failing.fetch(new Request('https://a.example/api/status'), env);
+    expect(response.status).toBe(500);
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
+    expect(await response.json()).toEqual({ error: 'Internal server error' });
+  }
+});

@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+/** @jsxRuntime automatic */
+/** @jsxImportSource hono/jsx */
 import type { AvailabilityHistory, Status } from "./index";
+import type { Child } from "hono/jsx";
 
-const escape = (value: string) =>
-  value.replace(
-    /[&<>"']/g,
-    (character) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
-        character
-      ]!,
-  );
 const stateLabel = {
   unknown: "Awaiting check",
   up: "Operational",
@@ -16,21 +11,35 @@ const stateLabel = {
   maintenance: "Maintenance",
   paused: "Monitoring paused",
 };
-function document(title: string, body: string, operator = false) {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(title)}</title><script src="/theme.js"></script><link rel="stylesheet" href="/app.css">${operator ? "" : '<meta http-equiv="refresh" content="60">'}</head><body><header><a class="brand" href="/">irisbeat</a><nav aria-label="Application"><a href="/"${operator ? "" : ' aria-current="page"'}>Status page</a><a href="/operator"${operator ? ' aria-current="page"' : ""}>Operator</a></nav></header><main>${body}</main><footer><a href="https://github.com/webriot/irisbeat/releases/download/v0.1.0/irisbeat-0.1.0-source.tar.gz">Source (AGPL-3.0-only)</a><label class="theme-control">Theme <select id="theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label></footer></body></html>`;
+
+function Document({ title, operator = false, children }: { title: string; operator?: boolean; children: Child }) {
+  return <html lang="en"><head>
+    <meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>{title}</title><script src="/theme.js"></script><link rel="stylesheet" href="/app.css" />
+    {!operator && <meta http-equiv="refresh" content="60" />}
+  </head><body>
+    <header><a class="brand" href="/">irisbeat</a><nav aria-label="Application">
+      <a href="/" aria-current={operator ? undefined : "page"}>Status page</a>
+      <a href="/operator" aria-current={operator ? "page" : undefined}>Operator</a>
+    </nav></header>
+    <main>{children}</main>
+    <footer><a href="https://github.com/webriot/irisbeat/releases/download/v0.1.0/irisbeat-0.1.0-source.tar.gz">Source (AGPL-3.0-only)</a>
+      <label class="theme-control">Theme <select id="theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
+    </footer>
+  </body></html>;
 }
 
-function historyMarkup(history: AvailabilityHistory | null | undefined, id: string) {
-  if (!history) return '<p class="history-unavailable">Bars unavailable</p>';
-  return `<div class="availability"><div class="history-head"><span>90 UTC days</span><span class="percentage" aria-label="Availability">${history.percentage === null ? "No observations" : history.percentage.toFixed(2) + "%"}</span></div><ol class="history" data-monitor="${encodeURIComponent(id)}" aria-label="90 UTC days of availability">${history.days.map((day, index) => {
-    const label = ({ empty: "No observations", up: "Successful checks", down: "Failed checks", degraded: "Mixed results", maintenance: "Maintenance" })[day.state] + "; " + day.successes + " successes, " + day.failures + " failures, " + day.maintenance + " Maintenance";
-    return `<li class="history-day ${day.state}" data-date="${day.date}" data-detail="${label}" tabindex="${index === history.days.length - 1 ? 0 : -1}" aria-label="${day.date} UTC: ${label}"></li>`;
-  }).join("")}</ol><p class="history-detail" role="status" aria-live="polite" aria-atomic="true"></p></div>`;
+function History({ history, id }: { history: AvailabilityHistory | null | undefined; id: string }) {
+  if (!history) return <p class="history-unavailable">Bars unavailable</p>;
+  return <div class="availability"><div class="history-head"><span>90 UTC days</span><span class="percentage" aria-label="Availability">{history.percentage === null ? "No observations" : history.percentage.toFixed(2) + "%"}</span></div>
+    <ol class="history" data-monitor={encodeURIComponent(id)} aria-label="90 UTC days of availability">{history.days.map((day, index) => {
+      const label = ({ empty: "No observations", up: "Successful checks", down: "Failed checks", degraded: "Mixed results", maintenance: "Maintenance" })[day.state] + "; " + day.successes + " successes, " + day.failures + " failures, " + day.maintenance + " Maintenance";
+      return <li class={"history-day " + day.state} data-date={day.date} data-detail={label} tabindex={index === history.days.length - 1 ? 0 : -1} aria-label={day.date + " UTC: " + label}></li>;
+    })}</ol><p class="history-detail" role="status" aria-live="polite" aria-atomic="true"></p>
+  </div>;
 }
 
-export function statusPage(status: Status) {
-  const time = (at: number) =>
-    `<time datetime="${new Date(at).toISOString()}">${new Date(at).toISOString()}</time>`;
+function StatusLedger({ status }: { status: Status }) {
   const banner = status.paused ? "Monitoring paused" : !status.monitors.length
     ? "No Monitors published"
     : status.incidents.some(incident => incident.closedAt === null) || status.monitors.some(monitor => monitor.state === "down")
@@ -42,69 +51,99 @@ export function statusPage(status: Status) {
       : status.monitors.every(monitor => monitor.state === "up")
         ? "All services operational"
         : "Awaiting check";
-  return document(
-    status.pageName,
-    `<h1>${escape(status.pageName)}</h1>
-    <section class="banner" data-state="${banner === "All services operational" ? "up" : banner === "Services unavailable" ? "down" : "unknown"}" aria-label="Current status"><h2>${escape(banner)}</h2></section>
-    <div class="ledger">${status.monitors.map((monitor, index) => `<article aria-labelledby="monitor-name${index || ""}"><div class="ledger-row" data-state="${monitor.state}"><h2 id="monitor-name${index || ""}">${escape(monitor.name)}</h2><span class="status">${stateLabel[monitor.state]}</span></div>${historyMarkup(monitor.history, monitor.id)}</article>`).join("")}</div>
-    ${status.monitors.length ? `<section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>${status.incidents.length ? `<ul class="incidents">${status.incidents.map((incident) => `<li><article class="incident"><strong>${escape(status.monitors.find(monitor => monitor.id === incident.monitorId)?.name ?? incident.monitorId)} — ${incident.closedAt === null ? "Open" : "Recovered"}</strong><p>Unavailable since ${time(incident.openedAt)}${incident.closedAt === null ? " — Ongoing" : ` — Recovered ${time(incident.closedAt)}`}</p></article></li>`).join("")}</ul>` : "<p>No Incidents</p>"}</section>` : ""}`,
-  );
+  return <>
+    <h1>{status.pageName}</h1>
+    <section class="banner" data-state={banner === "All services operational" ? "up" : banner === "Services unavailable" ? "down" : "unknown"} aria-label="Current status"><h2>{banner}</h2></section>
+    <div class="ledger">{status.monitors.map((monitor, index) => <article aria-labelledby={"monitor-name" + (index || "")}>
+      <div class="ledger-row" data-state={monitor.state}><h2 id={"monitor-name" + (index || "")}>{monitor.name}</h2><span class="status">{stateLabel[monitor.state]}</span></div>
+      <History history={monitor.history} id={monitor.id} />
+    </article>)}</div>
+    {!!status.monitors.length && <Incidents status={status} />}
+  </>;
 }
 
-function durationControl(field: string, label: string, min: number, max: number, value: number) {
-  return `<fieldset class="duration"><label for="${field}">${label}</label><div class="duration-value"><input id="${field}" name="${field}" type="number" min="${min}" max="${max}" step="any" value="${value}" data-duration required><select id="${field}-unit" aria-label="${label} unit"><option value="seconds">Seconds</option><option value="minutes">Minutes</option><option value="hours">Hours</option><option value="days">Days</option></select></div></fieldset>`;
+function Timestamp({ at }: { at: number }) {
+  const value = new Date(at).toISOString();
+  return <time datetime={value}>{value}</time>;
 }
 
-export function operatorPage(hosted = false) {
-  return document(
-    "Irisbeat operator",
-    `<h1>Monitors</h1>
-    <form id="login"><label for="secret">${hosted ? "Access token" : "Installation secret"}</label><input id="secret" type="password" required autocomplete="current-password"><button>Sign in</button></form>
+function Incidents({ status }: { status: Status }) {
+  return <section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>
+    {status.incidents.length ? <ul class="incidents">{status.incidents.map(incident => <li><article class="incident">
+      <strong>{status.monitors.find(monitor => monitor.id === incident.monitorId)?.name ?? incident.monitorId} — {incident.closedAt === null ? "Open" : "Recovered"}</strong>
+      <p>Unavailable since <Timestamp at={incident.openedAt} />{incident.closedAt === null ? " — Ongoing" : <> — Recovered <Timestamp at={incident.closedAt} /></>}</p>
+    </article></li>)}</ul> : <p>No Incidents</p>}
+  </section>;
+}
+
+export function statusPage(status: Status) {
+  return "<!doctype html>" + <Document title={status.pageName}><StatusLedger status={status} /></Document>;
+}
+
+function DurationControl({ field, label, min, max, value }: { field: string; label: string; min: number; max: number; value: number }) {
+  return <fieldset class="duration"><label for={field}>{label}</label><div class="duration-value"><input id={field} name={field} type="number" min={min} max={max} step="any" value={value} data-duration="" required /><select id={field + "-unit"} aria-label={label + " unit"}><option value="seconds">Seconds</option><option value="minutes">Minutes</option><option value="hours">Hours</option><option value="days">Days</option></select></div></fieldset>;
+}
+
+function Operator({ hosted }: { hosted: boolean }) {
+  return <>
+    <h1>Monitors</h1>
+    <form id="login"><label for="secret">{hosted ? "Access token" : "Installation secret"}</label><input id="secret" type="password" required autocomplete="current-password" /><button>Sign in</button></form>
     <section id="editor" hidden>
       <h2 id="paused" hidden>Monitoring paused</h2>
       <table aria-label="Monitors"><thead><tr><th scope="col">Monitor</th><th scope="col">State</th><th scope="col">Publication</th><th scope="col">Actions</th></tr></thead><tbody id="monitor-rows"></tbody></table>
       <form id="maintenance" hidden aria-labelledby="maintenance-heading">
         <h2 id="maintenance-heading">Maintenance</h2>
-        <label for="maintenance-end">End time</label><input id="maintenance-end" type="datetime-local" required>
+        <label for="maintenance-end">End time</label><input id="maintenance-end" type="datetime-local" required />
         <button id="save-maintenance">Declare Maintenance</button><button id="cancel-maintenance" type="button">Cancel</button>
       </form>
       <button id="new-monitor" type="button">New Monitor</button>
       <div class="configuration-layout">
         <form id="configuration" hidden aria-labelledby="monitor-settings">
           <h2 id="monitor-settings">New Monitor</h2>
-          <label for="name">Monitor name</label><input id="name" name="name" required maxlength="120">
+          <label for="name">Monitor name</label><input id="name" name="name" required maxlength={120} />
           <label for="kind">Check type</label><select id="kind" name="kind"><option value="http">HTTP(S)</option><option value="tcp">TCP</option><option value="heartbeat">Heartbeat</option></select>
           <output id="heartbeat-path"></output>
           <button id="rotate-heartbeat" type="button" hidden>Rotate heartbeat secret</button>
           <output id="heartbeat-credential"></output>
-          <fieldset id="http-target"><label for="url">HTTP(S) target</label><input id="url" name="url" type="url" required maxlength="2048"></fieldset>
-          <fieldset id="tcp-target" hidden disabled><label for="hostname">Hostname</label><input id="hostname" name="hostname" required maxlength="253" autocapitalize="none" spellcheck="false">
-          <label for="port">Port</label><input id="port" name="port" type="number" min="1" max="65535" step="1" required></fieldset>
-          ${durationControl("intervalSeconds", "Interval", 60, 86400, 60)}
-          ${durationControl("timeoutSeconds", "Timeout", 1, 60, 10)}
-          <label for="failureThreshold">Consecutive failures</label><input id="failureThreshold" name="failureThreshold" type="number" min="1" max="100" step="1" value="2" required>
-          <label for="recoveryThreshold">Consecutive successes</label><input id="recoveryThreshold" name="recoveryThreshold" type="number" min="1" max="100" step="1" value="2" required>
-          ${durationControl("silenceSeconds", "Silence", 60, 86400, 180)}
-          ${durationControl("recoverySpacingSeconds", "Recovery spacing", 60, 86400, 60)}
-          <label class="checkbox" for="published"><input id="published" name="published" type="checkbox" checked>Published</label>
+          <fieldset id="http-target"><label for="url">HTTP(S) target</label><input id="url" name="url" type="url" required maxlength={2048} /></fieldset>
+          <fieldset id="tcp-target" hidden disabled><label for="hostname">Hostname</label><input id="hostname" name="hostname" required maxlength={253} autocapitalize="none" spellcheck={false} />
+          <label for="port">Port</label><input id="port" name="port" type="number" min="1" max="65535" step="1" required /></fieldset>
+          <DurationControl field="intervalSeconds" label="Interval" min={60} max={86400} value={60} />
+          <DurationControl field="timeoutSeconds" label="Timeout" min={1} max={60} value={10} />
+          <label for="failureThreshold">Consecutive failures</label><input id="failureThreshold" name="failureThreshold" type="number" min="1" max="100" step="1" value="2" required />
+          <label for="recoveryThreshold">Consecutive successes</label><input id="recoveryThreshold" name="recoveryThreshold" type="number" min="1" max="100" step="1" value="2" required />
+          <DurationControl field="silenceSeconds" label="Silence" min={60} max={86400} value={180} />
+          <DurationControl field="recoverySpacingSeconds" label="Recovery spacing" min={60} max={86400} value={60} />
+          <label class="checkbox" for="published"><input id="published" name="published" type="checkbox" checked />Published</label>
           <button>Save Monitor</button><button id="cancel-edit" type="button">Cancel</button>
         </form>
         <aside aria-labelledby="page-settings"><h2 id="page-settings">Status page</h2>
-          <form id="page-configuration"><label for="pageName">Page name</label><input id="pageName" name="pageName" required maxlength="120"><button>Save page</button></form>
+          <form id="page-configuration"><label for="pageName">Page name</label><input id="pageName" name="pageName" required maxlength={120} /><button>Save page</button></form>
         </aside>
       </div>
       <form id="webhook" aria-labelledby="webhook-heading">
         <h2 id="webhook-heading">Operator alerts</h2>
-        <label for="webhookUrl">HTTPS webhook URL</label><input id="webhookUrl" name="url" type="url" maxlength="2048" autocomplete="off">
+        <label for="webhookUrl">HTTPS webhook URL</label><input id="webhookUrl" name="url" type="url" maxlength={2048} autocomplete="off" />
         <button>Save webhook</button>
       </form>
       <section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2><ul id="incidents" class="incidents"></ul></section>
       <div class="actions"><button id="refresh" type="button">Refresh</button><button id="logout" type="button">Sign out</button></div>
     </section>
     <p id="message" role="status" aria-live="polite"></p>
-    <script src="/operator.js" defer></script>`,
-    true,
-  );
+    <script src="/operator.js" defer></script>
+  </>;
+}
+
+export function operatorPage(hosted = false) {
+  return "<!doctype html>" + <Document title="Irisbeat operator" operator><Operator hosted={hosted} /></Document>;
+}
+
+function historyMarkup(history: AvailabilityHistory | null | undefined, id: string) {
+  if (!history) return '<p class="history-unavailable">Bars unavailable</p>';
+  return `<div class="availability"><div class="history-head"><span>90 UTC days</span><span class="percentage" aria-label="Availability">${history.percentage === null ? "No observations" : history.percentage.toFixed(2) + "%"}</span></div><ol class="history" data-monitor="${encodeURIComponent(id)}" aria-label="90 UTC days of availability">${history.days.map((day, index) => {
+    const label = ({ empty: "No observations", up: "Successful checks", down: "Failed checks", degraded: "Mixed results", maintenance: "Maintenance" })[day.state] + "; " + day.successes + " successes, " + day.failures + " failures, " + day.maintenance + " Maintenance";
+    return `<li class="history-day ${day.state}" data-date="${day.date}" data-detail="${label}" tabindex="${index === history.days.length - 1 ? 0 : -1}" aria-label="${day.date} UTC: ${label}"></li>`;
+  }).join("")}</ol><p class="history-detail" role="status" aria-live="polite" aria-atomic="true"></p></div>`;
 }
 
 // Runs before the stylesheet to apply a saved preference before first paint.
