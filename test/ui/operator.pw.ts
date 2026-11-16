@@ -71,7 +71,7 @@ test.describe('touch actions', () => {
 });
 
 
-test('Refresh updates pristine Settings while each save preserves the other draft', async ({ page }) => {
+test('Tab return updates pristine Settings while each save preserves the other draft', async ({ page }) => {
   let data = { pageName: 'Original page', webhookUrl: 'https://old.example/hook', monitors: [], incidents: [] };
   await page.route('**/api/operator', async route => {
     if (route.request().method() === 'PUT') data = { ...data, ...route.request().postDataJSON() };
@@ -88,7 +88,7 @@ test('Refresh updates pristine Settings while each save preserves the other draf
   const name = page.getByLabel('Page name', { exact: true });
   const webhook = page.getByLabel('HTTPS webhook URL', { exact: true });
   data = { ...data, pageName: 'External page', webhookUrl: 'https://external.example/hook' };
-  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await expect(name).toHaveValue('External page');
   await expect(webhook).toHaveValue('https://external.example/hook');
   await name.fill('Page draft');
@@ -97,7 +97,7 @@ test('Refresh updates pristine Settings while each save preserves the other draf
   await expect(page.locator('#message')).toHaveText('Saved');
   await expect(webhook).toHaveValue('https://draft.example/hook');
   data.pageName = 'Updated after save';
-  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await expect(name).toHaveValue('Updated after save');
   await expect(webhook).toHaveValue('https://draft.example/hook');
   await name.fill('Another page draft');
@@ -105,7 +105,7 @@ test('Refresh updates pristine Settings while each save preserves the other draf
   await expect(page.locator('#message')).toHaveText('Saved');
   await expect(name).toHaveValue('Another page draft');
   data.webhookUrl = 'https://newer.example/hook';
-  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await expect(name).toHaveValue('Another page draft');
   await expect(webhook).toHaveValue('https://newer.example/hook');
 });

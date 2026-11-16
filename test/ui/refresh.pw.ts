@@ -8,11 +8,12 @@ test.beforeEach(async ({ page }) => {
 });
 
 for (const kind of ['http', 'tcp', 'heartbeat']) {
-test(kind + ' refresh preserves rows, drafts, and focus while reconciling collection changes', async ({ page }) => {
+test(kind + ' retry preserves rows, drafts, and focus while reconciling collection changes', async ({ page }) => {
   const data = { pageName: 'Original', webhookUrl: 'https://example.com/hook', monitors: [
     { id: 'web', name: 'Website', kind, url: 'https://example.com', state: 'up', published: true, history: null as null | { percentage: number; days: { date: string; state: string; successes: number; failures: number; maintenance: number }[] } },
   ], incidents: [] };
-  await page.route('**/api/operator', route => route.fulfill({ json: data }));
+  let failure = false;
+  await page.route('**/api/operator', route => route.fulfill(failure ? { status: 503, json: { error: 'Unavailable' } } : { json: data }));
   await page.goto('/operator');
   await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -30,7 +31,12 @@ test(kind + ' refresh preserves rows, drafts, and focus while reconciling collec
   await page.locator('#webhookUrl').fill('https://example.com/draft');
   const row = await page.locator('#monitor-rows tr').first().elementHandle();
   data.pageName = 'Remote';
-  await page.locator('#refresh').click();
+  failure = true;
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await expect(page.locator('#stale')).toBeVisible();
+  failure = false;
+  await page.getByRole('button', { name: 'Retry', exact: true }).click();
+  await expect(page.locator('#stale')).toBeHidden();
   await expect(page.locator('#pageName')).toHaveValue('Draft page');
   await expect(page.locator('#intervalSeconds-unit')).toHaveValue('minutes');
   await expect(page.locator('#intervalSeconds')).toHaveValue('2.5');
@@ -147,9 +153,9 @@ for (const path of ['/', '/operator']) {
     data.monitors[0].name = 'Renamed';
     data.monitors[0].published = false;
     data.incidents.push({ monitorId: 'one', openedAt: Date.parse('2026-11-16T10:00Z'), closedAt: null });
-    await page.locator('#refresh').click();
+    await page.getByRole('button', { name: 'Retry', exact: true }).click();
     await expect(page.locator('#stale')).toBeHidden();
-    await expect(page.getByText('Renamed', { exact: true })).toBeVisible();
+    await expect(page.locator(path === '/' ? '.ledger' : '#monitor-rows').getByText('Renamed', { exact: true })).toBeVisible();
     if (path === '/operator') {
       await expect(page.getByRole('button', { name: 'Publish Renamed', exact: true })).toBeVisible();
     }
@@ -157,11 +163,10 @@ for (const path of ['/', '/operator']) {
     expect(await row!.evaluate(node => node.isConnected)).toBe(true);
     let release!: () => void;
     hold = () => new Promise<void>(resolve => { release = resolve; });
-    await page.locator('#refresh').click();
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await expect.poll(() => !!release).toBe(true);
     data.monitors.push({ ...data.monitors[0], id: 'two', name: 'Second' });
-    await page.locator('#refresh').click();
-    if (path === '/operator') await expect(page.getByText('Second', { exact: true })).toBeVisible();
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     const obsolete = page.waitForResponse(async response => response.url().includes('/api/') && (await response.text()).includes('Obsolete'));
     release();
     await obsolete;
@@ -174,7 +179,7 @@ for (const path of ['/', '/operator']) {
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await expect(page.getByText('Renamed', { exact: true })).toHaveCount(0);
     await expect(secondDay).toBeFocused();
-    await expect(page.locator('time')).toHaveCount(0);
+    await expect(page.locator('.incident time')).toHaveCount(0);
   });
 }
 
@@ -187,14 +192,15 @@ test('authorization loss clears private drafts and ignores an earlier in-flight 
   await page.locator('#secret').fill('ui-test-secret');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
   await monitorAction(page, 'Edit Private monitor');
+  await page.locator('#settings-button').click();
   let release!: () => void;
   await page.route('**/api/operator', async route => {
     if (!release) { await new Promise<void>(resolve => { release = resolve; }); return route.fulfill({ json: data }); }
     return route.fulfill({ status: 401, json: { error: 'Unauthorized' } });
   });
-  await page.locator('#refresh').click();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await expect.poll(() => !!release).toBe(true);
-  await page.locator('#refresh').click();
+  await page.getByRole('button', { name: 'Save page', exact: true }).click();
   await expect(page.locator('#login')).toBeVisible();
   release();
   await expect(page.locator('#editor')).toBeHidden();
@@ -212,6 +218,7 @@ for (const newerStatus of [200, 503]) {
     await page.locator('#secret').fill('ui-test-secret');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
     await expect(page.locator('#editor')).toBeVisible();
+    await page.locator('#settings-button').click();
     let release!: () => void;
     await page.route('**/api/operator', async route => {
       if (!release) {
@@ -220,12 +227,12 @@ for (const newerStatus of [200, 503]) {
       }
       return route.fulfill({ status: newerStatus, json: newerStatus === 200 ? { ...data, pageName: 'Newer' } : { error: 'Unavailable' } });
     });
-    await page.locator('#refresh').click();
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await expect.poll(() => !!release).toBe(true);
     const newerResponse = page.waitForResponse(response => response.url().endsWith('/api/operator'));
-    await page.locator('#refresh').click();
+    await page.getByRole('button', { name: 'Save page', exact: true }).click();
     await (await newerResponse).finished();
-    if (newerStatus === 503) await expect(page.locator('#stale')).toBeVisible();
+    if (newerStatus === 503) await expect(page.locator('#message')).toHaveText('Unavailable');
     else await expect(page.locator('#pageName')).toHaveValue('Newer');
     release();
     await expect(page.locator('#login')).toBeVisible();
@@ -251,7 +258,7 @@ for (const status of [200, 401, 503]) {
       }
       return route.fulfill({ json: data });
     });
-    await page.locator('#refresh').click();
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await expect.poll(() => !!release).toBe(true);
     await page.locator('#logout').click();
     data.pageName = 'New session'; data.webhookUrl = 'https://example.com/new';
@@ -280,12 +287,12 @@ test('pristine settings refresh independently, reverted drafts refresh, and own 
   await page.locator('#settings-button').click();
   await expect(page.locator('#pageName')).toHaveValue('Original');
   data.pageName = 'Remote'; data.webhookUrl = 'https://example.com/remote';
-  await page.locator('#refresh').click();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await expect(page.locator('#pageName')).toHaveValue('Remote');
   await expect(page.locator('#webhookUrl')).toHaveValue('https://example.com/remote');
   await page.locator('#pageName').fill('Draft page');
   data.pageName = 'Remote two'; data.webhookUrl = 'https://example.com/two';
-  await page.locator('#refresh').click();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await expect(page.locator('#pageName')).toHaveValue('Draft page');
   await expect(page.locator('#webhookUrl')).toHaveValue('https://example.com/two');
   await page.locator('#webhookUrl').fill('https://example.com/draft');
@@ -294,18 +301,18 @@ test('pristine settings refresh independently, reverted drafts refresh, and own 
   await expect(page.locator('#pageName')).toHaveValue('Saved page');
   await expect(page.locator('#webhookUrl')).toHaveValue('https://example.com/draft');
   data.pageName = 'After page save'; data.webhookUrl = 'https://example.com/saved';
-  await page.locator('#refresh').click();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await expect(page.locator('#pageName')).toHaveValue('After page save');
   await expect(page.locator('#webhookUrl')).toHaveValue('https://example.com/draft');
   await page.getByRole('button', { name: 'Save webhook', exact: true }).click();
   await expect(page.locator('#webhookUrl')).toHaveValue('https://example.com/saved');
   data.webhookUrl = 'https://example.com/after-save';
-  await page.locator('#refresh').click();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await expect(page.locator('#webhookUrl')).toHaveValue('https://example.com/after-save');
   await page.locator('#pageName').fill('Temporary draft');
   await page.locator('#pageName').fill('After page save');
   data.pageName = 'After revert';
-  await page.locator('#refresh').click();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await expect(page.locator('#pageName')).toHaveValue('After revert');
 });
 
@@ -320,16 +327,16 @@ for (const dirty of [false, true]) {
     await expect(page.locator('#webhookUrl')).toHaveValue('https://example.com/private');
     if (dirty) await page.locator('#webhookUrl').fill('https://example.com/private-draft');
     data.permission = 'reader'; data.webhookUrl = null;
-    await page.locator('#refresh').click();
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await expect(page.locator('#webhook')).toBeHidden();
     await expect(page.locator('#webhookUrl')).toHaveValue('');
     data.permission = 'editor';
-    await page.locator('#refresh').click();
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await page.locator('#settings-button').click();
     await expect(page.locator('#webhook')).toBeVisible();
     await expect(page.locator('#webhookUrl')).toHaveValue('');
     data.webhookUrl = 'https://example.com/newly-authorized';
-    await page.locator('#refresh').click();
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await expect(page.locator('#webhookUrl')).toHaveValue('https://example.com/newly-authorized');
   });
 }

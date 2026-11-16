@@ -39,15 +39,18 @@ for (const settings of [
           await expect(page.getByText('Bars unavailable', { exact: true })).toBeVisible();
           await expect(page.getByRole('cell', { name: 'Maintenance', exact: true })).toBeVisible();
         }
-        const times = page.locator('time');
+        const times = page.locator('.incident time');
         await expect(times.nth(0)).toHaveAttribute('datetime', '2026-03-08T09:30:00.000Z');
         await expect(times.nth(0)).toContainText(settings.before);
         await expect(times.nth(1)).toContainText(settings.after);
         await expect(page.getByText('66.67%', { exact: true })).toBeVisible();
+        await expect(page.getByText('past 90 days', { exact: true })).toBeVisible();
         await expect(page.locator('.history-detail').first()).toContainText('No observations');
         const strip = page.locator('.history').first();
         await expect(strip.locator('[tabindex="0"]')).toHaveCount(1);
         await strip.locator('[tabindex="0"]').focus();
+        await page.keyboard.press('End');
+        await expect(strip.locator('[tabindex="0"]')).toHaveAttribute('data-date', '2026-03-31');
         await page.keyboard.press('Home');
         await expect(strip.locator('[tabindex="0"]')).toHaveAttribute('data-date', '2026-01-01');
         await page.keyboard.press('ArrowRight');
@@ -55,10 +58,14 @@ for (const settings of [
         await strip.locator('[data-date="2026-03-08"]').click();
         const detail = page.locator('.history-detail').first();
         await expect(detail).toContainText(settings.bucket + ' UTC');
+        await expect(detail).toContainText('2 successful · 1 failed · 3 Maintenance');
+        await expect(detail).not.toContainText('Mixed results;');
+        await page.getByText('Exact time range', { exact: true }).click();
+        await expect(detail).toContainText('2026-03-08 00:00 UTC → 2026-03-09 00:00 UTC');
         await expect(detail).toContainText(settings.start);
         await expect(detail).toContainText(settings.end);
         await expect(detail).toContainText(settings.timezoneId);
-        await expect(detail).toContainText('Mixed results; 2 successes, 1 failures, 3 Maintenance');
+        await expect(strip.locator('[data-date="2026-03-08"]')).toHaveAttribute('aria-label', /Mixed results; 2 successes, 1 failures, 3 Maintenance/);
         if (path === '/') {
           await page.reload();
           await expect(strip.locator('[tabindex="0"]')).toHaveAttribute('data-date', '2026-03-08');
@@ -66,8 +73,9 @@ for (const settings of [
         if (path === '/operator') {
           data.monitors[0].history!.days.shift();
           data.monitors[0].history!.days.push({ date: '2026-04-01', state: 'empty', successes: 0, failures: 0, maintenance: 0 });
-          await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+          await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
           await expect(strip.locator('[tabindex="0"]')).toHaveAttribute('data-date', '2026-03-08');
+          await expect(detail.locator('details')).toHaveAttribute('open', '');
           await monitorAction(page, 'Maintenance Website');
           await expect(page.getByLabel('End time (' + settings.timezoneId + ')', { exact: true })).toBeVisible();
           await page.locator('#maintenance-end').fill('2026-11-17T12:00');
@@ -90,7 +98,7 @@ test('touch selects a day without adding tab stops', async ({ browser }) => {
   await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
   await page.locator('[data-date="2026-03-08"]').tap();
-  await expect(page.locator('.history-detail')).toContainText('Mixed results');
+  await expect(page.locator('.history-detail')).toContainText('2 successful · 1 failed · 3 Maintenance');
   await expect(page.locator('.history [tabindex="0"]')).toHaveCount(1);
   await context.close();
 });
@@ -111,24 +119,25 @@ test('empty, unavailable, and result states stay distinct through refresh and re
   const strip = page.locator('.history');
   await strip.locator('[tabindex="0"]').focus();
   await page.keyboard.press('Home');
-  await expect(page.locator('.history-detail')).toContainText('No observations; 0 successes, 0 failures, 0 Maintenance');
+  await expect(page.locator('.history-detail')).toContainText('No observations');
   data.monitors[0].history = null;
-  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await expect(page.getByText('Bars unavailable', { exact: true })).toHaveCount(2);
   data.monitors[0].history = history;
-  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await expect(strip.locator('[tabindex="0"]')).toHaveAttribute('data-date', '2026-01-01');
   for (const [state, label, successes, failures, maintenance] of [
     ['up', 'Successful checks', 1, 0, 0], ['down', 'Failed checks', 0, 1, 0], ['maintenance', 'Maintenance', 0, 0, 1],
   ] as const) {
     Object.assign(history.days[0], { state, successes, failures, maintenance });
     history.percentage = state === 'up' ? 100 : state === 'down' ? 0 : null;
-    await page.getByRole('button', { name: 'Refresh', exact: true }).click();
-    await expect(page.locator('.history-detail')).toContainText(label + '; ' + successes + ' successes, ' + failures + ' failures, ' + maintenance + ' Maintenance');
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await expect(strip.locator('[tabindex="0"]')).toHaveAttribute('aria-label', new RegExp(label + '; ' + successes + ' successes, ' + failures + ' failures, ' + maintenance + ' Maintenance'));
+    await expect(page.locator('.history-detail')).toContainText(successes + ' successful · ' + failures + ' failed' + (maintenance ? ' · 1 Maintenance' : ''));
   }
   history.days.shift();
   history.days.push({ date: '2026-04-01', state: 'empty', successes: 0, failures: 0, maintenance: 0 });
-  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await expect(strip.locator('[tabindex="0"]')).toHaveAttribute('data-date', '2026-04-01');
 });
 
@@ -144,10 +153,10 @@ test('fall daylight-saving repeated hours retain distinct exact instants', async
     await route.fulfill({ response });
   });
   await page.goto('/');
-  await expect(page.locator('time').nth(0)).toContainText('1:30 AM PDT');
-  await expect(page.locator('time').nth(1)).toContainText('1:30 AM PST');
-  await expect(page.locator('time').nth(0)).toHaveAttribute('datetime', '2026-11-01T08:30:00.000Z');
-  await expect(page.locator('time').nth(1)).toHaveAttribute('datetime', '2026-11-01T09:30:00.000Z');
+  await expect(page.locator('.incident time').nth(0)).toContainText('1:30 AM PDT');
+  await expect(page.locator('.incident time').nth(1)).toContainText('1:30 AM PST');
+  await expect(page.locator('.incident time').nth(0)).toHaveAttribute('datetime', '2026-11-01T08:30:00.000Z');
+  await expect(page.locator('.incident time').nth(1)).toHaveAttribute('datetime', '2026-11-01T09:30:00.000Z');
   await context.close();
 });
 
@@ -183,4 +192,31 @@ test('Maintenance preserves an unchanged fold instant and rejects gap or ambiguo
   await expect(page.locator('#maintenance')).toBeHidden();
   expect(writes[1]).toEqual({ endsAt: Date.parse('2027-11-07T10:30:00Z') });
   await context.close();
+});
+
+for (const path of ['/', '/operator']) {
+  test(`${path} shows one runtime page clock independently of snapshot freshness`, async ({ page }) => {
+    await page.clock.install({ time: new Date('2026-11-16T12:00:00Z') });
+    await page.goto(path);
+    const clock = page.locator('#page-clock');
+    await expect(clock).toHaveCount(1);
+    await expect(clock).toHaveAttribute('datetime', /^2026-11-16T12:00:/);
+    await expect(clock).toContainText('2026');
+    await expect(clock).toContainText('UTC');
+    await page.clock.runFor(60000);
+    await expect(clock).toHaveAttribute('datetime', /^2026-11-16T12:01:/);
+    await expect(clock).not.toContainText(/updated|fresh/i);
+  });
+}
+
+test('today stays compact and becomes an explicit historical UTC date after midnight', async ({ page }) => {
+  await page.clock.install({ time: new Date('2026-03-31T23:59:00Z') });
+  await page.route('**/api/operator', route => route.fulfill({ json: snapshot() }));
+  await page.goto('/operator');
+  await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await expect(page.locator('.history-counts')).toHaveText('No observations');
+  await page.clock.runFor(60000);
+  await expect(page.locator('.history-counts')).toHaveText('Mar 31, 2026 UTC · No observations');
+  await expect(page.locator('.history [tabindex="0"]')).toHaveAttribute('data-date', '2026-03-31');
 });
