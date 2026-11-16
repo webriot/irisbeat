@@ -112,6 +112,69 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       ctx.storage.sql.exec("ALTER TABLE incidents ADD COLUMN monitorName TEXT");
     }
   }
+  fetch(request: Request) {
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket")
+      return new Response(null, { status: 426 });
+    if (this.ctx.getWebSockets("public").length >= 128)
+      return new Response(null, { status: 503 });
+    const { 0: client, 1: server } = new WebSocketPair();
+    server.serializeAttachment({ pending: false, dirty: false });
+    this.ctx.acceptWebSocket(server, ["public"]);
+    this.schedulePublicAlarm();
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  webSocketMessage(socket: WebSocket, message: string | ArrayBuffer) {
+    const state = socket.deserializeAttachment() as { pending: boolean; dirty: boolean };
+    if (message !== "ack" || !state?.pending) {
+      socket.close(1008, "Read-only subscription");
+      return;
+    }
+    if (state.dirty) socket.send("changed");
+    socket.serializeAttachment({ pending: state.dirty, dirty: false });
+  }
+
+  webSocketClose(socket: WebSocket) { socket.close(1000, ""); this.schedulePublicAlarm(); }
+  webSocketError(socket: WebSocket) { socket.close(1011, "Subscription closed"); }
+
+  private publicSnapshot(state: StoredContext) {
+    const at = Date.now();
+    return { at, value: JSON.stringify(this.project(state, false, false, at)) };
+  }
+
+  private schedulePublicAlarm() {
+    const now = Date.now();
+    const monitors = this.read().monitors.filter(monitor => monitor.published);
+    const subscribed = this.ctx.getWebSockets("public").some(socket => socket.readyState === WebSocket.OPEN);
+    // Only public time boundaries can wake subscribers; private work never changes this clock.
+    const at = Math.min((Math.floor(now / DAY) + 1) * DAY,
+      ...monitors.flatMap(monitor => monitor.maintenance ? [monitor.maintenance.endsAt] : []));
+    this.ctx.waitUntil(subscribed && monitors.length ? this.ctx.storage.setAlarm(at) : this.ctx.storage.deleteAlarm());
+  }
+
+  alarm() {
+    this.read();
+    this.broadcast();
+    this.schedulePublicAlarm();
+  }
+
+  private notify(before: { at: number; value: string }) {
+    if (before.value === JSON.stringify(this.project(this.read(before.at), false, false, before.at))) return;
+    this.broadcast();
+    this.schedulePublicAlarm();
+  }
+
+  private broadcast() {
+    for (const socket of this.ctx.getWebSockets("public")) {
+      try {
+        if (socket.readyState !== WebSocket.OPEN) continue;
+        const state = socket.deserializeAttachment() as { pending: boolean; dirty: boolean };
+        if (!state.pending) socket.send("changed");
+        socket.serializeAttachment({ pending: true, dirty: state.pending });
+      } catch { socket.close(1011, "Subscription closed"); }
+    }
+  }
+
   private read(at = Date.now()): StoredContext {
     const stored = this.ctx.storage.kv.get<StoredContext | LegacyContext>("context");
     if (!stored) return { pageName: "Irisbeat", monitors: [] };
@@ -162,6 +225,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     }
     // Compare and persist policy together, without awaiting external I/O or another RPC.
     const state = this.read();
+    const before = this.publicSnapshot(state);
     state.policyRevision = policyRevision;
     if (!!state.paused === paused) {
       this.ctx.storage.kv.put("context", state);
@@ -180,12 +244,14 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
     }
     this.ctx.storage.kv.put("context", state);
+    this.notify(before);
   }
 
   configure(value: unknown, expectedMonitorId: string | null = null) {
     if (!value || typeof value !== "object") return undefined;
     const fields = value as Record<string, unknown>;
     const state = this.read();
+    const before = this.publicSnapshot(state);
     let configuration: Configuration | { pageName: string };
     if (Object.keys(fields).length === 1 && "pageName" in fields) {
       if (typeof fields.pageName !== "string" || !fields.pageName.trim() || fields.pageName.length > 120) return undefined;
@@ -206,6 +272,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     }
     state.pageName = configuration.pageName;
     this.ctx.storage.kv.put("context", state);
+    this.notify(before);
     return this.status(true);
   }
 
@@ -216,10 +283,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   create(configuration: MonitorConfiguration, limit?: number) {
     const state = this.read();
+    const before = this.publicSnapshot(state);
     // No await between allowance check and synchronous persistence: concurrent RPCs serialize.
     if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0 || state.monitors.length >= limit)) return null;
     state.monitors.push(this.newMonitor(configuration));
     this.ctx.storage.kv.put("context", state);
+    this.notify(before);
     return this.status(true);
   }
 
@@ -232,12 +301,14 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   edit(id: string, value: unknown) {
     const state = this.read();
+    const before = this.publicSnapshot(state);
     const monitor = state.monitors.find(monitor => monitor.id === id);
     if (!monitor) return null;
     const patch = parseMonitorPatch(value, monitor);
     if (!patch) return undefined;
     this.applyEdit(monitor, patch);
     this.ctx.storage.kv.put("context", state);
+    this.notify(before);
     return this.status(true);
   }
 
@@ -251,6 +322,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   maintenance(id: string, value: unknown, end = false) {
     const at = Date.now();
     const state = this.read(at);
+    const before = this.publicSnapshot(state);
     const monitor = state.monitors.find(monitor => monitor.id === id);
     if (!monitor) return null;
     if (end) {
@@ -265,6 +337,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       if (attempt) attempt.maintenance = true;
     }
     this.ctx.storage.kv.put("context", state);
+    this.notify(before);
     return this.status(true);
   }
 
@@ -287,9 +360,11 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   remove(id: string) {
     const state = this.read();
+    const before = this.publicSnapshot(state);
     if (!state.monitors.some(monitor => monitor.id === id)) return null;
     state.monitors = state.monitors.filter(monitor => monitor.id !== id);
     this.ctx.storage.kv.put("context", state);
+    this.notify(before);
     return this.status(true);
   }
 
@@ -359,7 +434,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     await this.record(current, monitor, at, success, attempt.failureThreshold, attempt.recoveryThreshold, observation.maintenance, (monitor.scheduleRevision ?? 0) !== (attempt.scheduleRevision ?? 0));
   }
 
-  private async record(current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number, maintenance = !!monitor.maintenance, resetProgress = false) {
+  private async record(current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number, maintenance = !!monitor.maintenance, resetProgress = false, before = this.publicSnapshot(current)) {
     if (current.paused) return;
     const pauseGeneration = current.pauseGeneration ?? 0;
     monitor.lastResult = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" };
@@ -371,6 +446,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     );
     if (maintenance) {
       this.ctx.storage.kv.put("context", current);
+      this.notify(before);
       return;
     }
     monitor.failures = success ? 0 : monitor.failures + 1;
@@ -414,6 +490,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       monitor.failures = 0; monitor.successes = 0;
       this.ctx.storage.kv.put("context", current);
     }
+    this.notify(before);
     // Delivery follows the committed transition; transport failure cannot undo detection.
     if (transition && current.webhookUrl)
       await this.deliverWebhook(current.webhookUrl, monitor.name, transition);
@@ -460,17 +537,20 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const current = this.read();
     const monitor = current.monitors.find(monitor => monitor.id === id);
     if (!monitor || monitor.kind !== "heartbeat") return false;
+    const before = this.publicSnapshot(current);
     monitor.lastSeen = at;
     if (current.paused) {
       this.ctx.storage.kv.put("context", current);
+      this.notify(before);
     } else if (monitor.maintenance) {
-      await this.record(current, monitor, at, true, 1, monitor.recoveryThreshold);
+      await this.record(current, monitor, at, true, 1, monitor.recoveryThreshold, !!monitor.maintenance, false, before);
     } else if (monitor.state !== "down" || monitor.recoveryReceiptAt === null ||
         at >= monitor.recoveryReceiptAt + monitor.recoverySpacingSeconds * 1000) {
       monitor.recoveryReceiptAt = at;
-      await this.record(current, monitor, at, true, 1, monitor.recoveryThreshold);
+      await this.record(current, monitor, at, true, 1, monitor.recoveryThreshold, !!monitor.maintenance, false, before);
     } else {
       this.ctx.storage.kv.put("context", current);
+      this.notify(before);
     }
     return true;
   }
@@ -526,8 +606,11 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   status(operator = false, secrets = operator) {
-    const start = historyStart(Date.now());
-    const state = this.read();
+    return this.project(this.read(), operator, secrets, Date.now());
+  }
+
+  private project(state: StoredContext, operator: boolean, secrets: boolean, at: number) {
+    const start = historyStart(at);
     const monitors = state.monitors.filter(monitor => operator || monitor.published).map(monitor => ({
       id: monitor.id, name: monitor.name, kind: monitor.kind, history: this.history(monitor.id, start),
       ...(monitor.kind === "heartbeat" ? { lastSeen: monitor.lastSeen } : {}), state: state.paused ? "paused" as const : monitor.maintenance ? "maintenance" as const : monitor.state, maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult,
@@ -762,7 +845,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   app.onError((_error, c) => requestFailed(c.req.raw));
   app.use("*", async (c, next) => {
     await next();
-    if (c.error) return;
+    if (c.error || c.res.status === 101) return;
     c.header("Cache-Control", "no-store");
     c.header("X-Content-Type-Options", "nosniff");
     c.header("Referrer-Policy", "no-referrer");
@@ -807,6 +890,13 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   app.get("/app.css", getOnly, () => new Response(styleSheet, { headers: { "Content-Type": "text/css; charset=utf-8" } }));
   app.get("/theme.js", getOnly, () => new Response(themeScript, { headers: { "Content-Type": "text/javascript; charset=utf-8" } }));
   app.get("/operator.js", getOnly, () => new Response(operatorScript, { headers: { "Content-Type": "text/javascript; charset=utf-8" } }));
+  app.get("/api/status/events", getOnly, async (c: Context<HttpEnv<E>>) => {
+    const url = new URL(c.req.url);
+    if (c.req.header("Origin") !== url.origin) return new Response(null, { status: 403 });
+    if (url.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))
+      return new Response(null, { status: 403 });
+    return c.get("context").fetch(c.req.raw);
+  });
   app.get("/api/status", getOnly, async (c: Context<HttpEnv<E>>) => Response.json(await c.get("context").status()));
 
   const monitorPath = "/api/operator/monitors/:id";
