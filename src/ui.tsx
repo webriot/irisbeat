@@ -4,6 +4,7 @@
 import type { AvailabilityHistory, Status } from "./index";
 import { createOperatorSession } from "./operator-session";
 import type { Child } from "hono/jsx";
+import { raw } from "hono/html";
 
 const stateLabel = {
   unknown: "Awaiting check",
@@ -22,7 +23,7 @@ function Document({ title, operator = false, children }: { title: string; operat
       <a href="/" aria-current={operator ? undefined : "page"}>Status page</a>
       <a href="/operator" aria-current={operator ? "page" : undefined}>Operator</a>
     </nav></header>
-    <main><div id="stale" hidden><span>Updates unavailable</span><button id="retry" type="button">Retry</button></div>{children}<span id="sync-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></span>{!operator && <span id="updates-mode" role="status">Polling</span>}</main>
+    <main><div class="page-clock"><time id="page-clock"></time></div><div id="stale" hidden><span>Updates unavailable</span><button id="retry" type="button">Retry</button></div>{children}<span id="sync-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></span>{!operator && <span id="updates-mode" role="status">Polling</span>}</main>
     <footer><a href="https://github.com/webriot/irisbeat/releases/download/v0.2.0/irisbeat-0.2.0-source.tar.gz">Source (AGPL-3.0-only)</a>
       <label class="theme-control">Theme <select id="theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
     </footer>
@@ -31,11 +32,11 @@ function Document({ title, operator = false, children }: { title: string; operat
 
 function History({ history, id }: { history: AvailabilityHistory | null | undefined; id: string }) {
   if (!history) return <p class="history-unavailable">Bars unavailable</p>;
-  return <div class="availability"><div class="history-head"><span>90 UTC days</span><span class="percentage" aria-label="Availability">{history.percentage === null ? "No observations" : history.percentage.toFixed(2) + "%"}</span></div>
+  return <div class="availability"><div class="history-head"><span>past 90 days</span><span class="percentage" aria-label="Availability">{history.percentage === null ? "No observations" : history.percentage.toFixed(2) + "%"}</span></div>
     <ol class="history" data-monitor={encodeURIComponent(id)} aria-label="90 UTC days of availability">{history.days.map((day, index) => {
       const label = ({ empty: "No observations", up: "Successful checks", down: "Failed checks", degraded: "Mixed results", maintenance: "Maintenance" })[day.state] + "; " + day.successes + " successes, " + day.failures + " failures, " + day.maintenance + " Maintenance";
-      return <li class={"history-day " + day.state} data-date={day.date} data-detail={label} tabindex={index === history.days.length - 1 ? 0 : -1} aria-label={day.date + " UTC: " + label}></li>;
-    })}</ol><p class="history-detail" role="status" aria-live="polite" aria-atomic="true"></p>
+      return <li class={"history-day " + day.state} data-date={day.date} data-detail={label} data-successes={day.successes} data-failures={day.failures} data-maintenance={day.maintenance} tabindex={index === history.days.length - 1 ? 0 : -1} aria-label={day.date + " UTC: " + label}></li>;
+    })}</ol><div class="history-detail"><span class="history-counts" role="status" aria-live="polite" aria-atomic="true"></span><details><summary>Exact time range</summary><p class="utc-range"></p><p class="local-range"></p></details></div>
   </div>;
 }
 
@@ -66,18 +67,25 @@ function StatusLedger({ status }: { status: Status }) {
   </>;
 }
 
-function Timestamp({ at }: { at: number }) {
-  const value = new Date(at).toISOString();
-  return <time datetime={value}>{value}</time>;
+function incidentMarkup(status: Pick<Status, "monitors" | "incidents">, operator = false) {
+  // Object methods serialize without bundler-injected function-name helpers.
+  const markup = { escape(value: string) { return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;'); },
+  timestamp(at: number, crossDay: boolean) { return '<time data-incident-time="' + (crossDay ? 'full' : 'compact') + '" datetime="' + new Date(at).toISOString() + '">' + new Date(at).toISOString() + '</time>'; } };
+  if (!status.incidents.length) return '<p>No Incidents</p>';
+  return [true, false].map(ongoing => {
+    const records = status.incidents.filter(incident => (incident.closedAt === null) === ongoing);
+    if (!records.length) return '';
+    const label = ongoing ? 'Ongoing' : 'Resolved';
+    return '<section aria-label="' + label + '"><h3>' + label + '</h3><ul class="incidents">' + records.map(incident => {
+      const monitor = status.monitors.find(monitor => monitor.id === incident.monitorId);
+      const crossDay = new Date(incident.openedAt).toISOString().slice(0, 10) !== new Date(incident.closedAt ?? Date.now()).toISOString().slice(0, 10);
+      return '<li data-key="' + encodeURIComponent(incident.monitorId) + ':' + incident.openedAt + '"><article class="incident"><div class="incident-top"><h4>' + markup.escape(monitor?.name ?? incident.monitorName ?? incident.monitorId) + '</h4>' + (operator && !monitor ? '<span class="deleted">Deleted Monitor</span>' : '') + '<span class="incident-state" data-state="' + (ongoing ? 'down' : 'up') + '">' + (ongoing ? 'Ongoing' : 'Recovered') + '</span></div><div class="incident-facts"><span>Started ' + markup.timestamp(incident.openedAt, crossDay) + '</span>' + (incident.closedAt === null ? '' : '<span>Recovered ' + markup.timestamp(incident.closedAt, crossDay) + '</span>') + '<span class="incident-duration" data-start="' + incident.openedAt + '"' + (incident.closedAt === null ? '' : ' data-end="' + incident.closedAt + '"') + ' aria-label="Elapsed duration"></span></div></article></li>';
+    }).join('') + '</ul></section>';
+  }).join('');
 }
 
 function Incidents({ status }: { status: Status }) {
-  return <section id="public-incidents" hidden={!status.monitors.length} aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>
-    {status.incidents.length ? <ul class="incidents">{status.incidents.map(incident => <li data-key={encodeURIComponent(incident.monitorId) + ":" + incident.openedAt}><article class="incident">
-      <strong>{status.monitors.find(monitor => monitor.id === incident.monitorId)?.name ?? incident.monitorId} — {incident.closedAt === null ? "Open" : "Recovered"}</strong>
-      <p>Unavailable since <Timestamp at={incident.openedAt} />{incident.closedAt === null ? " — Ongoing" : <> — Recovered <Timestamp at={incident.closedAt} /></>}</p>
-    </article></li>)}</ul> : <p>No Incidents</p>}
-  </section>;
+  return <section id="public-incidents" hidden={!status.monitors.length} aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>{raw(incidentMarkup(status))}</section>;
 }
 
 export function statusPage(status: Status) {
@@ -130,7 +138,7 @@ function Operator({ hosted }: { hosted: boolean }) {
           <label class="checkbox" for="published"><input id="published" name="published" type="checkbox" checked />Published</label>
           <p id="monitor-deleted" role="status" hidden>This Monitor was deleted. Copy your draft or cancel.</p><button id="save-monitor">Save Monitor</button><button id="cancel-edit" type="button">Cancel</button>
         </form>
-      <section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2><ul id="incidents" class="incidents"></ul></section>
+      <section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2><div id="incidents"></div></section>
       </div>
       <section id="settings" hidden>
         <section aria-labelledby="page-settings"><h2 id="page-settings">Status page</h2>
@@ -155,22 +163,20 @@ export function operatorPage(hosted = false) {
 
 function historyMarkup(history: AvailabilityHistory | null | undefined, id: string) {
   if (!history) return '<p class="history-unavailable">Bars unavailable</p>';
-  return `<div class="availability"><div class="history-head"><span>90 UTC days</span><span class="percentage" aria-label="Availability">${history.percentage === null ? "No observations" : history.percentage.toFixed(2) + "%"}</span></div><ol class="history" data-monitor="${encodeURIComponent(id)}" aria-label="90 UTC days of availability">${history.days.map((day, index) => {
+  return `<div class="availability"><div class="history-head"><span>past 90 days</span><span class="percentage" aria-label="Availability">${history.percentage === null ? "No observations" : history.percentage.toFixed(2) + "%"}</span></div><ol class="history" data-monitor="${encodeURIComponent(id)}" aria-label="90 UTC days of availability">${history.days.map((day, index) => {
     const label = ({ empty: "No observations", up: "Successful checks", down: "Failed checks", degraded: "Mixed results", maintenance: "Maintenance" })[day.state] + "; " + day.successes + " successes, " + day.failures + " failures, " + day.maintenance + " Maintenance";
-    return `<li class="history-day ${day.state}" data-date="${day.date}" data-detail="${label}" tabindex="${index === history.days.length - 1 ? 0 : -1}" aria-label="${day.date} UTC: ${label}"></li>`;
-  }).join("")}</ol><p class="history-detail" role="status" aria-live="polite" aria-atomic="true"></p></div>`;
+    return `<li class="history-day ${day.state}" data-date="${day.date}" data-detail="${label}" data-successes="${day.successes}" data-failures="${day.failures}" data-maintenance="${day.maintenance}" tabindex="${index === history.days.length - 1 ? 0 : -1}" aria-label="${day.date} UTC: ${label}"></li>`;
+  }).join("")}</ol><div class="history-detail"><span class="history-counts" role="status" aria-live="polite" aria-atomic="true"></span><details><summary>Exact time range</summary><p class="utc-range"></p><p class="local-range"></p></details></div></div>`;
 }
 
 const publicMarkupScript = `
+const incidentMarkup = ${incidentMarkup.toString()};
 function publicMarkup(data, history, bannerLabel) {
   const escape = (value) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('\"', '&quot;');
   const banner = bannerLabel(data);
-  const timestamp = (at) => '<time datetime="' + new Date(at).toISOString() + '"></time>';
   return '<h1>' + escape(data.pageName) + '</h1><section class="banner" data-state="' + (banner === 'All services operational' ? 'up' : banner === 'Services unavailable' ? 'down' : 'unknown') + '" aria-label="Current status"><h2>' + banner + '</h2></section><div class="ledger">' + data.monitors.map((monitor, index) =>
     '<article data-key="' + escape(monitor.id) + '" aria-labelledby="monitor-name' + (index || '') + '"><div class="ledger-row" data-state="' + monitor.state + '"><h2 id="monitor-name' + (index || '') + '">' + escape(monitor.name) + '</h2><span class="status">' + (${JSON.stringify(stateLabel)})[monitor.state] + '</span></div>' + history(monitor.history, monitor.id) + '</article>'
-  ).join('') + '</div><section id="public-incidents"' + (data.monitors.length ? '' : ' hidden') + ' aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>' + (data.incidents.length ? '<ul class="incidents">' + data.incidents.map(incident =>
-    '<li data-key="' + encodeURIComponent(incident.monitorId) + ':' + incident.openedAt + '"><article class="incident"><strong>' + escape(data.monitors.find(monitor => monitor.id === incident.monitorId)?.name ?? incident.monitorId) + ' — ' + (incident.closedAt === null ? 'Open' : 'Recovered') + '</strong><p>Unavailable since ' + timestamp(incident.openedAt) + (incident.closedAt === null ? ' — Ongoing' : ' — Recovered ' + timestamp(incident.closedAt)) + '</p></article></li>'
-  ).join('') + '</ul>' : '<p>No Incidents</p>') + '</section>';
+  ).join('') + '</div><section id="public-incidents"' + (data.monitors.length ? '' : ' hidden') + ' aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>' + incidentMarkup(data) + '</section>';
 }
 
 `;
@@ -327,13 +333,35 @@ function liveSnapshots(path, read, authorize) {
 }
 const selectedHistoryDays = new Map(Object.entries(history.state?.irisbeatDays || {}));
 const instantFormat = new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
+const timeFormat = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
+const localDateFormat = new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'numeric', day: 'numeric' });
 const bucketFormat = new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' });
 const browserTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-function initializeDisplay() {
-  document.querySelectorAll('time[datetime]:not([data-schedule-preview])').forEach(time => {
-    const label = instantFormat.format(new Date(time.dateTime));
+function updateTimeDisplays() {
+  const now = new Date();
+  const clock = document.getElementById('page-clock');
+  clock.dateTime = now.toISOString();
+  clock.textContent = instantFormat.format(now) + ' (' + browserTimeZone + ')';
+  document.querySelectorAll('time[datetime]:not([data-schedule-preview]):not(#page-clock)').forEach(time => {
+    const at = new Date(time.dateTime);
+    const incident = time.closest('.incident');
+    const duration = incident?.querySelector('.incident-duration');
+    const crossDay = duration && localDateFormat.format(new Date(Number(duration.dataset.start))) !== localDateFormat.format(new Date(Number(duration.dataset.end ?? now.getTime())));
+    const format = !crossDay && time.dataset.incidentTime === 'compact' && localDateFormat.format(at) === localDateFormat.format(now) ? timeFormat : instantFormat;
+    const label = format.format(at);
     if (time.textContent !== label) time.textContent = label;
   });
+  document.querySelectorAll('.incident-duration').forEach(duration => {
+    const seconds = Math.max(0, Math.floor((Number(duration.dataset.end ?? now.getTime()) - Number(duration.dataset.start)) / 1000));
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+    const days = Math.floor(hours / 24);
+    const label = days ? days + ' d ' + hours % 24 + ' h ' + minutes % 60 + ' min' : hours ? hours + ' h ' + minutes % 60 + ' min' : minutes ? minutes + ' min' : seconds + ' s';
+    if (duration.textContent !== label) duration.textContent = label;
+  });
+}
+function initializeDisplay() {
+  updateTimeDisplays();
   document.querySelectorAll('.history').forEach(strip => {
     const days = [...strip.children];
     if (!days.length) return;
@@ -349,8 +377,17 @@ function initializeDisplay() {
         const current = String(item === day);
         if (item.getAttribute('aria-current') !== current) item.setAttribute('aria-current', current);
       });
-      const label = day.getAttribute('aria-label');
-      if (detail.textContent !== label) detail.textContent = label;
+      const start = new Date(day.dataset.date + 'T00:00:00Z');
+      const end = new Date(start.getTime() + 86400000);
+      const today = new Date().toISOString().slice(0, 10);
+      const counts = Number(day.dataset.successes) + Number(day.dataset.failures) + Number(day.dataset.maintenance)
+        ? day.dataset.successes + ' successful · ' + day.dataset.failures + ' failed' + (Number(day.dataset.maintenance) ? ' · ' + day.dataset.maintenance + ' Maintenance' : '')
+        : 'No observations';
+      const label = (day.dataset.date === today ? '' : bucketFormat.format(start) + ' UTC · ') + counts;
+      const text = detail.querySelector('.history-counts');
+      if (text.textContent !== label) text.textContent = label;
+      detail.querySelector('.utc-range').textContent = day.dataset.date + ' 00:00 UTC → ' + end.toISOString().slice(0, 10) + ' 00:00 UTC';
+      detail.querySelector('.local-range').textContent = instantFormat.format(start) + ' → ' + instantFormat.format(end) + ' (' + browserTimeZone + ')';
     }
     days.forEach(day => {
       const start = new Date(day.dataset.date + 'T00:00:00Z');
@@ -381,6 +418,11 @@ try {
 document.documentElement.dataset.theme = theme;
 document.addEventListener('DOMContentLoaded', () => {
   initializeDisplay();
+  setInterval(() => {
+    const previous = document.getElementById('page-clock').dateTime.slice(0, 10);
+    if (previous !== new Date().toISOString().slice(0, 10)) initializeDisplay();
+    else updateTimeDisplays();
+  }, 1000);
   if (document.getElementById('public-status')) {
     const updates = liveSnapshots('/api/status/events', async current => {
       const controller = new AbortController();
@@ -467,6 +509,9 @@ tbody tr:nth-child(odd) td { padding-bottom: 0; }
 .percentage { font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .history { position: relative; display: grid; grid-template-columns: repeat(90, minmax(0, 1fr)); gap: 3px; list-style: none; padding: 0; margin: 8px 0 0; }
 .history-head { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
+.page-clock { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+.history-detail summary { cursor: pointer; width: fit-content; margin-top: 4px; }
+.history-detail p { margin: 4px 0; }
 .history-detail { color: var(--muted); font-size: 12px; line-height: 1.4; margin: 8px 0 0; min-height: 2.8em; }
 .history-day[aria-current="true"] { outline: 2px solid var(--foreground); outline-offset: 2px; }
 .history-day { cursor: pointer; height: 25px; border-radius: 2px; background: var(--secondary); }
@@ -505,6 +550,13 @@ form button[type="submit"], form button:not([type]), #new-monitor { background: 
 :focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
 .incidents { list-style: none; padding: 0; margin: 12px 0 0; }
 .incident { padding: 16px 0; border-top: 1px solid var(--line); }
+.incident-top, .incident-facts { display: flex; align-items: baseline; gap: 8px 16px; flex-wrap: wrap; }
+.incident-top h4 { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
+.incident-state { margin-left: auto; }
+.incident-state[data-state="down"] { color: var(--danger); }
+.incident-state[data-state="up"] { color: var(--success); }
+.deleted, .incident-facts { color: var(--muted); font-size: 12px; }
+.incident-facts { margin-top: 8px; }
 .incident p { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
 .actions { justify-content: flex-start; margin-top: 20px; }
 td .actions { margin: 0; gap: 6px; }
@@ -735,20 +787,9 @@ function render(data, savedField) {
     cell.colSpan = 4; cell.textContent = 'No Monitors'; row.append(cell); rows.push(row);
   }
   reconcileNodes(byId('monitor-rows'), rows);
-  const incidents = data.incidents.map(incident => {
-    const item = document.createElement('li'); item.className = 'incident'; item.dataset.key = incident.monitorId + ':' + incident.openedAt;
-    const monitor = data.monitors.find(monitor => monitor.id === incident.monitorId);
-    item.append((monitor?.name || incident.monitorName || incident.monitorId) + (monitor ? '' : ' (deleted)') + ' — Unavailable since ');
-    const appendTime = at => {
-      const time = document.createElement('time'); time.dateTime = new Date(at).toISOString(); item.append(time);
-    };
-    appendTime(incident.openedAt);
-    if (incident.closedAt === null) item.append(' — Ongoing');
-    else { item.append(' — Recovered '); appendTime(incident.closedAt); }
-    return item;
-  });
-  if (!incidents.length) { const item = document.createElement('li'); item.textContent = 'No Incidents'; incidents.push(item); }
-  reconcileNodes(byId('incidents'), incidents);
+  const incidentContent = document.createElement('div');
+  incidentContent.innerHTML = incidentMarkup(data, true);
+  reconcile(byId('incidents'), incidentContent);
   initializeDisplay();
   if (focused !== document.body && !focused.isConnected) byId(byId('new-monitor').hidden ? 'operator-title' : 'new-monitor').focus();
 }

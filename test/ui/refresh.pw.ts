@@ -153,7 +153,7 @@ for (const path of ['/', '/operator']) {
     data.incidents.push({ monitorId: 'one', openedAt: Date.parse('2026-11-16T10:00Z'), closedAt: null });
     await page.getByRole('button', { name: 'Retry', exact: true }).click();
     await expect(page.locator('#stale')).toBeHidden();
-    await expect(page.getByText('Renamed', { exact: true })).toBeVisible();
+    await expect(page.locator(path === '/' ? '.ledger' : '#monitor-rows').getByText('Renamed', { exact: true })).toBeVisible();
     if (path === '/operator') {
       await page.getByLabel('Actions Renamed', { exact: true }).click();
       await expect(page.getByRole('button', { name: 'Publish Renamed', exact: true })).toBeVisible();
@@ -178,7 +178,7 @@ for (const path of ['/', '/operator']) {
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await expect(page.getByText('Renamed', { exact: true })).toHaveCount(0);
     await expect(secondDay).toBeFocused();
-    await expect(page.locator('time')).toHaveCount(0);
+    await expect(page.locator('.incident time')).toHaveCount(0);
   });
 }
 
