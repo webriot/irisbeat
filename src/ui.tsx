@@ -22,7 +22,7 @@ function Document({ title, operator = false, children }: { title: string; operat
       <a href="/" aria-current={operator ? undefined : "page"}>Status page</a>
       <a href="/operator" aria-current={operator ? "page" : undefined}>Operator</a>
     </nav></header>
-    <main>{children}<span id="stale" role="status" hidden>Updates unavailable</span>{!operator && <><span id="updates-mode" role="status">Polling</span><button id="refresh" type="button">Refresh</button></>}</main>
+    <main><div id="stale" hidden><span>Updates unavailable</span><button id="retry" type="button">Retry</button></div>{children}<span id="sync-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></span>{!operator && <span id="updates-mode" role="status">Polling</span>}</main>
     <footer><a href="https://github.com/webriot/irisbeat/releases/download/v0.2.0/irisbeat-0.2.0-source.tar.gz">Source (AGPL-3.0-only)</a>
       <label class="theme-control">Theme <select id="theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
     </footer>
@@ -90,7 +90,7 @@ function DurationControl({ field, label, min, max, value }: { field: string; lab
 
 function Operator({ hosted }: { hosted: boolean }) {
   return <>
-    <div class="operator-heading"><h1 id="operator-title">Monitors</h1><div id="operator-navigation" hidden><button id="new-monitor" type="button">New Monitor</button><button id="settings-button" type="button">Settings</button><button id="back-monitors" type="button" hidden>Monitors</button></div></div>
+    <div class="operator-heading"><h1 id="operator-title" tabindex={-1}>Monitors</h1><div id="operator-navigation" hidden><button id="new-monitor" type="button">New Monitor</button><button id="settings-button" type="button">Settings</button><button id="back-monitors" type="button" hidden>Monitors</button></div></div>
     <form id="login"><label for="secret">{hosted ? "Access token" : "Installation secret"}</label><input id="secret" type="password" required autocomplete="current-password" /><button>Sign in</button></form>
     <section id="editor" hidden>
       <h2 id="paused" hidden>Monitoring paused</h2>
@@ -142,7 +142,7 @@ function Operator({ hosted }: { hosted: boolean }) {
         <button>Save webhook</button>
       </form>
       </section>
-      <div class="actions"><span id="updates-mode" role="status">Polling</span><button id="refresh" type="button">Refresh</button><button id="logout" type="button">Sign out</button></div>
+      <div class="actions"><span id="updates-mode" role="status">Polling</span><button id="logout" type="button">Sign out</button></div>
     </section>
     <p id="message" role="status" aria-live="polite"></p>
     <script src="/operator.js" defer></script>
@@ -207,6 +207,32 @@ function reconcile(parent, next) {
 function reconcileNodes(parent, nodes) {
   const next = document.createElement('div'); next.append(...nodes); reconcile(parent, next);
 }
+let retryHadFocus = false;
+function snapshotPending(pending) {
+  const retry = document.getElementById('retry');
+  if (pending && !retry.disabled) retryHadFocus = retry === document.activeElement;
+  if (pending && !document.getElementById('stale').hidden) document.getElementById('sync-announcement').textContent = 'Retrying updates';
+  retry.disabled = pending;
+  if (!pending) {
+    if (!document.getElementById('stale').hidden) {
+      document.getElementById('sync-announcement').textContent = 'Updates unavailable';
+      if (retryHadFocus && document.activeElement === document.body) retry.focus();
+    }
+    retryHadFocus = false;
+  }
+  retry.textContent = pending ? 'Retrying…' : 'Retry';
+}
+function snapshotFailure(failed) {
+  const stale = document.getElementById('stale');
+  const announcement = document.getElementById('sync-announcement');
+  const recovered = !failed && !stale.hidden;
+  if (recovered && (stale.contains(document.activeElement) || (retryHadFocus && document.activeElement === document.body))) {
+    const heading = document.querySelector('h1');
+    heading.tabIndex = -1; heading.focus();
+  }
+  stale.hidden = !failed;
+  announcement.textContent = failed ? 'Updates unavailable' : recovered ? 'Updates restored' : announcement.textContent;
+}
 function liveSnapshots(path, read, authorize) {
   let running = false, queued = false, ackSocket;
   let socket, retry, handshake, renewal, polling, stopped = false, ready = false, delay = 1000;
@@ -220,12 +246,14 @@ function liveSnapshots(path, read, authorize) {
     if (stopped) return;
     if (running) { queued = true; return; }
     running = true;
+    if (!authorize) snapshotPending(true);
     try {
       const success = await read(() => !stopped && !queued);
       if (success === false) socket?.close();
       else if (ready) delay = 1000;
     } finally {
       running = false;
+      if (!authorize) snapshotPending(false);
       if (queued && !stopped) { queued = false; sync(); }
       else if (ackSocket) {
         if (ackSocket === socket && socket.readyState === WebSocket.OPEN) socket.send('ack');
@@ -366,13 +394,13 @@ document.addEventListener('DOMContentLoaded', () => {
         next.innerHTML = publicMarkup(data, ${historyMarkup.toString()}, ${statusBanner.toString()});
         reconcile(document.getElementById('public-status'), next);
         document.title = data.pageName;
-        initializeDisplay(); document.getElementById('stale').hidden = true;
+        initializeDisplay(); snapshotFailure(false);
       } catch {
-        if (current()) document.getElementById('stale').hidden = false;
+        if (current()) snapshotFailure(true);
         return false;
       } finally { clearTimeout(timeout); }
     });
-    document.getElementById('refresh').addEventListener('click', updates.sync);
+    document.getElementById('retry').addEventListener('click', updates.sync);
   }
   const control = document.getElementById('theme');
   control.value = theme;
@@ -413,8 +441,10 @@ a { color: inherit; text-underline-offset: 4px; }
 .brand { font-size: 20px; font-weight: 750; letter-spacing: -.6px; text-decoration: none; }
 nav a { padding: 8px 10px; border-radius: 6px; color: var(--muted); text-decoration: none; }
 nav a[aria-current="page"] { background: var(--secondary); color: var(--foreground); font-weight: 600; }
-#stale { color: var(--warning); margin-right: 12px; }
+#stale { color: var(--warning); margin: 16px 0; }
+#stale button { margin-left: 12px; }
 #updates-mode { color: var(--muted); margin-right: 12px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
 h1 { margin: 28px 0 24px; font-size: 28px; line-height: 1.2; letter-spacing: -.8px; font-weight: 650; }
 h2 { margin: 0; font-size: 16px; font-weight: 650; }
 .banner { padding: 18px 20px; margin-bottom: 24px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); color: var(--info); }
@@ -628,7 +658,7 @@ function declareMaintenance(monitor) {
 }
 function clearSession() {
   document.querySelectorAll('button, input, select').forEach(control => { control.disabled = false; });
-  monitorIds.clear(); selectedHistoryDays.clear(); byId('stale').hidden = true;
+  monitorIds.clear(); selectedHistoryDays.clear(); byId('stale').hidden = true; byId('sync-announcement').textContent = ''; snapshotPending(false);
   savedSettings = {}; cancelEdit(); byId('heartbeat-path').textContent = ''; maintenanceForm.reset(); maintenanceForm.removeAttribute('data-monitor-id'); byId('maintenance-heading').textContent = 'Maintenance'; maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
   showSettings(false); byId('operator-navigation').hidden = true;
   byId('new-monitor-panel').append(maintenanceForm);
@@ -720,18 +750,21 @@ function render(data, savedField) {
   if (!incidents.length) { const item = document.createElement('li'); item.textContent = 'No Incidents'; incidents.push(item); }
   reconcileNodes(byId('incidents'), incidents);
   initializeDisplay();
-  if (focused !== document.body && !focused.isConnected) byId(byId('new-monitor').hidden ? 'refresh' : 'new-monitor').focus();
+  if (focused !== document.body && !focused.isConnected) byId(byId('new-monitor').hidden ? 'operator-title' : 'new-monitor').focus();
 }
 
 const session = createOperatorSession(liveSnapshots, {
   received(data, savedField) {
-    byId('stale').hidden = true;
     if (data.secret) byId('heartbeat-credential').textContent = 'Bearer ' + data.secret;
     else render(data, savedField);
   },
+  reading(state) {
+    if (state === 'success') snapshotFailure(false);
+    else snapshotPending(state === 'pending');
+  },
   signedOut: clearSession,
   failed(error, reading) {
-    if (reading && !editor.hidden) byId('stale').hidden = false;
+    if (reading) snapshotFailure(true);
     else message.textContent = error;
   },
   writing() {
@@ -741,7 +774,7 @@ const session = createOperatorSession(liveSnapshots, {
     return () => {
       disabled.forEach(control => { control.disabled = false; });
       updateKind(); updateDeleted();
-      if (!editor.hidden && document.activeElement === document.body) byId(byId('new-monitor').hidden ? 'refresh' : 'new-monitor').focus();
+      if (!editor.hidden && document.activeElement === document.body) byId(byId('new-monitor').hidden ? 'operator-title' : 'new-monitor').focus();
     };
   },
   saved(path, method) {
@@ -812,7 +845,7 @@ updateKind();
 login.addEventListener('submit', async event => {
   event.preventDefault();
   await session.signIn(byId('secret').value); byId('secret').value = '';
-  if (!editor.hidden) byId(byId('new-monitor').hidden ? 'refresh' : 'new-monitor').focus();
+  if (!editor.hidden) byId(byId('new-monitor').hidden ? 'operator-title' : 'new-monitor').focus();
 });
 form.addEventListener('submit', async event => {
   event.preventDefault();
@@ -868,6 +901,6 @@ document.addEventListener('keydown', event => { if (event.key === 'Escape') docu
 byId('new-monitor').addEventListener('click', () => edit());
 byId('rotate-heartbeat').addEventListener('click', () => { if (confirm('Replace this Monitor’s heartbeat secret?')) run('/api/operator/monitors/' + encodeURIComponent(editingId) + '/heartbeat-secret', 'POST'); });
 byId('cancel-edit').addEventListener('click', cancelEdit);
-byId('refresh').addEventListener('click', () => run());
+byId('retry').addEventListener('click', () => run());
 byId('logout').addEventListener('click', session.signOut);
 `;

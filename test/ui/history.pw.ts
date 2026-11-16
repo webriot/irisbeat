@@ -66,7 +66,7 @@ for (const settings of [
         if (path === '/operator') {
           data.monitors[0].history!.days.shift();
           data.monitors[0].history!.days.push({ date: '2026-04-01', state: 'empty', successes: 0, failures: 0, maintenance: 0 });
-          await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+          await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
           await expect(strip.locator('[tabindex="0"]')).toHaveAttribute('data-date', '2026-03-08');
           await monitorAction(page, 'Declare Maintenance Website');
           await expect(page.getByLabel('End time (' + settings.timezoneId + ')', { exact: true })).toBeVisible();
@@ -113,22 +113,22 @@ test('empty, unavailable, and result states stay distinct through refresh and re
   await page.keyboard.press('Home');
   await expect(page.locator('.history-detail')).toContainText('No observations; 0 successes, 0 failures, 0 Maintenance');
   data.monitors[0].history = null;
-  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await expect(page.getByText('Bars unavailable', { exact: true })).toHaveCount(2);
   data.monitors[0].history = history;
-  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await expect(strip.locator('[tabindex="0"]')).toHaveAttribute('data-date', '2026-01-01');
   for (const [state, label, successes, failures, maintenance] of [
     ['up', 'Successful checks', 1, 0, 0], ['down', 'Failed checks', 0, 1, 0], ['maintenance', 'Maintenance', 0, 0, 1],
   ] as const) {
     Object.assign(history.days[0], { state, successes, failures, maintenance });
     history.percentage = state === 'up' ? 100 : state === 'down' ? 0 : null;
-    await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await expect(page.locator('.history-detail')).toContainText(label + '; ' + successes + ' successes, ' + failures + ' failures, ' + maintenance + ' Maintenance');
   }
   history.days.shift();
   history.days.push({ date: '2026-04-01', state: 'empty', successes: 0, failures: 0, maintenance: 0 });
-  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await expect(strip.locator('[tabindex="0"]')).toHaveAttribute('data-date', '2026-04-01');
 });
 
