@@ -393,6 +393,7 @@ for (const input of form.querySelectorAll('[data-duration]')) {
   });
 }
 let secret = '';
+let savedSettings = {};
 let editingId = null;
 let busy = false;
 let hosted = false;
@@ -438,12 +439,12 @@ function declareMaintenance(monitor) {
   maintenanceForm.hidden = false; byId('maintenance-end').focus();
 }
 function signOut() {
-  secret = ''; cancelEdit(); showSettings(false); byId('operator-navigation').hidden = true; delete editor.dataset.loaded; maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
+  secret = ''; savedSettings = {}; cancelEdit(); showSettings(false); byId('operator-navigation').hidden = true; delete editor.dataset.loaded; maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
   byId('new-monitor-panel').append(maintenanceForm);
   byId('monitor-rows').replaceChildren(); byId('incidents').replaceChildren();
   message.textContent = ''; byId('secret').value = ''; byId('secret').focus();
 }
-function render(data) {
+function render(data, savedField) {
   const focusedHistory = document.activeElement?.closest('.history')?.dataset.monitor;
   const firstLoad = !editor.dataset.loaded;
   login.hidden = true; editor.hidden = false; editor.dataset.loaded = 'true'; byId('operator-navigation').hidden = false;
@@ -453,7 +454,12 @@ function render(data) {
   if (!canEdit) { cancelEdit(); maintenanceForm.hidden = true; }
   if (!canEdit) showSettings(false);
   byId('new-monitor').hidden = !canEdit || !byId('settings').hidden; byId('settings-button').hidden = !canEdit || !byId('settings').hidden;
-  if (firstLoad) { byId('pageName').value = data.pageName; byId('webhookUrl').value = data.webhookUrl || ''; }
+  for (const field of ['pageName', 'webhookUrl']) {
+    const input = byId(field);
+    const value = firstLoad || savedField === field || input.value === savedSettings[field] ? data[field] || '' : input.value;
+    savedSettings[field] = data[field] || '';
+    input.value = value;
+  }
   byId('new-monitor-panel').append(form, maintenanceForm);
   const rows = data.monitors.flatMap(monitor => {
     const row = document.createElement('tr');
@@ -528,7 +534,7 @@ async function run(path = '/api/operator', method = 'GET', body, after) {
     const data = await response.json();
     if (!response.ok) { if (response.status === 401) signOut(); throw new Error(data.error || 'Request failed'); }
     if (data.secret) { byId('heartbeat-credential').textContent = 'Bearer ' + data.secret; }
-    else render(data);
+    else render(data, method === 'PUT' ? (path === '/api/operator' ? 'pageName' : path === '/api/operator/webhook' ? 'webhookUrl' : undefined) : undefined);
     if (after) after();
     if (method !== 'GET') message.textContent = method === 'DELETE' ? (path.endsWith('/maintenance') ? 'Maintenance ended' : 'Deleted') : 'Saved';
   } catch (error) { message.textContent = error.message; }
