@@ -155,7 +155,7 @@ function publicMarkup(data, history, bannerLabel) {
   const banner = bannerLabel(data);
   const timestamp = (at) => '<time datetime="' + new Date(at).toISOString() + '"></time>';
   return '<h1>' + escape(data.pageName) + '</h1><section class="banner" data-state="' + (banner === 'All services operational' ? 'up' : banner === 'Services unavailable' ? 'down' : 'unknown') + '" aria-label="Current status"><h2>' + banner + '</h2></section><div class="ledger">' + data.monitors.map((monitor, index) =>
-    '<article data-key="' + escape(monitor.id) + '" aria-labelledby="monitor-name' + (index || '') + '"><div class="ledger-row" data-state="' + monitor.state + '"><h2 id="monitor-name' + (index || '') + '">' + escape(monitor.name) + '</h2><span class="status">' + ({ unknown: 'Awaiting check', up: 'Operational', down: 'Unavailable', maintenance: 'Maintenance', paused: 'Monitoring paused' })[monitor.state] + '</span></div>' + history(monitor.history, monitor.id) + '</article>'
+    '<article data-key="' + escape(monitor.id) + '" aria-labelledby="monitor-name' + (index || '') + '"><div class="ledger-row" data-state="' + monitor.state + '"><h2 id="monitor-name' + (index || '') + '">' + escape(monitor.name) + '</h2><span class="status">' + (${JSON.stringify(stateLabel)})[monitor.state] + '</span></div>' + history(monitor.history, monitor.id) + '</article>'
   ).join('') + '</div><section id="public-incidents"' + (data.monitors.length ? '' : ' hidden') + ' aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>' + (data.incidents.length ? '<ul class="incidents">' + data.incidents.map(incident =>
     '<li data-key="' + encodeURIComponent(incident.monitorId) + ':' + incident.openedAt + '"><article class="incident"><strong>' + escape(data.monitors.find(monitor => monitor.id === incident.monitorId)?.name ?? incident.monitorId) + ' — ' + (incident.closedAt === null ? 'Open' : 'Recovered') + '</strong><p>Unavailable since ' + timestamp(incident.openedAt) + (incident.closedAt === null ? ' — Ongoing' : ' — Recovered ' + timestamp(incident.closedAt)) + '</p></article></li>'
   ).join('') + '</ul>' : '<p>No Incidents</p>') + '</section>';
@@ -469,11 +469,13 @@ for (const input of form.querySelectorAll('[data-duration]')) {
   });
 }
 let secret = '';
+let savedSettings = {};
 let editingId = null;
 let busy = false;
 let hosted = false;
 let monitorIds = new Set();
 let requestVersion = 0;
+let sessionGeneration = 0;
 function updateDeleted() {
   const missing = editingId !== null && !monitorIds.has(editingId);
   byId('monitor-deleted').hidden = !missing;
@@ -522,23 +524,30 @@ function declareMaintenance(monitor) {
   maintenanceForm.hidden = false; updateDeleted(); byId('maintenance-end').focus();
 }
 function signOut() {
-  ++requestVersion; busy = false;
+  ++sessionGeneration; ++requestVersion; busy = false;
   document.querySelectorAll('button, input, select').forEach(control => { control.disabled = false; });
   monitorIds.clear(); selectedHistoryDays.clear(); byId('stale').hidden = true;
-  secret = ''; cancelEdit(); byId('heartbeat-path').textContent = ''; maintenanceForm.reset(); maintenanceForm.removeAttribute('data-monitor-id'); byId('maintenance-heading').textContent = 'Maintenance'; maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
+  secret = ''; savedSettings = {}; cancelEdit(); byId('heartbeat-path').textContent = ''; maintenanceForm.reset(); maintenanceForm.removeAttribute('data-monitor-id'); byId('maintenance-heading').textContent = 'Maintenance'; maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
   byId('monitor-rows').replaceChildren(); byId('incidents').replaceChildren();
   updateKind(); updateDeleted();
   message.textContent = ''; byId('secret').value = ''; byId('secret').focus();
 }
-function render(data) {
+function render(data, savedField) {
   const initial = editor.hidden;
   login.hidden = true; editor.hidden = false;
   hosted = !!data.hosted;
   byId('paused').hidden = !data.paused;
   const canEdit = data.permission !== 'reader';
-  if (!canEdit) { cancelEdit(); maintenanceForm.hidden = true; }
+  if (!canEdit) { cancelEdit(); maintenanceForm.hidden = true; byId('webhookUrl').value = ''; savedSettings.webhookUrl = ''; }
   byId('new-monitor').hidden = !canEdit; pageForm.closest('aside').hidden = !canEdit; webhook.hidden = !canEdit;
-  if (initial) { byId('pageName').value = data.pageName; byId('webhookUrl').value = data.webhookUrl || ''; }
+  for (const field of ['pageName', 'webhookUrl']) {
+    const input = byId(field);
+    if (initial || savedField === field || input.value === savedSettings[field]) {
+      const value = field === 'webhookUrl' && !canEdit ? '' : data[field] || '';
+      if (input.value !== value) input.value = value;
+      savedSettings[field] = value;
+    }
+  }
   monitorIds = new Set(data.monitors.map(monitor => monitor.id));
   updateDeleted();
   const rows = data.monitors.flatMap(monitor => {
@@ -551,14 +560,14 @@ function render(data) {
     const actions = document.createElement('td');
     const group = document.createElement('div'); group.className = 'actions';
     const path = '/api/operator/monitors/' + encodeURIComponent(monitor.id);
-    for (const [label, action] of (canEdit ? [
-      ['Edit', () => edit(monitor)],
-      [monitor.maintenance ? 'Replace Maintenance' : 'Declare Maintenance', () => declareMaintenance(monitor)],
-      ...(monitor.maintenance ? [['End Maintenance', () => run(path + '/maintenance', 'DELETE', undefined, () => { maintenanceForm.hidden = true; })]] : []),
-      [monitor.published ? 'Unpublish' : 'Publish', () => run(path, 'PATCH', { published: !monitor.published })],
-      ['Delete', () => { if (confirm('Delete ' + monitor.name + '?')) run(path, 'DELETE', undefined, () => { if (editingId === monitor.id) cancelEdit(); if (maintenanceForm.dataset.monitorId === monitor.id) maintenanceForm.hidden = true; }); }]
+    for (const [key, label, action] of (canEdit ? [
+      ['edit', 'Edit', () => edit(monitor)],
+      ['maintenance', monitor.maintenance ? 'Replace Maintenance' : 'Declare Maintenance', () => declareMaintenance(monitor)],
+      ...(monitor.maintenance ? [['end-maintenance', 'End Maintenance', () => run(path + '/maintenance', 'DELETE', undefined, () => { maintenanceForm.hidden = true; })]] : []),
+      ['publication', monitor.published ? 'Unpublish' : 'Publish', () => run(path, 'PATCH', { published: !monitor.published })],
+      ['delete', 'Delete', () => { if (confirm('Delete ' + monitor.name + '?')) run(path, 'DELETE', undefined, () => { if (editingId === monitor.id) cancelEdit(); if (maintenanceForm.dataset.monitorId === monitor.id) maintenanceForm.hidden = true; }); }]
     ] : [])) {
-      const button = document.createElement('button'); button.type = 'button'; button.textContent = label;
+      const button = document.createElement('button'); button.type = 'button'; button.dataset.key = key; button.textContent = label;
       button.setAttribute('aria-label', label + ' ' + monitor.name);
       button.onclick = action; group.append(button);
     }
@@ -595,6 +604,7 @@ async function run(path = '/api/operator', method = 'GET', body, after) {
   const reading = method === 'GET';
   if (busy) return;
   const version = ++requestVersion;
+  const session = sessionGeneration;
   const disabled = [...document.querySelectorAll('button, input, select')].filter(control => !control.disabled && control.id !== 'logout');
   if (!reading) { busy = true; disabled.forEach(control => { control.disabled = true; }); }
   if (!reading) message.textContent = '';
@@ -603,14 +613,15 @@ async function run(path = '/api/operator', method = 'GET', body, after) {
       method, headers: { Authorization: 'Bearer ' + secret, 'Content-Type': 'application/json' },
       ...(body === undefined ? {} : { body: JSON.stringify(body) })
     });
-    if (version !== requestVersion) return;
+    if (session !== sessionGeneration) return;
     if (response.status === 401) { signOut(); message.textContent = 'Unauthorized'; return; }
-    const data = await response.json();
     if (version !== requestVersion) return;
+    const data = await response.json();
+    if (session !== sessionGeneration || version !== requestVersion) return;
     if (!response.ok) throw new Error(data.error || 'Request failed');
     byId('stale').hidden = true;
     if (data.secret) { byId('heartbeat-credential').textContent = 'Bearer ' + data.secret; }
-    else render(data);
+    else render(data, method === 'PUT' ? (path === '/api/operator' ? 'pageName' : path === '/api/operator/webhook' ? 'webhookUrl' : undefined) : undefined);
     if (after) after(data);
     if (method !== 'GET') message.textContent = method === 'DELETE' ? (path.endsWith('/maintenance') ? 'Maintenance ended' : 'Deleted') : 'Saved';
   } catch (error) {
@@ -650,7 +661,7 @@ function updateKind() {
 document.getElementById('kind').addEventListener('change', updateKind);
 updateKind();
 login.addEventListener('submit', async event => {
-  event.preventDefault(); secret = byId('secret').value;
+  event.preventDefault(); ++sessionGeneration; secret = byId('secret').value;
   await run(); byId('secret').value = '';
   if (!editor.hidden) byId(byId('new-monitor').hidden ? 'refresh' : 'new-monitor').focus();
 });
@@ -691,8 +702,8 @@ maintenanceForm.addEventListener('submit', async event => {
 });
 byId('maintenance-end').addEventListener('input', event => event.target.setCustomValidity(''));
 byId('cancel-maintenance').addEventListener('click', () => { maintenanceForm.hidden = true; });
-webhook.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator/webhook', 'PUT', { url: byId('webhookUrl').value }, data => { byId('webhookUrl').value = data.webhookUrl || ''; }); });
-pageForm.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator', 'PUT', { pageName: byId('pageName').value }, data => { byId('pageName').value = data.pageName; }); });
+webhook.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator/webhook', 'PUT', { url: byId('webhookUrl').value }); });
+pageForm.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator', 'PUT', { pageName: byId('pageName').value }); });
 byId('new-monitor').addEventListener('click', () => edit());
 byId('rotate-heartbeat').addEventListener('click', () => { if (confirm('Replace this Monitor’s heartbeat secret?')) run('/api/operator/monitors/' + encodeURIComponent(editingId) + '/heartbeat-secret', 'POST'); });
 byId('cancel-edit').addEventListener('click', cancelEdit);
