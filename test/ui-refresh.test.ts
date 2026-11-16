@@ -20,19 +20,25 @@ async function mount() {
   await settle();
   return { window, doc, set: (next: ReturnType<typeof snapshot>) => { data = next; }, refresh: async () => { doc.querySelector<HTMLButtonElement>('#refresh')!.click(); await settle(); } };
 }
+function action(doc: Window['document'], label: string) {
+  const button = doc.querySelector<HTMLButtonElement>('button[aria-label="' + label + '"]')!;
+  button.closest('details')!.querySelector<import('happy-dom').HTMLElement>('summary')!.click();
+  button.click();
+}
+const rowSelector = '#monitor-rows tr, #monitor-rows-after tr';
 async function settle() { for (let n = 0; n < 10; n++) await new Promise(resolve => setTimeout(resolve, 0)); }
 afterEach(() => { for (const window of windows.splice(0)) window.happyDOM.abort(); });
 
 it('refreshes changed Monitor state while preserving row identity, drafts and focus', async () => {
   const { doc, set, refresh } = await mount();
-  const row = doc.querySelector('#monitor-rows tr');
-  doc.querySelector<HTMLButtonElement>('button[aria-label="Edit Website"]')!.click();
+  const row = doc.querySelector(rowSelector);
+  action(doc, 'Edit Website');
   const name = doc.querySelector<HTMLInputElement>('#name')!; name.value = 'Unsaved'; name.focus();
   doc.querySelector<HTMLInputElement>('#pageName')!.value = 'Draft page';
   doc.querySelector<HTMLInputElement>('#webhookUrl')!.value = 'https://draft.example';
   set(snapshot({ monitors: [{ ...monitor, state: 'down' }], pageName: 'Remote page' }));
   await refresh();
-  expect(doc.querySelector('#monitor-rows tr')).toBe(row);
+  expect(doc.querySelector(rowSelector)).toBe(row);
   expect(row!.textContent).toContain('Unavailable');
   expect(name.value).toBe('Unsaved');
   expect(doc.activeElement).toBe(name);
@@ -42,9 +48,9 @@ it('refreshes changed Monitor state while preserving row identity, drafts and fo
 
 it('retains Maintenance drafts and blocks saving deleted Monitor drafts', async () => {
   const { window, doc, set, refresh } = await mount();
-  doc.querySelector<HTMLButtonElement>('button[aria-label="Declare Maintenance Website"]')!.click();
+  action(doc, 'Declare Maintenance Website');
   const end = doc.querySelector<HTMLInputElement>('#maintenance-end')!; end.value = '2030-11-16T12:30';
-  doc.querySelector<HTMLButtonElement>('button[aria-label="Edit Website"]')!.click();
+  action(doc, 'Edit Website');
   doc.querySelector<HTMLInputElement>('#name')!.value = 'Retained';
   set(snapshot({ monitors: [] })); await refresh();
   expect(doc.querySelector<HTMLInputElement>('#name')!.value).toBe('Retained');
@@ -63,15 +69,15 @@ it('retains last-known state on failure, clears stale on recovery, and clears pr
   const { window, doc, refresh } = await mount();
   window.fetch = (async () => { throw new Error('offline'); }) as typeof window.fetch;
   await refresh();
-  expect(doc.querySelector('#monitor-rows')!.textContent).toContain('Website');
+  expect([...doc.querySelectorAll(rowSelector)].map(row => row.textContent).join('')).toContain('Website');
   expect(doc.querySelector('#stale')!.hasAttribute('hidden')).toBe(false);
   window.fetch = (async () => new window.Response(JSON.stringify(snapshot()))) as typeof window.fetch;
   await refresh(); expect(doc.querySelector('#stale')!.hasAttribute('hidden')).toBe(true);
-  doc.querySelector<HTMLButtonElement>('button[aria-label="Edit Website"]')!.click();
+  action(doc, 'Edit Website');
   window.fetch = (async () => new window.Response('not JSON', { status: 401 })) as typeof window.fetch;
   await refresh();
   expect(doc.querySelector('#editor')!.hasAttribute('hidden')).toBe(true);
-  expect(doc.querySelector('#monitor-rows')!.textContent).toBe('');
+  expect([...doc.querySelectorAll(rowSelector)].map(row => row.textContent).join('')).toBe('');
   expect(doc.querySelector<HTMLInputElement>('#url')!.value).toBe('');
   expect(doc.querySelector<HTMLInputElement>('#webhookUrl')!.value).toBe('');
   expect(doc.querySelector('#message')!.textContent).toBe('Sign in required');
@@ -87,7 +93,7 @@ it('ignores late snapshots after a newer snapshot or own save', async () => {
   doc.querySelector('#page-configuration')!.dispatchEvent(new window.Event('submit', { cancelable: true }));
   await settle();
   resolve(new window.Response(JSON.stringify(snapshot()))); await settle();
-  expect(doc.querySelector('#monitor-rows')!.textContent).toContain('Newest');
+  expect([...doc.querySelectorAll(rowSelector)].map(row => row.textContent).join('')).toContain('Newest');
   expect(doc.querySelector<HTMLInputElement>('#pageName')!.value).toBe('Saved');
   await refresh();
 });
@@ -168,8 +174,8 @@ it('refreshes the public ledger, history and Incidents in place without a docume
 it('clears all privileged Maintenance and Heartbeat details when signing out', async () => {
   const { doc, set, refresh } = await mount();
   set(snapshot({ monitors: [{ ...monitor, name: 'Private heartbeat', kind: 'heartbeat' }] })); await refresh();
-  doc.querySelector<HTMLButtonElement>('button[aria-label="Edit Private heartbeat"]')!.click();
-  doc.querySelector<HTMLButtonElement>('button[aria-label="Declare Maintenance Private heartbeat"]')!.click();
+  action(doc, 'Edit Private heartbeat');
+  action(doc, 'Declare Maintenance Private heartbeat');
   doc.querySelector<HTMLButtonElement>('#logout')!.click();
   expect(doc.querySelector('#heartbeat-path')!.textContent).toBe('');
   expect(doc.querySelector('#maintenance-heading')!.textContent).toBe('Maintenance');
@@ -187,7 +193,7 @@ it('keeps drafts entered while an own save is in flight', async () => {
   page.value = 'Next draft';
   resolve(new window.Response(JSON.stringify(snapshot({ pageName: 'Submitted' })))); await settle();
   expect(page.value).toBe('Next draft');
-  doc.querySelector<HTMLButtonElement>('button[aria-label="Edit Website"]')!.click();
+  action(doc, 'Edit Website');
   const name = doc.querySelector<HTMLInputElement>('#name')!; name.value = 'Submitted Monitor';
   doc.querySelector('#configuration')!.dispatchEvent(new window.Event('submit', { cancelable: true }));
   name.value = 'Next Monitor draft';
@@ -198,17 +204,17 @@ it('keeps drafts entered while an own save is in flight', async () => {
 
 it('reconciles creation order and publication changes and binds actions to the latest snapshot', async () => {
   const { window, doc, set, refresh } = await mount();
-  const oldRow = doc.querySelector('#monitor-rows tr');
+  const oldRow = doc.querySelector(rowSelector);
   set(snapshot({ paused: true, monitors: [{ ...monitor, id: 'two', name: 'New' }, { ...monitor, name: 'Renamed', published: false, maintenance: { endsAt: 2000000000000 } }] }));
   await refresh();
-  expect(doc.querySelectorAll('#monitor-rows tr')[2]).toBe(oldRow);
+  expect(doc.querySelectorAll(rowSelector)[2]).toBe(oldRow);
   expect(oldRow!.textContent).toContain('Private');
   expect(doc.querySelector('#paused')!.hasAttribute('hidden')).toBe(false);
-  doc.querySelector<HTMLButtonElement>('button[aria-label="Edit Renamed"]')!.click();
+  action(doc, 'Edit Renamed');
   expect(doc.querySelector<HTMLInputElement>('#name')!.value).toBe('Renamed');
   let request: { path: string; body: string } | undefined;
   window.fetch = (async (path, options) => { request = { path: String(path), body: String(options!.body) }; return new window.Response(JSON.stringify(snapshot())); }) as typeof window.fetch;
-  doc.querySelector<HTMLButtonElement>('button[aria-label="Publish Renamed"]')!.click(); await settle();
+  action(doc, 'Publish Renamed'); await settle();
   expect(request).toEqual({ path: '/api/operator/monitors/one', body: '{"published":true}' });
   set(snapshot({ permission: 'reader' }));
   window.fetch = (async () => new window.Response(JSON.stringify(snapshot({ permission: 'reader' })))) as typeof window.fetch;
@@ -253,8 +259,8 @@ it('keeps another Maintenance draft when an earlier End Maintenance finishes', a
   set(snapshot({ monitors: [{ ...monitor, maintenance: { endsAt: 2000000000000 } }, other] })); await refresh();
   let resolve!: (response: InstanceType<typeof window.Response>) => void;
   window.fetch = (() => new Promise(done => { resolve = done; })) as typeof window.fetch;
-  doc.querySelector<HTMLButtonElement>('button[aria-label="End Maintenance Website"]')!.click();
-  doc.querySelector<HTMLButtonElement>('button[aria-label="Declare Maintenance Other"]')!.click();
+  action(doc, 'End Maintenance Website');
+  action(doc, 'Declare Maintenance Other');
   const end = doc.querySelector<HTMLInputElement>('#maintenance-end')!;
   end.value = '2030-11-16T12:30'; end.focus();
   resolve(new window.Response(JSON.stringify(snapshot({ monitors: [monitor, other] })))); await settle();
@@ -273,9 +279,73 @@ it('ignores obsolete sign-in completion while a newer session edits a Monitor', 
   window.fetch = (async () => new window.Response(JSON.stringify(snapshot()))) as typeof window.fetch;
   doc.querySelector<HTMLInputElement>('#secret')!.value = 'new';
   doc.querySelector('#login')!.dispatchEvent(new window.Event('submit', { cancelable: true })); await settle();
-  doc.querySelector<HTMLButtonElement>('button[aria-label="Edit Website"]')!.click();
+  action(doc, 'Edit Website');
   const name = doc.querySelector<HTMLInputElement>('#name')!; name.value = 'New draft'; name.focus();
   resolve(new window.Response('{}', { status: 401 })); await settle();
   expect(doc.activeElement).toBe(name);
   expect(name.value).toBe('New draft');
+});
+
+it('returns focus to New Monitor after deleting from the ellipsis menu', async () => {
+  const { window, doc } = await mount();
+  window.eval('window.confirm = () => true');
+  window.fetch = (async () => new window.Response(JSON.stringify(snapshot({ monitors: [] })))) as typeof window.fetch;
+  action(doc, 'Delete Website'); await settle();
+  expect(doc.activeElement).toBe(doc.querySelector('#new-monitor'));
+});
+
+it.each(['End Maintenance', 'Save Maintenance'])('keeps a reopened identical Maintenance draft when pending %s completes', async label => {
+  const { window, doc, set, refresh } = await mount();
+  const active = snapshot({ monitors: [{ ...monitor, maintenance: { endsAt: 2000000000000 } }] });
+  set(active); await refresh();
+  action(doc, 'Replace Maintenance Website');
+  const end = doc.querySelector<HTMLInputElement>('#maintenance-end')!;
+  const value = end.value;
+  let resolve!: (response: InstanceType<typeof window.Response>) => void;
+  window.fetch = (() => new Promise(done => { resolve = done; })) as typeof window.fetch;
+  if (label === 'End Maintenance') action(doc, 'End Maintenance Website');
+  else doc.querySelector('#maintenance')!.dispatchEvent(new window.Event('submit', { cancelable: true }));
+  doc.querySelector<HTMLButtonElement>('#cancel-maintenance')!.click();
+  action(doc, 'Replace Maintenance Website');
+  expect(end.value).toBe(value);
+  end.focus();
+  resolve(new window.Response(JSON.stringify(active))); await settle();
+  expect(doc.querySelector('#maintenance')!.hasAttribute('hidden')).toBe(false);
+  expect(doc.activeElement).toBe(end);
+});
+
+it('does not expose a pending Heartbeat credential in a different inline draft', async () => {
+  const { window, doc, set, refresh } = await mount();
+  const producer = { ...monitor, id: 'producer', name: 'Producer', kind: 'heartbeat' };
+  const data = snapshot({ hosted: true, monitors: [monitor, producer] });
+  set(data); await refresh();
+  action(doc, 'Edit Producer');
+  window.eval('window.confirm = () => true');
+  let resolve!: (response: InstanceType<typeof window.Response>) => void;
+  window.fetch = (() => new Promise(done => { resolve = done; })) as typeof window.fetch;
+  doc.querySelector<HTMLButtonElement>('#rotate-heartbeat')!.click();
+  action(doc, 'Edit Website');
+  const name = doc.querySelector<HTMLInputElement>('#name')!;
+  name.value = 'Next draft';
+  resolve(new window.Response(JSON.stringify({ secret: 'old-producer-credential' }))); await settle();
+  expect(doc.querySelector('#heartbeat-credential')!.textContent).toBe('');
+  expect(name.value).toBe('Next draft');
+  expect(doc.activeElement).toBe(name);
+});
+
+it.each(['Monitor', 'Maintenance'])('keeps a %s draft changed while Delete is pending and blocks saving the deleted Monitor', async kind => {
+  const { window, doc } = await mount();
+  action(doc, kind === 'Monitor' ? 'Edit Website' : 'Declare Maintenance Website');
+  const input = doc.querySelector<HTMLInputElement>(kind === 'Monitor' ? '#name' : '#maintenance-end')!;
+  const value = kind === 'Monitor' ? 'New draft' : '2030-11-16T12:30';
+  window.eval('window.confirm = () => true');
+  let resolve!: (response: InstanceType<typeof window.Response>) => void;
+  window.fetch = (() => new Promise(done => { resolve = done; })) as typeof window.fetch;
+  action(doc, 'Delete Website');
+  input.value = value; input.focus();
+  resolve(new window.Response(JSON.stringify(snapshot({ monitors: [] })))); await settle();
+  expect(doc.querySelector(kind === 'Monitor' ? '#configuration' : '#maintenance')!.hasAttribute('hidden')).toBe(false);
+  expect(input.value).toBe(value);
+  expect(doc.activeElement).toBe(input);
+  expect(doc.querySelector<HTMLButtonElement>(kind === 'Monitor' ? '#save-monitor' : '#save-maintenance')!.disabled).toBe(true);
 });
