@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { operatorPage, operatorScript, statusPage, styleSheet, themeScript } from "./ui";
+import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { connect } from "cloudflare:sockets";
 import { DurableObject } from "cloudflare:workers";
 
@@ -643,7 +644,9 @@ function parseWebhook(value: unknown): string | null | undefined {
   }
 }
 
-function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E>) { return {
+function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E>) {
+  const app = createApp(adapter);
+  return {
   async scheduled(controller: ScheduledController, env: E) {
     const contexts = adapter ? await adapter.contexts(env) : ["personal"];
     const unique = new Map<string, ScheduledContext>();
@@ -663,32 +666,9 @@ function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E
   },
   async fetch(request: Request, env: E) {
     try {
-      const resolved = adapter ? await adapter.resolve(request, env) : undefined;
-      if (resolved && (typeof resolved.id !== "string" || !resolved.id ||
-          !["editor", "reader", null].includes(resolved.permission) ||
-          !Number.isSafeInteger(resolved.monitorLimit) || resolved.monitorLimit < 0 ||
-          !validPolicy(resolved)))
-        throw new Error("Invalid hosted context");
-      const response = adapter && !resolved ? new Response("Not found", { status: 404 }) : await handleRequest(request, env, resolved ?? undefined);
-      response.headers.set("Cache-Control", "no-store");
-      response.headers.set("X-Content-Type-Options", "nosniff");
-      response.headers.set("Referrer-Policy", "no-referrer");
-      response.headers.set(
-        "Content-Security-Policy",
-        "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
-      );
-      return response;
+      return await app.fetch(request, env);
     } catch {
-      console.error(
-        JSON.stringify({
-          event: "request_failed",
-          path: new URL(request.url).pathname,
-        }),
-      );
-      return Response.json(
-        { error: "Internal server error" },
-        { status: 500, headers: { "Cache-Control": "no-store" } },
-      );
+      return requestFailed(request);
     }
   },
 } satisfies ExportedHandler<E>; }
@@ -700,156 +680,205 @@ export function createHostedWorker<E extends EngineEnv = EngineEnv>(adapter: Hos
   return createWorker(adapter);
 }
 
-async function handleRequest(request: Request, env: EngineEnv, resolved?: ResolvedContext): Promise<Response> {
-  const operatorResponse = (result: Status | null, status = 200) => Response.json(result && { ...result, ...(resolved ? { hosted: true, permission: resolved.permission } : {}) }, { status });
-  const path = new URL(request.url).pathname;
-  const context = env.MONITORING.getByName(resolved?.id ?? "personal");
-  if (resolved?.paused !== undefined) await context.setPaused(resolved.paused, resolved.policyRevision);
-  if (resolved && path === "/heartbeat") {
-    if (request.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST" } });
-    const accepted = await context.hostedHeartbeat(request.headers.get("authorization") ?? "", Date.now());
+type HttpEnv<E extends EngineEnv> = {
+  Bindings: E;
+  Variables: {
+    resolved: ResolvedContext | undefined;
+    context: DurableObjectStub<MonitoringContext>;
+    permission: "editor" | "reader";
+    value: unknown;
+    selectedMonitor: Status["monitor"] | null;
+  };
+};
+
+function requestFailed(request: Request) {
+  console.error(JSON.stringify({ event: "request_failed", path: new URL(request.url).pathname }));
+  return Response.json({ error: "Internal server error" }, { status: 500, headers: { "Cache-Control": "no-store" } });
+}
+
+function methodNotAllowed(allow: string) {
+  return new Response(null, { status: 405, headers: { Allow: allow } });
+}
+
+function operatorResponse<E extends EngineEnv>(c: Context<HttpEnv<E>>, result: Status | null, status = 200) {
+  const resolved = c.get("resolved");
+  return Response.json(result && { ...result, ...(resolved ? { hosted: true, permission: resolved.permission } : {}) }, { status });
+}
+
+function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
+  // Use URL.pathname as before: Hono's default path extraction normalizes encoded paths.
+  const app = new Hono<HttpEnv<E>>({ getPath: request => new URL(request.url).pathname });
+  app.notFound(() => new Response("Not found", { status: 404 }));
+  app.onError((_error, c) => requestFailed(c.req.raw));
+  app.use("*", async (c, next) => {
+    await next();
+    if (c.error) return;
+    c.header("Cache-Control", "no-store");
+    c.header("X-Content-Type-Options", "nosniff");
+    c.header("Referrer-Policy", "no-referrer");
+    c.header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+  });
+  app.use("*", async (c, next) => {
+    const resolved = adapter ? await adapter.resolve(c.req.raw, c.env) : undefined;
+    if (resolved && (typeof resolved.id !== "string" || !resolved.id ||
+        !["editor", "reader", null].includes(resolved.permission) ||
+        !Number.isSafeInteger(resolved.monitorLimit) || resolved.monitorLimit < 0 || !validPolicy(resolved)))
+      throw new Error("Invalid hosted context");
+    if (adapter && !resolved) return c.notFound();
+    const context = c.env.MONITORING.getByName(resolved?.id ?? "personal");
+    c.set("resolved", resolved ?? undefined);
+    c.set("context", context);
+    if (resolved?.paused !== undefined) await context.setPaused(resolved.paused, resolved.policyRevision);
+    await next();
+  });
+
+  app.all("/heartbeat", async (c: Context<HttpEnv<E>>) => {
+    if (!c.get("resolved")) return c.notFound();
+    if (c.req.method !== "POST") return methodNotAllowed("POST");
+    const accepted = await c.get("context").hostedHeartbeat(c.req.header("authorization") ?? "", Date.now());
     return new Response(null, { status: accepted ? 204 : 401 });
-  }
-  if (resolved && path.startsWith("/heartbeat/")) return new Response(null, { status: 404 });
-  if (path.startsWith("/heartbeat/")) {
-    if (!(await authorized(request, env.INSTALLATION_SECRET)))
+  });
+  app.all("/heartbeat/*", async (c: Context<HttpEnv<E>>) => {
+    if (c.get("resolved")) return new Response(null, { status: 404 });
+    if (!(await authorized(c.req.raw, c.env.INSTALLATION_SECRET)))
       return Response.json({ error: "Unauthorized" }, { status: 401 });
-    if (request.method !== "POST")
-      return new Response(null, { status: 405, headers: { Allow: "POST" } });
-    const accepted = await context.heartbeat(path.slice("/heartbeat/".length), Date.now());
+    if (c.req.method !== "POST") return methodNotAllowed("POST");
+    const accepted = await c.get("context").heartbeat(c.req.path.slice("/heartbeat/".length), Date.now());
     return new Response(null, { status: accepted ? 204 : 404 });
-  }
-  if (request.method === "GET") {
-    if (path === "/")
-      return new Response(statusPage(await context.status()), {
-        headers: { "Content-Type": "text/html; charset=utf-8" },
-      });
-    if (path === "/operator")
-      return new Response(operatorPage(!!resolved), {
-        headers: { "Content-Type": "text/html; charset=utf-8" },
-      });
-    if (path === "/app.css")
-      return new Response(styleSheet, {
-        headers: { "Content-Type": "text/css; charset=utf-8" },
-      });
-    if (path === "/theme.js")
-      return new Response(themeScript, {
-        headers: { "Content-Type": "text/javascript; charset=utf-8" },
-      });
-    if (path === "/operator.js")
-      return new Response(operatorScript, {
-        headers: { "Content-Type": "text/javascript; charset=utf-8" },
-      });
-  }
-  const maintenanceMatch = path.match(/^\/api\/operator\/monitors\/([^/]+)\/maintenance$/);
-  const rotationMatch = resolved ? path.match(/^\/api\/operator\/monitors\/([^/]+)\/heartbeat-secret$/) : null;
-  const monitorMatch = path.match(/^\/api\/operator\/monitors\/([^/]+)$/);
-  if (path === "/api/operator" || path === "/api/operator/webhook" || path === "/api/operator/monitors" || monitorMatch || rotationMatch || maintenanceMatch) {
-    const permission = resolved ? resolved.permission : await authorized(request, env.INSTALLATION_SECRET) ? "editor" : null;
+  });
+
+  // Hono maps HEAD to GET internally; retain this application's existing method contract.
+  const getOnly: MiddlewareHandler<HttpEnv<E>> = async (c: Context<HttpEnv<E>>, next) => {
+    if (c.req.method !== "GET") return c.notFound();
+    await next();
+  };
+  app.get("/", getOnly, async (c: Context<HttpEnv<E>>) => new Response(statusPage(await c.get("context").status()), { headers: { "Content-Type": "text/html; charset=utf-8" } }));
+  app.get("/operator", getOnly, (c: Context<HttpEnv<E>>) => new Response(operatorPage(!!c.get("resolved")), { headers: { "Content-Type": "text/html; charset=utf-8" } }));
+  app.get("/app.css", getOnly, () => new Response(styleSheet, { headers: { "Content-Type": "text/css; charset=utf-8" } }));
+  app.get("/theme.js", getOnly, () => new Response(themeScript, { headers: { "Content-Type": "text/javascript; charset=utf-8" } }));
+  app.get("/operator.js", getOnly, () => new Response(operatorScript, { headers: { "Content-Type": "text/javascript; charset=utf-8" } }));
+  app.get("/api/status", getOnly, async (c: Context<HttpEnv<E>>) => Response.json(await c.get("context").status()));
+
+  const monitorPath = "/api/operator/monitors/:id";
+  const maintenancePath = monitorPath + "/maintenance";
+  const rotationPath = monitorPath + "/heartbeat-secret";
+  const operatorPaths = ["/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
+  for (const path of operatorPaths) app.use(path, async (c, next) => {
+    const resolved = c.get("resolved");
+    if (path === rotationPath && !resolved) return c.notFound();
+    const permission = resolved ? resolved.permission : await authorized(c.req.raw, c.env.INSTALLATION_SECRET) ? "editor" : null;
     if (!permission) return Response.json({ error: "Unauthorized" }, { status: 401 });
-    if (permission !== "editor" && request.method !== "GET") return Response.json({ error: "Forbidden" }, { status: 403 });
-    if (rotationMatch) {
-      if (request.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST" } });
-      const result = await context.rotateHeartbeatSecret(rotationMatch[1]);
-      return result ? Response.json(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
-    }
-    if (maintenanceMatch && request.method === "DELETE") {
-      const result = await context.maintenance(maintenanceMatch[1], null, true);
-      return result ? operatorResponse(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
-    }
-    if (monitorMatch && request.method === "DELETE") {
-      const result = await context.remove(monitorMatch[1]);
-      return result ? operatorResponse(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
-    }
-    if (request.method === "GET" && !monitorMatch && !maintenanceMatch)
-      return operatorResponse(await context.status(true, permission === "editor"));
-    if (((path === "/api/operator" || path === "/api/operator/webhook") && request.method === "PUT") ||
-        (path === "/api/operator/monitors" && request.method === "POST") ||
-        (monitorMatch && request.method === "PATCH") || (maintenanceMatch && request.method === "PUT")) {
-      if (!request.headers.get("Content-Type")?.startsWith("application/json"))
-        return Response.json(
-          { error: "Use application/json" },
-          { status: 415 },
-        );
-      if (Number(request.headers.get("Content-Length")) > 4096)
-        return new Response(null, { status: 413 });
-      const selectedMonitor = path === "/api/operator" ? (await context.status(true)).monitor : null;
-      let value: unknown;
-      const reader = request.body?.getReader();
-      let body = "";
-      let bytes = 0;
-      const decoder = new TextDecoder();
-      if (reader) {
-        try {
-          while (true) {
-            const { done, value: chunk } = await reader.read();
-            if (done) break;
-            bytes += chunk.byteLength;
-            if (bytes > 4096) {
-              await reader.cancel();
-              return new Response(null, { status: 413 });
-            }
-            body += decoder.decode(chunk, { stream: true });
-          }
-          body += decoder.decode();
-        } finally {
-          reader.releaseLock();
-        }
-      }
+    if (permission !== "editor" && c.req.method !== "GET") return Response.json({ error: "Forbidden" }, { status: 403 });
+    c.set("permission", permission);
+    await next();
+  });
+  const readBody: MiddlewareHandler<HttpEnv<E>> = async (c: Context<HttpEnv<E>>, next) => {
+    const request = c.req.raw;
+    if (!request.headers.get("Content-Type")?.startsWith("application/json"))
+      return Response.json(
+        { error: "Use application/json" },
+        { status: 415 },
+      );
+    if (Number(request.headers.get("Content-Length")) > 4096)
+      return new Response(null, { status: 413 });
+    const selectedMonitor: Status["monitor"] | null = c.req.path === "/api/operator" ? (await c.get("context").status(true)).monitor : null;
+    c.set("selectedMonitor", selectedMonitor);
+    let value: unknown;
+    const reader = request.body?.getReader();
+    let body = "";
+    let bytes = 0;
+    const decoder = new TextDecoder();
+    if (reader) {
       try {
-        value = JSON.parse(body);
-      } catch {
-        return Response.json({ error: "Invalid JSON" }, { status: 400 });
+        while (true) {
+          const { done, value: chunk } = await reader.read();
+          if (done) break;
+          bytes += chunk.byteLength;
+          if (bytes > 4096) {
+            await reader.cancel();
+            return new Response(null, { status: 413 });
+          }
+          body += decoder.decode(chunk, { stream: true });
+        }
+        body += decoder.decode();
+      } finally {
+        reader.releaseLock();
       }
-      if (path === "/api/operator/webhook") {
-        const url = value && typeof value === "object"
-          ? (value as Record<string, unknown>).url
-          : undefined;
-        const destination = parseWebhook(url);
-        if (destination === undefined)
-          return Response.json(
-            { error: "Enter an HTTPS webhook URL" },
-            { status: 400 },
-          );
-        return operatorResponse(await context.configureWebhook(destination));
-      }
-      if (maintenanceMatch) {
-        const result = await context.maintenance(maintenanceMatch[1], value);
-        if (result === undefined) return Response.json({ error: "Enter a future end time in epoch milliseconds" }, { status: 400 });
-        return result ? operatorResponse(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
-      }
-      if (monitorMatch) {
-        const result = await context.edit(monitorMatch[1], value);
-        if (result === undefined) return Response.json({ error: "Enter valid Monitor settings and an HTTP(S)/TCP target or Heartbeat settings; type cannot change" }, { status: 400 });
-        return result ? operatorResponse(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
-      }
-      if (path === "/api/operator" && value && typeof value === "object" &&
-          Object.keys(value).length === 1 && "pageName" in value) {
-        const pageName = value.pageName;
-        if (typeof pageName !== "string" || !pageName.trim() || pageName.length > 120)
-          return Response.json({ error: "Enter a page name" }, { status: 400 });
-        return operatorResponse(await context.configure({ pageName: pageName.trim() }) ?? null);
-      }
-      if (path === "/api/operator/monitors") {
-        const fields = value as Record<string, unknown>;
-        const configuration = parseConfiguration({ ...fields, pageName: "Irisbeat" });
-        if (!parseMonitorPatch(value) || !configuration)
-          return Response.json({ error: "Enter a Monitor name and HTTP(S)/TCP target or Heartbeat settings" }, { status: 400 });
-        const { pageName: _pageName, ...settings } = configuration;
-        const result = await context.create({ ...settings, published: fields.published as boolean | undefined }, resolved?.monitorLimit);
-        return result ? operatorResponse(result, 201) : Response.json({ error: "Monitor allowance reached" }, { status: 409 });
-      }
-      if (resolved) return Response.json({ error: "Use the Monitor collection" }, { status: 400 });
-      const configuration = parseConfiguration(value, selectedMonitor?.kind);
-      if (!configuration || !validKindFields(value as Record<string, unknown>, configuration.kind))
-        return Response.json({ error: "Enter a page name, Monitor name and HTTP(S)/TCP target or Heartbeat settings" }, { status: 400 });
-      const result = await context.configure(configuration, selectedMonitor?.id ?? null);
-      if (result === undefined) return Response.json({ error: "Monitor type cannot change" }, { status: 400 });
-      return result ? operatorResponse(result) : Response.json({ error: "Monitor changed; reload before saving" }, { status: 409 });
     }
-    return new Response(null, { status: 405, headers: { Allow: maintenanceMatch ? "PUT, DELETE" : monitorMatch ? "PATCH, DELETE" : path === "/api/operator/monitors" ? "GET, POST" : "GET, PUT" } });
+    try {
+      value = JSON.parse(body);
+    } catch {
+      return Response.json({ error: "Invalid JSON" }, { status: 400 });
+    }
+    c.set("value", value);
+    await next();
+  };
+  // IDs are opaque: read the original path rather than Hono's decoded params.
+  const monitorId = (c: Context<HttpEnv<E>>) => c.req.path.split("/")[4];
+  for (const path of ["/api/operator", "/api/operator/webhook", "/api/operator/monitors"]) {
+    app.get(path, async (c: Context<HttpEnv<E>>) => c.req.method === "GET"
+      ? operatorResponse(c, await c.get("context").status(true, c.get("permission") === "editor"))
+      : methodNotAllowed(path === "/api/operator/monitors" ? "GET, POST" : "GET, PUT"));
   }
-  if (path === "/api/status" && request.method === "GET")
-    return Response.json(await context.status());
-  return new Response("Not found", { status: 404 });
+  app.post(rotationPath, async (c: Context<HttpEnv<E>>) => {
+    const result = await c.get("context").rotateHeartbeatSecret(monitorId(c));
+    return result ? Response.json(result) : Response.json({ error: "Monitor not found" }, { status: 404 });
+  });
+  app.delete(maintenancePath, async (c: Context<HttpEnv<E>>) => {
+    const result = await c.get("context").maintenance(monitorId(c), null, true);
+    return result ? operatorResponse(c, result) : Response.json({ error: "Monitor not found" }, { status: 404 });
+  });
+  app.delete(monitorPath, async (c: Context<HttpEnv<E>>) => {
+    const result = await c.get("context").remove(monitorId(c));
+    return result ? operatorResponse(c, result) : Response.json({ error: "Monitor not found" }, { status: 404 });
+  });
+  app.put("/api/operator/webhook", readBody, async (c: Context<HttpEnv<E>>) => {
+    const value = c.get("value");
+    const url = value && typeof value === "object" ? (value as Record<string, unknown>).url : undefined;
+    const destination = parseWebhook(url);
+    if (destination === undefined) return Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
+    return operatorResponse(c, await c.get("context").configureWebhook(destination));
+  });
+  app.put(maintenancePath, readBody, async (c: Context<HttpEnv<E>>) => {
+    const result = await c.get("context").maintenance(monitorId(c), c.get("value"));
+    if (result === undefined) return Response.json({ error: "Enter a future end time in epoch milliseconds" }, { status: 400 });
+    return result ? operatorResponse(c, result) : Response.json({ error: "Monitor not found" }, { status: 404 });
+  });
+  app.patch(monitorPath, readBody, async (c: Context<HttpEnv<E>>) => {
+    const result = await c.get("context").edit(monitorId(c), c.get("value"));
+    if (result === undefined) return Response.json({ error: "Enter valid Monitor settings and an HTTP(S)/TCP target or Heartbeat settings; type cannot change" }, { status: 400 });
+    return result ? operatorResponse(c, result) : Response.json({ error: "Monitor not found" }, { status: 404 });
+  });
+  app.post("/api/operator/monitors", readBody, async (c: Context<HttpEnv<E>>) => {
+    const value = c.get("value");
+    const fields = value as Record<string, unknown>;
+    const configuration = parseConfiguration({ ...fields, pageName: "Irisbeat" });
+    if (!parseMonitorPatch(value) || !configuration)
+      return Response.json({ error: "Enter a Monitor name and HTTP(S)/TCP target or Heartbeat settings" }, { status: 400 });
+    const { pageName: _pageName, ...settings } = configuration;
+    const result = await c.get("context").create({ ...settings, published: fields.published as boolean | undefined }, c.get("resolved")?.monitorLimit);
+    return result ? operatorResponse(c, result, 201) : Response.json({ error: "Monitor allowance reached" }, { status: 409 });
+  });
+  app.put("/api/operator", readBody, async (c: Context<HttpEnv<E>>) => {
+    const value = c.get("value");
+    const context = c.get("context");
+    if (value && typeof value === "object" && Object.keys(value).length === 1 && "pageName" in value) {
+      const pageName = value.pageName;
+      if (typeof pageName !== "string" || !pageName.trim() || pageName.length > 120)
+        return Response.json({ error: "Enter a page name" }, { status: 400 });
+      return operatorResponse(c, await context.configure({ pageName: pageName.trim() }) ?? null);
+    }
+    if (c.get("resolved")) return Response.json({ error: "Use the Monitor collection" }, { status: 400 });
+    const selectedMonitor = c.get("selectedMonitor");
+    const configuration = parseConfiguration(value, selectedMonitor?.kind);
+    if (!configuration || !validKindFields(value as Record<string, unknown>, configuration.kind))
+      return Response.json({ error: "Enter a page name, Monitor name and HTTP(S)/TCP target or Heartbeat settings" }, { status: 400 });
+    const result = await context.configure(configuration, selectedMonitor?.id ?? null);
+    if (result === undefined) return Response.json({ error: "Monitor type cannot change" }, { status: 400 });
+    return result ? operatorResponse(c, result) : Response.json({ error: "Monitor changed; reload before saving" }, { status: 409 });
+  });
+  for (const path of operatorPaths) app.all(path, () => methodNotAllowed(
+    path === rotationPath ? "POST" : path === maintenancePath ? "PUT, DELETE" : path === monitorPath ? "PATCH, DELETE" : path === "/api/operator/monitors" ? "GET, POST" : "GET, PUT",
+  ));
+  return app;
 }

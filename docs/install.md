@@ -232,7 +232,7 @@ The public/operator Source link targets that release's source archive. It remain
 pending until publication. Irisbeat's own code is AGPL-3.0-only, with LICENSE and
 NOTICE in both archives. Provide Corresponding Source to network users of your
 running version. If modified, publish its complete corresponding source/build
-instructions and update `src/ui.ts`'s Source link before serving it; the upstream
+instructions and update `src/ui.tsx`'s Source link before serving it; the upstream
 release link is insufficient for modifications. Preserve third-party notices.
 
 ## Post-publication acceptance (pending)

@@ -233,7 +233,7 @@ it("serves labeled timing controls inside the existing Monitor configuration", a
     ["recoveryThreshold", "Consecutive successes", 1, 100, 2],
   ]) {
     expect(html).toContain(`<label for="${field}">${label}</label>`);
-    expect(html).toContain(`<input id="${field}" name="${field}" type="number" min="${min}" max="${max}" step="1" value="${value}" required>`);
+    expect(html).toMatch(new RegExp(`<input id="${field}" name="${field}" type="number" min="${min}" max="${max}" step="1" value="${value}" required(?:="")?\\s*/?>`));
     expect(html.indexOf(`id="${field}"`)).toBeLessThan(html.indexOf('<aside aria-labelledby="page-settings">'));
   }
 });
