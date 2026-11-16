@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { createHostedWorker } from '../src/index';
+import { createHostedWorker, type Status } from '../src/index';
 import { env } from 'cloudflare:workers';
-import { reset } from 'cloudflare:test';
+import { createScheduledController, evictDurableObject, reset } from 'cloudflare:test';
 import { afterEach, expect, it, vi } from 'vitest';
 const app = createHostedWorker({
   contractVersion: '1',
@@ -33,6 +33,46 @@ it('counts private Monitors atomically, releases deleted slots and prevents lega
   expect((await request('a.example', '/api/operator/monitors', 'POST', { name: 'Replacement', kind: 'heartbeat' })).status).toBe(201);
   expect((await request('b.example', '/api/operator/monitors', 'POST', { name: 'Other context', kind: 'heartbeat' })).status).toBe(201);
 });
+it('accepts exactly one concurrent Calendar Heartbeat creation at the hosted Monitor allowance after yielding validation', async () => {
+  const start = Date.UTC(2026, 10, 16);
+  vi.spyOn(Date, 'now').mockReturnValue(start);
+  const wait = scheduler.wait.bind(scheduler);
+  let release!: () => void;
+  const validation = new Promise<void>(resolve => { release = resolve; });
+  let yields = 0, finished = 0;
+  vi.spyOn(scheduler, 'wait').mockImplementation(async (delay, options) => {
+    if (++yields > 1000) throw new Error('Unbounded grace validation');
+    await validation;
+    await wait(delay, options);
+  });
+  const pending = ['First', 'Second'].map(name => request('a.example', '/api/operator/monitors', 'POST', {
+    name, kind: 'heartbeat', published: false, scheduleMode: 'calendar',
+    cron: '0-28/2,31-57/2 * * * *', timezone: 'Australia/Lord_Howe', graceSeconds: 60,
+  }).then(response => { finished++; return response; }));
+  try {
+    for (let attempts = 0; yields < 2 && attempts < 100; attempts++) await wait(0);
+    // Each request is held at its first yield, so neither can commit before both validate.
+    expect(yields).toBe(2);
+    expect(finished).toBe(0);
+    expect(await (await request('a.example', '/api/operator')).json()).toMatchObject({ monitors: [] });
+  } finally { release(); }
+  const responses = await Promise.all(pending);
+  expect(responses.map(response => response.status).sort()).toEqual([201, 409]);
+  expect(await responses.find(response => response.status === 409)!.json()).toEqual({ error: 'Monitor allowance reached' });
+  const accepted = await responses.find(response => response.status === 201)!.json() as Status;
+  expect(accepted.monitors).toHaveLength(1);
+  const winner = responses.findIndex(response => response.status === 201);
+  expect(accepted.monitor).toMatchObject({ name: ['First', 'Second'][winner], kind: 'heartbeat', published: false, graceSeconds: 60 });
+  await evictDurableObject(env.MONITORING.getByName('a.example'));
+  expect(await (await request('a.example', '/api/operator')).json()).toEqual(accepted);
+  expect(await (await request('a.example', '/api/status')).json()).toMatchObject({ monitors: [] });
+  await app.scheduled(createScheduledController({ scheduledTime: start + 180_001 }), env);
+  const observed = await (await request('a.example', '/api/operator')).json() as Status;
+  expect(observed.monitors).toHaveLength(1);
+  expect(observed.monitor).toMatchObject({ id: accepted.monitor!.id, lastResult: { at: start + 180_000, outcome: 'failure' } });
+  expect(observed.incidents).toMatchObject([{ monitorId: accepted.monitor!.id, openedAt: start + 180_000, closedAt: null }]);
+});
+
 it('filters credentials for readers and confines heartbeat credentials to their tenant with immediate rotation', async () => {
   await request('a.example', '/api/operator/monitors', 'POST', { name: 'Producer', kind: 'heartbeat' });
   const editor = await (await request('a.example', '/api/operator')).json() as { monitor: { id: string } };
