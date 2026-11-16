@@ -12,6 +12,7 @@ export type LiveSnapshots = (
 ) => { sync(): void; stop(): void };
 export interface OperatorSessionCallbacks {
   received(data: OperatorResponse, savedField?: 'pageName' | 'webhookUrl'): void;
+  reading?(state: 'pending' | 'success' | 'idle'): void;
   signedOut(): void;
   failed(message: string, reading: boolean): void;
   writing(): () => void;
@@ -25,6 +26,7 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
   let secret = '';
   let generation = 0;
   let requestVersion = 0;
+  let readingVersion = 0;
   let busy = false;
   let pendingRefresh = false;
   let updates: ReturnType<LiveSnapshots> | undefined;
@@ -65,6 +67,7 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
       const version = ++requestVersion;
       const started = generation;
       if (!reading) busy = true;
+      else { readingVersion = version; ui.reading?.('pending'); }
       const finishWriting = reading ? undefined : ui.writing();
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 10000);
@@ -82,6 +85,7 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
         if (!response.ok) throw new Error(data.error || 'Request failed');
         if (reading && !current()) return;
         ui.received(data, method === 'PUT' ? (path === '/api/operator' ? 'pageName' : path === '/api/operator/webhook' ? 'webhookUrl' : undefined) : undefined);
+        if (reading) ui.reading?.('success');
         lifecycle.startUpdates();
         if (after) after(data);
         if (!reading) ui.saved(path, method);
@@ -90,6 +94,7 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
         return false;
       } finally {
         clearTimeout(timeout);
+        if (reading && started === generation && version === readingVersion) ui.reading?.('idle');
         if (!reading && started === generation) {
           busy = false; finishWriting?.();
           if (pendingRefresh) { pendingRefresh = false; updates?.sync(); }

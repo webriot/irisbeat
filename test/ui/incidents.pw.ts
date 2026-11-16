@@ -51,7 +51,7 @@ for (const path of ['/', '/operator']) {
       await expect(ongoing.locator('.incident').first()).toBeVisible();
     }
     data.incidents = [];
-    await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await expect(page.getByText('No Incidents', { exact: true })).toBeVisible();
     await expect(ongoing).toHaveCount(0);
     await expect(resolved).toHaveCount(0);

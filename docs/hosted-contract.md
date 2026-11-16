@@ -253,7 +253,10 @@ existing row nodes, history selection and focus. Reconnect delays increase from
 one second to at most thirty seconds (including jitter), with a ten-second handshake
 deadline. Disconnected visible pages poll every sixty seconds and show Polling;
 connected pages stop fallback polling. A failed read retains the last snapshot and
-shows Updates unavailable. Visibility return and manual Refresh fetch immediately.
+shows Updates unavailable with Retry, including when the first read fails. Visibility
+return and Retry fetch immediately without reloading. Retry stays disabled while
+pending; only a successful snapshot read clears the failure. Recovery is announced
+and moves focus from the removed Retry control to the page heading.
 Page exit closes the connection, and returning from the browser page cache resubscribes.
 All mutations continue through existing HTTP routes. JSON shapes and contract version
 remain unchanged.
@@ -325,9 +328,10 @@ Closed sockets are cleaned up by the runtime, expired tickets are pruned on the
 next issuance, and consumed tickets are deleted immediately.
 
 The operator browser shares reconnect/backoff, visible-page polling fallback,
-manual/visibility resynchronization and bounded coalescing with the public page.
+failure-only Retry, visibility resynchronization and bounded coalescing with the public page.
 It preserves drafts, focus, open menus, selected history days and Monitor
-validation. Failed snapshots retain the last view with Updates unavailable.
+validation. Failed snapshots retain the last view with Updates unavailable and Retry;
+successful writes alone do not clear a failed-read indicator.
 Sign-out or authorization loss closes the socket, stops renewal/reconnect/polling,
 and clears private UI state. Session guards reject late ticket and snapshot
 responses. Consumer UIs must implement the same teardown on sign-out and denied

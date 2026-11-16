@@ -50,7 +50,7 @@ for (const kind of ['http', 'tcp']) {
       await expect(page.getByLabel('Cron', { exact: true })).toHaveValue('0 9 15 * 1');
       await expect(page.locator('#schedule-occurrences time')).toHaveCount(3);
       const preview = await page.locator('#schedule-occurrences').textContent();
-      await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+      await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
       await expect(page.locator('#schedule-occurrences')).toHaveText(preview!);
       await expect(page.getByLabel('Cron', { exact: true })).toHaveValue('0 9 15 * 1');
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
