@@ -210,7 +210,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       const schedule = monitor?.scheduleMode === "calendar" && fields.scheduleMode === undefined
         ? { scheduleMode: monitor.scheduleMode, cron: monitor.cron, timezone: monitor.timezone } : {};
       const grace = monitor?.kind === "heartbeat" && (fields.scheduleMode ?? monitor.scheduleMode) === "calendar" ? { graceSeconds: monitor.graceSeconds } : {};
-      const parsed = parseConfiguration({ ...schedule, ...grace, ...fields }, monitor?.kind);
+      const parsed = parseConfiguration({ ...schedule, ...grace, ...fields }, monitor?.kind, monitor);
       if (!parsed || !validKindFields({ ...fields, scheduleMode: parsed.scheduleMode ?? "interval" }, parsed.kind) || (monitor && monitor.kind !== parsed.kind)) return undefined;
       configuration = parsed;
       const { pageName: _pageName, ...settings } = parsed;
@@ -652,7 +652,7 @@ async function authorized(request: Request, secret: string | undefined) {
   return crypto.subtle.timingSafeEqual(actual, expected);
 }
 
-function parseConfiguration(value: unknown, existingKind: Configuration["kind"] = "http"): Configuration | null {
+function parseConfiguration(value: unknown, existingKind: Configuration["kind"] = "http", current?: MonitorConfiguration): Configuration | null {
   if (!value || typeof value !== "object") return null;
   const { pageName, name, url, kind = existingKind, hostname, port } = value as Record<string, unknown>;
   if (
@@ -704,10 +704,16 @@ function parseConfiguration(value: unknown, existingKind: Configuration["kind"] 
     }
     if (fields.scheduleMode === "calendar") {
       if (kind !== "http" && kind !== "heartbeat") return null;
-      const parsed = calendar(fields.cron, fields.timezone === undefined ? "UTC" : fields.timezone);
-      parsed.next(Date.now());
-      if (kind === "heartbeat" && !parsed.acceptsGrace(timing.graceSeconds ?? timingDefaults.graceSeconds, Date.now())) return null;
-      schedule.cron = parsed.cron; schedule.timezone = parsed.timezone;
+      if (current?.scheduleMode === "calendar" && fields.cron === current.cron &&
+          (fields.timezone === undefined ? "UTC" : fields.timezone) === current.timezone &&
+          (kind !== "heartbeat" || (timing.graceSeconds ?? timingDefaults.graceSeconds) === current.graceSeconds)) {
+        schedule.cron = current.cron; schedule.timezone = current.timezone;
+      } else {
+        const parsed = calendar(fields.cron, fields.timezone === undefined ? "UTC" : fields.timezone);
+        parsed.next(Date.now());
+        if (kind === "heartbeat" && !parsed.acceptsGrace(timing.graceSeconds ?? timingDefaults.graceSeconds, Date.now())) return null;
+        schedule.cron = parsed.cron; schedule.timezone = parsed.timezone;
+      }
     } else if ("cron" in fields || "timezone" in fields) return null;
     return { pageName: pageName.trim(), name: name.trim(), ...target, ...timing, ...schedule };
   } catch {
@@ -724,18 +730,24 @@ function validKindFields(fields: Record<string, unknown>, kind: Configuration["k
       : !("silenceSeconds" in fields || "recoverySpacingSeconds" in fields || "graceSeconds" in fields));
 }
 
+function parseMonitorPatch(value: unknown): MonitorConfiguration | null;
+function parseMonitorPatch(value: unknown, current: MonitorConfiguration): Partial<MonitorConfiguration> | null;
 function parseMonitorPatch(value: unknown, current?: MonitorConfiguration): Partial<MonitorConfiguration> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const fields = value as Record<string, unknown>;
   if (!Object.keys(fields).length || Object.keys(fields).some(key => !["name", "kind", "url", "hostname", "port", "published", "scheduleMode", "cron", "timezone", ...Object.keys(timingDefaults)].includes(key))) return null;
-  if ("published" in fields && typeof fields.published !== "boolean") return null;
+  if ((!current && !("name" in fields)) || ("published" in fields && typeof fields.published !== "boolean")) return null;
   const merged: Record<string, unknown> = { pageName: "Irisbeat", name: "Monitor", ...current, ...fields };
   if (fields.scheduleMode === "interval") {
     if ("cron" in fields || "timezone" in fields) return null;
     delete merged.cron; delete merged.timezone;
   }
-  const configuration = parseConfiguration(merged);
+  const configuration = parseConfiguration(merged, "http", current);
   if (!configuration || (current && configuration.kind !== current.kind) || !validKindFields({ ...fields, scheduleMode: merged.scheduleMode ?? "interval" }, configuration.kind)) return null;
+  if (!current) {
+    const { pageName: _pageName, ...settings } = configuration;
+    return { ...settings, published: fields.published as boolean | undefined };
+  }
   const patch: Record<string, unknown> = {};
   for (const key of ["name", "published", ...Object.keys(timingDefaults)]) {
     if (key in fields) patch[key] = key === "published" ? fields[key] : configuration[key as keyof Configuration];
@@ -999,12 +1011,10 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   });
   app.post("/api/operator/monitors", readBody, async (c: Context<HttpEnv<E>>) => {
     const value = c.get("value");
-    const fields = value as Record<string, unknown>;
-    const configuration = parseConfiguration({ ...fields, pageName: "Irisbeat" });
-    if (!parseMonitorPatch(value) || !configuration)
+    const configuration = parseMonitorPatch(value);
+    if (!configuration)
       return Response.json({ error: "Enter a Monitor name and HTTP(S)/TCP target or Heartbeat settings" }, { status: 400 });
-    const { pageName: _pageName, ...settings } = configuration;
-    const result = await c.get("context").create({ ...settings, published: fields.published as boolean | undefined }, c.get("resolved")?.monitorLimit);
+    const result = await c.get("context").create(configuration, c.get("resolved")?.monitorLimit);
     return result ? operatorResponse(c, result, 201) : Response.json({ error: "Monitor allowance reached" }, { status: 409 });
   });
   app.put("/api/operator", readBody, async (c: Context<HttpEnv<E>>) => {

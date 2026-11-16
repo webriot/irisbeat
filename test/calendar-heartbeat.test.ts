@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { calendar } from '../src/calendar';
 import worker, { createHostedWorker } from '../src/index';
 import { exports, env } from 'cloudflare:workers';
 import { createScheduledController, evictDurableObject, reset } from 'cloudflare:test';
@@ -361,4 +362,65 @@ it('preserves pending evidence across ordinary edits and validates mode-specific
   await tick(start + 990_001);
   expect((await read()).incidents).toMatchObject([{ openedAt: start + 390_000, closedAt: start + 990_000 }]);
   expect((await create({ cron: '0 9 * * 1', graceSeconds: 86400 })).status).toBe(201);
+});
+
+// Bound expensive Intl work independently of workerd's I/O-driven clock.
+it('bounds dense named-zone grace validation over the full Gregorian horizon', () => {
+  const format = Intl.DateTimeFormat.prototype.formatToParts;
+  let calls = 0;
+  vi.spyOn(Intl.DateTimeFormat.prototype, 'formatToParts').mockImplementation(function (this: Intl.DateTimeFormat, at) {
+    calls++;
+    if (calls > 160_000) throw new Error('Calendar validation exceeded 160000 timezone conversions');
+    return format.call(this, at);
+  });
+  expect(calendar('*/2 * * * *', 'America/New_York').acceptsGrace(60, start)).toBe(true);
+  expect(calls).toBeLessThan(160_000);
+});
+
+it('validates creation once and saves unchanged Calendar settings without rescanning the horizon', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(start);
+  const format = Intl.DateTimeFormat.prototype.formatToParts;
+  let calls = 0;
+  vi.spyOn(Intl.DateTimeFormat.prototype, 'formatToParts').mockImplementation(function (this: Intl.DateTimeFormat, at) {
+    calls++;
+    if (calls > 160_000) throw new Error('Repeated Calendar validation');
+    return format.call(this, at);
+  });
+  expect((await create({ cron: '*/2 * * * *', timezone: 'America/New_York', graceSeconds: 60 })).status).toBe(201);
+  const id = (await read()).monitor!.id;
+  calls = 0;
+  expect((await request('/api/operator/monitors/' + id, 'PATCH', {
+    name: 'Renamed', published: false, recoveryThreshold: 3,
+    scheduleMode: 'calendar', cron: '*/2 * * * *', timezone: 'America/New_York', graceSeconds: 60,
+  })).status).toBe(200);
+  expect(calls).toBeLessThan(100);
+  expect((await request('/api/operator/monitors/' + id, 'PATCH', { name: 'Job', published: true })).status).toBe(200);
+  expect(calls).toBeLessThan(100);
+  expect((await request('/api/operator', 'PUT', { pageName: 'Legacy', name: 'Renamed', kind: 'heartbeat' })).status).toBe(200);
+  expect(calls).toBeLessThan(100);
+  expect((await request('/heartbeat/' + id, 'POST')).status).toBe(204);
+  expect((await request('/api/operator/monitors/' + id, 'PATCH', { graceSeconds: 120 })).status).toBe(400);
+  calls = 0;
+  expect((await request('/api/operator/schedule-preview', 'POST', { cron: '*/2 * * * *', timezone: 'America/New_York', graceSeconds: 60, after: start })).status).toBe(200);
+});
+
+it.each([
+  ['0 9 * * *', 'America/New_York', 82_800],
+  ['0 9 * * *', 'Australia/Lord_Howe', 84_600],
+  ['30 1,2 * * *', 'Australia/Lord_Howe', 1_800],
+  ['0 0,3 * * *', 'America/New_York', 7_200],
+  ['15,45 * * * *', 'Pacific/Chatham', 1_800],
+  ['0,2 * * * *', 'Asia/Kathmandu', 120],
+] as const)('preserves the exact strict gap for %s in %s', (cron, timezone, gap) => {
+  const schedule = calendar(cron, timezone);
+  expect(schedule.acceptsGrace(gap - 1, start)).toBe(true);
+  expect(schedule.acceptsGrace(gap, start)).toBe(false);
+});
+
+it('retains sparse Gregorian-cycle dates and does not mistake residue proximity for overlap', () => {
+  const schedule = calendar('0 9 29 2 */7', 'Pacific/Chatham');
+  expect(schedule.next(Date.UTC(2096, 2, 1), 3)).toEqual([
+    Date.parse('2128-02-28T19:15:00Z'), Date.parse('2156-02-28T19:15:00Z'), Date.parse('2184-02-28T19:15:00Z'),
+  ]);
+  expect(schedule.acceptsGrace(86_400, start)).toBe(true);
 });

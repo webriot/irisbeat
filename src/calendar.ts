@@ -86,9 +86,25 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
       }
       return offsets.get(day)!;
     };
+    const separated = new Map<string, boolean>();
+    const safelySeparated = (candidates: number[]) => {
+      const key = candidates.join(',');
+      if (!separated.has(key)) {
+        // This superset includes even nonexistent/repeated wall times. Its circular gaps
+        // bound every positive actual gap within this day.
+        const residues = [...new Set(candidates.flatMap(offset => minutes.map(minute =>
+          ((minute * 60_000 - offset) % DAY + DAY) % DAY)))].sort((a, b) => a - b);
+        separated.set(key, residues.every((at, i) =>
+          (i ? at - residues[i - 1] : at + DAY - residues[residues.length - 1]) > limit));
+      }
+      return separated.get(key)!;
+    };
+    const instant = (day: number, minute: number, candidates: number[]) => {
+      const wall = day + minute * 60_000;
+      return Math.min(...candidates.map(offset => wall - offset).filter(at => local(at) === wall));
+    };
     let previous: number | undefined;
-    // Inspect a full Gregorian cycle, including timezone transitions, without enumerating
-    // every minute of dense schedules. Ordinary days need only their first/last instant.
+    // Keep the full Gregorian horizon; cache proofs by offset set, not sampled years.
     for (let day = start; day <= start + 400 * 366 * DAY; day += DAY) {
       if (!matchesDay(new Date(day))) continue;
       const candidates = fixedUTC ? [0] : [...new Set([-2, -1, 0, 1, 2].map(delta => offsetAt(day + delta * DAY)))];
@@ -98,11 +114,20 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
         if (insideGap <= limit) return false;
         first = day + minutes[0] * 60_000 - candidates[0];
         last = day + minutes[minutes.length - 1] * 60_000 - candidates[0];
+      } else if (safelySeparated(candidates)) {
+        // Only the actual endpoints are needed when the superset proves internal safety.
+        first = Infinity; last = Infinity;
+        for (const minute of minutes) {
+          first = instant(day, minute, candidates);
+          if (Number.isFinite(first)) break;
+        }
+        if (!Number.isFinite(first)) continue;
+        for (let i = minutes.length - 1; i >= 0; i--) {
+          last = instant(day, minutes[i], candidates);
+          if (Number.isFinite(last)) break;
+        }
       } else {
-        const instants = minutes.map(minute => {
-          const wall = day + minute * 60_000;
-          return Math.min(...candidates.map(offset => wall - offset).filter(at => local(at) === wall));
-        }).filter(Number.isFinite).sort((a, b) => a - b);
+        const instants = minutes.map(minute => instant(day, minute, candidates)).filter(Number.isFinite).sort((a, b) => a - b);
         if (!instants.length) continue;
         if (instants.slice(1).some((at, i) => at - instants[i] <= limit)) return false;
         first = instants[0]; last = instants[instants.length - 1];
