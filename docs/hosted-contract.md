@@ -207,6 +207,12 @@ regenerated after integration changes, before #12 publishes anything.
 
 Contract 1 also accepts HTTP/TCP `scheduleMode`, `cron` and `timezone` through the same authorized collection routes as personal installations. Existing consumers and omitted fields remain Interval-compatible. `/api/operator/schedule-preview` requires editor permission and returns authoritative explanation/three future instants without mutation. Calendar configuration is operator-only; private/public visibility and allowances are unchanged. Persisted pause skips occurrences, and resume anchors at the next future occurrence without catch-up Checks or observations. Calendar Maintenance uses the existing observation exclusion and transition suppression. See [Calendar API](monitor-api.md#http-and-tcp-calendar-schedules).
 
+### Calendar Heartbeat compatibility
+
+Contract 1 also accepts Calendar Heartbeats through the existing authorized collection and legacy configuration routes. Calendar mode adds `graceSeconds` and uses occurrence-based recovery; Interval behavior and omitted fields remain compatible. The operator preview accepts optional `graceSeconds` and rejects overlapping receipt windows using the same validator as saves. Reader/editor permissions, allowance checks, tenant credential rotation and anonymous visibility remain unchanged.
+
+Receipts use the same authenticated `POST /heartbeat`, ignore bodies and persist last-seen immediately. Per-occurrence evidence and chronological finalization survive object recreation and credential rotation. Receipt freshness and every committed catch-up outcome invalidate the appropriate public/operator projection before alert delivery; pending invalidations coalesce, and private Monitors remain silent to public subscribers. Each scheduled invocation processes at most 128 expired occurrences per Monitor; following invocations resume the durable cursor. Pause skips occurrences without observations; resume starts at the next future occurrence while retaining unexpired Maintenance and open Incidents. Calendar/grace changes isolate generations. No backfill precedes Calendar enablement, and old outcomes never insert out-of-retention observations. See [Calendar Heartbeat integration](heartbeat-api.md#calendar-heartbeats) for inclusive deadlines, durable Maintenance evidence, detector progress and best-effort transition delivery.
+
 ## Public subscriptions
 
 Contract 1 adds `GET /api/status/events` with `Upgrade: websocket`. Hono resolves
@@ -222,7 +228,8 @@ The existing `MonitoringContext` accepts the connection through Cloudflare's
 Hibernation WebSocket API. Its fixed text message `changed` means fetch the current
 `/api/status` snapshot. There are no snapshots, fields, identifiers, revisions or
 credentials on the socket. Only public projection changes notify: published
-Monitor results/history (including Calendar Checks), publication, names, visible
+Monitor results/history (including Calendar Checks and finalized Heartbeat occurrences),
+last-seen receipts, publication, names, visible
 Incidents, Maintenance and pause. Target/timing-only settings, webhook destinations,
 private Monitor activity and other contexts remain silent. Notification comparison
 and send happen synchronously after persistence and before external alert delivery.

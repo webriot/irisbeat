@@ -35,7 +35,9 @@ it('rejects invalid grammar, impossible dates, zones and unauthenticated preview
   }
   expect((await preview('* * * * *', 'Invalid/Zone')).status).toBe(400);
   expect((await request('/api/operator/schedule-preview', 'POST', { cron: '* * * * *' }, false)).status).toBe(401);
-  expect((await create({ kind: 'heartbeat', url: undefined })).status).toBe(400);
+  expect((await create({ kind: 'heartbeat' })).status).toBe(400); // HTTP targets remain wrong-kind fields.
+  expect((await create({ kind: 'heartbeat', url: undefined })).status).toBe(201);
+  expect((await read()).monitors.at(-1)).toMatchObject({ kind: 'heartbeat', scheduleMode: 'calendar', graceSeconds: 30 });
 });
 
 it('supports lists, ranges, steps, Sunday 7 and OR day semantics with explicit explanations', async () => {

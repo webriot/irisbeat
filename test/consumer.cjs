@@ -594,6 +594,62 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       await policy('omit');
       console.log('PASS packed ' + kind + ' Calendar: preview, permissions, validation, private dispatch, persisted pause, next-future resume, Maintenance, retained Incident and both transition delivery paths');
     }
+    // Calendar Heartbeat retains receipt evidence and credentials through a real isolate restart.
+    now = Math.ceil((now + 60_000) / 60_000) * 60_000;
+    const heartbeatBase = now;
+    const jobResponse = await request('a.example', '/api/operator/monitors', 'POST', {
+      name: 'Calendar producer', kind: 'heartbeat', published: false, scheduleMode: 'calendar', cron: '* * * * *',
+    });
+    assert.equal(jobResponse.status, 201);
+    const job = (await jobResponse.json()).monitors.at(-1);
+    const jobPath = '/api/operator/monitors/' + job.id;
+    assert.equal(job.graceSeconds, 30);
+    assert.equal(job.silenceSeconds, undefined);
+    assert.equal((await request('a.example', jobPath, 'PATCH', { graceSeconds: 60 })).status, 400);
+    assert.equal((await request('a.example', jobPath + '/heartbeat-secret', 'POST', undefined, 'reader')).status, 403);
+    const jobSecret = (await (await request('a.example', jobPath + '/heartbeat-secret', 'POST')).json()).secret;
+    now = heartbeatBase + 90_001;
+    assert.equal((await request('a.example', '/heartbeat', 'POST', undefined, jobSecret)).status, 204);
+    await tick(now);
+    const jobIncident = (await read()).incidents.find(row => row.monitorId === job.id);
+    assert.equal(jobIncident.openedAt, heartbeatBase + 90_000, 'late receipt cannot satisfy a closed window');
+    now = heartbeatBase + 120_000;
+    assert.equal((await request('a.example', '/heartbeat', 'POST', 'ignored', jobSecret)).status, 204);
+    const rotatedJobSecret = (await (await request('a.example', jobPath + '/heartbeat-secret', 'POST')).json()).secret;
+    assert.equal((await request('a.example', '/heartbeat', 'POST', undefined, jobSecret)).status, 401);
+    assert.equal((await request('b.example', '/heartbeat', 'POST', undefined, rotatedJobSecret)).status, 401);
+    assert.equal((await request('a.example', '/heartbeat', 'POST', undefined, 'editor')).status, 401);
+    await mf.setOptions(convertV4MiniflareOptions({ ...workerOptions, script: script + '\n// Calendar Heartbeat restart' }));
+    await tick(heartbeatBase + 150_001);
+    assert.equal((await read()).incidents.find(row => row.id === jobIncident.id).closedAt, null, 'rotation preserves earlier occurrence evidence without advancing recovery');
+    now = heartbeatBase + 210_000;
+    assert.equal((await request('a.example', '/heartbeat', 'POST', undefined, rotatedJobSecret)).status, 204);
+    assert.equal((await request('a.example', '/heartbeat', 'POST', undefined, rotatedJobSecret)).status, 204);
+    await tick(now);
+    assert.equal((await read()).incidents.find(row => row.id === jobIncident.id).closedAt, null, 'inclusive deadline remains open for receipt ingress');
+    await tick(now + 1);
+    assert.equal((await read()).incidents.find(row => row.id === jobIncident.id).closedAt, heartbeatBase + 210_000);
+    assert.deepEqual(deliveries.filter(event => event.incident.monitorId === job.id).map(event => event.transition), ['opened', 'recovered']);
+    assert.equal((await (await request('a.example', '/api/status')).json()).monitors.some(row => row.id === job.id), false);
+    const readerJob = await (await request('a.example', '/api/operator', 'GET', undefined, 'reader')).text();
+    assert.equal(readerJob.includes(rotatedJobSecret), false);
+    await request('a.example', jobPath, 'DELETE');
+    assert.equal((await request('a.example', '/heartbeat', 'POST', undefined, rotatedJobSecret)).status, 401);
+    now = Math.ceil((now + 60_000) / 60_000) * 60_000;
+    const overlapBase = now;
+    const overlapJob = (await (await request('a.example', '/api/operator/monitors', 'POST', {
+      name: 'Delayed Calendar producer', kind: 'heartbeat', scheduleMode: 'calendar', cron: '* * * * *', recoveryThreshold: 1,
+    })).json()).monitors.at(-1);
+    const overlapPath = '/api/operator/monitors/' + overlapJob.id;
+    const overlapSecret = (await (await request('a.example', overlapPath + '/heartbeat-secret', 'POST')).json()).secret;
+    now = overlapBase + 120_000;
+    await request('a.example', '/heartbeat', 'POST', undefined, overlapSecret);
+    now = overlapBase + 160_000;
+    await request('a.example', overlapPath + '/maintenance', 'PUT', { endsAt: overlapBase + 400_000 });
+    await tick(now);
+    assert.deepEqual(deliveries.filter(event => event.incident.monitorId === overlapJob.id).map(event => event.transition), ['opened', 'recovered'], 'later Maintenance must not suppress earlier non-overlapping occurrence hooks');
+    await request('a.example', overlapPath, 'DELETE');
+    console.log('PASS packed Calendar Heartbeat: occurrence deadlines, durable evidence/restart, credential rotation, ignored bodies, tenant permissions, privacy, recovery and transition hooks');
     console.log('PASS packed irisbeat@0.1.0: reproducible artifact, pinned integrity, consumer typecheck, isolated scheduling/Incidents, HTTP/TCP/heartbeat hooks, failure isolation, webhooks rotated tenant credentials and three-kind Maintenance suppression and HTTP/TCP boundary overlap of both delivery paths, persisted pause/resume and omission, paused history, Maintenance precedence, in-flight checks and delivery suppression');
   } finally { await mf.dispose(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

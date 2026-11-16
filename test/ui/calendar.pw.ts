@@ -78,3 +78,48 @@ test('Calendar preview authorization loss clears the operator session', async ({
   await expect(page.locator('#message')).toHaveText('Unauthorized');
   await expect(page.getByLabel('Installation secret', { exact: true })).toHaveValue('');
 });
+
+test('operator configures Calendar Heartbeat grace in duration units and returns to Interval controls', async ({ page, request }) => {
+  await page.setViewportSize({ width: 390, height: 900 });
+  await page.goto('/operator');
+  await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await page.getByRole('button', { name: 'New Monitor', exact: true }).click();
+  await page.getByLabel('Monitor name', { exact: true }).fill('Calendar producer');
+  await page.getByLabel('Check type', { exact: true }).selectOption('heartbeat');
+  await page.getByLabel('Schedule', { exact: true }).selectOption('calendar');
+  await expect(page.getByLabel('Silence', { exact: true })).toBeHidden();
+  await expect(page.getByLabel('Recovery spacing', { exact: true })).toBeHidden();
+  await expect(page.getByLabel('Expectation', { exact: true })).toBeHidden();
+  await expect(page.getByLabel('Grace', { exact: true })).toHaveValue('30');
+  await page.getByLabel('Cron', { exact: true }).fill('0 9 * * *');
+  await page.getByLabel('Grace unit', { exact: true }).selectOption('minutes');
+  await page.getByLabel('Grace', { exact: true }).fill('1.5');
+  await page.getByLabel('Consecutive successful occurrences', { exact: true }).fill('3');
+  await page.getByLabel('Cron', { exact: true }).fill('* * * * *');
+  await expect(page.locator('#schedule-explanation')).toContainText('shorter than every occurrence gap');
+  await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
+  await expect(page.locator('#configuration')).toBeVisible();
+  await page.getByLabel('Cron', { exact: true }).fill('0 9 * * *');
+  await expect(page.locator('#schedule-occurrences time')).toHaveCount(3);
+  const saving = page.waitForResponse(response => response.request().method() === 'POST' && response.url().endsWith('/monitors'));
+  await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
+  const saved = await saving;
+  expect(saved.status()).toBe(201);
+  const monitor = (await saved.json()).monitors.at(-1);
+  try {
+    expect(monitor).toMatchObject({ kind: 'heartbeat', scheduleMode: 'calendar', graceSeconds: 90, recoveryThreshold: 3 });
+    await monitorAction(page, 'Edit Calendar producer');
+    await expect(page.getByLabel('Grace', { exact: true })).toHaveValue('90');
+    await page.getByLabel('Grace unit', { exact: true }).selectOption('minutes');
+    await expect(page.getByLabel('Grace', { exact: true })).toHaveValue('1.5');
+    await page.getByLabel('Schedule', { exact: true }).selectOption('interval');
+    await expect(page.getByLabel('Grace', { exact: true })).toBeHidden();
+    await expect(page.getByLabel('Silence', { exact: true })).toBeVisible();
+    await expect(page.getByLabel('Recovery spacing', { exact: true })).toBeVisible();
+    const editing = page.waitForResponse(response => response.request().method() === 'PATCH');
+    await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
+    expect((await (await editing).json()).monitors.find((item: { id: string }) => item.id === monitor.id)).toMatchObject({ id: monitor.id, scheduleMode: 'interval', silenceSeconds: 180 });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  } finally { await request.delete('/api/operator/monitors/' + monitor.id, { headers: { authorization: 'Bearer ui-test-secret' } }); }
+});
