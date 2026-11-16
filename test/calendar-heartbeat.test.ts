@@ -481,6 +481,74 @@ it('interleaves receipts and ordinary edits with grace validation without restor
   expect((await read()).monitor).toMatchObject({ name: 'Concurrent', published: false, lastSeen: start, cron: '0-28/2,31-57/2 * * * *', graceSeconds: 60 });
 });
 
+it.each(['PATCH', 'PUT'])('rejects a %s save when its Monitor is deleted during grace validation without editing the next Monitor', async method => {
+  vi.spyOn(Date, 'now').mockReturnValue(start);
+  expect((await create({ cron: '*/5 * * * *', graceSeconds: 90 })).status).toBe(201);
+  const id = (await read()).monitor!.id;
+  expect((await create({ name: 'Sibling', cron: '*/5 * * * *' })).status).toBe(201);
+  const sibling = (await read()).monitors[1];
+  const format = Intl.DateTimeFormat.prototype.formatToParts;
+  let calls = 0, finished = false;
+  vi.spyOn(Intl.DateTimeFormat.prototype, 'formatToParts').mockImplementation(function (this: Intl.DateTimeFormat, at) {
+    if (++calls > 200_000) throw new Error('Unbounded grace validation');
+    return format.call(this, at);
+  });
+  const saving = request(method === 'PATCH' ? '/api/operator/monitors/' + id : '/api/operator', method, {
+    ...(method === 'PUT' ? { pageName: 'Changed', kind: 'heartbeat', name: 'Configured' } : {}),
+    cron: '0-28/2,31-57/2 * * * *', timezone: 'Australia/Lord_Howe', graceSeconds: 60,
+  }).then(response => { finished = true; return response; });
+  for (let yields = 0; calls < 1024 && yields < 100; yields++) await scheduler.wait(0);
+  expect(calls).toBeGreaterThanOrEqual(1024);
+  expect(finished).toBe(false);
+  expect((await request('/api/operator/monitors/' + id, 'DELETE')).status).toBe(200);
+  const afterDeletion = await read();
+  expect(afterDeletion.monitors).toEqual([sibling]);
+  expect(finished).toBe(false);
+  const response = await saving;
+  expect(response.status).toBe(method === 'PATCH' ? 404 : 409);
+  expect(await response.json()).toEqual({ error: method === 'PATCH' ? 'Monitor not found' : 'Monitor changed; reload before saving' });
+  expect((await request('/heartbeat/' + id, 'POST')).status).toBe(404);
+  await tick(start + 90_001);
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  expect(await read()).toEqual(afterDeletion);
+});
+
+it.each([
+  ['*/2 * * * *', 200, 60],
+  ['* * * * *', 400, 30],
+] as const)('revalidates pending grace against concurrent schedule %s and retains the latest other fields', async (cron, status, graceSeconds) => {
+  vi.spyOn(Date, 'now').mockReturnValue(start);
+  expect((await create({ cron: '0-28/2,31-57/2 * * * *', timezone: 'Australia/Lord_Howe' })).status).toBe(201);
+  const id = (await read()).monitor!.id;
+  const path = '/api/operator/monitors/' + id;
+  const format = Intl.DateTimeFormat.prototype.formatToParts;
+  let calls = 0, finished = false;
+  vi.spyOn(Intl.DateTimeFormat.prototype, 'formatToParts').mockImplementation(function (this: Intl.DateTimeFormat, at) {
+    if (++calls > 200_000) throw new Error('Repeated validation after concurrent schedule changes');
+    return format.call(this, at);
+  });
+  const saving = request(path, 'PATCH', { graceSeconds: 60 }).then(response => { finished = true; return response; });
+  for (let yields = 0; calls < 1024 && yields < 100; yields++) await scheduler.wait(0);
+  expect(calls).toBeGreaterThanOrEqual(1024);
+  expect(finished).toBe(false);
+  expect((await request(path, 'PATCH', { cron, timezone: 'UTC', name: 'Concurrent', published: false, recoveryThreshold: 3 })).status).toBe(200);
+  const concurrent = await read();
+  expect(finished).toBe(false);
+  const response = await saving;
+  expect(response.status).toBe(status);
+  const saved = await read();
+  expect(saved.monitor).toMatchObject({ id, cron, timezone: 'UTC', graceSeconds, name: 'Concurrent', published: false, recoveryThreshold: 3 });
+  if (status === 200) expect(await response.json()).toEqual(saved);
+  else expect(saved).toEqual(concurrent);
+  expect((await (await request('/api/status')).json() as import('../src/index').Status).monitors).toEqual([]);
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  await tick(start + 90_001);
+  const observed = (await read()).monitor!;
+  expect(observed.lastResult).toEqual(status === 200 ? null : { at: start + 90_000, outcome: 'failure' });
+  await tick(start + 180_001);
+  expect((await read()).monitor!.lastResult).toEqual({ at: start + (status === 200 ? 180_000 : 150_000), outcome: 'failure' });
+});
+
 it('bounds work between yields as well as total exact validation work', async () => {
   const format = Intl.DateTimeFormat.prototype.formatToParts;
   let total = 0, chunk = 0, maximum = 0;
