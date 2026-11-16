@@ -14,3 +14,6 @@ worker-configuration.d.ts
 test/consumer/package-lock.json
 
 .tmp/
+
+playwright-report/
+test-results/

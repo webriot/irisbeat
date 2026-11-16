@@ -20,6 +20,7 @@
     "vitest.config.ts"
   ],
   "exclude": [
-    "test/consumer"
+    "test/consumer",
+    "test/ui/*.pw.ts"
   ]
 }

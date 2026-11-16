@@ -17,10 +17,14 @@ npm ci
 npm run types
 npm test
 npm run check
+npx playwright install chromium
+npm run test:ui
 npm run build
 ```
 
 For interactive local use, create an ignored `.dev.vars` file containing `INSTALLATION_SECRET="<your local secret>"`, then run `npm run dev`. Open `/operator` and sign in with that secret. Save a page name and create Monitors with a name and kind. HTTP(S) requires a URL; TCP requires hostname and port; Heartbeat shows its authenticated POST endpoint when edited. Publish or unpublish each Monitor from its ledger row; private Monitors keep checking. Delete removes a Monitor from checking and public visibility while retaining its Incidents for the operator. The secret stays in browser memory until sign-out or reload; it is never stored in browser storage or returned by the API. Use a dedicated secret and HTTPS outside local development.
+
+Both views offer System, Light, and Dark themes. System follows browser preference changes; explicit choices are saved locally when browser storage is available. Theme selection never stores operator credentials. `npm run test:ui` checks rendered themes, keyboard access, mobile layouts, and editor draft preservation against the local Worker.
 
 Local cron dispatch can be triggered at `/__scheduled?cron=*+*+*+*+*`. Deployed cron runs every minute; missed dispatches are not replayed. New Monitors remain “Awaiting check” until observed. HTTP GET accepts every 2xx response and follows redirects; network errors, the configured deadline (ten seconds by default), and non-2xx responses are failures. TCP checks establish a plain connection using native Cloudflare sockets, succeeding when the connection opens; refusal, network errors and the configured deadline are failures. Each socket requests closure without delaying observations or later dispatch. TCP checks do not verify TLS or application protocols. By default, two consecutive failures open an Incident and two consecutive successes close it. The public page refreshes every minute and displays Incident timestamps in UTC.
 
