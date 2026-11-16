@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /** @jsxRuntime automatic */
 /** @jsxImportSource hono/jsx */
-import type { AvailabilityHistory, Status } from "./index";
+import type { Status } from "./index";
 import { createOperatorSession } from "./operator-session";
+import { createMonitorEditor } from "./monitor-editor";
 import type { Child } from "hono/jsx";
+import { raw } from "hono/html";
+import { createStatusLedger } from "./status-ledger";
 
-const stateLabel = {
-  unknown: "Awaiting check",
-  up: "Operational",
-  down: "Unavailable",
-  maintenance: "Maintenance",
-  paused: "Monitoring paused",
-};
+const statusLedger = createStatusLedger();
 
 function Document({ title, operator = false, children }: { title: string; operator?: boolean; children: Child }) {
   return <html lang="en"><head>
@@ -29,59 +26,8 @@ function Document({ title, operator = false, children }: { title: string; operat
   </body></html>;
 }
 
-function History({ history, id }: { history: AvailabilityHistory | null | undefined; id: string }) {
-  if (!history) return <p class="history-unavailable">Bars unavailable</p>;
-  return <div class="availability"><div class="history-head"><span>90 UTC days</span><span class="percentage" aria-label="Availability">{history.percentage === null ? "No observations" : history.percentage.toFixed(2) + "%"}</span></div>
-    <ol class="history" data-monitor={encodeURIComponent(id)} aria-label="90 UTC days of availability">{history.days.map((day, index) => {
-      const label = ({ empty: "No observations", up: "Successful checks", down: "Failed checks", degraded: "Mixed results", maintenance: "Maintenance" })[day.state] + "; " + day.successes + " successes, " + day.failures + " failures, " + day.maintenance + " Maintenance";
-      return <li class={"history-day " + day.state} data-date={day.date} data-detail={label} tabindex={index === history.days.length - 1 ? 0 : -1} aria-label={day.date + " UTC: " + label}></li>;
-    })}</ol><p class="history-detail" role="status" aria-live="polite" aria-atomic="true"></p>
-  </div>;
-}
-
-function statusBanner(status: Status) {
-  return status.paused ? "Monitoring paused" : !status.monitors.length
-    ? "No Monitors published"
-    : status.incidents.some(incident => incident.closedAt === null) || status.monitors.some(monitor => monitor.state === "down")
-      ? "Services unavailable"
-      : status.monitors.every(monitor => monitor.state === "maintenance")
-        ? "Maintenance"
-      : status.monitors.every(monitor => monitor.state === "up" || monitor.state === "maintenance") && status.monitors.some(monitor => monitor.state === "maintenance")
-        ? "Some services in Maintenance"
-      : status.monitors.every(monitor => monitor.state === "up")
-        ? "All services operational"
-        : "Awaiting check";
-}
-
-function StatusLedger({ status }: { status: Status }) {
-  const banner = statusBanner(status);
-  return <>
-    <h1>{status.pageName}</h1>
-    <section class="banner" data-state={banner === "All services operational" ? "up" : banner === "Services unavailable" ? "down" : "unknown"} aria-label="Current status"><h2>{banner}</h2></section>
-    <div class="ledger">{status.monitors.map((monitor, index) => <article data-key={monitor.id} aria-labelledby={"monitor-name" + (index || "")}>
-      <div class="ledger-row" data-state={monitor.state}><h2 id={"monitor-name" + (index || "")}>{monitor.name}</h2><span class="status">{stateLabel[monitor.state]}</span></div>
-      <History history={monitor.history} id={monitor.id} />
-    </article>)}</div>
-    <Incidents status={status} />
-  </>;
-}
-
-function Timestamp({ at }: { at: number }) {
-  const value = new Date(at).toISOString();
-  return <time datetime={value}>{value}</time>;
-}
-
-function Incidents({ status }: { status: Status }) {
-  return <section id="public-incidents" hidden={!status.monitors.length} aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>
-    {status.incidents.length ? <ul class="incidents">{status.incidents.map(incident => <li data-key={encodeURIComponent(incident.monitorId) + ":" + incident.openedAt}><article class="incident">
-      <strong>{status.monitors.find(monitor => monitor.id === incident.monitorId)?.name ?? incident.monitorId} — {incident.closedAt === null ? "Open" : "Recovered"}</strong>
-      <p>Unavailable since <Timestamp at={incident.openedAt} />{incident.closedAt === null ? " — Ongoing" : <> — Recovered <Timestamp at={incident.closedAt} /></>}</p>
-    </article></li>)}</ul> : <p>No Incidents</p>}
-  </section>;
-}
-
 export function statusPage(status: Status) {
-  return "<!doctype html>" + <Document title={status.pageName}><div id="public-status"><StatusLedger status={status} /></div></Document>;
+  return "<!doctype html>" + <Document title={status.pageName}><div id="public-status">{raw(statusLedger.render(status))}</div></Document>;
 }
 
 function DurationControl({ field, label, min, max, value }: { field: string; label: string; min: number; max: number; value: number }) {
@@ -153,31 +99,9 @@ export function operatorPage(hosted = false) {
   return "<!doctype html>" + <Document title="Irisbeat operator" operator><Operator hosted={hosted} /></Document>;
 }
 
-function historyMarkup(history: AvailabilityHistory | null | undefined, id: string) {
-  if (!history) return '<p class="history-unavailable">Bars unavailable</p>';
-  return `<div class="availability"><div class="history-head"><span>90 UTC days</span><span class="percentage" aria-label="Availability">${history.percentage === null ? "No observations" : history.percentage.toFixed(2) + "%"}</span></div><ol class="history" data-monitor="${encodeURIComponent(id)}" aria-label="90 UTC days of availability">${history.days.map((day, index) => {
-    const label = ({ empty: "No observations", up: "Successful checks", down: "Failed checks", degraded: "Mixed results", maintenance: "Maintenance" })[day.state] + "; " + day.successes + " successes, " + day.failures + " failures, " + day.maintenance + " Maintenance";
-    return `<li class="history-day ${day.state}" data-date="${day.date}" data-detail="${label}" tabindex="${index === history.days.length - 1 ? 0 : -1}" aria-label="${day.date} UTC: ${label}"></li>`;
-  }).join("")}</ol><p class="history-detail" role="status" aria-live="polite" aria-atomic="true"></p></div>`;
-}
-
-const publicMarkupScript = `
-function publicMarkup(data, history, bannerLabel) {
-  const escape = (value) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('\"', '&quot;');
-  const banner = bannerLabel(data);
-  const timestamp = (at) => '<time datetime="' + new Date(at).toISOString() + '"></time>';
-  return '<h1>' + escape(data.pageName) + '</h1><section class="banner" data-state="' + (banner === 'All services operational' ? 'up' : banner === 'Services unavailable' ? 'down' : 'unknown') + '" aria-label="Current status"><h2>' + banner + '</h2></section><div class="ledger">' + data.monitors.map((monitor, index) =>
-    '<article data-key="' + escape(monitor.id) + '" aria-labelledby="monitor-name' + (index || '') + '"><div class="ledger-row" data-state="' + monitor.state + '"><h2 id="monitor-name' + (index || '') + '">' + escape(monitor.name) + '</h2><span class="status">' + (${JSON.stringify(stateLabel)})[monitor.state] + '</span></div>' + history(monitor.history, monitor.id) + '</article>'
-  ).join('') + '</div><section id="public-incidents"' + (data.monitors.length ? '' : ' hidden') + ' aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>' + (data.incidents.length ? '<ul class="incidents">' + data.incidents.map(incident =>
-    '<li data-key="' + encodeURIComponent(incident.monitorId) + ':' + incident.openedAt + '"><article class="incident"><strong>' + escape(data.monitors.find(monitor => monitor.id === incident.monitorId)?.name ?? incident.monitorId) + ' — ' + (incident.closedAt === null ? 'Open' : 'Recovered') + '</strong><p>Unavailable since ' + timestamp(incident.openedAt) + (incident.closedAt === null ? ' — Ongoing' : ' — Recovered ' + timestamp(incident.closedAt)) + '</p></article></li>'
-  ).join('') + '</ul>' : '<p>No Incidents</p>') + '</section>';
-}
-
-`;
-
 // Runs before the stylesheet to apply a saved preference before first paint.
 export const themeScript = `
-${publicMarkupScript}
+const statusLedger = (${createStatusLedger.toString()})();
 function reconcile(parent, next) {
   const key = node => node.nodeType === 1 ? node.getAttribute('data-key') || node.getAttribute('data-date') : null;
   // Inline forms own their drafts and stay attached while snapshot siblings change.
@@ -391,7 +315,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const data = await response.json();
         if (!current()) return;
         const next = document.createElement('div');
-        next.innerHTML = publicMarkup(data, ${historyMarkup.toString()}, ${statusBanner.toString()});
+        next.innerHTML = statusLedger.render(data);
         reconcile(document.getElementById('public-status'), next);
         document.title = data.pageName;
         initializeDisplay(); snapshotFailure(false);
@@ -545,7 +469,7 @@ h1 { margin: 24px 0 20px; font-size: 24px; }
 
 export const operatorScript = `
 const createOperatorSession = ${createOperatorSession.toString()};
-const historyMarkup = ${historyMarkup.toString()};
+const createMonitorEditor = ${createMonitorEditor.toString()};
 const byId = id => document.getElementById(id);
 const login = byId('login');
 const editor = byId('editor');
@@ -554,93 +478,17 @@ const pageForm = byId('page-configuration');
 const webhook = byId('webhook');
 const maintenanceForm = byId('maintenance');
 const message = byId('message');
-const timingDefaults = { intervalSeconds: 60, timeoutSeconds: 10, failureThreshold: 2, recoveryThreshold: 2, silenceSeconds: 180, recoverySpacingSeconds: 60, graceSeconds: 30 };
-const durationFactors = { seconds: 1, minutes: 60, hours: 3600, days: 86400 };
-const durations = new Map();
-function durationSeconds(input) {
-  const state = durations.get(input);
-  // Keep the original seconds when a unit has a repeating decimal representation.
-  if (input.value === state.display) return state.seconds;
-  const match = input.value.match(/^(\\d*)(?:\\.(\\d*))?(?:e([+-]?\\d+))?$/i);
-  if (!match || !(match[1] + (match[2] || '')) || !Number.isFinite(Number(input.value))) return null;
-  const exponent = Number(match[3] || 0) - (match[2] || '').length;
-  if (Math.abs(exponent) > 400) return null;
-  const numerator = BigInt(match[1] + (match[2] || '')) * BigInt(durationFactors[state.unit]) * 10n ** BigInt(Math.max(0, exponent));
-  const denominator = 10n ** BigInt(Math.max(0, -exponent));
-  if (numerator % denominator !== 0n) return null;
-  const seconds = Number(numerator / denominator);
-  return Number.isSafeInteger(seconds) && seconds >= state.min && seconds <= state.max ? seconds : null;
-}
-function validateDuration(input) {
-  const seconds = durationSeconds(input);
-  const state = durations.get(input);
-  input.setCustomValidity(seconds === null ? 'Enter whole seconds between ' + state.min + ' and ' + state.max + '.' : '');
-  return seconds;
-}
-function displayDuration(input, seconds, unit = 'seconds') {
-  const state = durations.get(input);
-  state.unit = unit; state.seconds = seconds;
-  state.control.value = unit;
-  input.min = state.min / durationFactors[unit];
-  input.max = state.max / durationFactors[unit];
-  input.value = seconds / durationFactors[unit];
-  state.display = input.value;
-  input.setCustomValidity('');
-}
-for (const input of form.querySelectorAll('[data-duration]')) {
-  const control = byId(input.id + '-unit');
-  durations.set(input, { control, min: Number(input.min), max: Number(input.max) });
-  displayDuration(input, Number(input.value));
-  input.addEventListener('input', () => validateDuration(input));
-  control.addEventListener('change', () => {
-    const seconds = validateDuration(input);
-    if (seconds === null) { control.value = durations.get(input).unit; input.reportValidity(); return; }
-    displayDuration(input, seconds, control.value);
-  });
-}
 let savedSettings = {};
-let editingId = null;
 let hosted = false;
 let monitorIds = new Set();
 function updateDeleted() {
-  const missing = editingId !== null && !monitorIds.has(editingId);
-  byId('monitor-deleted').hidden = !missing;
-  byId('save-monitor').disabled = missing;
+  monitorEditor.update(monitorIds);
   const maintenanceMissing = !maintenanceForm.hidden && !monitorIds.has(maintenanceForm.dataset.monitorId);
   byId('maintenance-deleted').hidden = !maintenanceMissing;
   byId('save-maintenance').disabled = maintenanceMissing;
 }
 
-function edit(monitor = null) {
-  editingId = monitor?.id || null;
-  form.reset();
-  byId('monitor-settings').textContent = monitor ? 'Edit Monitor' : 'New Monitor';
-  byId('name').value = monitor?.name || '';
-  byId('kind').value = monitor?.kind || 'http';
-  byId('kind').disabled = editingId !== null;
-  byId('url').value = monitor?.url || '';
-  byId('hostname').value = monitor?.hostname || '';
-  byId('port').value = monitor?.port || '';
-  byId('published').checked = monitor?.published ?? true;
-  byId('scheduleMode').value = monitor?.scheduleMode || 'interval';
-  byId('cron').value = monitor?.cron || '0 9 * * *';
-  byId('timezone').value = monitor?.timezone || 'UTC';
-  byId('cron').setCustomValidity('');
-  for (const [field, value] of Object.entries(timingDefaults)) {
-    const input = byId(field);
-    if (durations.has(input)) displayDuration(input, monitor?.[field] ?? value);
-    else input.value = monitor?.[field] ?? value;
-  }
-  byId('heartbeat-path').textContent = monitor?.kind === 'heartbeat' ? (hosted ? 'POST /heartbeat' : 'POST /heartbeat/' + monitor.id) : '';
-  byId('rotate-heartbeat').hidden = !hosted || monitor?.kind !== 'heartbeat';
-  byId('heartbeat-credential').textContent = '';
-  updateKind();
-  (monitor ? document.getElementById('history-' + monitor.id) : byId('new-monitor-panel')).append(form);
-  form.hidden = false; updateDeleted(); previewSchedule();
-  byId('name').focus();
-}
 function focusActions(id) { (document.getElementById('actions-' + id) || byId('new-monitor')).focus(); }
-function cancelEdit() { session.cancelPreview(); byId('cron').setCustomValidity(''); const id = editingId; byId('heartbeat-credential').textContent = ''; editingId = null; form.reset(); form.hidden = true; byId('new-monitor-panel').append(form); focusActions(id); }
 function localMinute(date) { return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16); }
 function declareMaintenance(monitor) {
   maintenanceForm.querySelector('label').textContent = 'End time (' + browserTimeZone + ')';
@@ -659,11 +507,11 @@ function declareMaintenance(monitor) {
 function clearSession() {
   document.querySelectorAll('button, input, select').forEach(control => { control.disabled = false; });
   monitorIds.clear(); selectedHistoryDays.clear(); byId('stale').hidden = true; byId('sync-announcement').textContent = ''; snapshotPending(false);
-  savedSettings = {}; cancelEdit(); byId('heartbeat-path').textContent = ''; maintenanceForm.reset(); maintenanceForm.removeAttribute('data-monitor-id'); byId('maintenance-heading').textContent = 'Maintenance'; maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
+  savedSettings = {}; monitorEditor.close(); byId('heartbeat-path').textContent = ''; maintenanceForm.reset(); maintenanceForm.removeAttribute('data-monitor-id'); byId('maintenance-heading').textContent = 'Maintenance'; maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
   showSettings(false); byId('operator-navigation').hidden = true;
   byId('new-monitor-panel').append(maintenanceForm);
   byId('monitor-rows').replaceChildren(); byId('incidents').replaceChildren();
-  updateKind(); updateDeleted();
+  updateDeleted();
   message.textContent = ''; byId('secret').value = ''; byId('secret').focus();
 }
 function render(data, savedField) {
@@ -672,7 +520,7 @@ function render(data, savedField) {
   hosted = !!data.hosted;
   byId('paused').hidden = !data.paused;
   const canEdit = data.permission !== 'reader';
-  if (!canEdit) { cancelEdit(); maintenanceForm.hidden = true; byId('webhookUrl').value = ''; savedSettings.webhookUrl = ''; }
+  if (!canEdit) { monitorEditor.close(); maintenanceForm.hidden = true; byId('webhookUrl').value = ''; savedSettings.webhookUrl = ''; }
   if (!canEdit) showSettings(false);
   byId('new-monitor').hidden = !canEdit || !byId('settings').hidden; byId('settings-button').hidden = !canEdit || !byId('settings').hidden;
   for (const field of ['pageName', 'webhookUrl']) {
@@ -687,7 +535,7 @@ function render(data, savedField) {
   updateDeleted();
   const focused = document.activeElement;
   for (const draft of [form, maintenanceForm]) {
-    const id = draft === form ? editingId : draft.dataset.monitorId;
+    const id = draft === form ? monitorEditor.id : draft.dataset.monitorId;
     if (id && !monitorIds.has(id) && draft.parentElement !== byId('new-monitor-panel')) {
       byId('new-monitor-panel').append(draft);
       if (draft.contains(focused)) focused.focus();
@@ -695,7 +543,7 @@ function render(data, savedField) {
   }
   const rows = data.monitors.flatMap(monitor => {
     const row = document.createElement('tr'); row.dataset.key = monitor.id;
-    for (const text of [monitor.name, (${JSON.stringify(stateLabel)})[monitor.state], monitor.published ? 'Published' : 'Private']) {
+    for (const text of [monitor.name, statusLedger.stateLabel[monitor.state], monitor.published ? 'Published' : 'Private']) {
       const cell = document.createElement('td'); cell.textContent = text;
       if (row.children.length === 1) { cell.className = 'status'; cell.dataset.state = monitor.state; }
       row.append(cell);
@@ -707,7 +555,7 @@ function render(data, savedField) {
     if (canEdit) group.append(trigger, items);
     const path = '/api/operator/monitors/' + encodeURIComponent(monitor.id);
     for (const [key, label, action] of (canEdit ? [
-      ['edit', 'Edit', () => edit(monitor)],
+      ['edit', 'Edit', () => monitorEditor.open(monitor, hosted)],
       ['maintenance', monitor.maintenance ? 'Replace Maintenance' : 'Declare Maintenance', () => declareMaintenance(monitor)],
       ...(monitor.maintenance ? [['end-maintenance', 'End Maintenance', () => run(path + '/maintenance', 'DELETE', undefined, () => { maintenanceForm.hidden = true; })]] : []),
       ['publication', monitor.published ? 'Unpublish' : 'Publish', () => run(path, 'PATCH', { published: !monitor.published })],
@@ -727,7 +575,7 @@ function render(data, savedField) {
     const availability = document.createElement('td'); availability.colSpan = 4;
     availability.id = 'history-' + monitor.id;
     availability.setAttribute('aria-label', monitor.name + ' availability');
-    availability.innerHTML = historyMarkup(monitor.history, monitor.id); historyRow.append(availability);
+    availability.innerHTML = statusLedger.history(monitor.history, monitor.id); historyRow.append(availability);
     return [row, historyRow];
   });
   if (!rows.length) {
@@ -773,95 +621,22 @@ const session = createOperatorSession(liveSnapshots, {
     message.textContent = '';
     return () => {
       disabled.forEach(control => { control.disabled = false; });
-      updateKind(); updateDeleted();
+      updateDeleted();
       if (!editor.hidden && document.activeElement === document.body) byId(byId('new-monitor').hidden ? 'operator-title' : 'new-monitor').focus();
     };
   },
   saved(path, method) {
     message.textContent = method === 'DELETE' ? (path.endsWith('/maintenance') ? 'Maintenance ended' : 'Deleted') : 'Saved';
   },
-  previewed(data) {
-    byId('schedule-explanation').textContent = data.explanation;
-    const format = new Intl.DateTimeFormat(undefined, { timeZone: data.timezone, dateStyle: 'medium', timeStyle: 'long' });
-    byId('schedule-occurrences').replaceChildren(...data.occurrences.map(at => {
-      const item = document.createElement('li');
-      const time = document.createElement('time');
-      time.dataset.schedulePreview = '';
-      time.dateTime = new Date(at).toISOString();
-      time.textContent = format.format(at) + ' (' + data.timezone + ')';
-      item.append(time); return item;
-    }));
-  },
-  previewFailed(error) {
-    byId('schedule-explanation').textContent = error;
-    byId('cron').setCustomValidity(error);
-  },
+  previewed: data => monitorEditor.previewed(data),
+  previewFailed: error => monitorEditor.previewFailed(error),
 });
 const run = session.run;
-function updateKind() {
-  const kind = byId('kind').value;
-  const heartbeat = kind === 'heartbeat';
-  const calendar = byId('scheduleMode').value === 'calendar';
-  byId('calendar-schedule').hidden = !calendar;
-  byId('calendar-schedule').disabled = !calendar;
-  for (const field of ['cron', 'timezone']) byId(field).disabled = !calendar;
-  byId('intervalSeconds').closest('.duration').hidden = calendar;
-  byId('intervalSeconds').disabled = calendar;
-  byId('intervalSeconds-unit').disabled = calendar;
-  for (const target of ['http', 'tcp']) {
-    byId(target + '-target').hidden = kind !== target;
-    byId(target + '-target').disabled = kind !== target;
-  }
-  byId('kind').disabled = !!editingId;
-  for (const field of ['timeoutSeconds', 'failureThreshold', 'silenceSeconds', 'recoverySpacingSeconds', 'graceSeconds']) {
-    const input = document.getElementById(field);
-    const hidden = field === 'graceSeconds' ? !heartbeat || !calendar : ['silenceSeconds', 'recoverySpacingSeconds'].includes(field) ? !heartbeat || calendar : heartbeat;
-    input.disabled = hidden; input.hidden = hidden;
-    if (durations.has(input)) {
-      input.closest('.duration').hidden = hidden;
-      durations.get(input).control.disabled = hidden;
-    }
-    document.querySelector('label[for="' + field + '"]').hidden = hidden;
-  }
-  document.querySelector('label[for="intervalSeconds"]').textContent = heartbeat ? 'Expectation' : 'Interval';
-  byId('intervalSeconds-unit').setAttribute('aria-label', heartbeat ? 'Expectation unit' : 'Interval unit');
-  document.querySelector('label[for="recoveryThreshold"]').textContent = heartbeat ? calendar ? 'Consecutive successful occurrences' : 'Recovery receipts' : 'Consecutive successes';
-}
-function previewSchedule() {
-  byId('cron').setCustomValidity('');
-  byId('schedule-explanation').textContent = '';
-  byId('schedule-occurrences').replaceChildren();
-  const cron = byId('cron').value;
-  const timezone = byId('timezone').value;
-  session.preview(byId('scheduleMode').value !== 'calendar' ? null : () => ({
-    cron, timezone, ...(byId('kind').value === 'heartbeat' ? { graceSeconds: validateDuration(byId('graceSeconds')) } : {}),
-  }));
-}
-for (const field of ['cron', 'timezone', 'graceSeconds']) byId(field).addEventListener('input', previewSchedule);
-byId('graceSeconds-unit').addEventListener('change', previewSchedule);
-byId('scheduleMode').addEventListener('change', () => { updateKind(); previewSchedule(); });
-document.getElementById('kind').addEventListener('change', () => { updateKind(); previewSchedule(); });
-updateKind();
+const monitorEditor = createMonitorEditor(form, session, focusActions);
 login.addEventListener('submit', async event => {
   event.preventDefault();
   await session.signIn(byId('secret').value); byId('secret').value = '';
   if (!editor.hidden) byId(byId('new-monitor').hidden ? 'operator-title' : 'new-monitor').focus();
-});
-form.addEventListener('submit', async event => {
-  event.preventDefault();
-  if (editingId && !monitorIds.has(editingId)) return;
-  const body = { name: byId('name').value, kind: byId('kind').value, published: byId('published').checked };
-  if (body.kind === 'tcp') { body.hostname = byId('hostname').value; body.port = Number(byId('port').value); }
-  else if (body.kind === 'http') body.url = byId('url').value;
-  body.scheduleMode = byId('scheduleMode').value;
-  if (body.scheduleMode === 'calendar') { body.cron = byId('cron').value; body.timezone = byId('timezone').value; }
-  for (const field of Object.keys(timingDefaults)) {
-    const input = byId(field);
-    if (input.disabled) continue;
-    body[field] = durations.has(input) ? validateDuration(input) : Number(input.value);
-    if (body[field] === null) { input.reportValidity(); return; }
-  }
-  await run('/api/operator/monitors' + (editingId ? '/' + encodeURIComponent(editingId) : ''), editingId ? 'PATCH' : 'POST', body, cancelEdit);
 });
 maintenanceForm.addEventListener('submit', async event => {
   event.preventDefault();
@@ -898,9 +673,7 @@ byId('settings-button').addEventListener('click', () => { showSettings(true); by
 byId('back-monitors').addEventListener('click', () => { showSettings(false); byId('settings-button').focus(); });
 document.addEventListener('click', event => { document.querySelectorAll('details.menu[open]').forEach(menu => { if (!menu.contains(event.target)) menu.open = false; }); });
 document.addEventListener('keydown', event => { if (event.key === 'Escape') document.querySelectorAll('details.menu[open]').forEach(menu => { menu.open = false; menu.querySelector('summary').focus(); }); });
-byId('new-monitor').addEventListener('click', () => edit());
-byId('rotate-heartbeat').addEventListener('click', () => { if (confirm('Replace this Monitor’s heartbeat secret?')) run('/api/operator/monitors/' + encodeURIComponent(editingId) + '/heartbeat-secret', 'POST'); });
-byId('cancel-edit').addEventListener('click', cancelEdit);
+byId('new-monitor').addEventListener('click', () => monitorEditor.open(null, hosted));
 byId('retry').addEventListener('click', () => run());
 byId('logout').addEventListener('click', session.signOut);
 `;

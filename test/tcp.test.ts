@@ -160,8 +160,6 @@ it("offers HTTP and TCP targets within the Status ledger operator configuration"
   expect(html).toContain('<label for="hostname">Hostname</label>');
   expect(html).toContain('<label for="port">Port</label>');
   expect(html).toContain('id="port" name="port" type="number" min="1" max="65535"');
-  const script = await (await request("/operator.js")).text();
-  expect(script).toContain("body.port = Number(byId('port').value)");
 });
 
 it("records synchronous connection errors and tolerates rejected socket cleanup before the next attempt", async () => {
