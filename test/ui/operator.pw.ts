@@ -214,10 +214,10 @@ test('Maintenance and publication actions keep their existing semantics', async 
     expect((await snapshot()).maintenance).toBeNull();
     await action('Unpublish');
     await expect(page.locator('#message')).toHaveText('Saved');
-    expect((await snapshot()).published).toBe(false);
+    await expect.poll(async () => (await snapshot()).published).toBe(false);
     await action('Publish');
     await expect(page.locator('#message')).toHaveText('Saved');
-    expect((await snapshot()).published).toBe(true);
+    await expect.poll(async () => (await snapshot()).published).toBe(true);
   } finally { await request.delete(path, { headers }); }
 });
 
