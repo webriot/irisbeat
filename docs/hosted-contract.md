@@ -228,8 +228,14 @@ The only server frame is the literal JSON `{"type":"status-changed"}`. It has no
 revision, timestamp, context/Monitor identifier, snapshot or delta. Notifications
 occur only when the public projection changes (including publication, page name,
 visible observations/history/Incidents, Maintenance and pause). Comparisons use a
-fixed public clock instant, so unrelated private writes cannot trigger a clock
-notification. Clock alarms depend only on published data. Target/timing-only
+fixed instant throughout each synchronous mutation stage, including state reads
+and expiry processing, so unrelated private writes cannot trigger a clock
+notification. Notification equality uses committed public observation counts,
+independently of fallible presentation history queries. History failure/recovery
+alone is silent; snapshots still return null series and log query failures. Real
+committed-comparison storage errors propagate rather than becoming empty history.
+Clock alarms depend only on published data, and public writes preserve overdue
+clock deadlines for the independent clock path. Target/timing-only
 edits, private observations, webhook saves, credential rotation and unchanged
 policy revisions remain silent. Public Heartbeat freshness is part of the existing
 snapshot, including receipts during pause, so changes to published `lastSeen`

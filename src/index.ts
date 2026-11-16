@@ -139,31 +139,37 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       if (!pending) socket.send('{"type":"status-changed"}');
     } catch { socket.close(1011, "Connection failed"); }
   }
-  private publicSnapshot() {
-    const at = Date.now();
-    return this.ctx.getWebSockets("public").length ? { at, value: JSON.stringify(this.statusAt(false, false, at)) } : undefined;
+  // Notification equality uses committed facts, never fallible presentation history.
+  private publicValue(at: number) {
+    const status = this.statusAt(false, false, at, false);
+    const start = historyStart(at);
+    return JSON.stringify({ ...status, history: status.monitors.map(monitor =>
+      this.committedHistory(monitor.id, start, start + 90 * DAY)) });
   }
-  private publicChange(before: { at: number; value: string } | undefined) {
-    if (before === undefined) return;
-    const after = JSON.stringify(this.statusAt(false, false, before.at));
+  private publicSnapshot(at = Date.now()) {
+    return { at, value: this.ctx.getWebSockets("public").length ? this.publicValue(at) : undefined };
+  }
+  private publicChange(before: { at: number; value: string | undefined }) {
+    if (before.value === undefined) return;
+    const after = this.publicValue(before.at);
     if (before.value === after) return;
     for (const socket of this.ctx.getWebSockets("public")) this.sendPublicChange(socket);
-    this.schedulePublicClock(false);
+    this.schedulePublicClock(false, before.at);
   }
-  private schedulePublicClock(notifyClock = true) {
+  private schedulePublicClock(notifyClock = true, now = Date.now()) {
     const sockets = this.ctx.getWebSockets("public");
-    const state = this.read();
+    const state = this.read(now);
     const monitors = state.monitors.filter(monitor => monitor.published);
     if (!sockets.length || !monitors.length) {
       this.ctx.storage.kv.delete("public-clock-deadline");
       this.ctx.waitUntil(this.ctx.storage.deleteAlarm());
       return;
     }
-    const now = Date.now();
     const deadline = this.ctx.storage.kv.get<number>("public-clock-deadline");
     if (notifyClock && deadline !== undefined && now >= deadline)
       for (const socket of sockets) this.sendPublicChange(socket);
-    const next = Math.min((Math.floor(now / DAY) + 1) * DAY,
+    // A public write must not consume an overdue independent clock transition.
+    const next = Math.min(!notifyClock && deadline !== undefined && deadline <= now ? deadline : Infinity, (Math.floor(now / DAY) + 1) * DAY,
       ...monitors.flatMap(monitor => monitor.maintenance && monitor.maintenance.endsAt > now ? [monitor.maintenance.endsAt] : []));
     this.ctx.storage.kv.put("public-clock-deadline", next);
     this.ctx.waitUntil(this.ctx.storage.setAlarm(next));
@@ -220,7 +226,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
     }
     // Compare and persist policy together, without awaiting external I/O or another RPC.
-    const state = this.read();
+    const state = this.read(before.at);
     state.policyRevision = policyRevision;
     if (!!state.paused === paused) {
       this.ctx.storage.kv.put("context", state);
@@ -244,7 +250,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   configure(configuration: Configuration | { pageName: string }, expectedMonitorId: string | null = null) {
     const before = this.publicSnapshot();
-    const state = this.read();
+    const state = this.read(before.at);
     // Keep the original single-Monitor save contract for existing clients.
     if ("name" in configuration) {
       const monitor = state.monitors[0];
@@ -253,7 +259,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       if (monitor && monitor.kind !== configuration.kind) return undefined;
       const { pageName: _pageName, ...settings } = configuration;
       if (monitor) this.applyEdit(monitor, settings);
-      else state.monitors.push(this.newMonitor(settings));
+      else state.monitors.push(this.newMonitor(settings, before.at));
     }
     state.pageName = configuration.pageName;
     this.ctx.storage.kv.put("context", state);
@@ -261,17 +267,17 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return this.status(true);
   }
 
-  private newMonitor(configuration: MonitorConfiguration): Monitor {
+  private newMonitor(configuration: MonitorConfiguration, at: number): Monitor {
     return { ...timingDefaults, ...configuration, id: crypto.randomUUID(), published: configuration.published ?? true, state: "unknown", lastResult: null,
-      failures: 0, successes: 0, nextDue: 0, createdAt: Date.now(), lastSeen: null, recoveryReceiptAt: null };
+      failures: 0, successes: 0, nextDue: 0, createdAt: at, lastSeen: null, recoveryReceiptAt: null };
   }
 
   create(configuration: MonitorConfiguration, limit?: number) {
     const before = this.publicSnapshot();
-    const state = this.read();
+    const state = this.read(before.at);
     // No await between allowance check and synchronous persistence: concurrent RPCs serialize.
     if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0 || state.monitors.length >= limit)) return null;
-    state.monitors.push(this.newMonitor(configuration));
+    state.monitors.push(this.newMonitor(configuration, before.at));
     this.ctx.storage.kv.put("context", state);
     this.publicChange(before);
     return this.status(true);
@@ -286,7 +292,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   edit(id: string, value: unknown) {
     const before = this.publicSnapshot();
-    const state = this.read();
+    const state = this.read(before.at);
     const monitor = state.monitors.find(monitor => monitor.id === id);
     if (!monitor) return null;
     const patch = parseMonitorPatch(value, monitor);
@@ -306,7 +312,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   maintenance(id: string, value: unknown, end = false) {
     const before = this.publicSnapshot();
-    const at = Date.now();
+    const at = before.at;
     const state = this.read(at);
     const monitor = state.monitors.find(monitor => monitor.id === id);
     if (!monitor) return null;
@@ -335,7 +341,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   remove(id: string) {
     const before = this.publicSnapshot();
-    const state = this.read();
+    const state = this.read(before.at);
     if (!state.monitors.some(monitor => monitor.id === id)) return null;
     state.monitors = state.monitors.filter(monitor => monitor.id !== id);
     this.ctx.storage.kv.put("context", state);
@@ -347,17 +353,18 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   private checking = new Map<string, { maintenance: boolean; paused: boolean }>();
 
   async check(at: number) {
-    await Promise.all(this.read().monitors.map(monitor => this.checkMonitor(monitor.id, at)));
+    await Promise.all(this.read(at).monitors.map(monitor => this.checkMonitor(monitor.id, at)));
   }
 
   private async checkMonitor(id: string, at: number) {
-    const state = this.read(at);
+    const before = this.publicSnapshot(at);
+    const state = this.read(before.at);
     const attempt = state.monitors.find(monitor => monitor.id === id);
     if (!attempt || state.paused) return;
     if (attempt.kind === "heartbeat") {
       if (at >= (attempt.lastSeen ?? attempt.createdAt) + attempt.silenceSeconds * 1000) {
         attempt.recoveryReceiptAt = null;
-        await this.record(state, attempt, at, false, 1, attempt.recoveryThreshold);
+        await this.record(before, state, attempt, at, false, 1, attempt.recoveryThreshold);
       }
       return;
     }
@@ -402,15 +409,15 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
       this.checking.delete(id);
     }
-    const current = this.read(Math.max(at, Date.now()));
+    const completed = this.publicSnapshot(Math.max(at, Date.now()));
+    const current = this.read(completed.at);
     // Record the executed attempt without overwriting newer configuration.
     const monitor = current.monitors.find(monitor => monitor.id === attempt.id);
     if (!monitor || current.paused || observation.paused) return;
-    await this.record(current, monitor, at, success, attempt.failureThreshold, attempt.recoveryThreshold, observation.maintenance);
+    await this.record(completed, current, monitor, at, success, attempt.failureThreshold, attempt.recoveryThreshold, observation.maintenance);
   }
 
-  private async record(current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number, maintenance = !!monitor.maintenance) {
-    const before = this.publicSnapshot();
+  private async record(before: ReturnType<MonitoringContext["publicSnapshot"]>, current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number, maintenance = !!monitor.maintenance) {
     if (current.paused) return;
     const pauseGeneration = current.pauseGeneration ?? 0;
     monitor.lastResult = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" };
@@ -418,7 +425,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     // Bounded cleanup keeps the entire current UTC day and never touches Incidents.
     this.ctx.storage.sql.exec(
       "DELETE FROM observations WHERE id IN (SELECT id FROM observations WHERE at < ? ORDER BY at LIMIT 1000)",
-      historyStart(Math.max(at, Date.now())),
+      historyStart(before.at),
     );
     if (maintenance) {
       this.ctx.storage.kv.put("context", current);
@@ -506,8 +513,8 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   async heartbeat(id: string, at: number) {
-    const before = this.publicSnapshot();
-    const current = this.read();
+    const before = this.publicSnapshot(at);
+    const current = this.read(before.at);
     const monitor = current.monitors.find(monitor => monitor.id === id);
     if (!monitor || monitor.kind !== "heartbeat") return false;
     monitor.lastSeen = at;
@@ -515,11 +522,11 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       this.ctx.storage.kv.put("context", current);
       this.publicChange(before);
     } else if (monitor.maintenance) {
-      await this.record(current, monitor, at, true, 1, monitor.recoveryThreshold);
+      await this.record(before, current, monitor, at, true, 1, monitor.recoveryThreshold);
     } else if (monitor.state !== "down" || monitor.recoveryReceiptAt === null ||
         at >= monitor.recoveryReceiptAt + monitor.recoverySpacingSeconds * 1000) {
       monitor.recoveryReceiptAt = at;
-      await this.record(current, monitor, at, true, 1, monitor.recoveryThreshold);
+      await this.record(before, current, monitor, at, true, 1, monitor.recoveryThreshold);
     } else {
       this.ctx.storage.kv.put("context", current);
       this.publicChange(before);
@@ -547,11 +554,15 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   // Separate series reads so their failure never hides current state or Incidents.
   protected queryHistory(id: string, start: number, end: number): DailyCounts[] | null {
+    return this.committedHistory(id, start, end);
+  }
+
+  private committedHistory(id: string, start: number, end: number): DailyCounts[] {
     return this.ctx.storage.sql.exec<DailyCounts>(
       `SELECT CAST(at / ${DAY} AS INTEGER) AS day,
         SUM(outcome = 'success') AS successes, SUM(outcome = 'failure') AS failures,
         SUM(outcome = 'maintenance') AS maintenance
-       FROM observations WHERE monitorId = ? AND at >= ? AND at < ? GROUP BY day`,
+       FROM observations WHERE monitorId = ? AND at >= ? AND at < ? GROUP BY day ORDER BY day`,
       id, start, end,
     ).toArray();
   }
@@ -581,11 +592,11 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return this.statusAt(operator, secrets, Date.now());
   }
 
-  private statusAt(operator: boolean, secrets: boolean, at: number) {
+  private statusAt(operator: boolean, secrets: boolean, at: number, includeHistory = true) {
     const start = historyStart(at);
     const state = this.read(at);
     const monitors = state.monitors.filter(monitor => operator || monitor.published).map(monitor => ({
-      id: monitor.id, name: monitor.name, kind: monitor.kind, history: this.history(monitor.id, start),
+      id: monitor.id, name: monitor.name, kind: monitor.kind, history: includeHistory ? this.history(monitor.id, start) : null,
       ...(monitor.kind === "heartbeat" ? { lastSeen: monitor.lastSeen } : {}), state: state.paused ? "paused" as const : monitor.maintenance ? "maintenance" as const : monitor.state, maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult,
       ...(operator ? {
         kind: monitor.kind,
