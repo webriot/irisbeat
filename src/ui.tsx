@@ -86,18 +86,19 @@ function DurationControl({ field, label, min, max, value }: { field: string; lab
 
 function Operator({ hosted }: { hosted: boolean }) {
   return <>
-    <h1>Monitors</h1>
+    <div class="operator-heading"><h1 id="operator-title">Monitors</h1><div id="operator-navigation" hidden><button id="new-monitor" type="button">New Monitor</button><button id="settings-button" type="button">Settings</button><button id="back-monitors" type="button" hidden>Monitors</button></div></div>
     <form id="login"><label for="secret">{hosted ? "Access token" : "Installation secret"}</label><input id="secret" type="password" required autocomplete="current-password" /><button>Sign in</button></form>
     <section id="editor" hidden>
       <h2 id="paused" hidden>Monitoring paused</h2>
+      <div id="workspace">
+        <div id="new-monitor-panel"></div>
       <table aria-label="Monitors"><thead><tr><th scope="col">Monitor</th><th scope="col">State</th><th scope="col">Publication</th><th scope="col">Actions</th></tr></thead><tbody id="monitor-rows"></tbody></table>
       <form id="maintenance" hidden aria-labelledby="maintenance-heading">
         <h2 id="maintenance-heading">Maintenance</h2>
         <label for="maintenance-end">End time</label><input id="maintenance-end" type="datetime-local" required />
         <button id="save-maintenance">Declare Maintenance</button><button id="cancel-maintenance" type="button">Cancel</button>
       </form>
-      <button id="new-monitor" type="button">New Monitor</button>
-      <div class="configuration-layout">
+
         <form id="configuration" hidden aria-labelledby="monitor-settings">
           <h2 id="monitor-settings">New Monitor</h2>
           <label for="name">Monitor name</label><input id="name" name="name" required maxlength={120} />
@@ -117,16 +118,18 @@ function Operator({ hosted }: { hosted: boolean }) {
           <label class="checkbox" for="published"><input id="published" name="published" type="checkbox" checked />Published</label>
           <button>Save Monitor</button><button id="cancel-edit" type="button">Cancel</button>
         </form>
-        <aside aria-labelledby="page-settings"><h2 id="page-settings">Status page</h2>
-          <form id="page-configuration"><label for="pageName">Page name</label><input id="pageName" name="pageName" required maxlength={120} /><button>Save page</button></form>
-        </aside>
+      <section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2><ul id="incidents" class="incidents"></ul></section>
       </div>
+      <section id="settings" hidden>
+        <section aria-labelledby="page-settings"><h2 id="page-settings">Status page</h2>
+          <form id="page-configuration"><label for="pageName">Page name</label><input id="pageName" name="pageName" required maxlength={120} /><button>Save page</button></form>
+        </section>
       <form id="webhook" aria-labelledby="webhook-heading">
         <h2 id="webhook-heading">Operator alerts</h2>
         <label for="webhookUrl">HTTPS webhook URL</label><input id="webhookUrl" name="url" type="url" maxlength={2048} autocomplete="off" />
         <button>Save webhook</button>
       </form>
-      <section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2><ul id="incidents" class="incidents"></ul></section>
+      </section>
       <div class="actions"><button id="refresh" type="button">Refresh</button><button id="logout" type="button">Sign out</button></div>
     </section>
     <p id="message" role="status" aria-live="polite"></p>
@@ -269,9 +272,13 @@ tbody tr:nth-child(odd) td { padding-bottom: 0; }
 .history-day.maintenance { background: var(--info); }
 .history-day.empty { border: 1px dashed var(--line); }
 .history-unavailable { color: var(--muted); font-size: 12px; }
-.configuration-layout { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 20px; margin: 20px 0; align-items: start; }
+.operator-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+#operator-navigation { display: flex; gap: 8px; }
+#settings { max-width: 620px; }
+#page-configuration { margin-bottom: 24px; }
+#configuration { margin: 16px 0; }
 form, aside { min-width: 0; }
-#configuration, #maintenance, #webhook, aside, #login { border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; background: var(--card); }
+#configuration, #maintenance, #webhook, #page-configuration, #login { border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; background: var(--card); }
 #configuration, #maintenance { background: var(--secondary); }
 #maintenance { margin-bottom: 20px; }
 fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
@@ -305,7 +312,8 @@ footer { margin-top: 36px; padding-top: 18px; border-top: 1px solid var(--line);
 .theme-control select { width: auto; }
 /* Shared surfaces for operator action menus and inline panels. */
 .menu { position: relative; }
-summary { cursor: pointer; border-radius: 7px; padding: 8px 13px; }
+summary { list-style: none; cursor: pointer; border-radius: 7px; padding: 8px 13px; }
+summary::-webkit-details-marker { display: none; }
 .menu-items { position: absolute; right: 0; z-index: 5; width: 205px; padding: 5px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); box-shadow: 0 10px 30px #0002; }
 .menu-items button { display: block; width: 100%; text-align: left; border: 0; }
 button.danger { color: var(--danger); }
@@ -326,7 +334,6 @@ button.danger { color: var(--danger); }
   th, td { padding: 8px 12px; }
   tbody tr:nth-child(odd) { padding-top: 8px; }
   tbody tr:nth-child(even) td { padding-bottom: 16px; }
-  .configuration-layout { grid-template-columns: 1fr; gap: 16px; }
   footer { align-items: flex-start; }
 }
 `;
@@ -409,10 +416,12 @@ function edit(monitor = null) {
   byId('rotate-heartbeat').hidden = !hosted || monitor?.kind !== 'heartbeat';
   byId('heartbeat-credential').textContent = '';
   updateKind();
+  (monitor ? document.getElementById('history-' + monitor.id) : byId('new-monitor-panel')).append(form);
   form.hidden = false;
   byId('name').focus();
 }
-function cancelEdit() { byId('heartbeat-credential').textContent = ''; editingId = null; form.reset(); form.hidden = true; }
+function focusActions(id) { (document.getElementById('actions-' + id) || byId('new-monitor')).focus(); }
+function cancelEdit() { const id = editingId; byId('heartbeat-credential').textContent = ''; editingId = null; form.reset(); form.hidden = true; byId('new-monitor-panel').append(form); focusActions(id); }
 function localMinute(date) { return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16); }
 function declareMaintenance(monitor) {
   maintenanceForm.querySelector('label').textContent = 'End time (' + browserTimeZone + ')';
@@ -425,23 +434,27 @@ function declareMaintenance(monitor) {
   input.dataset.originalValue = input.value;
   input.dataset.originalInstant = String(end.getTime());
   input.setCustomValidity('');
+  document.getElementById('history-' + monitor.id).append(maintenanceForm);
   maintenanceForm.hidden = false; byId('maintenance-end').focus();
 }
 function signOut() {
-  secret = ''; cancelEdit(); maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
+  secret = ''; cancelEdit(); showSettings(false); byId('operator-navigation').hidden = true; delete editor.dataset.loaded; maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
+  byId('new-monitor-panel').append(maintenanceForm);
   byId('monitor-rows').replaceChildren(); byId('incidents').replaceChildren();
   message.textContent = ''; byId('secret').value = ''; byId('secret').focus();
 }
 function render(data) {
   const focusedHistory = document.activeElement?.closest('.history')?.dataset.monitor;
-  login.hidden = true; editor.hidden = false;
+  const firstLoad = !editor.dataset.loaded;
+  login.hidden = true; editor.hidden = false; editor.dataset.loaded = 'true'; byId('operator-navigation').hidden = false;
   hosted = !!data.hosted;
   byId('paused').hidden = !data.paused;
   const canEdit = data.permission !== 'reader';
   if (!canEdit) { cancelEdit(); maintenanceForm.hidden = true; }
-  byId('new-monitor').hidden = !canEdit; pageForm.closest('aside').hidden = !canEdit; webhook.hidden = !canEdit;
-  byId('pageName').value = data.pageName;
-  byId('webhookUrl').value = data.webhookUrl || '';
+  if (!canEdit) showSettings(false);
+  byId('new-monitor').hidden = !canEdit || !byId('settings').hidden; byId('settings-button').hidden = !canEdit || !byId('settings').hidden;
+  if (firstLoad) { byId('pageName').value = data.pageName; byId('webhookUrl').value = data.webhookUrl || ''; }
+  byId('new-monitor-panel').append(form, maintenanceForm);
   const rows = data.monitors.flatMap(monitor => {
     const row = document.createElement('tr');
     for (const text of [monitor.name, (${JSON.stringify(stateLabel)})[monitor.state], monitor.published ? 'Published' : 'Private']) {
@@ -450,22 +463,27 @@ function render(data) {
       row.append(cell);
     }
     const actions = document.createElement('td');
-    const group = document.createElement('div'); group.className = 'actions';
+    const group = document.createElement('details'); group.className = 'menu';
+    const trigger = document.createElement('summary'); trigger.textContent = '…'; trigger.id = 'actions-' + monitor.id; trigger.setAttribute('aria-label', 'Actions ' + monitor.name);
+    const items = document.createElement('div'); items.className = 'menu-items';
+    if (canEdit) group.append(trigger, items);
     const path = '/api/operator/monitors/' + encodeURIComponent(monitor.id);
     for (const [label, action] of (canEdit ? [
       ['Edit', () => edit(monitor)],
       [monitor.maintenance ? 'Replace Maintenance' : 'Declare Maintenance', () => declareMaintenance(monitor)],
       ...(monitor.maintenance ? [['End Maintenance', () => run(path + '/maintenance', 'DELETE', undefined, () => { maintenanceForm.hidden = true; })]] : []),
       [monitor.published ? 'Unpublish' : 'Publish', () => run(path, 'PATCH', { published: !monitor.published })],
-      ['Delete', () => { if (confirm('Delete ' + monitor.name + '?')) run(path, 'DELETE', undefined, () => { if (editingId === monitor.id) cancelEdit(); if (maintenanceForm.dataset.monitorId === monitor.id) maintenanceForm.hidden = true; }); }]
+      ['Delete', () => { if (confirm('Delete ' + monitor.name + '? Checks and publication stop. Incident history is retained.')) run(path, 'DELETE', undefined, () => { if (editingId === monitor.id) cancelEdit(); if (maintenanceForm.dataset.monitorId === monitor.id) maintenanceForm.hidden = true; }); }]
     ] : [])) {
       const button = document.createElement('button'); button.type = 'button'; button.textContent = label;
       button.setAttribute('aria-label', label + ' ' + monitor.name);
-      button.addEventListener('click', action); group.append(button);
+      if (label === 'Delete') button.className = 'danger';
+      button.addEventListener('click', () => { group.open = false; trigger.focus(); action(); }); items.append(button);
     }
     actions.append(group); row.append(actions);
     const historyRow = document.createElement('tr');
     const availability = document.createElement('td'); availability.colSpan = 4;
+    availability.id = 'history-' + monitor.id;
     availability.setAttribute('aria-label', monitor.name + ' availability');
     availability.innerHTML = historyMarkup(monitor.history, monitor.id); historyRow.append(availability);
     return [row, historyRow];
@@ -475,6 +493,8 @@ function render(data) {
     cell.colSpan = 4; cell.textContent = 'No Monitors'; row.append(cell); rows.push(row);
   }
   byId('monitor-rows').replaceChildren(...rows);
+  if (editingId && document.getElementById('history-' + editingId)) document.getElementById('history-' + editingId).append(form);
+  if (!maintenanceForm.hidden && document.getElementById('history-' + maintenanceForm.dataset.monitorId)) document.getElementById('history-' + maintenanceForm.dataset.monitorId).append(maintenanceForm);
   const incidents = data.incidents.map(incident => {
     const item = document.createElement('li'); item.className = 'incident';
     const monitor = data.monitors.find(monitor => monitor.id === incident.monitorId);
@@ -497,6 +517,7 @@ function render(data) {
 }
 async function run(path = '/api/operator', method = 'GET', body, after) {
   if (busy) return;
+  const focusedAction = document.activeElement?.closest('details')?.querySelector('summary')?.id;
   busy = true; message.textContent = '';
   document.querySelectorAll('button, input, select').forEach(control => { control.disabled = true; });
   try {
@@ -515,6 +536,7 @@ async function run(path = '/api/operator', method = 'GET', body, after) {
     busy = false;
     document.querySelectorAll('button, input, select').forEach(control => { control.disabled = false; });
     updateKind();
+    if (!editor.hidden && document.activeElement === document.body) (document.getElementById(focusedAction) || byId(byId('new-monitor').hidden ? 'refresh' : 'new-monitor')).focus();
   }
 }
 function updateKind() {
@@ -577,12 +599,22 @@ maintenanceForm.addEventListener('submit', async event => {
     }
     endsAt = end.getTime();
   }
-  await run('/api/operator/monitors/' + encodeURIComponent(maintenanceForm.dataset.monitorId) + '/maintenance', 'PUT', { endsAt }, () => { maintenanceForm.hidden = true; });
+  await run('/api/operator/monitors/' + encodeURIComponent(maintenanceForm.dataset.monitorId) + '/maintenance', 'PUT', { endsAt }, () => { maintenanceForm.hidden = true; focusActions(maintenanceForm.dataset.monitorId); });
 });
 byId('maintenance-end').addEventListener('input', event => event.target.setCustomValidity(''));
-byId('cancel-maintenance').addEventListener('click', () => { maintenanceForm.hidden = true; });
+byId('cancel-maintenance').addEventListener('click', () => { maintenanceForm.hidden = true; focusActions(maintenanceForm.dataset.monitorId); });
 webhook.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator/webhook', 'PUT', { url: byId('webhookUrl').value }); });
 pageForm.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator', 'PUT', { pageName: byId('pageName').value }); });
+function showSettings(settings) {
+  byId('settings').hidden = !settings; byId('workspace').hidden = settings;
+  byId('operator-title').textContent = settings ? 'Settings' : 'Monitors';
+  byId('new-monitor').hidden = settings; byId('settings-button').hidden = settings; byId('back-monitors').hidden = !settings;
+  message.textContent = '';
+}
+byId('settings-button').addEventListener('click', () => { showSettings(true); byId('pageName').focus(); });
+byId('back-monitors').addEventListener('click', () => { showSettings(false); byId('settings-button').focus(); });
+document.addEventListener('click', event => { document.querySelectorAll('details.menu[open]').forEach(menu => { if (!menu.contains(event.target)) menu.open = false; }); });
+document.addEventListener('keydown', event => { if (event.key === 'Escape') document.querySelectorAll('details.menu[open]').forEach(menu => { menu.open = false; menu.querySelector('summary').focus(); }); });
 byId('new-monitor').addEventListener('click', () => edit());
 byId('rotate-heartbeat').addEventListener('click', () => { if (confirm('Replace this Monitor’s heartbeat secret?')) run('/api/operator/monitors/' + encodeURIComponent(editingId) + '/heartbeat-secret', 'POST'); });
 byId('cancel-edit').addEventListener('click', cancelEdit);

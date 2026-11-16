@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { expect, test } from '@playwright/test';
+import { monitorAction } from './actions';
 
 for (const kind of ['http', 'tcp', 'heartbeat']) {
   test(`operator configures, publishes, maintains and deletes a ${kind} Monitor`, async ({ page }) => {
@@ -20,23 +21,27 @@ for (const kind of ['http', 'tcp', 'heartbeat']) {
     }
     await page.getByLabel('Published', { exact: true }).uncheck();
     await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
+    await page.getByLabel('Actions ' + ('Publish ' + name).replace(/^(Publish|Unpublish|End Maintenance) /, ''), { exact: true }).click();
     await expect(page.getByRole('button', { name: 'Publish ' + name, exact: true })).toBeVisible();
     const historyDay = page.getByRole('cell', { name: name + ' availability', exact: true }).getByRole('listitem').first();
     await historyDay.focus();
     await expect(historyDay).toBeFocused();
-    await page.getByRole('button', { name: 'Edit ' + name, exact: true }).click();
+    await monitorAction(page, 'Edit ' + name);
     await expect(page.getByLabel('Check type', { exact: true })).toBeDisabled();
     if (kind === 'heartbeat') await expect(page.locator('#heartbeat-path')).toContainText('POST /heartbeat/');
     await page.getByLabel('Monitor name', { exact: true }).fill(name + ' edited');
     await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
     const edited = name + ' edited';
-    await page.getByRole('button', { name: 'Publish ' + edited, exact: true }).click();
+    await monitorAction(page, 'Publish ' + edited);
+    await page.getByLabel('Actions ' + ('Unpublish ' + edited).replace(/^(Publish|Unpublish|End Maintenance) /, ''), { exact: true }).click();
     await expect(page.getByRole('button', { name: 'Unpublish ' + edited, exact: true })).toBeVisible();
-    await page.getByRole('button', { name: 'Declare Maintenance ' + edited, exact: true }).click();
+    await monitorAction(page, 'Declare Maintenance ' + edited);
     await page.getByRole('button', { name: 'Declare Maintenance', exact: true }).click();
+    await page.getByLabel('Actions ' + ('End Maintenance ' + edited).replace(/^(Publish|Unpublish|End Maintenance) /, ''), { exact: true }).click();
     await expect(page.getByRole('button', { name: 'End Maintenance ' + edited, exact: true })).toBeVisible();
-    await page.getByRole('button', { name: 'End Maintenance ' + edited, exact: true }).click();
+    await monitorAction(page, 'End Maintenance ' + edited);
     await expect(page.locator('#message')).toHaveText('Maintenance ended');
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
     await page.getByLabel('Page name', { exact: true }).fill('Workflow status');
     await page.getByRole('button', { name: 'Save page', exact: true }).click();
     await expect(page.locator('#message')).toHaveText('Saved');
@@ -56,7 +61,7 @@ for (const kind of ['http', 'tcp', 'heartbeat']) {
     await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
     page.once('dialog', dialog => dialog.accept());
-    await page.getByRole('button', { name: 'Delete ' + edited, exact: true }).click();
+    await monitorAction(page, 'Delete ' + edited);
     await expect(page.getByRole('button', { name: 'Edit ' + edited, exact: true })).toHaveCount(0);
   });
 }
@@ -73,7 +78,7 @@ test('hosted editor rotates Heartbeat credentials and reader sees a read-only le
     await page.goto(origin + '/operator');
     await page.getByLabel('Access token', { exact: true }).fill('ui-editor');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-    await page.getByRole('button', { name: 'Edit Hosted producer', exact: true }).click();
+    await monitorAction(page, 'Edit Hosted producer');
     await expect(page.locator('#heartbeat-path')).toHaveText('POST /heartbeat');
     page.once('dialog', dialog => dialog.accept());
     await page.getByRole('button', { name: 'Rotate heartbeat secret', exact: true }).click();

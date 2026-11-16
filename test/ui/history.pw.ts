@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { expect, test } from '@playwright/test';
+import { monitorAction } from './actions';
 
 function snapshot() {
   const days = Array.from({ length: 90 }, (_, i) => ({
@@ -67,7 +68,7 @@ for (const settings of [
           data.monitors[0].history!.days.push({ date: '2026-04-01', state: 'empty', successes: 0, failures: 0, maintenance: 0 });
           await page.getByRole('button', { name: 'Refresh', exact: true }).click();
           await expect(strip.locator('[tabindex="0"]')).toHaveAttribute('data-date', '2026-03-08');
-          await page.getByRole('button', { name: 'Declare Maintenance Website', exact: true }).click();
+          await monitorAction(page, 'Declare Maintenance Website');
           await expect(page.getByLabel('End time (' + settings.timezoneId + ')', { exact: true })).toBeVisible();
           await page.locator('#maintenance-end').fill('2026-11-17T12:00');
           const write = page.waitForRequest(req => req.url().endsWith('/web/maintenance') && req.method() === 'PUT');
@@ -131,14 +132,14 @@ test('empty, unavailable, and result states stay distinct through refresh and re
   await expect(strip.locator('[tabindex="0"]')).toHaveAttribute('data-date', '2026-04-01');
 });
 
-test('fall daylight-saving repeated hours retain distinct exact instants', async ({ browser }) => {
+test('fall daylight-saving repeated hours retain distinct exact instants', async ({ browser, baseURL }) => {
   const context = await browser.newContext({ locale: 'en-US', timezoneId: 'America/Los_Angeles' });
   const page = await context.newPage();
   const request = context.request;
   const data = snapshot();
   data.incidents[0].openedAt = Date.parse('2026-11-01T08:30:00Z');
   data.incidents[0].closedAt = Date.parse('2026-11-01T09:30:00Z');
-  await page.route('http://127.0.0.1:8787/', async route => {
+  await page.route(new URL('/', baseURL).href, async route => {
     const response = await request.post('/__ui/status', { data });
     await route.fulfill({ response });
   });
@@ -165,12 +166,12 @@ test('Maintenance preserves an unchanged fold instant and rejects gap or ambiguo
   await page.goto('/operator');
   await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-  await page.getByRole('button', { name: 'Replace Maintenance Website', exact: true }).click();
+  await monitorAction(page, 'Replace Maintenance Website');
   await expect(page.locator('#maintenance-end')).toHaveValue('2027-11-07T01:30');
   await page.locator('#save-maintenance').click();
   await expect(page.locator('#maintenance')).toBeHidden();
   expect(writes).toEqual([{ endsAt: Date.parse('2027-11-07T09:30:25Z') }]);
-  await page.getByRole('button', { name: 'Replace Maintenance Website', exact: true }).click();
+  await monitorAction(page, 'Replace Maintenance Website');
   for (const value of ['2027-03-14T02:30', '2027-11-07T01:45']) {
     await page.locator('#maintenance-end').fill(value);
     await page.locator('#save-maintenance').click();

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { expect, test } from '@playwright/test';
+import { monitorAction } from './actions';
 
 const headers = { Authorization: 'Bearer ui-test-secret' };
 
@@ -27,7 +28,7 @@ test('duration units save whole seconds and preserve repeating fractions on unit
     await page.reload();
     await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-    await page.getByRole('button', { name: 'Edit Duration HTTP', exact: true }).click();
+    await monitorAction(page, 'Edit Duration HTTP');
     await expect(page.getByLabel('Interval', { exact: true })).toHaveValue('66');
     await page.getByLabel('Interval unit', { exact: true }).selectOption('days');
     await page.getByLabel('Timeout unit', { exact: true }).selectOption('days');
@@ -52,7 +53,7 @@ for (const kind of ['http', 'tcp', 'heartbeat']) {
       await page.goto('/operator');
       await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
       await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-      await page.getByRole('button', { name: 'Edit ' + name, exact: true }).click();
+      await monitorAction(page, 'Edit ' + name);
       await expect(page.getByLabel('Check type', { exact: true })).toBeDisabled();
       const interval = kind === 'heartbeat' ? 'Expectation' : 'Interval';
       await page.getByLabel(interval + ' unit', { exact: true }).selectOption('hours');
@@ -77,12 +78,12 @@ for (const kind of ['http', 'tcp', 'heartbeat']) {
       await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
       const edited = (await (await saved).json()).monitors.find((item: { id: string }) => item.id === original.id);
       expect(edited).toMatchObject({ ...original, intervalSeconds: 90, recoveryThreshold: 3, ...(kind === 'heartbeat' ? { silenceSeconds: 86400, recoverySpacingSeconds: 90 } : { timeoutSeconds: 30 }) });
-      await page.getByRole('button', { name: 'Edit ' + name, exact: true }).click();
+      await monitorAction(page, 'Edit ' + name);
       await expect(page.getByLabel(interval, { exact: true })).toHaveValue('90');
       await page.getByLabel(interval + ' unit', { exact: true }).selectOption('days');
       await page.getByLabel(interval, { exact: true }).fill('0.5');
       await page.locator('#cancel-edit').click();
-      await page.getByRole('button', { name: 'Edit ' + name, exact: true }).click();
+      await monitorAction(page, 'Edit ' + name);
       await expect(page.getByLabel(interval, { exact: true })).toHaveValue('90');
       await expect(page.getByLabel(interval + ' unit', { exact: true })).toHaveValue('seconds');
       const current = (await (await request.get('/api/operator', { headers })).json()).monitors.find((item: { id: string }) => item.id === original.id);
