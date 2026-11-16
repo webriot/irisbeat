@@ -17,7 +17,8 @@
     "test:release": "node test/release.cjs",
     "test:deployment": "node test/deployment.cjs",
     "release:verify": "npm run check && npm test && npm run build && npm run test:release && npm run test:consumer -- --prepared && npm run test:deployment",
-    "test:ui": "tsc -p test/ui && playwright test"
+    "test:ui": "tsc -p test/ui && playwright test",
+    "prototype": "node scripts/ui-prototype.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.8.2",

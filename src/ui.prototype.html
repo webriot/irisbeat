@@ -1,0 +1,208 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- THROWAWAY: selected A — Text ledger on / and /operator.
+     Fixture-only sibling of ui.tsx: no production imports, credentials, requests, or persistence.
+     Approved scope: compact day detail with expandable UTC/local bounds; named action icons;
+     Retry only on failed updates; structured ongoing/resolved Incidents retaining deleted Monitors.
+     No ADR: these presentation choices are reversible. No new domain terms introduced.
+     Owner selected A. Styling follows ui.tsx; Four fixed actions; Maintenance dialog owns end-date updates and early end.
+     Snapshot date/time appears once; historical selections keep explicit UTC dates.
+     Question: which hierarchy makes day history and retained Incidents easiest to inspect? -->
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Irisbeat UI prototype</title>
+<style>
+
+:root {
+  color-scheme: light; font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
+  --background: light-dark(#f5f7f8, #101417); --foreground: light-dark(#202b30, #e2eaed);
+  --muted: light-dark(#596970, #99a9b1); --card: light-dark(#fff, #171e23);
+  --secondary: light-dark(#edf1f3, #222c33); --line: light-dark(#d9e1e5, #35424a);
+  --control-border: light-dark(#78868d, #788c98);
+  --primary: light-dark(#245e66, #9bd4d6); --primary-foreground: light-dark(#fff, #142b30);
+  --success: light-dark(#176744, #77d6ab); --success-surface: light-dark(#eaf6ef, #172e27);
+  --danger: light-dark(#b42e3d, #ff96a0); --warning: light-dark(#825b0a, #eac16f);
+  --info: light-dark(#6357a2, #b4a5ee); --radius: 12px;
+  background: var(--background); color: var(--foreground);
+}
+@media (prefers-color-scheme: dark) { :root { color-scheme: dark; } }
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { max-width: 1088px; margin: auto; padding: 0 24px 32px; overflow-wrap: anywhere; }
+header, nav, .ledger-row, .actions, footer { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+header, .ledger-row, footer { justify-content: space-between; }
+header { padding: 20px 0; border-bottom: 1px solid var(--line); }
+nav { gap: 6px; }
+a { color: inherit; text-underline-offset: 4px; }
+.brand { font-size: 20px; font-weight: 750; letter-spacing: -.6px; text-decoration: none; }
+nav a { padding: 8px 10px; border-radius: 6px; color: var(--muted); text-decoration: none; }
+nav a[aria-current="page"] { background: var(--secondary); color: var(--foreground); font-weight: 600; }
+#stale { color: var(--warning); margin-right: 12px; }
+#updates-mode { color: var(--muted); margin-right: 12px; }
+h1 { margin: 28px 0 24px; font-size: 28px; line-height: 1.2; letter-spacing: -.8px; font-weight: 650; }
+h2 { margin: 0; font-size: 16px; font-weight: 650; }
+.banner { padding: 18px 20px; margin-bottom: 24px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); color: var(--info); }
+.banner[data-state="up"] { background: var(--success-surface); color: var(--success); border-color: color-mix(in srgb, var(--success) 24%, transparent); }
+.banner[data-state="down"] { color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, var(--card)); border-color: color-mix(in srgb, var(--danger) 30%, transparent); }
+.ledger, table { border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); margin-bottom: 28px; }
+.ledger > article { padding: 18px 20px; }
+.ledger > article + article { border-top: 1px solid var(--line); }
+.ledger-row h2 { font-size: 15px; }
+.status { font-size: 13px; color: var(--muted); }
+.ledger-row[data-state="up"] .status, .status[data-state="up"] { color: var(--success); }
+.ledger-row[data-state="down"] .status, .status[data-state="down"] { color: var(--danger); }
+.ledger-row[data-state="maintenance"] .status, .status[data-state="maintenance"], .ledger-row[data-state="paused"] .status, .status[data-state="paused"] { color: var(--info); }
+table { width: 100%; border-spacing: 0; margin-top: 20px; }
+th, td { padding: 12px 16px; text-align: left; }
+th { font-size: 12px; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--line); }
+tbody tr:nth-child(even):not(:last-child) td { border-bottom: 1px solid var(--line); }
+tbody tr:nth-child(odd) td { padding-bottom: 0; }
+.availability { padding-top: 12px; min-width: 0; }
+.percentage { font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.history { position: relative; display: grid; grid-template-columns: repeat(90, minmax(0, 1fr)); gap: 3px; list-style: none; padding: 0; margin: 8px 0 0; }
+.history-head { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
+.history-detail { color: var(--muted); font-size: 12px; line-height: 1.4; margin: 8px 0 0; min-height: 2.8em; }
+.history-day[aria-current="true"] { outline: 2px solid var(--foreground); outline-offset: 2px; }
+.history-day { cursor: pointer; height: 25px; border-radius: 2px; background: var(--secondary); }
+.history-day.up { background: var(--success); }
+.history-day.down { background: var(--danger); }
+.history-day.degraded { background: var(--warning); }
+.history-day.maintenance { background: var(--info); }
+.history-day.empty { border: 1px dashed var(--line); }
+.history-unavailable { color: var(--muted); font-size: 12px; }
+.operator-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+#operator-navigation { display: flex; gap: 8px; }
+#settings { max-width: 620px; }
+#page-configuration { margin-bottom: 24px; }
+#configuration { margin: 16px 0; }
+form, aside { min-width: 0; }
+#configuration, #maintenance, #webhook, #page-configuration, #login { border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; background: var(--card); }
+#configuration, #maintenance { background: var(--secondary); }
+#maintenance { margin-bottom: 20px; }
+fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+label { display: block; margin: 12px 0 6px; font-size: 13px; }
+input, select, button { font: inherit; min-height: 40px; max-width: 100%; border: 1px solid var(--line); border-radius: 7px; background: var(--card); color: var(--foreground); }
+input, select { width: 100%; padding: 8px 11px; border-color: var(--control-border); }
+.duration-value { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
+input:disabled, select:disabled { opacity: .65; }
+.checkbox { display: flex; align-items: center; gap: 8px; }
+input[type="checkbox"] { width: auto; accent-color: var(--primary); }
+button { padding: 8px 13px; cursor: pointer; font-weight: 550; }
+button:hover, summary:hover { background: var(--secondary); }
+button:disabled { opacity: .5; cursor: wait; }
+form button { margin-top: 16px; }
+form button + button { margin-left: 8px; }
+#webhook { margin-bottom: 28px; }
+.ledger:empty { display: none; }
+form button[type="submit"], form button:not([type]), #new-monitor { background: var(--primary); border-color: var(--primary); color: var(--primary-foreground); }
+.text-button { border: 0; background: transparent; color: inherit; padding-left: 0; text-decoration: underline; text-underline-offset: 4px; }
+:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+.incidents { list-style: none; padding: 0; margin: 12px 0 0; }
+.incident { padding: 16px 0; border-top: 1px solid var(--line); }
+.incident p { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
+.actions { justify-content: flex-start; margin-top: 20px; }
+td .actions { margin: 0; gap: 6px; }
+#login { max-width: 28rem; }
+#paused { color: var(--info); }
+#message:empty { display: none; }
+footer { margin-top: 36px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+.theme-control { display: flex; align-items: center; gap: 8px; margin: 0; }
+.theme-control select { width: auto; }
+/* Shared surfaces for operator action menus and inline panels. */
+.menu { position: relative; }
+summary { list-style: none; cursor: pointer; border-radius: 7px; padding: 8px 13px; }
+summary::-webkit-details-marker { display: none; }
+.menu-items { position: absolute; right: 0; z-index: 5; width: 205px; padding: 5px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); box-shadow: 0 10px 30px #0002; }
+.menu-items button { display: block; width: 100%; text-align: left; border: 0; }
+button.danger { color: var(--danger); }
+[hidden] { display: none !important; }
+@media (max-width: 44rem) {
+  body { padding: 0 16px 24px; }
+  header { gap: 8px; }
+  nav { gap: 0; }
+  nav a { padding: 7px; }
+  .brand { font-size: 18px; }
+  #stale { color: var(--warning); margin-right: 12px; }
+h1 { margin: 24px 0 20px; font-size: 24px; }
+  .banner { padding: 16px; }
+  .ledger > article { padding: 16px 12px; }
+  .history { gap: 2px; }
+  .history-day { height: 23px; }
+  table, thead, tbody, tr, td { display: block; }
+  thead { position: absolute; clip-path: inset(100%); }
+  th, td { padding: 8px 12px; }
+  tbody tr:nth-child(odd) { padding-top: 8px; }
+  tbody tr:nth-child(even) td { padding-bottom: 16px; }
+  footer { align-items: flex-start; }
+}
+
+/* Prototype-only adaptations for the approved text ledger. Base styles copied from ui.tsx. */
+.heading,.tools,.row,.history-head,.incident-top,.incident-facts{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.heading .tools{gap:8px}.brand{color:var(--foreground)}
+nav button{border:0;background:transparent;color:var(--muted);padding:8px 10px;font-weight:400}
+nav button[aria-current="page"]{background:var(--secondary);color:var(--foreground);font-weight:600}
+nav button,.tools button{min-height:40px}
+.monitor{padding:18px 20px}.monitor+.monitor{border-top:1px solid var(--line)}
+.operator-ledger .monitor{padding:12px 16px 20px}.columns,.operator-row{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr) minmax(0,1fr) 194px;gap:16px;align-items:center}
+.columns{padding:12px 16px;border-bottom:1px solid var(--line);font-size:12px;color:var(--muted)}.columns span:last-child{width:194px}.operator-row>*{min-width:0}.operator-row .actions{display:grid;grid-template-columns:repeat(4,44px);gap:6px}.page-time{margin:0 0 20px;color:var(--muted);font-size:12px}
+.operator-row h2{font-size:14px;font-weight:400}.row h2{font-size:15px}.row .status{margin-left:auto}
+.actions{margin:0;gap:6px;flex-wrap:wrap}.icon{position:relative;width:44px;min-height:40px;display:grid;place-items:center;padding:10px;border:0;background:transparent}
+.icon svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.tip{display:none;position:absolute;bottom:calc(100% + 6px);right:0;z-index:8;background:var(--card);border:1px solid var(--line);border-radius:7px;padding:7px 10px;white-space:nowrap;color:var(--foreground);font-size:12px;font-weight:400}
+.icon:hover .tip,.icon:focus .tip{display:block}
+.bars{display:grid;grid-template-columns:repeat(90,minmax(0,1fr));gap:3px;margin:8px 0 12px}.bar{height:25px;min-height:0;min-width:0;padding:0;border:0;border-radius:2px;background:var(--success)!important}.bar.empty{background:var(--secondary)!important;border:1px dashed var(--line)}.bar.down{background:var(--danger)!important}.bar.maintenance{background:var(--info)!important}.bar[aria-pressed=true]{outline:2px solid var(--foreground);outline-offset:2px}
+.dayline{display:flex;gap:8px 18px;flex-wrap:wrap;font-size:12px;color:var(--muted)}.dayline strong{color:var(--foreground);font-weight:600}.dayline small{font-size:inherit}
+.interval{font-size:12px;color:var(--muted);margin-top:4px}.interval summary{display:list-item;list-style:disclosure-closed;margin-left:14px;padding:4px 0}.interval[open] summary{list-style:disclosure-open}.interval p{margin:4px 0}
+.good{color:var(--success)}.bad{color:var(--danger)}.gold{color:var(--info)}.muted{color:var(--muted)}
+.incidents{margin-top:28px}.incidents>h2{margin-bottom:16px}.incidents>p{font-size:12px;color:var(--muted)}.incident-top{align-items:baseline}.incident-top h3{margin:0;font-size:14px;font-weight:550}.incident-top>span{font-size:12px}.incident-facts{justify-content:flex-start;color:var(--muted);font-size:12px;gap:8px 24px;margin-top:8px}.deleted{font-weight:400;color:var(--muted);margin-left:8px;font-size:12px}.incidents>details>summary{padding-left:0;font-size:13px}
+.retry{display:flex;align-items:center;gap:12px;color:var(--warning);margin-bottom:16px}.primary{background:var(--primary);border-color:var(--primary);color:var(--primary-foreground)}
+#notice:empty{display:none}#notice{font-size:12px;color:var(--muted)}#signout{margin-top:16px}.fixture-controls{margin-top:28px;display:flex;align-items:center;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--muted)}.fixture-controls label{display:flex;align-items:center;gap:8px;margin:0}.fixture-controls select{width:auto}.fixture-controls pre{white-space:pre-wrap}
+dialog{color:var(--foreground);background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:20px;max-width:440px;width:calc(100% - 32px)}dialog::backdrop{background:#0008}dialog .tools{margin-top:16px}
+@media(max-width:44rem){.columns{display:none}.operator-row{display:flex;flex-wrap:wrap;gap:12px}.operator-row h2{flex-basis:100%}.operator-row .actions{margin-left:auto}.operator-ledger .monitor,.monitor{padding:16px 12px}.bars{gap:2px}.bar{height:23px}.heading{margin:24px 0 20px}.heading h1{margin:0}.heading .tools{margin-left:auto}nav button{padding:7px}.incident-top{align-items:flex-start}.incident-top h3{flex:1}}
+
+</style>
+<header><strong class="brand">irisbeat</strong><nav aria-label="Application"><button data-view="public">Status page</button><button data-view="operator">Operator</button></nav></header>
+<main id="app"></main><div id="notice" role="status"></div>
+<footer><a href="https://github.com/Webriot/irisbeat">Source (AGPL-3.0-only)</a><label class="theme-control">Theme <select id="theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label></footer>
+<div class="fixture-controls"><strong>Prototype fixtures</strong><label>Data <select id="scenario"><option value="screenshot">Screenshot</option><option value="edge">Outage + Maintenance</option><option value="empty">No observations</option></select></label><label><input type="checkbox" id="stale"> Updates failed</label><details><summary>Prototype state</summary><pre id="state"></pre></details></div>
+<dialog id="dialog"><form method="dialog" id="dialog-form"><h2 id="dialog-title"></h2><div id="dialog-body"></div><div class="tools"><button value="cancel">Cancel</button><button value="confirm" id="confirm" class="primary">Save</button></div></form></dialog>
+<script>
+const params=new URLSearchParams(location.search);
+const variant='A';
+let view=params.get('view')||(location.pathname==='/operator'?'operator':'public'),scenario='screenshot',stale=false,selected=0,day=89;
+let monitors=[];
+function reset(){monitors=scenario==='edge'?[{name:'Webriot.com',state:'Unavailable',published:true},{name:'API',state:'Maintenance',published:false,endsAt:'2026-11-16T18:00',previousState:'Operational'}]:[{name:'Webriot.com',state:scenario==='empty'?'Awaiting check':'Operational',published:true}];selected=0;day=89}
+reset();
+const paths={edit:'M12 4l4 4M3 17l1-5L14 2l4 4L8 16z',publish:'M1 10s4-6 9-6 9 6 9 6-4 6-9 6-9-6-9-6z M13 10a3 3 0 1 1-6 0 3 3 0 0 1 6 0',maintenance:'M12 3a5 5 0 0 0-6 6l-5 5 4 4 5-5a5 5 0 0 0 6-6l-3 3-3-3z',end:'M4 4l12 12M16 4L4 16',delete:'M3 5h14M7 5V2h6v3M5 5l1 13h8l1-13M8 8v7M12 8v7'};
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function icon(kind,label,i){return `<button class="icon ${kind==='delete'?'bad':''}" data-action="${kind}" data-i="${i}" aria-label="${label}" title="${label}"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="${paths[kind]}"/></svg><span class="tip" aria-hidden="true">${label}</span></button>`}
+function actions(m,i){return view==='operator'?`<div class="actions">${icon('edit','Edit',i)}${icon('publish',m.published?'Unpublish':'Publish',i)}${icon('maintenance','Maintenance',i)}${icon('delete','Delete',i)}</div>`:''}
+function color(s){return s==='Unavailable'?'bad':s==='Maintenance'?'gold':s==='Operational'?'good':'muted'}
+function counts(d,m){if(m.state==='Awaiting check'||scenario==='empty'||(scenario==='screenshot'&&d<89))return [0,0,0];if(m.state==='Maintenance'&&d===89)return [0,0,320];return [d===89?318:1440,m.state==='Unavailable'&&d===89?12:0,0]}
+function date(d){return new Date(Date.UTC(2026,7,19+d)).toISOString().slice(0,10)}
+function detail(m){let [s,f,t]=counts(day,m),label=new Date(date(day)+'T00:00Z').toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'UTC'});return `<div class="dayline">${day!==89?`<strong>${label} <small>UTC</small></strong>`:''}<span>${s+f+t?`${s} successful · ${f} failed${t?' · '+t+' Maintenance':''}`:'No observations'}</span></div><details class="interval"><summary>Exact time range</summary><p>${date(day)} 00:00 UTC → ${date(day+1)} 00:00 UTC</p><p>${new Date(date(day)+'T00:00Z').toLocaleString()} → ${new Date(date(day+1)+'T00:00Z').toLocaleString()} (${Intl.DateTimeFormat().resolvedOptions().timeZone})</p></details>`}
+function renderHistory(m,i){return `<div class="availability"><div class="history-head"><span>past 90 days</span><strong>${m.state==='Awaiting check'||scenario==='empty'?'No observations':m.state==='Unavailable'?'99.99%':'100.00%'}</strong></div><div class="bars" role="group" aria-label="90 days of availability">${Array.from({length:90},(_,d)=>{let [s,f,t]=counts(d,m);return `<button class="bar ${s+f+t===0?'empty':f?'down':t?'maintenance':''}" data-day="${d}" data-i="${i}" tabindex="${d===day?0:-1}" aria-pressed="${d===day}" aria-label="${date(d)} UTC: ${s+f+t?`${s} successful, ${f} failed, ${t} Maintenance`:'No observations'}"></button>`}).join('')}</div><div class="inspector" aria-live="polite">${detail(m)}</div></div>`}
+function monitor(m,i){return `<article class="monitor"><div class="${view==='operator'?'operator-row':'row'}"><h2>${esc(m.name)}</h2><span class="status ${color(m.state)}">${m.state}</span>${view==='operator'?`<span>${m.published?'Published':'Private'}</span>${actions(m,i)}`:''}</div>${renderHistory(m,i)}</article>`}
+function incidents(){let ongoing=scenario==='edge'?[['Webriot.com','Ongoing','10:31 AM','—','12 min']]:[];let resolved=view==='operator'?[['ib-button-cf7e5788c1 heartbeat','Recovered','10:33 AM','10:37 AM','4 min'],['ib-button-cf7e5788c1 http','Recovered','10:31 AM','10:37 AM','6 min'],['ib-button-cf7e5788c1 tcp','Recovered','10:31 AM','10:37 AM','6 min']]:[];
+const record=(r,deleted)=>`<article class="incident"><div class="incident-top"><h3>${r[0]}${deleted?'<span class="deleted">Deleted Monitor</span>':''}</h3><span class="${r[1]==='Ongoing'?'bad':'good'}">${r[1]}</span></div><div class="incident-facts"><span>Started ${r[2]}</span>${r[1]==='Recovered'?`<span>Recovered ${r[3]}</span>`:''}<span>${r[4]}</span></div></article>`;
+return `<section class="incidents"><h2>Incidents</h2>${!ongoing.length&&!resolved.length?'<p class="muted">No Incidents</p>':`${ongoing.length?'<h3>Ongoing</h3>'+ongoing.map(r=>record(r,false)).join(''):''}${resolved.length?`<details open><summary>Resolved · ${resolved.length}</summary>${resolved.map(r=>record(r,true)).join('')}</details>`:''}`}</section>`}
+function render(){let visible=monitors.map((m,i)=>({m,i})).filter(({m})=>view==='operator'||m.published);if(!visible.some(x=>x.i===selected))selected=visible[0]?.i??0;
+document.querySelector('#app').innerHTML=`<div class="heading"><h1>${view==='operator'?'Monitors':'Webriot Status'}</h1>${view==='operator'?'<div class="tools"><button class="primary" data-global="new">New Monitor</button><button data-global="settings">Settings</button></div>':''}</div><p class="page-time"><time datetime="2026-11-16T16:43:00Z">Nov 16, 2026 · 10:43 AM CST</time> · America/Chicago</p>${stale?'<div class="retry"><span>Updates unavailable</span><button id="retry">Retry</button></div>':''}${view==='public'?`<div class="banner" data-state="${visible.some(x=>x.m.state==='Unavailable')?'down':scenario==='empty'||!visible.length?'unknown':'up'}">${!visible.length?'No Monitors published':visible.some(x=>x.m.state==='Unavailable')?'Services unavailable':scenario==='empty'?'Awaiting check':'All services operational'}</div>`:''}<div class="ledger ${view==='operator'?'operator-ledger':''}">${view==='operator'?'<div class="columns"><span>Monitor</span><span>State</span><span>Publication</span><span>Actions</span></div>':''}${visible.map(({m,i})=>monitor(m,i)).join('')}</div>${incidents()}${view==='operator'?'<button id="signout">Sign out</button>':''}`;
+document.querySelectorAll('[data-view]').forEach(b=>b.setAttribute('aria-current',b.dataset.view===view?'page':'false'));document.querySelector('#state').textContent=JSON.stringify({variant,view,scenario,stale,selected,day:date(day),monitors},null,2);}
+function url(){try{const u=new URL(location.href);u.searchParams.set('variant',variant);u.searchParams.set('view',view);window.history.replaceState(null,'',u)}catch{}}
+const dialog=document.querySelector('#dialog');let pending=null,endMaintenance=null;
+function openDialog(title,body,confirm,callback){endMaintenance=null;dialog.returnValue='';document.querySelector('#dialog-title').textContent=title;document.querySelector('#dialog-body').innerHTML=body;document.querySelector('#confirm').textContent=confirm;pending=callback;dialog.showModal()}
+dialog.addEventListener('close',()=>{if(dialog.returnValue==='confirm'&&pending)pending();else if(dialog.returnValue==='end'&&endMaintenance)endMaintenance();pending=null;endMaintenance=null;render()});
+document.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;
+if(b.dataset.view){view=b.dataset.view;url();render()}
+
+if(b.id==='retry'){stale=false;document.querySelector('#stale').checked=false;render()}
+if(b.dataset.select!==undefined){selected=+b.dataset.select;render()}
+if(b.dataset.day!==undefined){day=+b.dataset.day;selected=+b.dataset.i;render();document.querySelector(`[data-i="${selected}"][data-day="${day}"]`)?.focus()}
+if(b.dataset.action){const i=+b.dataset.i,m=monitors[i],a=b.dataset.action;if(a==='publish'){m.published=!m.published;render()}else if(a==='delete'){openDialog('Delete '+m.name+'?','<p>Incident history is retained.</p>','Delete',()=>monitors.splice(i,1))}else if(a==='edit'){openDialog('Edit Monitor',`<label>Monitor name<input id="draft" value="${esc(m.name)}" required></label>`,'Save',()=>m.name=document.querySelector('#draft').value)}else{const active=m.state==='Maintenance';openDialog('Maintenance',`<label>End date (${Intl.DateTimeFormat().resolvedOptions().timeZone})<input id="draft" type="datetime-local" required value="${m.endsAt||'2026-11-16T18:00'}"></label>${active?'<button type="submit" value="end" formnovalidate class="danger">End Maintenance</button>':''}`,active?'Update end date':'Start Maintenance',()=>{m.endsAt=document.querySelector('#draft').value;if(!active)m.previousState=m.state;m.state='Maintenance'});endMaintenance=()=>{m.state=m.previousState||'Operational';delete m.endsAt}}}
+if(b.dataset.global==='new')openDialog('New Monitor','<label>Monitor name<input id="draft" required></label>','Create',()=>monitors.push({name:document.querySelector('#draft').value,state:'Awaiting check',published:true}));
+if(b.dataset.global==='settings')openDialog('Settings','<p>Settings layout is outside this prototype.</p>','Close',()=>{});
+if(b.id==='signout'){view='public';url();render()}});
+document.addEventListener('keydown',e=>{if(e.target.matches('input,textarea,select,[contenteditable]')||dialog.open)return;if(e.target.dataset.day!==undefined&&['ArrowLeft','ArrowRight','Home','End'].includes(e.key)){e.preventDefault();day=e.key==='Home'?0:e.key==='End'?89:Math.max(0,Math.min(89,day+(e.key==='ArrowRight'?1:-1)));let i=e.target.dataset.i;render();document.querySelector(`[data-i="${i}"][data-day="${day}"]`)?.focus();return}});
+document.querySelector('#theme').onchange=e=>{document.documentElement.dataset.theme=e.target.value};
+document.querySelector('#scenario').onchange=e=>{scenario=e.target.value;reset();render()};document.querySelector('#stale').onchange=e=>{stale=e.target.checked;render()};render();
+</script></html>
