@@ -27,15 +27,19 @@ plus the previous 89 UTC calendar days. Both endpoints and the ledger share this
 range. Public filtering happens before series reads, so private/deleted Monitors
 never acquire public bars. Hosted readers receive the operator view with unchanged
 secret filtering and no editing controls. The UI formats a counted percentage to
-two decimals; null percentage displays “Unavailable”, null history displays
-“Bars unavailable”. Each bar exposes its UTC date, state and observation counts
-to assistive technology and a title tooltip. Operator bars span the ledger width
+two decimals; null percentage displays “No observations”, null history displays
+“Bars unavailable”. Each strip has one keyboard entry point with arrow-key navigation and touch
+selection. Day details expose a locale-formatted UTC bucket date, result state
+and observation counts, followed by the bucket interval in the browser timezone.
+Selection tracks the bucket date across operator refreshes and public timed
+reloads; public selection is kept in the current browser history entry. Operator bars span the ledger width
 beneath their Monitor row; Incidents follow the ledger.
 
 Public Incidents have `openedAt < next UTC midnight` and either no recovery or
 `closedAt > first displayed UTC midnight`. Recovery exactly at the range start
 does not overlap. Incidents remain newest first (`openedAt DESC`, ID tie-break),
-with UTC times. Operators receive all retained Incidents, including older and
+with exact UTC instants in machine-readable timestamps and browser-local display
+times. Operators receive all retained Incidents, including older and
 deleted-Monitor names. No page-wide percentage is added.
 
 ## Storage and failure boundary

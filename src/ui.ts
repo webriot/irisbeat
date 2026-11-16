@@ -20,12 +20,12 @@ function document(title: string, body: string, operator = false) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(title)}</title><script src="/theme.js"></script><link rel="stylesheet" href="/app.css">${operator ? "" : '<meta http-equiv="refresh" content="60">'}</head><body><header><a class="brand" href="/">irisbeat</a><nav aria-label="Application"><a href="/"${operator ? "" : ' aria-current="page"'}>Status page</a><a href="/operator"${operator ? ' aria-current="page"' : ""}>Operator</a></nav></header><main>${body}</main><footer><a href="https://github.com/webriot/irisbeat/releases/download/v0.1.0/irisbeat-0.1.0-source.tar.gz">Source (AGPL-3.0-only)</a><label class="theme-control">Theme <select id="theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label></footer></body></html>`;
 }
 
-function historyMarkup(history: AvailabilityHistory | null | undefined) {
+function historyMarkup(history: AvailabilityHistory | null | undefined, id: string) {
   if (!history) return '<p class="history-unavailable">Bars unavailable</p>';
-  return `<div class="availability"><span class="percentage" aria-label="Availability">${history.percentage === null ? "Unavailable" : history.percentage.toFixed(2) + "%"}</span><ol class="history" aria-label="90 UTC days of availability">${history.days.map(day => {
-    const label = day.date + " UTC: " + (day.state === "maintenance" ? "Maintenance" : day.state) + "; " + day.successes + " successes, " + day.failures + " failures, " + day.maintenance + " Maintenance";
-    return `<li class="history-day ${day.state}" tabindex="0" aria-label="${label}"><span class="history-detail" aria-hidden="true">${label}</span></li>`;
-  }).join("")}</ol></div>`;
+  return `<div class="availability"><div class="history-head"><span>90 UTC days</span><span class="percentage" aria-label="Availability">${history.percentage === null ? "No observations" : history.percentage.toFixed(2) + "%"}</span></div><ol class="history" data-monitor="${encodeURIComponent(id)}" aria-label="90 UTC days of availability">${history.days.map((day, index) => {
+    const label = ({ empty: "No observations", up: "Successful checks", down: "Failed checks", degraded: "Mixed results", maintenance: "Maintenance" })[day.state] + "; " + day.successes + " successes, " + day.failures + " failures, " + day.maintenance + " Maintenance";
+    return `<li class="history-day ${day.state}" data-date="${day.date}" data-detail="${label}" tabindex="${index === history.days.length - 1 ? 0 : -1}" aria-label="${day.date} UTC: ${label}"></li>`;
+  }).join("")}</ol><p class="history-detail" role="status" aria-live="polite" aria-atomic="true"></p></div>`;
 }
 
 export function statusPage(status: Status) {
@@ -46,7 +46,7 @@ export function statusPage(status: Status) {
     status.pageName,
     `<h1>${escape(status.pageName)}</h1>
     <section class="banner" data-state="${banner === "All services operational" ? "up" : banner === "Services unavailable" ? "down" : "unknown"}" aria-label="Current status"><h2>${escape(banner)}</h2></section>
-    <div class="ledger">${status.monitors.map((monitor, index) => `<article aria-labelledby="monitor-name${index || ""}"><div class="ledger-row" data-state="${monitor.state}"><h2 id="monitor-name${index || ""}">${escape(monitor.name)}</h2><span class="status">${stateLabel[monitor.state]}</span></div>${historyMarkup(monitor.history)}</article>`).join("")}</div>
+    <div class="ledger">${status.monitors.map((monitor, index) => `<article aria-labelledby="monitor-name${index || ""}"><div class="ledger-row" data-state="${monitor.state}"><h2 id="monitor-name${index || ""}">${escape(monitor.name)}</h2><span class="status">${stateLabel[monitor.state]}</span></div>${historyMarkup(monitor.history, monitor.id)}</article>`).join("")}</div>
     ${status.monitors.length ? `<section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>${status.incidents.length ? `<ul class="incidents">${status.incidents.map((incident) => `<li><article class="incident"><strong>${escape(status.monitors.find(monitor => monitor.id === incident.monitorId)?.name ?? incident.monitorId)} — ${incident.closedAt === null ? "Open" : "Recovered"}</strong><p>Unavailable since ${time(incident.openedAt)}${incident.closedAt === null ? " — Ongoing" : ` — Recovered ${time(incident.closedAt)}`}</p></article></li>`).join("")}</ul>` : "<p>No Incidents</p>"}</section>` : ""}`,
   );
 }
@@ -109,6 +109,49 @@ export function operatorPage(hosted = false) {
 
 // Runs before the stylesheet to apply a saved preference before first paint.
 export const themeScript = `
+const selectedHistoryDays = new Map(Object.entries(history.state?.irisbeatDays || {}));
+const instantFormat = new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
+const bucketFormat = new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' });
+const browserTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+function initializeDisplay() {
+  document.querySelectorAll('time[datetime]').forEach(time => {
+    time.textContent = instantFormat.format(new Date(time.dateTime));
+  });
+  document.querySelectorAll('.history').forEach(strip => {
+    const days = [...strip.children];
+    if (!days.length) return;
+    const detail = strip.nextElementSibling;
+    function select(day) {
+      selectedHistoryDays.set(strip.dataset.monitor, day.dataset.date);
+      if (!document.getElementById('login')) {
+        try { history.replaceState({ ...history.state, irisbeatDays: Object.fromEntries(selectedHistoryDays) }, ''); } catch {}
+      }
+      days.forEach(item => {
+        item.tabIndex = item === day ? 0 : -1;
+        item.setAttribute('aria-current', String(item === day));
+      });
+      detail.textContent = day.getAttribute('aria-label');
+    }
+    days.forEach(day => {
+      const start = new Date(day.dataset.date + 'T00:00:00Z');
+      const end = new Date(start.getTime() + 86400000);
+      const counts = day.dataset.detail;
+      day.setAttribute('aria-label', bucketFormat.format(start) + ' UTC: ' + counts + ' · ' + instantFormat.format(start) + ' – ' + instantFormat.format(end) + ' (' + browserTimeZone + ')');
+      day.onfocus = () => select(day);
+      day.onclick = () => { select(day); day.focus(); };
+      day.onkeydown = event => {
+        const index = days.indexOf(day);
+        const target = { ArrowLeft: index - 1, ArrowRight: index + 1, Home: 0, End: days.length - 1 }[event.key];
+        if (target !== undefined) {
+          event.preventDefault();
+          days[Math.max(0, Math.min(days.length - 1, target))].focus();
+        }
+      };
+    });
+    const selected = selectedHistoryDays.get(strip.dataset.monitor);
+    select(days.find(day => day.dataset.date === selected) || days.at(-1));
+  });
+}
 let theme = 'system';
 try {
   const saved = localStorage.getItem('irisbeat-theme');
@@ -116,6 +159,7 @@ try {
 } catch {}
 document.documentElement.dataset.theme = theme;
 document.addEventListener('DOMContentLoaded', () => {
+  initializeDisplay();
   const control = document.getElementById('theme');
   control.value = theme;
   control.addEventListener('change', () => {
@@ -176,10 +220,10 @@ tbody tr:nth-child(odd) td { padding-bottom: 0; }
 .availability { padding-top: 12px; min-width: 0; }
 .percentage { font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .history { position: relative; display: grid; grid-template-columns: repeat(90, minmax(0, 1fr)); gap: 3px; list-style: none; padding: 0; margin: 8px 0 0; }
-.history:has(.history-day:focus), .history:has(.history-day:hover) { padding-bottom: 5rem; }
-.history-detail { display: none; position: absolute; inset: 2.2rem 0 auto; color: var(--muted); font-size: 12px; line-height: 1.4; }
-.history-day:focus .history-detail, .history:not(:has(.history-day:focus)) .history-day:hover .history-detail { display: block; }
-.history-day { height: 25px; border-radius: 2px; background: var(--secondary); }
+.history-head { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
+.history-detail { color: var(--muted); font-size: 12px; line-height: 1.4; margin: 8px 0 0; min-height: 2.8em; }
+.history-day[aria-current="true"] { outline: 2px solid var(--foreground); outline-offset: 2px; }
+.history-day { cursor: pointer; height: 25px; border-radius: 2px; background: var(--secondary); }
 .history-day.up { background: var(--success); }
 .history-day.down { background: var(--danger); }
 .history-day.degraded { background: var(--warning); }
@@ -330,12 +374,18 @@ function edit(monitor = null) {
   byId('name').focus();
 }
 function cancelEdit() { byId('heartbeat-credential').textContent = ''; editingId = null; form.reset(); form.hidden = true; }
+function localMinute(date) { return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16); }
 function declareMaintenance(monitor) {
+  maintenanceForm.querySelector('label').textContent = 'End time (' + browserTimeZone + ')';
   maintenanceForm.dataset.monitorId = monitor.id;
   byId('maintenance-heading').textContent = monitor.name + ' — Maintenance';
   byId('save-maintenance').textContent = monitor.maintenance ? 'Replace Maintenance' : 'Declare Maintenance';
   const end = new Date(monitor.maintenance?.endsAt ?? Date.now() + 3600000);
-  byId('maintenance-end').value = new Date(end.getTime() - end.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  const input = byId('maintenance-end');
+  input.value = localMinute(end);
+  input.dataset.originalValue = input.value;
+  input.dataset.originalInstant = String(end.getTime());
+  input.setCustomValidity('');
   maintenanceForm.hidden = false; byId('maintenance-end').focus();
 }
 function signOut() {
@@ -344,6 +394,7 @@ function signOut() {
   message.textContent = ''; byId('secret').value = ''; byId('secret').focus();
 }
 function render(data) {
+  const focusedHistory = document.activeElement?.closest('.history')?.dataset.monitor;
   login.hidden = true; editor.hidden = false;
   hosted = !!data.hosted;
   byId('paused').hidden = !data.paused;
@@ -377,7 +428,7 @@ function render(data) {
     const historyRow = document.createElement('tr');
     const availability = document.createElement('td'); availability.colSpan = 4;
     availability.setAttribute('aria-label', monitor.name + ' availability');
-    availability.innerHTML = historyMarkup(monitor.history); historyRow.append(availability);
+    availability.innerHTML = historyMarkup(monitor.history, monitor.id); historyRow.append(availability);
     return [row, historyRow];
   });
   if (!rows.length) {
@@ -388,11 +439,22 @@ function render(data) {
   const incidents = data.incidents.map(incident => {
     const item = document.createElement('li'); item.className = 'incident';
     const monitor = data.monitors.find(monitor => monitor.id === incident.monitorId);
-    item.textContent = (monitor?.name || incident.monitorName || incident.monitorId) + (monitor ? '' : ' (deleted)') + ' — Unavailable since ' + new Date(incident.openedAt).toISOString() + (incident.closedAt === null ? ' — Ongoing' : ' — Recovered ' + new Date(incident.closedAt).toISOString());
+    item.append((monitor?.name || incident.monitorName || incident.monitorId) + (monitor ? '' : ' (deleted)') + ' — Unavailable since ');
+    const appendTime = at => {
+      const time = document.createElement('time'); time.dateTime = new Date(at).toISOString(); item.append(time);
+    };
+    appendTime(incident.openedAt);
+    if (incident.closedAt === null) item.append(' — Ongoing');
+    else { item.append(' — Recovered '); appendTime(incident.closedAt); }
     return item;
   });
   if (!incidents.length) { const item = document.createElement('li'); item.textContent = 'No Incidents'; incidents.push(item); }
   byId('incidents').replaceChildren(...incidents);
+  initializeDisplay();
+  if (focusedHistory) {
+    const strip = [...document.querySelectorAll('.history')].find(strip => strip.dataset.monitor === focusedHistory);
+    strip?.querySelector('[tabindex="0"]')?.focus();
+  }
 }
 async function run(path = '/api/operator', method = 'GET', body, after) {
   if (busy) return;
@@ -460,8 +522,25 @@ form.addEventListener('submit', async event => {
 });
 maintenanceForm.addEventListener('submit', async event => {
   event.preventDefault();
-  await run('/api/operator/monitors/' + encodeURIComponent(maintenanceForm.dataset.monitorId) + '/maintenance', 'PUT', { endsAt: new Date(byId('maintenance-end').value).getTime() }, () => { maintenanceForm.hidden = true; });
+  const input = byId('maintenance-end');
+  let endsAt = Number(input.dataset.originalInstant);
+  if (input.value !== input.dataset.originalValue) {
+    const end = new Date(input.value);
+    // Offset changes around the entered day expose a second occurrence of the same local minute.
+    const ambiguous = Number.isFinite(end.getTime()) && [-86400000, 86400000].some(delta => {
+      const offsetChange = new Date(end.getTime() + delta).getTimezoneOffset() - end.getTimezoneOffset();
+      return offsetChange !== 0 && localMinute(new Date(end.getTime() + offsetChange * 60000)) === input.value;
+    });
+    if (!Number.isFinite(end.getTime()) || localMinute(end) !== input.value || ambiguous) {
+      input.setCustomValidity('Choose an unambiguous local time that exists in ' + browserTimeZone + '.');
+      input.reportValidity();
+      return;
+    }
+    endsAt = end.getTime();
+  }
+  await run('/api/operator/monitors/' + encodeURIComponent(maintenanceForm.dataset.monitorId) + '/maintenance', 'PUT', { endsAt }, () => { maintenanceForm.hidden = true; });
 });
+byId('maintenance-end').addEventListener('input', event => event.target.setCustomValidity(''));
 byId('cancel-maintenance').addEventListener('click', () => { maintenanceForm.hidden = true; });
 webhook.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator/webhook', 'PUT', { url: byId('webhookUrl').value }); });
 pageForm.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator', 'PUT', { pageName: byId('pageName').value }); });
