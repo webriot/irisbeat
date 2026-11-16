@@ -17,7 +17,7 @@ const stateLabel = {
   paused: "Monitoring paused",
 };
 function document(title: string, body: string, operator = false) {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(title)}</title><link rel="stylesheet" href="/app.css">${operator ? "" : '<meta http-equiv="refresh" content="60">'}</head><body><header><a class="brand" href="/">irisbeat</a><nav aria-label="Application"><a href="/"${operator ? "" : ' aria-current="page"'}>Status page</a><a href="/operator"${operator ? ' aria-current="page"' : ""}>Operator</a></nav></header><main>${body}</main><footer><a href="https://github.com/webriot/irisbeat/releases/download/v0.1.0/irisbeat-0.1.0-source.tar.gz">Source (AGPL-3.0-only)</a></footer></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(title)}</title><script src="/theme.js"></script><link rel="stylesheet" href="/app.css">${operator ? "" : '<meta http-equiv="refresh" content="60">'}</head><body><header><a class="brand" href="/">irisbeat</a><nav aria-label="Application"><a href="/"${operator ? "" : ' aria-current="page"'}>Status page</a><a href="/operator"${operator ? ' aria-current="page"' : ""}>Operator</a></nav></header><main>${body}</main><footer><a href="https://github.com/webriot/irisbeat/releases/download/v0.1.0/irisbeat-0.1.0-source.tar.gz">Source (AGPL-3.0-only)</a><label class="theme-control">Theme <select id="theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label></footer></body></html>`;
 }
 
 function historyMarkup(history: AvailabilityHistory | null | undefined) {
@@ -45,8 +45,8 @@ export function statusPage(status: Status) {
   return document(
     status.pageName,
     `<h1>${escape(status.pageName)}</h1>
-    <section class="banner" aria-label="Current status"><h2>${escape(banner)}</h2></section>
-    ${status.monitors.map((monitor, index) => `<article aria-labelledby="monitor-name${index || ""}"><div class="ledger-row"><h2 id="monitor-name${index || ""}">${escape(monitor.name)}</h2><span class="status">${stateLabel[monitor.state]}</span></div>${historyMarkup(monitor.history)}</article>`).join("")}
+    <section class="banner" data-state="${banner === "All services operational" ? "up" : banner === "Services unavailable" ? "down" : "unknown"}" aria-label="Current status"><h2>${escape(banner)}</h2></section>
+    <div class="ledger">${status.monitors.map((monitor, index) => `<article aria-labelledby="monitor-name${index || ""}"><div class="ledger-row" data-state="${monitor.state}"><h2 id="monitor-name${index || ""}">${escape(monitor.name)}</h2><span class="status">${stateLabel[monitor.state]}</span></div>${historyMarkup(monitor.history)}</article>`).join("")}</div>
     ${status.monitors.length ? `<section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>${status.incidents.length ? `<ul class="incidents">${status.incidents.map((incident) => `<li><article class="incident"><strong>${escape(status.monitors.find(monitor => monitor.id === incident.monitorId)?.name ?? incident.monitorId)} — ${incident.closedAt === null ? "Open" : "Recovered"}</strong><p>Unavailable since ${time(incident.openedAt)}${incident.closedAt === null ? " — Ongoing" : ` — Recovered ${time(incident.closedAt)}`}</p></article></li>`).join("")}</ul>` : "<p>No Incidents</p>"}</section>` : ""}`,
   );
 }
@@ -103,57 +103,144 @@ export function operatorPage(hosted = false) {
   );
 }
 
+// Runs before the stylesheet to apply a saved preference before first paint.
+export const themeScript = `
+let theme = 'system';
+try {
+  const saved = localStorage.getItem('irisbeat-theme');
+  if (saved === 'light' || saved === 'dark') theme = saved;
+} catch {}
+document.documentElement.dataset.theme = theme;
+document.addEventListener('DOMContentLoaded', () => {
+  const control = document.getElementById('theme');
+  control.value = theme;
+  control.addEventListener('change', () => {
+    theme = control.value;
+    document.documentElement.dataset.theme = theme;
+    try {
+      if (theme === 'system') localStorage.removeItem('irisbeat-theme');
+      else localStorage.setItem('irisbeat-theme', theme);
+    } catch {}
+  });
+});
+`;
+
 export const styleSheet = `
-:root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.5; --line: light-dark(#d6dfda, #42544d); }
+:root {
+  color-scheme: light; font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
+  --background: light-dark(#f5f7f8, #101417); --foreground: light-dark(#202b30, #e2eaed);
+  --muted: light-dark(#596970, #99a9b1); --card: light-dark(#fff, #171e23);
+  --secondary: light-dark(#edf1f3, #222c33); --line: light-dark(#d9e1e5, #35424a);
+  --control-border: light-dark(#78868d, #788c98);
+  --primary: light-dark(#245e66, #9bd4d6); --primary-foreground: light-dark(#fff, #142b30);
+  --success: light-dark(#176744, #77d6ab); --success-surface: light-dark(#eaf6ef, #172e27);
+  --danger: light-dark(#b42e3d, #ff96a0); --warning: light-dark(#825b0a, #eac16f);
+  --info: light-dark(#6357a2, #b4a5ee); --radius: 12px;
+  background: var(--background); color: var(--foreground);
+}
+@media (prefers-color-scheme: dark) { :root { color-scheme: dark; } }
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
 * { box-sizing: border-box; }
-body { max-width: 66rem; margin: auto; padding: 1.5rem; overflow-wrap: anywhere; }
-header, nav, .ledger-row, .actions { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
-header { padding-bottom: 1.5rem; border-bottom: 1px solid var(--line); }
-nav { justify-content: flex-start; }
-a { color: inherit; text-underline-offset: .2em; }
-.brand { font-size: 1.3rem; font-weight: 700; text-decoration: none; }
-[aria-current="page"] { font-weight: 700; }
-h1 { font-size: clamp(2rem, 5vw, 3rem); }
-h2 { font-size: 1.25rem; }
-.banner { padding: 1rem 0 2rem; border-bottom: 1px solid var(--line); }
-.banner h2 { font-size: 1.8rem; }
-.ledger-row { padding: 1rem 0; border-bottom: 1px solid var(--line); }
-table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; }
-th, td { padding: 1rem .5rem; text-align: left; border-bottom: 1px solid var(--line); }
-.availability { padding: 1rem 0; min-width: 12rem; }
-.percentage { font-variant-numeric: tabular-nums; }
-.history { position: relative; display: grid; grid-template-columns: repeat(90, minmax(0, 1fr)); gap: 2px; list-style: none; padding: 0; margin: .5rem 0; }
+body { max-width: 1088px; margin: auto; padding: 0 24px 32px; overflow-wrap: anywhere; }
+header, nav, .ledger-row, .actions, footer { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+header, .ledger-row, footer { justify-content: space-between; }
+header { padding: 20px 0; border-bottom: 1px solid var(--line); }
+nav { gap: 6px; }
+a { color: inherit; text-underline-offset: 4px; }
+.brand { font-size: 20px; font-weight: 750; letter-spacing: -.6px; text-decoration: none; }
+nav a { padding: 8px 10px; border-radius: 6px; color: var(--muted); text-decoration: none; }
+nav a[aria-current="page"] { background: var(--secondary); color: var(--foreground); font-weight: 600; }
+h1 { margin: 28px 0 24px; font-size: 28px; line-height: 1.2; letter-spacing: -.8px; font-weight: 650; }
+h2 { margin: 0; font-size: 16px; font-weight: 650; }
+.banner { padding: 18px 20px; margin-bottom: 24px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); color: var(--info); }
+.banner[data-state="up"] { background: var(--success-surface); color: var(--success); border-color: color-mix(in srgb, var(--success) 24%, transparent); }
+.banner[data-state="down"] { color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, var(--card)); border-color: color-mix(in srgb, var(--danger) 30%, transparent); }
+.ledger, table { border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); margin-bottom: 28px; }
+.ledger > article { padding: 18px 20px; }
+.ledger > article + article { border-top: 1px solid var(--line); }
+.ledger-row h2 { font-size: 15px; }
+.status { font-size: 13px; color: var(--muted); }
+.ledger-row[data-state="up"] .status, .status[data-state="up"] { color: var(--success); }
+.ledger-row[data-state="down"] .status, .status[data-state="down"] { color: var(--danger); }
+.ledger-row[data-state="maintenance"] .status, .status[data-state="maintenance"], .ledger-row[data-state="paused"] .status, .status[data-state="paused"] { color: var(--info); }
+table { width: 100%; border-spacing: 0; margin-top: 20px; }
+th, td { padding: 12px 16px; text-align: left; }
+th { font-size: 12px; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--line); }
+tbody tr:nth-child(even):not(:last-child) td { border-bottom: 1px solid var(--line); }
+tbody tr:nth-child(odd) td { padding-bottom: 0; }
+.availability { padding-top: 12px; min-width: 0; }
+.percentage { font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.history { position: relative; display: grid; grid-template-columns: repeat(90, minmax(0, 1fr)); gap: 3px; list-style: none; padding: 0; margin: 8px 0 0; }
 .history:has(.history-day:focus), .history:has(.history-day:hover) { padding-bottom: 5rem; }
-.history-detail { display: none; position: absolute; inset: 2.2rem 0 auto; font-size: .875rem; line-height: 1.4; }
+.history-detail { display: none; position: absolute; inset: 2.2rem 0 auto; color: var(--muted); font-size: 12px; line-height: 1.4; }
 .history-day:focus .history-detail, .history:not(:has(.history-day:focus)) .history-day:hover .history-detail { display: block; }
-.history-day { height: 1.8rem; background: light-dark(#e6eae8, #35413c); }
-.history-day.up { background: light-dark(#19734b, #59c990); }
-.history-day.down { background: light-dark(#b52a34, #ff7880); }
-.history-day.degraded { background: light-dark(#986500, #e6b64d); }
-.history-day.maintenance { background: light-dark(#5454a6, #a4a4ef); }
-.history-day.empty { border: 1px dashed var(--line); background: transparent; }
-@media (max-width: 44rem) { table, thead, tbody, tr, td { display: block; } thead { position: absolute; clip-path: inset(100%); } td { border: 0; padding: .4rem 0; } tr { border-bottom: 1px solid var(--line); padding: 1rem 0; } }
-.configuration-layout { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 2.5rem; margin: 2rem 0; }
-aside { border-left: 1px solid var(--line); padding-left: 1.5rem; }
+.history-day { height: 25px; border-radius: 2px; background: var(--secondary); }
+.history-day.up { background: var(--success); }
+.history-day.down { background: var(--danger); }
+.history-day.degraded { background: var(--warning); }
+.history-day.maintenance { background: var(--info); }
+.history-day.empty { border: 1px dashed var(--line); }
+.history-unavailable { color: var(--muted); font-size: 12px; }
+.configuration-layout { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 20px; margin: 20px 0; align-items: start; }
+form, aside { min-width: 0; }
+#configuration, #maintenance, #webhook, aside, #login { border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; background: var(--card); }
+#configuration, #maintenance { background: var(--secondary); }
+#maintenance { margin-bottom: 20px; }
 fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
-label { display: block; margin: 1rem 0 .4rem; }
-input, select, button { font: inherit; min-height: 2.75rem; max-width: 100%; }
-input, select { width: 100%; padding: .5rem; }
-.checkbox { display: flex; align-items: center; gap: .5rem; }
-input[type="checkbox"] { width: auto; }
-td .actions { margin: 0; gap: .5rem; }
-button:disabled { cursor: wait; }
-[hidden] { display: none !important; }
-button { padding: .5rem .9rem; cursor: pointer; }
-form button { margin-top: 1rem; }
-.text-button { border: 0; background: transparent; color: inherit; padding-left: 0; text-decoration: underline; text-underline-offset: .2em; }
-:focus-visible { outline: 2px solid currentColor; outline-offset: 4px; }
-.incidents { list-style: none; padding: 0; }
-.incident { padding: 1rem 0; border-top: 1px solid var(--line); }
-.incident p { margin-bottom: 0; }
-.actions { justify-content: flex-start; margin-top: 2rem; }
+label { display: block; margin: 12px 0 6px; font-size: 13px; }
+input, select, button { font: inherit; min-height: 40px; max-width: 100%; border: 1px solid var(--line); border-radius: 7px; background: var(--card); color: var(--foreground); }
+input, select { width: 100%; padding: 8px 11px; border-color: var(--control-border); }
+input:disabled, select:disabled { opacity: .65; }
+.checkbox { display: flex; align-items: center; gap: 8px; }
+input[type="checkbox"] { width: auto; accent-color: var(--primary); }
+button { padding: 8px 13px; cursor: pointer; font-weight: 550; }
+button:hover, summary:hover { background: var(--secondary); }
+button:disabled { opacity: .5; cursor: wait; }
+form button { margin-top: 16px; }
+form button + button { margin-left: 8px; }
+#webhook { margin-bottom: 28px; }
+.ledger:empty { display: none; }
+form button[type="submit"], form button:not([type]), #new-monitor { background: var(--primary); border-color: var(--primary); color: var(--primary-foreground); }
+.text-button { border: 0; background: transparent; color: inherit; padding-left: 0; text-decoration: underline; text-underline-offset: 4px; }
+:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+.incidents { list-style: none; padding: 0; margin: 12px 0 0; }
+.incident { padding: 16px 0; border-top: 1px solid var(--line); }
+.incident p { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
+.actions { justify-content: flex-start; margin-top: 20px; }
+td .actions { margin: 0; gap: 6px; }
 #login { max-width: 28rem; }
-@media (max-width: 44rem) { .configuration-layout { grid-template-columns: 1fr; gap: 1rem; } aside { border-left: 0; padding-left: 0; } body { padding: 1rem; } }
+#paused { color: var(--info); }
+#message:empty { display: none; }
+footer { margin-top: 36px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+.theme-control { display: flex; align-items: center; gap: 8px; margin: 0; }
+.theme-control select { width: auto; }
+/* Shared surfaces for operator action menus and inline panels. */
+.menu { position: relative; }
+summary { cursor: pointer; border-radius: 7px; padding: 8px 13px; }
+.menu-items { position: absolute; right: 0; z-index: 5; width: 205px; padding: 5px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); box-shadow: 0 10px 30px #0002; }
+.menu-items button { display: block; width: 100%; text-align: left; border: 0; }
+button.danger { color: var(--danger); }
+[hidden] { display: none !important; }
+@media (max-width: 44rem) {
+  body { padding: 0 16px 24px; }
+  header { gap: 8px; }
+  nav { gap: 0; }
+  nav a { padding: 7px; }
+  .brand { font-size: 18px; }
+  h1 { margin: 24px 0 20px; font-size: 24px; }
+  .banner { padding: 16px; }
+  .ledger > article { padding: 16px 12px; }
+  .history { gap: 2px; }
+  .history-day { height: 23px; }
+  table, thead, tbody, tr, td { display: block; }
+  thead { position: absolute; clip-path: inset(100%); }
+  th, td { padding: 8px 12px; }
+  tbody tr:nth-child(odd) { padding-top: 8px; }
+  tbody tr:nth-child(even) td { padding-bottom: 16px; }
+  .configuration-layout { grid-template-columns: 1fr; gap: 16px; }
+  footer { align-items: flex-start; }
+}
 `;
 
 export const operatorScript = `
@@ -216,7 +303,9 @@ function render(data) {
   const rows = data.monitors.flatMap(monitor => {
     const row = document.createElement('tr');
     for (const text of [monitor.name, (${JSON.stringify(stateLabel)})[monitor.state], monitor.published ? 'Published' : 'Private']) {
-      const cell = document.createElement('td'); cell.textContent = text; row.append(cell);
+      const cell = document.createElement('td'); cell.textContent = text;
+      if (row.children.length === 1) { cell.className = 'status'; cell.dataset.state = monitor.state; }
+      row.append(cell);
     }
     const actions = document.createElement('td');
     const group = document.createElement('div'); group.className = 'actions';

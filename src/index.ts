@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { operatorPage, operatorScript, statusPage, styleSheet } from "./ui";
+import { operatorPage, operatorScript, statusPage, styleSheet, themeScript } from "./ui";
 import { connect } from "cloudflare:sockets";
 import { DurableObject } from "cloudflare:workers";
 
@@ -731,6 +731,10 @@ async function handleRequest(request: Request, env: EngineEnv, resolved?: Resolv
     if (path === "/app.css")
       return new Response(styleSheet, {
         headers: { "Content-Type": "text/css; charset=utf-8" },
+      });
+    if (path === "/theme.js")
+      return new Response(themeScript, {
+        headers: { "Content-Type": "text/javascript; charset=utf-8" },
       });
     if (path === "/operator.js")
       return new Response(operatorScript, {

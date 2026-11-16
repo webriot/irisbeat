@@ -16,11 +16,13 @@
     "release:prepare": "node scripts/release.cjs",
     "test:release": "node test/release.cjs",
     "test:deployment": "node test/deployment.cjs",
-    "release:verify": "npm run check && npm test && npm run build && npm run test:release && npm run test:consumer -- --prepared && npm run test:deployment"
+    "release:verify": "npm run check && npm test && npm run build && npm run test:release && npm run test:consumer -- --prepared && npm run test:deployment",
+    "test:ui": "tsc -p test/ui && playwright test"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.8.2",
     "@msw/cloudflare": "^0.2.0",
+    "@playwright/test": "^1.65.1",
     "msw": "^3.0.5",
     "typescript": "^7.0.2",
     "vitest": "^5.1.0",
