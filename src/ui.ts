@@ -51,6 +51,10 @@ export function statusPage(status: Status) {
   );
 }
 
+function durationControl(field: string, label: string, min: number, max: number, value: number) {
+  return `<fieldset class="duration"><label for="${field}">${label}</label><div class="duration-value"><input id="${field}" name="${field}" type="number" min="${min}" max="${max}" step="any" value="${value}" data-duration required><select id="${field}-unit" aria-label="${label} unit"><option value="seconds">Seconds</option><option value="minutes">Minutes</option><option value="hours">Hours</option><option value="days">Days</option></select></div></fieldset>`;
+}
+
 export function operatorPage(hosted = false) {
   return document(
     "Irisbeat operator",
@@ -76,12 +80,12 @@ export function operatorPage(hosted = false) {
           <fieldset id="http-target"><label for="url">HTTP(S) target</label><input id="url" name="url" type="url" required maxlength="2048"></fieldset>
           <fieldset id="tcp-target" hidden disabled><label for="hostname">Hostname</label><input id="hostname" name="hostname" required maxlength="253" autocapitalize="none" spellcheck="false">
           <label for="port">Port</label><input id="port" name="port" type="number" min="1" max="65535" step="1" required></fieldset>
-          <label for="intervalSeconds">Interval (seconds)</label><input id="intervalSeconds" name="intervalSeconds" type="number" min="60" max="86400" step="1" value="60" required>
-          <label for="timeoutSeconds">Timeout (seconds)</label><input id="timeoutSeconds" name="timeoutSeconds" type="number" min="1" max="60" step="1" value="10" required>
+          ${durationControl("intervalSeconds", "Interval", 60, 86400, 60)}
+          ${durationControl("timeoutSeconds", "Timeout", 1, 60, 10)}
           <label for="failureThreshold">Consecutive failures</label><input id="failureThreshold" name="failureThreshold" type="number" min="1" max="100" step="1" value="2" required>
           <label for="recoveryThreshold">Consecutive successes</label><input id="recoveryThreshold" name="recoveryThreshold" type="number" min="1" max="100" step="1" value="2" required>
-          <label for="silenceSeconds">Silence (seconds)</label><input id="silenceSeconds" name="silenceSeconds" type="number" min="60" max="86400" step="1" value="180" required>
-          <label for="recoverySpacingSeconds">Recovery spacing (seconds)</label><input id="recoverySpacingSeconds" name="recoverySpacingSeconds" type="number" min="60" max="86400" step="1" value="60" required>
+          ${durationControl("silenceSeconds", "Silence", 60, 86400, 180)}
+          ${durationControl("recoverySpacingSeconds", "Recovery spacing", 60, 86400, 60)}
           <label class="checkbox" for="published"><input id="published" name="published" type="checkbox" checked>Published</label>
           <button>Save Monitor</button><button id="cancel-edit" type="button">Cancel</button>
         </form>
@@ -191,6 +195,7 @@ fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 label { display: block; margin: 12px 0 6px; font-size: 13px; }
 input, select, button { font: inherit; min-height: 40px; max-width: 100%; border: 1px solid var(--line); border-radius: 7px; background: var(--card); color: var(--foreground); }
 input, select { width: 100%; padding: 8px 11px; border-color: var(--control-border); }
+.duration-value { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
 input:disabled, select:disabled { opacity: .65; }
 .checkbox { display: flex; align-items: center; gap: 8px; }
 input[type="checkbox"] { width: auto; accent-color: var(--primary); }
@@ -254,6 +259,49 @@ const webhook = byId('webhook');
 const maintenanceForm = byId('maintenance');
 const message = byId('message');
 const timingDefaults = { intervalSeconds: 60, timeoutSeconds: 10, failureThreshold: 2, recoveryThreshold: 2, silenceSeconds: 180, recoverySpacingSeconds: 60 };
+const durationFactors = { seconds: 1, minutes: 60, hours: 3600, days: 86400 };
+const durations = new Map();
+function durationSeconds(input) {
+  const state = durations.get(input);
+  // Keep the original seconds when a unit has a repeating decimal representation.
+  if (input.value === state.display) return state.seconds;
+  const match = input.value.match(/^(\\d*)(?:\\.(\\d*))?(?:e([+-]?\\d+))?$/i);
+  if (!match || !(match[1] + (match[2] || '')) || !Number.isFinite(Number(input.value))) return null;
+  const exponent = Number(match[3] || 0) - (match[2] || '').length;
+  if (Math.abs(exponent) > 400) return null;
+  const numerator = BigInt(match[1] + (match[2] || '')) * BigInt(durationFactors[state.unit]) * 10n ** BigInt(Math.max(0, exponent));
+  const denominator = 10n ** BigInt(Math.max(0, -exponent));
+  if (numerator % denominator !== 0n) return null;
+  const seconds = Number(numerator / denominator);
+  return Number.isSafeInteger(seconds) && seconds >= state.min && seconds <= state.max ? seconds : null;
+}
+function validateDuration(input) {
+  const seconds = durationSeconds(input);
+  const state = durations.get(input);
+  input.setCustomValidity(seconds === null ? 'Enter whole seconds between ' + state.min + ' and ' + state.max + '.' : '');
+  return seconds;
+}
+function displayDuration(input, seconds, unit = 'seconds') {
+  const state = durations.get(input);
+  state.unit = unit; state.seconds = seconds;
+  state.control.value = unit;
+  input.min = state.min / durationFactors[unit];
+  input.max = state.max / durationFactors[unit];
+  input.value = seconds / durationFactors[unit];
+  state.display = input.value;
+  input.setCustomValidity('');
+}
+for (const input of form.querySelectorAll('[data-duration]')) {
+  const control = byId(input.id + '-unit');
+  durations.set(input, { control, min: Number(input.min), max: Number(input.max) });
+  displayDuration(input, Number(input.value));
+  input.addEventListener('input', () => validateDuration(input));
+  control.addEventListener('change', () => {
+    const seconds = validateDuration(input);
+    if (seconds === null) { control.value = durations.get(input).unit; input.reportValidity(); return; }
+    displayDuration(input, seconds, control.value);
+  });
+}
 let secret = '';
 let editingId = null;
 let busy = false;
@@ -269,7 +317,11 @@ function edit(monitor = null) {
   byId('hostname').value = monitor?.hostname || '';
   byId('port').value = monitor?.port || '';
   byId('published').checked = monitor?.published ?? true;
-  for (const [field, value] of Object.entries(timingDefaults)) byId(field).value = monitor?.[field] ?? value;
+  for (const [field, value] of Object.entries(timingDefaults)) {
+    const input = byId(field);
+    if (durations.has(input)) displayDuration(input, monitor?.[field] ?? value);
+    else input.value = monitor?.[field] ?? value;
+  }
   byId('heartbeat-path').textContent = monitor?.kind === 'heartbeat' ? (hosted ? 'POST /heartbeat' : 'POST /heartbeat/' + monitor.id) : '';
   byId('rotate-heartbeat').hidden = !hosted || monitor?.kind !== 'heartbeat';
   byId('heartbeat-credential').textContent = '';
@@ -376,9 +428,14 @@ function updateKind() {
     const input = document.getElementById(field);
     const hidden = ['silenceSeconds', 'recoverySpacingSeconds'].includes(field) ? !heartbeat : heartbeat;
     input.disabled = hidden; input.hidden = hidden;
+    if (durations.has(input)) {
+      input.closest('.duration').hidden = hidden;
+      durations.get(input).control.disabled = hidden;
+    }
     document.querySelector('label[for="' + field + '"]').hidden = hidden;
   }
-  document.querySelector('label[for="intervalSeconds"]').textContent = heartbeat ? 'Expectation (seconds)' : 'Interval (seconds)';
+  document.querySelector('label[for="intervalSeconds"]').textContent = heartbeat ? 'Expectation' : 'Interval';
+  byId('intervalSeconds-unit').setAttribute('aria-label', heartbeat ? 'Expectation unit' : 'Interval unit');
   document.querySelector('label[for="recoveryThreshold"]').textContent = heartbeat ? 'Recovery receipts' : 'Consecutive successes';
 }
 document.getElementById('kind').addEventListener('change', updateKind);
@@ -393,7 +450,12 @@ form.addEventListener('submit', async event => {
   const body = { name: byId('name').value, kind: byId('kind').value, published: byId('published').checked };
   if (body.kind === 'tcp') { body.hostname = byId('hostname').value; body.port = Number(byId('port').value); }
   else if (body.kind === 'http') body.url = byId('url').value;
-  for (const field of Object.keys(timingDefaults)) { if (!byId(field).disabled) body[field] = Number(byId(field).value); }
+  for (const field of Object.keys(timingDefaults)) {
+    const input = byId(field);
+    if (input.disabled) continue;
+    body[field] = durations.has(input) ? validateDuration(input) : Number(input.value);
+    if (body[field] === null) { input.reportValidity(); return; }
+  }
   await run('/api/operator/monitors' + (editingId ? '/' + encodeURIComponent(editingId) : ''), editingId ? 'PATCH' : 'POST', body, cancelEdit);
 });
 maintenanceForm.addEventListener('submit', async event => {

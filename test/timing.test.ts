@@ -227,13 +227,15 @@ it("uses the configured timeout snapshot while saving a different deadline for t
 it("serves labeled timing controls inside the existing Monitor configuration", async () => {
   const html = await (await request("/operator")).text();
   for (const [field, label, min, max, value] of [
-    ["intervalSeconds", "Interval (seconds)", 60, 86400, 60],
-    ["timeoutSeconds", "Timeout (seconds)", 1, 60, 10],
+    ["intervalSeconds", "Interval", 60, 86400, 60],
+    ["timeoutSeconds", "Timeout", 1, 60, 10],
     ["failureThreshold", "Consecutive failures", 1, 100, 2],
     ["recoveryThreshold", "Consecutive successes", 1, 100, 2],
   ]) {
     expect(html).toContain(`<label for="${field}">${label}</label>`);
-    expect(html).toContain(`<input id="${field}" name="${field}" type="number" min="${min}" max="${max}" step="1" value="${value}" required>`);
+    const duration = String(field).endsWith("Seconds");
+    expect(html).toContain(`<input id="${field}" name="${field}" type="number" min="${min}" max="${max}" step="${duration ? "any" : "1"}" value="${value}"${duration ? " data-duration" : ""} required>`);
+    if (duration) expect(html).toContain(`aria-label="${label} unit"`);
     expect(html.indexOf(`id="${field}"`)).toBeLessThan(html.indexOf('<aside aria-labelledby="page-settings">'));
   }
 });
