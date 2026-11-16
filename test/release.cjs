@@ -16,7 +16,7 @@ try {
   }
   const source = `dist/irisbeat-${version}-source.tar.gz`;
   const listing = execFileSync('tar', ['-tzf', source], { encoding: 'utf8' }).split('\n');
-  for (const file of ['src/index.ts', 'src/ui.ts', 'LICENSE', 'package-lock.json', 'wrangler.jsonc', '.dev.vars.example', 'docs/install.md', 'scripts/release.cjs']) {
+  for (const file of ['src/index.ts', 'src/ui.tsx', 'LICENSE', 'package-lock.json', 'wrangler.jsonc', '.dev.vars.example', 'docs/install.md', 'scripts/release.cjs']) {
     assert.ok(listing.includes(`irisbeat-${version}/${file}`), 'deployable source includes ' + file);
   }
   assert.ok(!listing.some(file => /(?:node_modules|\.dev\.vars$|\.env$|dist\/)/.test(file)));

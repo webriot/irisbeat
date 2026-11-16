@@ -310,12 +310,12 @@ it("resets consecutive streaks and accepts HTTP 299 without replaying duplicate 
   });
 });
 
-it("presents the selected Status ledger with Monitor configuration beside page settings", async () => {
+it("presents the selected Status ledger with separate operator Settings", async () => {
   const operator = await (await request("/operator")).text();
   expect(operator).toContain('<table aria-label="Monitors">');
   expect(operator).toContain('<th scope="col">Monitor</th>');
   expect(operator).toContain('<th scope="col">State</th>');
-  expect(operator).toContain('<aside aria-labelledby="page-settings">');
+  expect(operator).toContain('<section aria-labelledby="page-settings">');
   expect(operator).toContain('id="page-settings">Status page</h2>');
   expect(operator).not.toContain("Schedule Maintenance");
   expect(operator).toContain("Save webhook");
@@ -328,7 +328,7 @@ it("presents the selected Status ledger with Monitor configuration beside page s
   await tick(0);
   const page = await (await request("/")).text();
   expect(page).toContain("All services operational");
-  expect(page).toContain('<article aria-labelledby="monitor-name">');
+  expect(page).toMatch(/<article[^>]*aria-labelledby="monitor-name"/);
   expect(page.indexOf("All services operational")).toBeLessThan(
     page.indexOf('id="monitor-name"'),
   );

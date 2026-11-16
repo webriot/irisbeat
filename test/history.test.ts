@@ -41,14 +41,14 @@ it('renders exactly 90 UTC days and counts only in-range observations across mid
   const html = await (await request('/')).text();
   expect(html.match(/class="history-day /g)).toHaveLength(90);
   expect(html).toContain('66.67%');
-  expect(html).toContain('2026-11-13 UTC: down');
+  expect(html).toContain('2026-11-13 UTC: Failed checks');
 });
 
 it('distinguishes empty, Maintenance-only and mixed counted days without inventing a denominator', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(today - 2 * day);
   const monitor = await create();
   let html = await (await request('/')).text();
-  expect(html).toContain('aria-label="Availability">Unavailable');
+  expect(html).toContain('aria-label="Availability">No observations');
   expect(html).not.toContain('100.00%');
   expect((await status()).monitor!.history!.days.every(day => day.state === 'empty')).toBe(true);
   const path = '/api/operator/monitors/' + monitor.id + '/maintenance';
@@ -79,7 +79,7 @@ it('distinguishes empty, Maintenance-only and mixed counted days without inventi
   expect(history.percentage).toBeCloseTo(200 / 3);
   html = await (await request('/')).text();
   expect(html).toContain('2026-11-11 UTC: Maintenance');
-  expect(html).toContain('2026-11-13 UTC: degraded');
+  expect(html).toContain('2026-11-13 UTC: Mixed results');
 });
 
 it('shows overlapping published Incidents newest first in UTC and retains older/private/deleted history only for operators', async () => {
@@ -215,7 +215,7 @@ it('bounds observation cleanup per execution while preserving the unfinished UTC
   expect((await status()).monitor!.history!.days.at(-1)?.successes).toBe(2);
   clock.mockReturnValue(today - 100 * day);
   expect((await status()).monitor!.history!.percentage).toBeNull();
-});
+}, 30_000); // The retention boundary requires 1,001 sequential HTTP receipts on shared CI runners.
 
 it('keeps percentages per Monitor and uses down for failure with Maintenance', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(today);

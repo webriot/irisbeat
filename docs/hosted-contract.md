@@ -17,7 +17,9 @@ A released consumer must retain its exact version and integrity lock; release op
 
 The package exports TypeScript source and includes its UI and license. A
 TypeScript-aware Workers bundler (including Wrangler/esbuild) is required; it is
-not a Node.js runtime library. Import `createHostedWorker`, `MonitoringContext`,
+not a Node.js runtime library. Hono is an installed runtime dependency. For consumer
+TypeScript checks, enable `"jsx": "react-jsx"` and `"jsxImportSource": "hono/jsx"`;
+the packaged page source also declares its JSX runtime for bundlers. Import `createHostedWorker`, `MonitoringContext`,
 `HostedAdapter`, `EngineEnv`, `Status` and `IncidentTransition` from `irisbeat`.
 Pin the artifact version **and literal `contractVersion: '1'`**; unsupported
 versions throw during factory construction, before requests or scheduling run.
@@ -200,3 +202,134 @@ coverage verifies suppression of both delivery paths for all three check kinds.
 The hook observes committed detector transitions, not every raw observation.
 [History #9](history-api.md) adds the same filtered per-Monitor series to personal and hosted status, including readers; it does not change credentials, permissions, allowances or delivery. The release candidate must be
 regenerated after integration changes, before #12 publishes anything.
+
+### HTTP and TCP Calendar compatibility
+
+Contract 1 also accepts HTTP/TCP `scheduleMode`, `cron` and `timezone` through the same authorized collection routes as personal installations. Existing consumers and omitted fields remain Interval-compatible. `/api/operator/schedule-preview` requires editor permission and returns authoritative explanation/three future instants without mutation. Calendar configuration is operator-only; private/public visibility and allowances are unchanged. Persisted pause skips occurrences, and resume anchors at the next future occurrence without catch-up Checks or observations. Calendar Maintenance uses the existing observation exclusion and transition suppression. See [Calendar API](monitor-api.md#http-and-tcp-calendar-schedules).
+
+### Calendar Heartbeat compatibility
+
+Contract 1 also accepts Calendar Heartbeats through the existing authorized collection and legacy configuration routes. Calendar mode adds `graceSeconds` and uses occurrence-based recovery; Interval behavior and omitted fields remain compatible. The operator preview accepts optional `graceSeconds` and rejects overlapping receipt windows using the same validator as saves. Reader/editor permissions, allowance checks, tenant credential rotation and anonymous visibility remain unchanged.
+
+Receipts use the same authenticated `POST /heartbeat`, ignore bodies and persist last-seen immediately. Per-occurrence evidence and chronological finalization survive object recreation and credential rotation. Receipt freshness and every committed catch-up outcome invalidate the appropriate public/operator projection before alert delivery; pending invalidations coalesce, and private Monitors remain silent to public subscribers. Each scheduled invocation processes at most 128 expired occurrences per Monitor; following invocations resume the durable cursor. Pause skips occurrences without observations; resume starts at the next future occurrence while retaining unexpired Maintenance and open Incidents. Calendar/grace changes isolate generations. No backfill precedes Calendar enablement, and old outcomes never insert out-of-retention observations. See [Calendar Heartbeat integration](heartbeat-api.md#calendar-heartbeats) for inclusive deadlines, durable Maintenance evidence, detector progress and best-effort transition delivery.
+
+## Public subscriptions
+
+Contract 1 adds `GET /api/status/events` with `Upgrade: websocket`. Hono resolves
+it through the same trusted `HostedAdapter.resolve` and context binding as
+`/api/status`. Anonymous access is intentional; operator subscriptions and
+credentials are outside this endpoint. The browser `Origin` must exactly match
+the resolved application URL's origin, including scheme and port. Forwarded host
+headers do not override it. Use HTTPS/WSS in production; HTTP/WS is accepted only
+on localhost and loopback for development. Serve the engine at the trusted
+application URL, and keep the existing context resolution validation.
+
+The existing `MonitoringContext` accepts the connection through Cloudflare's
+Hibernation WebSocket API. Its fixed text message `changed` means fetch the current
+`/api/status` snapshot. There are no snapshots, fields, identifiers, revisions or
+credentials on the socket. Only public projection changes notify: published
+Monitor results/history (including Calendar Checks and finalized Heartbeat occurrences),
+last-seen receipts, publication, names, visible
+Incidents, Maintenance and pause. Target/timing-only settings, webhook destinations,
+private Monitor activity and other contexts remain silent. Notification comparison
+and send happen synchronously after persistence and before external alert delivery.
+
+After processing a notice and completing its snapshot read, send exactly `ack`.
+This acknowledges delivery only and cannot mutate monitoring data. Each socket
+retains one pending notice plus one dirty bit; changes while pending collapse into
+one further `changed` after acknowledgment. Attachments and the public subscription
+tag survive hibernation. Unexpected messages, including unsolicited acknowledgments
+and binary messages, close with 1008. The context accepts at most 128 connections;
+excess upgrades return 503. No-origin/cross-origin or insecure nonlocal requests
+return 403; requests without an upgrade return 426. Closed sockets are removed by
+the runtime. Public Maintenance expiry and UTC history rollover use a storage alarm
+while published Monitors have subscribers; no permanent server timer is needed.
+
+Clients must subscribe **before** fetching a fresh snapshot, and repeat that read
+on every reconnect. Notifications are hints, not a replay log. The public UI bounds
+reads to one active request and one queued refresh, ignores an intermediate response
+when another refresh is queued, and aborts reads after ten seconds. It preserves
+existing row nodes, history selection and focus. Reconnect delays increase from
+one second to at most thirty seconds (including jitter), with a ten-second handshake
+deadline. Disconnected visible pages poll every sixty seconds and show Polling;
+connected pages stop fallback polling. A failed read retains the last snapshot and
+shows Updates unavailable. Visibility return and manual Refresh fetch immediately.
+Page exit closes the connection, and returning from the browser page cache resubscribes.
+All mutations continue through existing HTTP routes. JSON shapes and contract version
+remain unchanged.
+
+Implementation references: [Cloudflare Hibernation WebSockets](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)
+and [Hono upgrade middleware caveat](https://hono.dev/docs/helpers/websocket).
+
+## Operator subscriptions
+
+Contract 1 adds an authenticated handoff for `GET /api/operator/events`. Open a
+same-origin WebSocket, then obtain `POST /api/operator/events/ticket` using the
+same authorization as `GET /api/operator`. The personal Worker checks the
+installation Bearer secret; hosted Workers call `HostedAdapter.resolve` on every
+ticket request, including renewal. Both readers and editors can obtain tickets;
+null permission returns 401. The response is uncached JSON `{ ticket, expiresAt }`.
+Tickets are random, expire **30 seconds after issuance**, and are consumed once by
+an atomic Durable Object operation. They are bound to the resolved context,
+operator audience, exact application origin and resolved reader/editor permission.
+
+The **first** socket message must be JSON `{ "type": "auth", "ticket": "…" }`.
+Before it succeeds, the socket receives no notifications, including private
+activity. Success returns the fixed text `authorized`; immediately fetch the
+current authorized `/api/operator` snapshot. Notifications use the same fixed
+`changed` and `ack` protocol as public subscriptions, with one pending notice and
+one dirty bit. They carry no configuration, identifiers or credentials. Operators
+receive private Monitor/configuration/results/history/Incident/Maintenance/pause
+changes in their context. Readers do not receive webhook-only change activity.
+A permission change discards previously queued dirty activity before the client
+resynchronizes. Public and other-context subscribers remain isolated.
+
+Authorization lasts at most **five minutes from ticket issuance**, enforced by
+server alarms and checked before every operator message or notification. Obtain
+a fresh HTTP-authorized ticket before expiry and send
+`{ "type": "renew", "ticket": "…" }` on the **same socket**. `authorized` confirms
+the new lease and permission scope; fetch another authorized snapshot. The supplied
+browser renews after four minutes. Renewal does not require reconnecting. Invalid,
+reused, expired, wrong-origin or wrong-context tickets, wrong first messages and
+expired leases close with 1008. An expired lease cannot be revived by renewal.
+
+These durations are application authorization policy, not Hono or Cloudflare
+connection limits. Hosted role changes/revocation take effect on the next HTTP
+request; an already issued ticket/lease can permit notifications until its
+five-minute deadline. Consumers must resolve current permissions on each ticket
+issuance and must not cache authorization beyond their intended revocation policy.
+There is no push revocation hook or account/session infrastructure in this public
+engine. A consumer requiring immediate server-side account revocation must arrange
+that separately; snapshot reads and every mutation always retain independent
+request-time authorization and existing reader/editor projections. Socket messages
+cannot mutate application state or bypass monitor allowances.
+
+The trusted URL origin and HTTPS/WSS rules match public subscriptions; no Origin,
+a cross-origin browser, or insecure nonlocal upgrade returns 403. Forwarded host
+headers never override the application origin. Serve the Worker at the trusted
+application origin, and validate host/context identity in the hosted adapter.
+Upgrade query strings and WebSocket subprotocols are rejected with 400. Never put
+installation secrets, account bearer credentials, or tickets in socket URLs,
+protocols, logs or persistent browser storage. Only the short-lived ticket crosses
+the socket, inside an authentication/renewal message; browser credentials and
+tickets remain in memory. The ticket endpoint checks Origin when supplied so
+non-browser authenticated consumers can also use the handoff.
+
+Each context bounds operator sockets to 128, including at most 16 awaiting
+authentication, and pending tickets to 128. Excess requests return 503. An
+unauthenticated socket must authenticate within ten seconds. Attachments retain
+audience, context, origin, permission, expiry and coalescing state across
+hibernation. A shared storage alarm handles authorization deadlines, Maintenance
+expiry and UTC history rollover; private deadlines never wake public subscribers.
+Closed sockets are cleaned up by the runtime, expired tickets are pruned on the
+next issuance, and consumed tickets are deleted immediately.
+
+The operator browser shares reconnect/backoff, visible-page polling fallback,
+manual/visibility resynchronization and bounded coalescing with the public page.
+It preserves drafts, focus, open menus, selected history days and Monitor
+validation. Failed snapshots retain the last view with Updates unavailable.
+Sign-out or authorization loss closes the socket, stops renewal/reconnect/polling,
+and clears private UI state. Session guards reject late ticket and snapshot
+responses. Consumer UIs must implement the same teardown on sign-out and denied
+renewal; they must not leave a valid lease running after local authorization loss.
+All writes continue through existing authorized HTTP routes.

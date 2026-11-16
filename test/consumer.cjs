@@ -74,6 +74,58 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
   const tick = at => { now = at; return request('a.example', '/test-tick?at=' + at); };
   try {
     {
+      const response = await mf.dispatchFetch('https://a.example/api/status/events', { headers: { Upgrade: 'websocket', Origin: 'https://a.example', 'x-test-at': String(now) } });
+      assert.equal(response.status, 101, 'packed consumer routes public upgrades');
+      const socket = response.webSocket;
+      socket.accept();
+      const messages = [];
+      socket.addEventListener('message', event => { messages.push(event.data); });
+      const settle = () => new Promise(resolve => setTimeout(resolve, 30));
+      await request('b.example', '/api/operator', 'PUT', { pageName: 'Other context' });
+      const created = await (await request('a.example', '/api/operator/monitors', 'POST', { name: 'Private socket producer', kind: 'heartbeat', published: false })).json();
+      await settle(); assert.deepEqual(messages, [], 'private changes and other contexts remain silent');
+      await request('a.example', '/api/operator/monitors/' + created.monitor.id, 'DELETE');
+      await request('a.example', '/api/operator', 'PUT', { pageName: 'Public consumer' });
+      await settle(); assert.deepEqual(messages, ['changed'], 'only a fixed public invalidation crosses the consumer boundary');
+      assert.equal((await (await request('a.example', '/api/status')).json()).pageName, 'Public consumer');
+      const closed = new Promise(resolve => socket.addEventListener('close', resolve, { once: true }));
+      socket.close(); await closed;
+    }
+    {
+      // Use wall time for this real socket exchange; deterministic dispatch tests below retain their clock.
+      const previousNow = now; now = Date.now();
+      const socketResponse = await mf.dispatchFetch('https://a.example/api/operator/events', { headers: { Upgrade: 'websocket', Origin: 'https://a.example', 'x-test-at': String(now) } });
+      assert.equal(socketResponse.status, 101);
+      const socket = socketResponse.webSocket; socket.accept();
+      const messages = []; socket.addEventListener('message', event => { messages.push(event.data); });
+      const settle = () => new Promise(resolve => setTimeout(resolve, 30));
+      await request('a.example', '/test-operator-permission?value=reader');
+      const grant = await request('a.example', '/api/operator/events/ticket', 'POST', undefined, 'reader');
+      assert.equal(grant.status, 200, 'hosted readers can obtain operator tickets');
+      socket.send(JSON.stringify({ type: 'auth', ticket: (await grant.json()).ticket }));
+      await settle(); assert.deepEqual(messages, ['authorized']);
+      assert.equal((await request('a.example', '/api/operator/monitors', 'POST', { name: 'Denied', kind: 'heartbeat' }, 'reader')).status, 403);
+      assert.equal(Object.hasOwn(await (await request('a.example', '/api/operator', 'GET', undefined, 'reader')).json(), 'webhookUrl'), false);
+      await request('a.example', '/test-operator-permission?value=editor');
+      await request('b.example', '/api/operator', 'PUT', { pageName: 'Other operator context' });
+      await settle(); assert.deepEqual(messages, ['authorized'], 'other contexts cannot reach an operator subscription');
+      const created = await (await request('a.example', '/api/operator/monitors', 'POST', { name: 'Private operator producer', kind: 'heartbeat', published: false })).json();
+      await settle(); assert.deepEqual(messages, ['authorized', 'changed'], 'reader receives notification only; authorized HTTP owns the projection');
+      socket.send('ack'); await settle();
+      const renewal = await request('a.example', '/api/operator/events/ticket', 'POST');
+      socket.send(JSON.stringify({ type: 'renew', ticket: (await renewal.json()).ticket }));
+      await settle(); assert.deepEqual(messages, ['authorized', 'changed', 'authorized'], 'permission promotion renews in place');
+      await request('a.example', '/test-operator-permission?value=revoked');
+      assert.equal((await request('a.example', '/api/operator/events/ticket', 'POST')).status, 401, 'unchanged bearer cannot renew after hosted revocation');
+      assert.equal((await request('a.example', '/api/operator')).status, 401, 'snapshot checks remain independent');
+      const closed = new Promise(resolve => socket.addEventListener('close', event => resolve(event.code), { once: true }));
+      socket.send(JSON.stringify({ type: 'renew', ticket: 'denied' }));
+      assert.equal(await closed, 1008);
+      await request('a.example', '/test-operator-permission?value=reset');
+      await request('a.example', '/api/operator/monitors/' + created.monitor.id, 'DELETE');
+      now = previousNow;
+    }
+    {
       const evidence = [];
       for (const newerPaused of [true, false]) for (const source of ['request', 'schedule']) {
         // Gate a substituted external dependency after the adapter captured its trusted policy.
@@ -475,6 +527,129 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     assert.equal(deliveries.length, hookBefore, 'pause generation suppresses delayed hosted hook after resume');
     await request('a.example', '/api/operator/monitors/' + queued.monitor.id, 'DELETE');
     await policy('omit');
+    for (const kind of ['http', 'tcp']) {
+      // Calendar is exercised from the separately installed artifact through trusted hosted boundaries.
+      now = Math.ceil((now + 60_000) / 60_000) * 60_000;
+      const calendarBase = now;
+      outcome = 503;
+      const calendarResponse = await request('a.example', '/api/operator/monitors', 'POST', {
+        name: 'Hosted Calendar', kind, ...(kind === 'http' ? { url: 'https://target.example/' } : { hostname: 'db.example', port: 5432 }), scheduleMode: 'calendar', cron: '* * * * *', published: false, failureThreshold: 1,
+      });
+      assert.equal(calendarResponse.status, 201);
+      const calendar = (await calendarResponse.json()).monitors.at(-1);
+      const calendarPath = '/api/operator/monitors/' + calendar.id;
+      assert.equal(calendar.timezone, 'UTC');
+      const previewResponse = await request('a.example', '/api/operator/schedule-preview', 'POST', { cron: '0 9 15 * 1', timezone: 'America/New_York' });
+      assert.equal(previewResponse.status, 200);
+      assert.equal((await previewResponse.json()).occurrences.length, 3);
+      assert.equal((await request('a.example', '/api/operator/schedule-preview', 'POST', { cron: '* * * * *' }, 'reader')).status, 403);
+      assert.equal((await request('a.example', calendarPath, 'PATCH', { cron: '0 0 30 2 *' })).status, 400);
+      assert.equal((await request('a.example', calendarPath, 'PATCH', { cron: '* * * * *' }, 'reader')).status, 403);
+      const calendarCounts = [targetCount, deliveries.length, webhooks.length];
+      await tick(calendarBase);
+      assert.equal(targetCount, calendarCounts[0], 'Calendar creation begins in the future');
+      await tick(calendarBase + 60_000);
+      const calendarIncident = (await read()).incidents.find(row => row.monitorId === calendar.id && row.closedAt === null);
+      assert.ok(calendarIncident);
+      assert.equal(deliveries.at(-1).incident.id, calendarIncident.id);
+      assert.equal((await (await request('a.example', '/api/status')).json()).monitors.some(row => row.id === calendar.id), false);
+      await policy('true', 'request'); await read();
+      const frozen = (await read()).monitor;
+      await tick(calendarBase + 180_000);
+      await policy('omit');
+      await mf.setOptions(convertV4MiniflareOptions({ ...workerOptions, script: script + '\n// Calendar restart' }));
+      assert.equal((await read()).paused, true);
+      assert.deepEqual((await read()).monitor.history, frozen.history);
+      assert.deepEqual([targetCount, deliveries.length, webhooks.length], calendarCounts.map(n => n + 1));
+      await policy('false', 'request'); await read();
+      await tick(calendarBase + 180_000);
+      assert.equal(targetCount, calendarCounts[0] + 1, 'resume skips paused Calendar occurrences without catch-up');
+      await request('a.example', calendarPath + '/maintenance', 'PUT', { endsAt: calendarBase + 360_000 });
+      outcome = 204;
+      await tick(calendarBase + 240_000); await tick(calendarBase + 300_000);
+      assert.equal((await read()).monitor.lastResult.outcome, 'maintenance');
+      assert.equal((await read()).incidents.find(row => row.id === calendarIncident.id).closedAt, null);
+      await tick(calendarBase + 360_000);
+      assert.equal((await read()).incidents.find(row => row.id === calendarIncident.id).closedAt, null);
+      await tick(calendarBase + 420_000);
+      assert.equal((await read()).incidents.find(row => row.id === calendarIncident.id).closedAt, now);
+      assert.deepEqual(deliveries.filter(event => event.incident.monitorId === calendar.id).map(event => event.transition), ['opened', 'recovered']);
+      const beforePending = (await read()).monitor;
+      const pendingCounts = [deliveries.length, webhooks.length];
+      outcome = 503;
+      overlapAction = async () => {
+        overlapAction = undefined;
+        await policy('true', 'request'); await read();
+        await policy('false', 'request'); await read();
+      };
+      await tick(calendarBase + 480_000);
+      assert.deepEqual((await read()).monitor.lastResult, beforePending.lastResult, kind + ' Calendar pause/resume discards pending result');
+      assert.deepEqual((await read()).monitor.history, beforePending.history);
+      assert.deepEqual([deliveries.length, webhooks.length], pendingCounts);
+      await tick(calendarBase + 480_000);
+      assert.deepEqual([deliveries.length, webhooks.length], pendingCounts, 'resume starts at a future occurrence');
+      await tick(calendarBase + 540_000);
+      assert.deepEqual([deliveries.length, webhooks.length], pendingCounts.map(n => n + 1));
+      await request('a.example', calendarPath, 'DELETE');
+      await policy('omit');
+      console.log('PASS packed ' + kind + ' Calendar: preview, permissions, validation, private dispatch, persisted pause, next-future resume, Maintenance, retained Incident and both transition delivery paths');
+    }
+    // Calendar Heartbeat retains receipt evidence and credentials through a real isolate restart.
+    now = Math.ceil((now + 60_000) / 60_000) * 60_000;
+    const heartbeatBase = now;
+    const jobResponse = await request('a.example', '/api/operator/monitors', 'POST', {
+      name: 'Calendar producer', kind: 'heartbeat', published: false, scheduleMode: 'calendar', cron: '* * * * *',
+    });
+    assert.equal(jobResponse.status, 201);
+    const job = (await jobResponse.json()).monitors.at(-1);
+    const jobPath = '/api/operator/monitors/' + job.id;
+    assert.equal(job.graceSeconds, 30);
+    assert.equal(job.silenceSeconds, undefined);
+    assert.equal((await request('a.example', jobPath, 'PATCH', { graceSeconds: 60 })).status, 400);
+    assert.equal((await request('a.example', jobPath + '/heartbeat-secret', 'POST', undefined, 'reader')).status, 403);
+    const jobSecret = (await (await request('a.example', jobPath + '/heartbeat-secret', 'POST')).json()).secret;
+    now = heartbeatBase + 90_001;
+    assert.equal((await request('a.example', '/heartbeat', 'POST', undefined, jobSecret)).status, 204);
+    await tick(now);
+    const jobIncident = (await read()).incidents.find(row => row.monitorId === job.id);
+    assert.equal(jobIncident.openedAt, heartbeatBase + 90_000, 'late receipt cannot satisfy a closed window');
+    now = heartbeatBase + 120_000;
+    assert.equal((await request('a.example', '/heartbeat', 'POST', 'ignored', jobSecret)).status, 204);
+    const rotatedJobSecret = (await (await request('a.example', jobPath + '/heartbeat-secret', 'POST')).json()).secret;
+    assert.equal((await request('a.example', '/heartbeat', 'POST', undefined, jobSecret)).status, 401);
+    assert.equal((await request('b.example', '/heartbeat', 'POST', undefined, rotatedJobSecret)).status, 401);
+    assert.equal((await request('a.example', '/heartbeat', 'POST', undefined, 'editor')).status, 401);
+    await mf.setOptions(convertV4MiniflareOptions({ ...workerOptions, script: script + '\n// Calendar Heartbeat restart' }));
+    await tick(heartbeatBase + 150_001);
+    assert.equal((await read()).incidents.find(row => row.id === jobIncident.id).closedAt, null, 'rotation preserves earlier occurrence evidence without advancing recovery');
+    now = heartbeatBase + 210_000;
+    assert.equal((await request('a.example', '/heartbeat', 'POST', undefined, rotatedJobSecret)).status, 204);
+    assert.equal((await request('a.example', '/heartbeat', 'POST', undefined, rotatedJobSecret)).status, 204);
+    await tick(now);
+    assert.equal((await read()).incidents.find(row => row.id === jobIncident.id).closedAt, null, 'inclusive deadline remains open for receipt ingress');
+    await tick(now + 1);
+    assert.equal((await read()).incidents.find(row => row.id === jobIncident.id).closedAt, heartbeatBase + 210_000);
+    assert.deepEqual(deliveries.filter(event => event.incident.monitorId === job.id).map(event => event.transition), ['opened', 'recovered']);
+    assert.equal((await (await request('a.example', '/api/status')).json()).monitors.some(row => row.id === job.id), false);
+    const readerJob = await (await request('a.example', '/api/operator', 'GET', undefined, 'reader')).text();
+    assert.equal(readerJob.includes(rotatedJobSecret), false);
+    await request('a.example', jobPath, 'DELETE');
+    assert.equal((await request('a.example', '/heartbeat', 'POST', undefined, rotatedJobSecret)).status, 401);
+    now = Math.ceil((now + 60_000) / 60_000) * 60_000;
+    const overlapBase = now;
+    const overlapJob = (await (await request('a.example', '/api/operator/monitors', 'POST', {
+      name: 'Delayed Calendar producer', kind: 'heartbeat', scheduleMode: 'calendar', cron: '* * * * *', recoveryThreshold: 1,
+    })).json()).monitors.at(-1);
+    const overlapPath = '/api/operator/monitors/' + overlapJob.id;
+    const overlapSecret = (await (await request('a.example', overlapPath + '/heartbeat-secret', 'POST')).json()).secret;
+    now = overlapBase + 120_000;
+    await request('a.example', '/heartbeat', 'POST', undefined, overlapSecret);
+    now = overlapBase + 160_000;
+    await request('a.example', overlapPath + '/maintenance', 'PUT', { endsAt: overlapBase + 400_000 });
+    await tick(now);
+    assert.deepEqual(deliveries.filter(event => event.incident.monitorId === overlapJob.id).map(event => event.transition), ['opened', 'recovered'], 'later Maintenance must not suppress earlier non-overlapping occurrence hooks');
+    await request('a.example', overlapPath, 'DELETE');
+    console.log('PASS packed Calendar Heartbeat: occurrence deadlines, durable evidence/restart, credential rotation, ignored bodies, tenant permissions, privacy, recovery and transition hooks');
     console.log('PASS packed irisbeat@0.1.0: reproducible artifact, pinned integrity, consumer typecheck, isolated scheduling/Incidents, HTTP/TCP/heartbeat hooks, failure isolation, webhooks rotated tenant credentials and three-kind Maintenance suppression and HTTP/TCP boundary overlap of both delivery paths, persisted pause/resume and omission, paused history, Maintenance precedence, in-flight checks and delivery suppression');
   } finally { await mf.dispose(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });
