@@ -96,12 +96,12 @@ function Operator({ hosted }: { hosted: boolean }) {
       <h2 id="paused" hidden>Monitoring paused</h2>
       <div id="workspace">
         <div id="new-monitor-panel"></div>
-      <table aria-label="Monitors"><thead><tr><th scope="col">Monitor</th><th scope="col">State</th><th scope="col">Publication</th><th scope="col">Actions</th></tr></thead><tbody id="monitor-rows"></tbody></table>
-      <form id="maintenance" hidden aria-labelledby="maintenance-heading">
+      <table aria-label="Monitors"><colgroup><col class="monitor-column" /><col class="state-column" /><col class="publication-column" /><col class="actions-column" /></colgroup><thead><tr><th scope="col">Monitor</th><th scope="col">State</th><th scope="col">Publication</th><th scope="col">Actions</th></tr></thead><tbody id="monitor-rows"></tbody></table>
+      <dialog id="maintenance-dialog" aria-labelledby="maintenance-heading"><form id="maintenance" hidden aria-labelledby="maintenance-heading">
         <h2 id="maintenance-heading">Maintenance</h2>
         <label for="maintenance-end">End time</label><input id="maintenance-end" type="datetime-local" required />
-        <p id="maintenance-deleted" role="status" hidden>This Monitor was deleted. Copy your draft or cancel.</p><button id="save-maintenance">Declare Maintenance</button><button id="cancel-maintenance" type="button">Cancel</button>
-      </form>
+        <p id="maintenance-deleted" role="status" hidden>This Monitor was deleted. Copy your draft or cancel.</p><p id="maintenance-error" role="status"></p><button id="save-maintenance">Start Maintenance</button><button id="end-maintenance" type="button" class="danger" hidden>End Maintenance</button><button id="cancel-maintenance" type="button">Cancel</button>
+      </form></dialog>
 
         <form id="configuration" hidden aria-labelledby="monitor-settings">
           <h2 id="monitor-settings">New Monitor</h2>
@@ -428,7 +428,10 @@ h2 { margin: 0; font-size: 16px; font-weight: 650; }
 .ledger-row[data-state="up"] .status, .status[data-state="up"] { color: var(--success); }
 .ledger-row[data-state="down"] .status, .status[data-state="down"] { color: var(--danger); }
 .ledger-row[data-state="maintenance"] .status, .status[data-state="maintenance"], .ledger-row[data-state="paused"] .status, .status[data-state="paused"] { color: var(--info); }
-table { width: 100%; border-spacing: 0; margin-top: 20px; }
+table { width: 100%; table-layout: fixed; border-spacing: 0; margin-top: 20px; }
+.monitor-column { width: auto; }
+.state-column, .publication-column { width: 19%; }
+.actions-column { width: 226px; }
 th, td { padding: 12px 16px; text-align: left; }
 th { font-size: 12px; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--line); }
 tbody tr:nth-child(even):not(:last-child) td { border-bottom: 1px solid var(--line); }
@@ -446,6 +449,8 @@ tbody tr:nth-child(odd) td { padding-bottom: 0; }
 .history-day.maintenance { background: var(--info); }
 .history-day.empty { border: 1px dashed var(--line); }
 .history-unavailable { color: var(--muted); font-size: 12px; }
+.operator-heading h1 { margin-right: auto; }
+#operator-navigation { margin-left: auto; }
 .operator-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 #operator-navigation { display: flex; gap: 8px; }
 #settings { max-width: 620px; }
@@ -454,7 +459,10 @@ tbody tr:nth-child(odd) td { padding-bottom: 0; }
 form, aside { min-width: 0; }
 #configuration, #maintenance, #webhook, #page-configuration, #login { border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; background: var(--card); }
 #configuration, #maintenance { background: var(--secondary); }
-#maintenance { margin-bottom: 20px; }
+#maintenance-dialog { width: min(480px, calc(100% - 32px)); padding: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); color: var(--foreground); }
+#maintenance-dialog::backdrop { background: #0006; }
+#maintenance { border: 0; }
+#maintenance-error:empty { display: none; }
 fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 label { display: block; margin: 12px 0 6px; font-size: 13px; }
 input, select, button { font: inherit; min-height: 40px; max-width: 100%; border: 1px solid var(--line); border-radius: 7px; background: var(--card); color: var(--foreground); }
@@ -484,12 +492,12 @@ td .actions { margin: 0; gap: 6px; }
 footer { margin-top: 36px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
 .theme-control { display: flex; align-items: center; gap: 8px; margin: 0; }
 .theme-control select { width: auto; }
-/* Shared surfaces for operator action menus and inline panels. */
-.menu { position: relative; }
-summary { list-style: none; cursor: pointer; border-radius: 7px; padding: 8px 13px; }
-summary::-webkit-details-marker { display: none; }
-.menu-items { position: absolute; right: 0; z-index: 5; width: 205px; padding: 5px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); box-shadow: 0 10px 30px #0002; }
-.menu-items button { display: block; width: 100%; text-align: left; border: 0; }
+.monitor-actions { display: grid; grid-template-columns: repeat(4, 44px); gap: 6px; }
+.monitor-action { position: relative; display: grid; place-items: center; width: 44px; min-height: 44px; padding: 10px; border: 0; background: transparent; }
+.monitor-action svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.action-label { display: none; position: absolute; z-index: 6; top: 100%; right: 0; width: max-content; padding: 5px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--card); color: var(--foreground); font-size: 12px; }
+.monitor-action:hover .action-label, .monitor-action:focus .action-label { display: block; }
+@media (hover: none) { .actions-column { width: 290px; } .monitor-actions { grid-template-columns: 44px 64px 88px 44px; } .monitor-action { width: 100%; padding: 6px 0; } .action-label { display: block; position: static; width: auto; padding: 0; border: 0; font-size: 10px; } }
 button.danger { color: var(--danger); }
 [hidden] { display: none !important; }
 @media (max-width: 44rem) {
@@ -579,6 +587,7 @@ function updateDeleted() {
   const maintenanceMissing = !maintenanceForm.hidden && !monitorIds.has(maintenanceForm.dataset.monitorId);
   byId('maintenance-deleted').hidden = !maintenanceMissing;
   byId('save-maintenance').disabled = maintenanceMissing;
+  byId('end-maintenance').disabled = maintenanceMissing;
 }
 
 function edit(monitor = null) {
@@ -609,29 +618,31 @@ function edit(monitor = null) {
   form.hidden = false; updateDeleted(); previewSchedule();
   byId('name').focus();
 }
-function focusActions(id) { (document.getElementById('actions-' + id) || byId('new-monitor')).focus(); }
+function focusActions(id) { (document.getElementById('actions-' + id)?.querySelector('button') || byId('new-monitor')).focus(); }
 function cancelEdit() { session.cancelPreview(); byId('cron').setCustomValidity(''); const id = editingId; byId('heartbeat-credential').textContent = ''; editingId = null; form.reset(); form.hidden = true; byId('new-monitor-panel').append(form); focusActions(id); }
 function localMinute(date) { return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16); }
 function declareMaintenance(monitor) {
   maintenanceForm.querySelector('label').textContent = 'End time (' + browserTimeZone + ')';
   maintenanceForm.dataset.monitorId = monitor.id;
-  byId('maintenance-heading').textContent = monitor.name + ' — Maintenance';
-  byId('save-maintenance').textContent = monitor.maintenance ? 'Replace Maintenance' : 'Declare Maintenance';
+  byId('maintenance-error').textContent = '';
+  byId('end-maintenance').hidden = !monitor.maintenance;
+  byId('save-maintenance').textContent = monitor.maintenance ? 'Update end date' : 'Start Maintenance';
   const end = new Date(monitor.maintenance?.endsAt ?? Date.now() + 3600000);
   const input = byId('maintenance-end');
   input.value = localMinute(end);
   input.dataset.originalValue = input.value;
   input.dataset.originalInstant = String(end.getTime());
   input.setCustomValidity('');
-  document.getElementById('history-' + monitor.id).append(maintenanceForm);
-  maintenanceForm.hidden = false; updateDeleted(); byId('maintenance-end').focus();
+  maintenanceForm.hidden = false; updateDeleted(); byId('maintenance-dialog').showModal(); byId('maintenance-end').focus();
 }
+function closeMaintenance() { byId('maintenance-dialog').close(); maintenanceForm.hidden = true; queueMicrotask(() => (document.getElementById('actions-' + maintenanceForm.dataset.monitorId)?.querySelector('[data-key=maintenance]') || byId('new-monitor')).focus()); }
 function clearSession() {
+  byId('maintenance-dialog').close();
   document.querySelectorAll('button, input, select').forEach(control => { control.disabled = false; });
   monitorIds.clear(); selectedHistoryDays.clear(); byId('stale').hidden = true;
   savedSettings = {}; cancelEdit(); byId('heartbeat-path').textContent = ''; maintenanceForm.reset(); maintenanceForm.removeAttribute('data-monitor-id'); byId('maintenance-heading').textContent = 'Maintenance'; maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
   showSettings(false); byId('operator-navigation').hidden = true;
-  byId('new-monitor-panel').append(maintenanceForm);
+
   byId('monitor-rows').replaceChildren(); byId('incidents').replaceChildren();
   updateKind(); updateDeleted();
   message.textContent = ''; byId('secret').value = ''; byId('secret').focus();
@@ -642,7 +653,7 @@ function render(data, savedField) {
   hosted = !!data.hosted;
   byId('paused').hidden = !data.paused;
   const canEdit = data.permission !== 'reader';
-  if (!canEdit) { cancelEdit(); maintenanceForm.hidden = true; byId('webhookUrl').value = ''; savedSettings.webhookUrl = ''; }
+  if (!canEdit) { cancelEdit(); closeMaintenance(); byId('webhookUrl').value = ''; savedSettings.webhookUrl = ''; }
   if (!canEdit) showSettings(false);
   byId('new-monitor').hidden = !canEdit || !byId('settings').hidden; byId('settings-button').hidden = !canEdit || !byId('settings').hidden;
   for (const field of ['pageName', 'webhookUrl']) {
@@ -656,12 +667,9 @@ function render(data, savedField) {
   monitorIds = new Set(data.monitors.map(monitor => monitor.id));
   updateDeleted();
   const focused = document.activeElement;
-  for (const draft of [form, maintenanceForm]) {
-    const id = draft === form ? editingId : draft.dataset.monitorId;
-    if (id && !monitorIds.has(id) && draft.parentElement !== byId('new-monitor-panel')) {
-      byId('new-monitor-panel').append(draft);
-      if (draft.contains(focused)) focused.focus();
-    }
+  if (editingId && !monitorIds.has(editingId) && form.parentElement !== byId('new-monitor-panel')) {
+    byId('new-monitor-panel').append(form);
+    if (form.contains(focused)) focused.focus();
   }
   const rows = data.monitors.flatMap(monitor => {
     const row = document.createElement('tr'); row.dataset.key = monitor.id;
@@ -671,26 +679,23 @@ function render(data, savedField) {
       row.append(cell);
     }
     const actions = document.createElement('td');
-    const group = document.createElement('details'); group.className = 'menu';
-    const trigger = document.createElement('summary'); trigger.textContent = '…'; trigger.id = 'actions-' + monitor.id; trigger.setAttribute('aria-label', 'Actions ' + monitor.name);
-    const items = document.createElement('div'); items.className = 'menu-items';
-    if (canEdit) group.append(trigger, items);
+    const group = document.createElement('div'); group.className = 'monitor-actions'; group.id = 'actions-' + monitor.id; group.setAttribute('role', 'group'); group.setAttribute('aria-label', 'Actions ' + monitor.name);
     const path = '/api/operator/monitors/' + encodeURIComponent(monitor.id);
     for (const [key, label, action] of (canEdit ? [
       ['edit', 'Edit', () => edit(monitor)],
-      ['maintenance', monitor.maintenance ? 'Replace Maintenance' : 'Declare Maintenance', () => declareMaintenance(monitor)],
-      ...(monitor.maintenance ? [['end-maintenance', 'End Maintenance', () => run(path + '/maintenance', 'DELETE', undefined, () => { maintenanceForm.hidden = true; })]] : []),
       ['publication', monitor.published ? 'Unpublish' : 'Publish', () => run(path, 'PATCH', { published: !monitor.published })],
+      ['maintenance', 'Maintenance', () => declareMaintenance(monitor)],
       ['delete', 'Delete', () => { if (confirm('Delete ' + monitor.name + '? Checks and publication stop. Incident history is retained.')) run(path, 'DELETE'); }]
     ] : [])) {
-      const button = document.createElement('button'); button.type = 'button'; button.dataset.key = key; button.textContent = label;
+      const button = document.createElement('button'); button.type = 'button'; button.dataset.key = key; button.className = 'monitor-action';
+      const icons = { edit: 'M13 3l4 4-9 9-5 1 1-5z M11 5l4 4', publication: monitor.published ? 'M2 2l16 16 M8 4a10 10 0 0 1 10 6 12 12 0 0 1-3 4 M5 5a12 12 0 0 0-3 5 10 10 0 0 0 10 6 M8 8a3 3 0 0 0 4 4' : 'M2 10s3-6 8-6 8 6 8 6-3 6-8 6-8-6-8-6z M13 10a3 3 0 1 1-6 0 3 3 0 0 1 6 0', maintenance: 'M12 3a5 5 0 0 0-5 6l-5 5a2 2 0 0 0 4 4l5-5a5 5 0 0 0 6-6l-3 3-3-3 3-3z', delete: 'M3 5h14 M7 5V2h6v3 M5 5l1 13h8l1-13 M8 8v7 M12 8v7' };
+      button.innerHTML = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="' + icons[key] + '"/></svg>';
+      const tooltip = document.createElement('span'); tooltip.className = 'action-label'; tooltip.textContent = label; tooltip.setAttribute('aria-hidden', 'true'); button.append(tooltip);
+      button.title = label;
       button.setAttribute('aria-label', label + ' ' + monitor.name);
-      if (key === 'delete') button.className = 'danger';
-      button.onclick = event => {
-        const menu = event.currentTarget.closest('details');
-        menu.open = false; menu.querySelector('summary').focus(); action();
-      };
-      items.append(button);
+      if (key === 'delete') button.classList.add('danger');
+      button.onclick = () => action();
+      group.append(button);
     }
     actions.append(group); row.append(actions);
     const historyRow = document.createElement('tr'); historyRow.dataset.key = monitor.id + ':history';
@@ -732,12 +737,12 @@ const session = createOperatorSession(liveSnapshots, {
   signedOut: clearSession,
   failed(error, reading) {
     if (reading && !editor.hidden) byId('stale').hidden = false;
-    else message.textContent = error;
+    else { message.textContent = error; if (byId('maintenance-dialog').open) byId('maintenance-error').textContent = error; }
   },
   writing() {
     const disabled = [...document.querySelectorAll('button, input, select')].filter(control => !control.disabled && control.id !== 'logout');
     disabled.forEach(control => { control.disabled = true; });
-    message.textContent = '';
+    message.textContent = ''; byId('maintenance-error').textContent = '';
     return () => {
       disabled.forEach(control => { control.disabled = false; });
       updateKind(); updateDeleted();
@@ -849,10 +854,12 @@ maintenanceForm.addEventListener('submit', async event => {
     }
     endsAt = end.getTime();
   }
-  await run('/api/operator/monitors/' + encodeURIComponent(maintenanceForm.dataset.monitorId) + '/maintenance', 'PUT', { endsAt }, () => { maintenanceForm.hidden = true; focusActions(maintenanceForm.dataset.monitorId); });
+  await run('/api/operator/monitors/' + encodeURIComponent(maintenanceForm.dataset.monitorId) + '/maintenance', 'PUT', { endsAt }, closeMaintenance);
 });
 byId('maintenance-end').addEventListener('input', event => event.target.setCustomValidity(''));
-byId('cancel-maintenance').addEventListener('click', () => { maintenanceForm.hidden = true; focusActions(maintenanceForm.dataset.monitorId); });
+byId('cancel-maintenance').addEventListener('click', closeMaintenance);
+byId('maintenance-dialog').addEventListener('cancel', event => { event.preventDefault(); closeMaintenance(); });
+byId('end-maintenance').addEventListener('click', () => { if (monitorIds.has(maintenanceForm.dataset.monitorId)) run('/api/operator/monitors/' + encodeURIComponent(maintenanceForm.dataset.monitorId) + '/maintenance', 'DELETE', undefined, closeMaintenance); });
 webhook.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator/webhook', 'PUT', { url: byId('webhookUrl').value }); });
 pageForm.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator', 'PUT', { pageName: byId('pageName').value }); });
 function showSettings(settings) {
@@ -863,8 +870,6 @@ function showSettings(settings) {
 }
 byId('settings-button').addEventListener('click', () => { showSettings(true); byId('pageName').focus(); });
 byId('back-monitors').addEventListener('click', () => { showSettings(false); byId('settings-button').focus(); });
-document.addEventListener('click', event => { document.querySelectorAll('details.menu[open]').forEach(menu => { if (!menu.contains(event.target)) menu.open = false; }); });
-document.addEventListener('keydown', event => { if (event.key === 'Escape') document.querySelectorAll('details.menu[open]').forEach(menu => { menu.open = false; menu.querySelector('summary').focus(); }); });
 byId('new-monitor').addEventListener('click', () => edit());
 byId('rotate-heartbeat').addEventListener('click', () => { if (confirm('Replace this Monitor’s heartbeat secret?')) run('/api/operator/monitors/' + encodeURIComponent(editingId) + '/heartbeat-secret', 'POST'); });
 byId('cancel-edit').addEventListener('click', cancelEdit);

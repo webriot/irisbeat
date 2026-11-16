@@ -22,8 +22,9 @@ test(kind + ' refresh preserves rows, drafts, and focus while reconciling collec
   if (kind === 'tcp') { await page.locator('#hostname').fill('draft.internal'); await page.locator('#port').fill('8443'); }
   await page.locator('#intervalSeconds-unit').selectOption('minutes');
   await page.locator('#intervalSeconds').fill('2.5');
-  await monitorAction(page, 'Declare Maintenance Website');
+  await monitorAction(page, 'Maintenance Website');
   await page.locator('#maintenance-end').fill('2027-01-01T12:00');
+  await page.keyboard.press('Escape');
   await page.locator('#settings-button').click();
   await page.locator('#pageName').fill('Draft page');
   await page.locator('#webhookUrl').fill('https://example.com/draft');
@@ -62,7 +63,8 @@ test(kind + ' refresh preserves rows, drafts, and focus while reconciling collec
   await expect(page.locator('#name')).toBeFocused();
   await expect(page.locator('#configuration')).toBeVisible();
   await expect(page.locator('#configuration').locator('..')).toHaveAttribute('id', 'history-web');
-  await page.locator('#maintenance-end').focus();
+  await monitorAction(page, 'Maintenance Website');
+  await page.locator('#maintenance-end').fill('2027-01-01T12:00');
   data.monitors[0].history = null;
   await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await expect(page.locator('#monitor-rows .history')).toHaveCount(0);
@@ -72,7 +74,7 @@ test(kind + ' refresh preserves rows, drafts, and focus while reconciling collec
   expect(await maintenance!.evaluate(node => node === document.querySelector('#maintenance'))).toBe(true);
   expect(await moves.evaluate(removed => removed.length)).toBe(0);
   data.monitors = [];
-  await page.locator('#refresh').click();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await expect(page.locator('#name')).toHaveValue('Draft');
   await expect(page.locator('#configuration').locator('..')).toHaveAttribute('id', 'new-monitor-panel');
   await expect(page.locator('#maintenance')).toBeVisible();
@@ -149,7 +151,6 @@ for (const path of ['/', '/operator']) {
     await expect(page.locator('#stale')).toBeHidden();
     await expect(page.getByText('Renamed', { exact: true })).toBeVisible();
     if (path === '/operator') {
-      await page.getByLabel('Actions Renamed', { exact: true }).click();
       await expect(page.getByRole('button', { name: 'Publish Renamed', exact: true })).toBeVisible();
     }
     await expect(page.locator('[data-date="2026-11-15"]')).toHaveAttribute('aria-current', 'true');
@@ -333,7 +334,7 @@ for (const dirty of [false, true]) {
   });
 }
 
-test('Maintenance insertion and removal preserve focused publication actions and keyboard behavior', async ({ page }) => {
+test('Maintenance changes preserve focused publication actions and keyboard behavior', async ({ page }) => {
   const data = { pageName: 'Actions', webhookUrl: null, monitors: [
     { id: 'one', name: 'One', kind: 'http', url: 'https://example.com', state: 'up', published: true, maintenance: null as { endsAt: number } | null },
   ], incidents: [] };
@@ -347,21 +348,16 @@ test('Maintenance insertion and removal preserve focused publication actions and
   await page.goto('/operator');
   await page.locator('#secret').fill('ui-test-secret');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-  await page.getByLabel('Actions One', { exact: true }).click();
-  const menu = page.locator('details.menu');
+  const actions = page.getByRole('group', { name: 'Actions One', exact: true });
   const unpublish = page.getByRole('button', { name: 'Unpublish One', exact: true });
   const node = await unpublish.elementHandle();
   await unpublish.focus();
   data.monitors[0].maintenance = { endsAt: Date.now() + 3600000 };
   await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
-  await expect(page.getByRole('button', { name: 'End Maintenance One', exact: true })).toBeVisible();
-  await expect(menu).toHaveAttribute('open', '');
+  await expect(actions.getByRole('button')).toHaveCount(4);
   await expect(unpublish).toBeFocused();
   expect(await node!.evaluate(node => node === document.activeElement)).toBe(true);
   await page.keyboard.press('Enter');
-  await expect(menu).not.toHaveAttribute('open', '');
-  await expect(page.getByLabel('Actions One', { exact: true })).toBeFocused();
-  await page.getByLabel('Actions One', { exact: true }).click();
   await expect(page.getByRole('button', { name: 'Publish One', exact: true })).toBeVisible();
   expect(mutations).toEqual([{ method: 'PATCH', path: '/api/operator/monitors/one', body: { published: false } }]);
   const publish = page.getByRole('button', { name: 'Publish One', exact: true });
@@ -369,18 +365,16 @@ test('Maintenance insertion and removal preserve focused publication actions and
   await publish.focus();
   data.monitors[0].maintenance = null;
   await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
-  await expect(page.getByRole('button', { name: 'End Maintenance One', exact: true })).toHaveCount(0);
+  await expect(actions.getByRole('button')).toHaveCount(4);
   await expect(publish).toBeFocused();
   expect(await publishNode!.evaluate(node => node === document.activeElement)).toBe(true);
   await page.keyboard.press('Enter');
-  await expect(menu).not.toHaveAttribute('open', '');
-  await page.getByLabel('Actions One', { exact: true }).click();
   await expect(unpublish).toBeVisible();
   expect(mutations[1]).toEqual({ method: 'PATCH', path: '/api/operator/monitors/one', body: { published: true } });
 });
 
 
-test('deleting an edited Monitor preserves both inline drafts and returns focus to New Monitor', async ({ page }) => {
+test('deleting an edited Monitor preserves its editor and closed Maintenance draft', async ({ page }) => {
   const data = { pageName: 'Delete', webhookUrl: null, monitors: [
     { id: 'one', name: 'One', kind: 'http', url: 'https://example.com', state: 'up', published: true, history: null },
   ], incidents: [] };
@@ -395,18 +389,17 @@ test('deleting an edited Monitor preserves both inline drafts and returns focus 
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
   await monitorAction(page, 'Edit One');
   await page.locator('#name').fill('Retained draft');
-  await monitorAction(page, 'Declare Maintenance One');
+  await monitorAction(page, 'Maintenance One');
   await page.locator('#maintenance-end').fill('2027-01-01T12:00');
   page.once('dialog', dialog => dialog.accept());
+  await page.keyboard.press('Escape');
   await monitorAction(page, 'Delete One');
   await expect(page.locator('#message')).toHaveText('Deleted');
   await expect(page.locator('#configuration')).toBeVisible();
   await expect(page.locator('#name')).toHaveValue('Retained draft');
   await expect(page.locator('#monitor-deleted')).toBeVisible();
   await expect(page.locator('#save-monitor')).toBeDisabled();
-  await expect(page.locator('#maintenance')).toBeVisible();
   await expect(page.locator('#maintenance-end')).toHaveValue('2027-01-01T12:00');
-  await expect(page.locator('#maintenance-deleted')).toBeVisible();
-  await expect(page.locator('#save-maintenance')).toBeDisabled();
+  await expect(page.locator('#maintenance-dialog')).toBeHidden();
   await expect(page.locator('#new-monitor')).toBeFocused();
 });
