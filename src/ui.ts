@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { AvailabilityHistory, Status } from "./index";
+import { timeMarkup } from "./ui-presentation";
+export { presentationScript } from "./ui-presentation";
 
 const escape = (value: string) =>
   value.replace(
@@ -17,20 +19,21 @@ const stateLabel = {
   paused: "Monitoring paused",
 };
 function document(title: string, body: string, operator = false) {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(title)}</title><link rel="stylesheet" href="/app.css">${operator ? "" : '<meta http-equiv="refresh" content="60">'}</head><body><header><a class="brand" href="/">irisbeat</a><nav aria-label="Application"><a href="/"${operator ? "" : ' aria-current="page"'}>Status page</a><a href="/operator"${operator ? ' aria-current="page"' : ""}>Operator</a></nav></header><main>${body}</main><footer><a href="https://github.com/webriot/irisbeat/releases/download/v0.1.0/irisbeat-0.1.0-source.tar.gz">Source (AGPL-3.0-only)</a></footer></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(title)}</title><link rel="stylesheet" href="/app.css"><script src="/presentation.js" defer></script>${operator ? "" : '<meta http-equiv="refresh" content="60">'}</head><body><header><a class="brand" href="/">irisbeat</a><nav aria-label="Application"><a href="/"${operator ? "" : ' aria-current="page"'}>Status page</a><a href="/operator"${operator ? ' aria-current="page"' : ""}>Operator</a></nav></header><main>${body}</main><footer><a href="https://github.com/webriot/irisbeat/releases/download/v0.1.0/irisbeat-0.1.0-source.tar.gz">Source (AGPL-3.0-only)</a></footer></body></html>`;
 }
 
-function historyMarkup(history: AvailabilityHistory | null | undefined) {
+function historyMarkup(history: AvailabilityHistory | null | undefined, monitorId: string) {
   if (!history) return '<p class="history-unavailable">Bars unavailable</p>';
-  return `<div class="availability"><span class="percentage" aria-label="Availability">${history.percentage === null ? "Unavailable" : history.percentage.toFixed(2) + "%"}</span><ol class="history" aria-label="90 UTC days of availability">${history.days.map(day => {
-    const label = day.date + " UTC: " + (day.state === "maintenance" ? "Maintenance" : day.state) + "; " + day.successes + " successes, " + day.failures + " failures, " + day.maintenance + " Maintenance";
-    return `<li class="history-day ${day.state}" tabindex="0" aria-label="${label}"><span class="history-detail" aria-hidden="true">${label}</span></li>`;
-  }).join("")}</ol></div>`;
+  const labels = { up: "Operational", down: "Failed checks", degraded: "Mixed results", maintenance: "Maintenance", empty: "No observations" };
+  return `<div class="availability"><span>90 UTC days</span> <span class="percentage" aria-label="Availability">${history.percentage === null ? "No observations" : history.percentage.toFixed(2) + "%"}</span><ol class="history" data-history-id="${encodeURIComponent(monitorId)}" aria-label="90 UTC days of availability">${history.days.map((day, index) => {
+    const summary = labels[day.state] + "; " + day.successes + " successes, " + day.failures + " failures, " + day.maintenance + " Maintenance";
+    const label = day.date + " UTC: " + summary;
+    return `<li><button type="button" class="history-day ${day.state}" data-date="${day.date}" data-summary="${summary}" tabindex="${index === history.days.length - 1 ? 0 : -1}" aria-label="${label}" aria-pressed="${index === history.days.length - 1}"></button></li>`;
+  }).join("")}</ol><p class="history-detail" role="status" aria-live="polite"></p></div>`;
 }
 
 export function statusPage(status: Status) {
-  const time = (at: number) =>
-    `<time datetime="${new Date(at).toISOString()}">${new Date(at).toISOString()}</time>`;
+  const time = timeMarkup;
   const banner = status.paused ? "Monitoring paused" : !status.monitors.length
     ? "No Monitors published"
     : status.incidents.some(incident => incident.closedAt === null) || status.monitors.some(monitor => monitor.state === "down")
@@ -46,7 +49,7 @@ export function statusPage(status: Status) {
     status.pageName,
     `<h1>${escape(status.pageName)}</h1>
     <section class="banner" aria-label="Current status"><h2>${escape(banner)}</h2></section>
-    ${status.monitors.map((monitor, index) => `<article aria-labelledby="monitor-name${index || ""}"><div class="ledger-row"><h2 id="monitor-name${index || ""}">${escape(monitor.name)}</h2><span class="status">${stateLabel[monitor.state]}</span></div>${historyMarkup(monitor.history)}</article>`).join("")}
+    ${status.monitors.map((monitor, index) => `<article aria-labelledby="monitor-name${index || ""}"><div class="ledger-row"><h2 id="monitor-name${index || ""}">${escape(monitor.name)}</h2><span class="status">${stateLabel[monitor.state]}</span></div>${historyMarkup(monitor.history, monitor.id)}</article>`).join("")}
     ${status.monitors.length ? `<section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>${status.incidents.length ? `<ul class="incidents">${status.incidents.map((incident) => `<li><article class="incident"><strong>${escape(status.monitors.find(monitor => monitor.id === incident.monitorId)?.name ?? incident.monitorId)} — ${incident.closedAt === null ? "Open" : "Recovered"}</strong><p>Unavailable since ${time(incident.openedAt)}${incident.closedAt === null ? " — Ongoing" : ` — Recovered ${time(incident.closedAt)}`}</p></article></li>`).join("")}</ul>` : "<p>No Incidents</p>"}</section>` : ""}`,
   );
 }
@@ -123,10 +126,9 @@ th, td { padding: 1rem .5rem; text-align: left; border-bottom: 1px solid var(--l
 .availability { padding: 1rem 0; min-width: 12rem; }
 .percentage { font-variant-numeric: tabular-nums; }
 .history { position: relative; display: grid; grid-template-columns: repeat(90, minmax(0, 1fr)); gap: 2px; list-style: none; padding: 0; margin: .5rem 0; }
-.history:has(.history-day:focus), .history:has(.history-day:hover) { padding-bottom: 5rem; }
-.history-detail { display: none; position: absolute; inset: 2.2rem 0 auto; font-size: .875rem; line-height: 1.4; }
-.history-day:focus .history-detail, .history:not(:has(.history-day:focus)) .history-day:hover .history-detail { display: block; }
-.history-day { height: 1.8rem; background: light-dark(#e6eae8, #35413c); }
+.history-detail { min-height: 4.2em; margin: .5rem 0; font-size: .875rem; line-height: 1.4; }
+.history-day { display: block; width: 100%; min-height: 1.8rem; height: 1.8rem; padding: 0; border: 0; border-radius: 0; background: light-dark(#e6eae8, #35413c); }
+.history-day[aria-pressed="true"] { outline: 2px solid currentColor; outline-offset: 2px; }
 .history-day.up { background: light-dark(#19734b, #59c990); }
 .history-day.down { background: light-dark(#b52a34, #ff7880); }
 .history-day.degraded { background: light-dark(#986500, #e6b64d); }
@@ -157,6 +159,7 @@ form button { margin-top: 1rem; }
 `;
 
 export const operatorScript = `
+const timeMarkup = ${timeMarkup.toString()};
 const historyMarkup = ${historyMarkup.toString()};
 const byId = id => document.getElementById(id);
 const login = byId('login');
@@ -196,11 +199,12 @@ function declareMaintenance(monitor) {
   byId('maintenance-heading').textContent = monitor.name + ' — Maintenance';
   byId('save-maintenance').textContent = monitor.maintenance ? 'Replace Maintenance' : 'Declare Maintenance';
   const end = new Date(monitor.maintenance?.endsAt ?? Date.now() + 3600000);
+  document.querySelector('label[for="maintenance-end"]').textContent = 'End time (' + Intl.DateTimeFormat().resolvedOptions().timeZone + ')';
   byId('maintenance-end').value = new Date(end.getTime() - end.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
   maintenanceForm.hidden = false; byId('maintenance-end').focus();
 }
 function signOut() {
-  secret = ''; cancelEdit(); maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
+  secret = ''; window.IrisbeatPresentation.clear(); cancelEdit(); maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
   byId('monitor-rows').replaceChildren(); byId('incidents').replaceChildren();
   message.textContent = ''; byId('secret').value = ''; byId('secret').focus();
 }
@@ -236,7 +240,7 @@ function render(data) {
     const historyRow = document.createElement('tr');
     const availability = document.createElement('td'); availability.colSpan = 4;
     availability.setAttribute('aria-label', monitor.name + ' availability');
-    availability.innerHTML = historyMarkup(monitor.history); historyRow.append(availability);
+    availability.innerHTML = historyMarkup(monitor.history, monitor.id); historyRow.append(availability);
     return [row, historyRow];
   });
   if (!rows.length) {
@@ -247,11 +251,15 @@ function render(data) {
   const incidents = data.incidents.map(incident => {
     const item = document.createElement('li'); item.className = 'incident';
     const monitor = data.monitors.find(monitor => monitor.id === incident.monitorId);
-    item.textContent = (monitor?.name || incident.monitorName || incident.monitorId) + (monitor ? '' : ' (deleted)') + ' — Unavailable since ' + new Date(incident.openedAt).toISOString() + (incident.closedAt === null ? ' — Ongoing' : ' — Recovered ' + new Date(incident.closedAt).toISOString());
+    item.append((monitor?.name || incident.monitorName || incident.monitorId) + (monitor ? '' : ' (deleted)') + ' — Unavailable since ');
+    const timestamps = document.createElement('span');
+    timestamps.innerHTML = timeMarkup(incident.openedAt) + (incident.closedAt === null ? ' — Ongoing' : ' — Recovered ' + timeMarkup(incident.closedAt));
+    item.append(timestamps);
     return item;
   });
   if (!incidents.length) { const item = document.createElement('li'); item.textContent = 'No Incidents'; incidents.push(item); }
   byId('incidents').replaceChildren(...incidents);
+  window.IrisbeatPresentation.initialize();
 }
 async function run(path = '/api/operator', method = 'GET', body, after) {
   if (busy) return;

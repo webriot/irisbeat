@@ -339,6 +339,10 @@ it("presents the selected Status ledger with Monitor configuration beside page s
   expect((await request("/app.css")).headers.get("Content-Type")).toContain(
     "text/css",
   );
+  expect(page).toContain('<script src="/presentation.js" defer></script>');
+  expect((await request("/presentation.js")).headers.get("Content-Type")).toContain(
+    "text/javascript",
+  );
 });
 
 
