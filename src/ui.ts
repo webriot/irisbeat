@@ -131,6 +131,7 @@ export const styleSheet = `
   --background: light-dark(#f5f7f8, #101417); --foreground: light-dark(#202b30, #e2eaed);
   --muted: light-dark(#596970, #99a9b1); --card: light-dark(#fff, #171e23);
   --secondary: light-dark(#edf1f3, #222c33); --line: light-dark(#d9e1e5, #35424a);
+  --control-border: light-dark(#78868d, #788c98);
   --primary: light-dark(#245e66, #9bd4d6); --primary-foreground: light-dark(#fff, #142b30);
   --success: light-dark(#176744, #77d6ab); --success-surface: light-dark(#eaf6ef, #172e27);
   --danger: light-dark(#b42e3d, #ff96a0); --warning: light-dark(#825b0a, #eac16f);
@@ -189,7 +190,7 @@ form, aside { min-width: 0; }
 fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 label { display: block; margin: 12px 0 6px; font-size: 13px; }
 input, select, button { font: inherit; min-height: 40px; max-width: 100%; border: 1px solid var(--line); border-radius: 7px; background: var(--card); color: var(--foreground); }
-input, select { width: 100%; padding: 8px 11px; }
+input, select { width: 100%; padding: 8px 11px; border-color: var(--control-border); }
 input:disabled, select:disabled { opacity: .65; }
 .checkbox { display: flex; align-items: center; gap: 8px; }
 input[type="checkbox"] { width: auto; accent-color: var(--primary); }

@@ -93,3 +93,26 @@ for (const colorScheme of ['light', 'dark'] as const) {
     }
   }
 }
+
+for (const colorScheme of ['light', 'dark'] as const) {
+  test(`empty input boundaries have readable contrast in ${colorScheme}`, async ({ page }) => {
+    await page.emulateMedia({ colorScheme });
+    await page.goto('/operator');
+    const contrast = await page.getByLabel('Installation secret', { exact: true }).evaluate(input => {
+      const luminance = (color: string) => {
+        const channels = color.match(/[\d.]+/g)!.slice(0, 3).map(Number).map(value => {
+          const channel = value / 255;
+          return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+        });
+        return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+      };
+      const style = getComputedStyle(input);
+      const border = luminance(style.borderTopColor);
+      return [style.backgroundColor, getComputedStyle(input.closest('form')!).backgroundColor].map(color => {
+        const background = luminance(color);
+        return (Math.max(border, background) + 0.05) / (Math.min(border, background) + 0.05);
+      });
+    });
+    for (const ratio of contrast) expect(ratio).toBeGreaterThanOrEqual(3);
+  });
+}
