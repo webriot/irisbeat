@@ -96,9 +96,22 @@ export type Status = ReturnType<MonitoringContext["status"]>;
 type StoredContext = { pageName: string; monitors: Monitor[]; webhookUrl?: string | null; paused?: boolean; policyRevision?: number; pauseGeneration?: number };
 type LegacyContext = { webhookUrl?: string | null; monitor: (Monitor & { pageName: string }) | null };
 
-type Subscription = { pending: boolean; dirty: boolean; audience?: "operator"; origin?: string;
-  contextId?: string; permission?: "reader" | "editor"; expiresAt?: number; authenticated?: boolean };
+type OperatorSubscription = { audience: "operator"; origin: string; expiresAt: number } & (
+  | { authenticated: false; contextId?: never; permission?: never }
+  | { authenticated: true; contextId: string; permission: "reader" | "editor" }
+);
+type Subscription = { pending: boolean; dirty: boolean } & (
+  | { audience?: undefined; authenticated?: never; permission?: never }
+  | OperatorSubscription
+);
 type Ticket = { origin: string; contextId: string; permission: "reader" | "editor"; expiresAt: number; leaseEndsAt: number };
+
+function allowedSubscriptionOrigin(request: Request, requireOrigin: boolean) {
+  const url = new URL(request.url);
+  const origin = request.headers.get("Origin");
+  return (origin === url.origin || (!requireOrigin && !origin)) &&
+    (url.protocol === "https:" || ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname));
+}
 
 export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableObject<E> {
   constructor(ctx: DurableObjectState, env: E) {
@@ -139,9 +152,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (active.length >= 128 || (operator && active.filter(socket => !socket.deserializeAttachment()?.authenticated).length >= 16))
       return new Response(null, { status: 503 });
     const { 0: client, 1: server } = new WebSocketPair();
-    server.serializeAttachment({ pending: false, dirty: false, ...(operator ? {
-      audience, origin: new URL(request.url).origin, authenticated: false, expiresAt: Date.now() + 10_000,
-    } : {}) });
+    const attachment: Subscription = operator
+      ? { pending: false, dirty: false, audience: "operator", origin: new URL(request.url).origin, authenticated: false, expiresAt: Date.now() + 10_000 }
+      : { pending: false, dirty: false };
+    server.serializeAttachment(attachment);
     this.ctx.acceptWebSocket(server, [audience]);
     this.scheduleSubscriptionAlarm();
     return new Response(null, { status: 101, webSocket: client });
@@ -165,7 +179,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
           socket.close(1008, "Invalid authorization"); return;
         }
         socket.serializeAttachment({ ...state, ...scope, dirty: state.permission === scope.permission && state.dirty,
-          audience: "operator", authenticated: true, expiresAt: scope.leaseEndsAt });
+          audience: "operator", authenticated: true, expiresAt: scope.leaseEndsAt } satisfies Subscription);
         socket.send("authorized");
         this.scheduleSubscriptionAlarm();
         return;
@@ -183,7 +197,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   webSocketError(socket: WebSocket) { socket.close(1011, "Subscription closed"); this.scheduleSubscriptionAlarm(); }
 
   private subscriptionValid(socket: WebSocket, state: Subscription) {
-    if (!state.expiresAt || state.expiresAt <= Date.now()) { socket.close(1008, "Authorization expired"); return false; }
+    if (state.audience !== "operator" || !state.expiresAt || state.expiresAt <= Date.now()) { socket.close(1008, "Authorization expired"); return false; }
     return true;
   }
 
@@ -212,7 +226,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       previous && previous.operatorAt <= now ? previous.operatorAt : Infinity) : Infinity;
     // Separate clocks prevent private authorization alarms from announcing public activity.
     this.ctx.storage.kv.put("subscription-boundaries", { publicAt, operatorAt });
-    const at = Math.min(publicAt, operatorAt, ...operators.map(socket => (socket.deserializeAttachment() as Subscription).expiresAt!));
+    const at = Math.min(publicAt, operatorAt, ...operators.map(socket => (socket.deserializeAttachment() as OperatorSubscription).expiresAt));
     this.ctx.waitUntil(Number.isFinite(at) ? this.ctx.storage.setAlarm(at) : this.ctx.storage.deleteAlarm());
   }
 
@@ -966,9 +980,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   app.get("/operator.js", getOnly, () => new Response(operatorScript, { headers: { "Content-Type": "text/javascript; charset=utf-8" } }));
   const subscribe: MiddlewareHandler<HttpEnv<E>> = async (c: Context<HttpEnv<E>>) => {
     const url = new URL(c.req.url);
-    if (c.req.header("Origin") !== url.origin) return new Response(null, { status: 403 });
-    if (url.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))
-      return new Response(null, { status: 403 });
+    if (!allowedSubscriptionOrigin(c.req.raw, true)) return new Response(null, { status: 403 });
     if (url.search || c.req.header("Sec-WebSocket-Protocol")) return new Response(null, { status: 400 });
     return c.get("context").fetch(c.req.raw);
   };
@@ -993,8 +1005,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   });
   app.post(ticketPath, async c => {
     const url = new URL(c.req.url);
-    if ((c.req.header("Origin") && c.req.header("Origin") !== url.origin) ||
-        (url.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))) return new Response(null, { status: 403 });
+    if (!allowedSubscriptionOrigin(c.req.raw, false)) return new Response(null, { status: 403 });
     const grant = await c.get("context").issueSubscriptionTicket(c.get("resolved")?.id ?? "personal", url.origin, c.get("permission"));
     return grant ? Response.json(grant) : new Response(null, { status: 503 });
   });
