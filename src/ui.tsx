@@ -140,7 +140,7 @@ function Operator({ hosted }: { hosted: boolean }) {
         <button>Save webhook</button>
       </form>
       </section>
-      <div class="actions"><button id="refresh" type="button">Refresh</button><button id="logout" type="button">Sign out</button></div>
+      <div class="actions"><span id="updates-mode" role="status">Polling</span><button id="refresh" type="button">Refresh</button><button id="logout" type="button">Sign out</button></div>
     </section>
     <p id="message" role="status" aria-live="polite"></p>
     <script src="/operator.js" defer></script>
@@ -205,14 +205,95 @@ function reconcile(parent, next) {
 function reconcileNodes(parent, nodes) {
   const next = document.createElement('div'); next.append(...nodes); reconcile(parent, next);
 }
-function pollSnapshots(sync) {
-  let timer;
-  function resume() {
-    clearInterval(timer);
-    if (!document.hidden) { sync(); timer = setInterval(sync, 60000); }
+function liveSnapshots(path, read, authorize) {
+  let running = false, queued = false, ackSocket;
+  let socket, retry, handshake, renewal, polling, stopped = false, ready = false, delay = 1000;
+  function pollingMode() {
+    const mode = document.getElementById('updates-mode');
+    if (mode) mode.hidden = ready;
+    if (ready || document.hidden || stopped) { clearInterval(polling); polling = undefined; }
+    else if (!polling) polling = setInterval(sync, 60000);
   }
-  document.addEventListener('visibilitychange', resume);
-  if (!document.hidden) timer = setInterval(sync, 60000);
+  async function sync() {
+    if (stopped) return;
+    if (running) { queued = true; return; }
+    running = true;
+    try {
+      const success = await read(() => !stopped && !queued);
+      if (success === false) socket?.close();
+      else if (ready) delay = 1000;
+    } finally {
+      running = false;
+      if (queued && !stopped) { queued = false; sync(); }
+      else if (ackSocket) {
+        if (ackSocket === socket && socket.readyState === WebSocket.OPEN) socket.send('ack');
+        ackSocket = undefined;
+      }
+    }
+  }
+  async function authenticate(current, type) {
+    try {
+      const ticket = await authorize();
+      if (stopped || current !== socket || current.readyState !== WebSocket.OPEN) return;
+      current.send(JSON.stringify({ type, ticket }));
+    } catch { if (current === socket) current.close(); }
+  }
+  function connect() {
+    if (stopped) return;
+    clearTimeout(retry);
+    try {
+      const url = new URL(path, location.href);
+      url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const current = socket = new WebSocket(url);
+      handshake = setTimeout(() => current.close(), 10000);
+      function connected() {
+        clearTimeout(handshake); ready = true; pollingMode(); sync();
+        if (authorize) {
+          clearTimeout(renewal);
+          renewal = setTimeout(() => {
+            if (stopped || current !== socket) return;
+            handshake = setTimeout(() => current.close(), 10000);
+            authenticate(current, 'renew');
+          }, 240000);
+        }
+      }
+      current.onopen = () => {
+        if (current !== socket) return;
+        if (authorize) authenticate(current, 'auth'); else connected();
+      };
+      current.onmessage = event => {
+        if (current !== socket) return;
+        if (authorize && event.data === 'authorized') { connected(); return; }
+        if (!ready || event.data !== 'changed') return;
+        ackSocket = current; sync();
+      };
+      current.onerror = () => current.close();
+      current.onclose = () => {
+        if (current !== socket) return;
+        clearTimeout(handshake); clearTimeout(renewal); socket = undefined; ackSocket = undefined; ready = false;
+        pollingMode(); reconnect();
+      };
+    } catch { pollingMode(); reconnect(); }
+  }
+  function reconnect() {
+    if (stopped) return;
+    retry = setTimeout(connect, delay + Math.random() * delay * 0.2);
+    delay = Math.min(delay * 2, 25000);
+  }
+  function visible() { pollingMode(); if (!document.hidden) sync(); }
+  function suspend() {
+    stopped = true; ready = false; clearTimeout(retry); clearTimeout(handshake); clearTimeout(renewal); clearInterval(polling); polling = undefined;
+    const previous = socket; socket = undefined; ackSocket = undefined; previous?.close();
+  }
+  function resume() { if (stopped) { stopped = false; pollingMode(); connect(); } }
+  document.addEventListener('visibilitychange', visible);
+  window.addEventListener('pagehide', suspend);
+  window.addEventListener('pageshow', resume);
+  pollingMode(); connect();
+  return { sync, stop() {
+    suspend(); document.removeEventListener('visibilitychange', visible);
+    window.removeEventListener('pagehide', suspend); window.removeEventListener('pageshow', resume);
+  } };
 }
 const selectedHistoryDays = new Map(Object.entries(history.state?.irisbeatDays || {}));
 const instantFormat = new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
@@ -271,83 +352,25 @@ document.documentElement.dataset.theme = theme;
 document.addEventListener('DOMContentLoaded', () => {
   initializeDisplay();
   if (document.getElementById('public-status')) {
-    let running = false, queued = false, ackSocket;
-    let socket, retry, handshake, polling, stopped = false, delay = 1000;
-    function pollingMode() {
-      const connected = !!socket && socket.readyState === WebSocket.OPEN;
-      document.getElementById('updates-mode').hidden = connected;
-      if (connected || document.hidden || stopped) { clearInterval(polling); polling = undefined; }
-      else if (!polling) polling = setInterval(sync, 60000);
-    }
-    async function sync() {
-      if (running) { queued = true; return; }
-      running = true;
+    const updates = liveSnapshots('/api/status/events', async current => {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 10000);
       try {
         const response = await fetch('/api/status', { signal: controller.signal });
         if (!response.ok) throw new Error('Request failed');
         const data = await response.json();
-        if (!queued) {
-          const next = document.createElement('div');
-          next.innerHTML = publicMarkup(data, ${historyMarkup.toString()}, ${statusBanner.toString()});
-          reconcile(document.getElementById('public-status'), next);
-          document.title = data.pageName;
-          initializeDisplay(); document.getElementById('stale').hidden = true;
-          if (socket && socket.readyState === WebSocket.OPEN) delay = 1000;
-        }
+        if (!current()) return;
+        const next = document.createElement('div');
+        next.innerHTML = publicMarkup(data, ${historyMarkup.toString()}, ${statusBanner.toString()});
+        reconcile(document.getElementById('public-status'), next);
+        document.title = data.pageName;
+        initializeDisplay(); document.getElementById('stale').hidden = true;
       } catch {
-        document.getElementById('stale').hidden = false;
-        socket?.close();
-      } finally {
-        clearTimeout(timeout); running = false;
-        if (queued && !stopped) { queued = false; sync(); }
-        else if (ackSocket) {
-          if (ackSocket === socket && socket.readyState === WebSocket.OPEN) socket.send('ack');
-          ackSocket = undefined;
-        }
-      }
-    }
-    function connect() {
-      if (stopped) return;
-      clearTimeout(retry);
-      try {
-        const url = new URL('/api/status/events', location.href);
-        url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const current = socket = new WebSocket(url);
-        handshake = setTimeout(() => current.close(), 10000);
-        current.onopen = () => {
-          if (current !== socket) return;
-          clearTimeout(handshake); pollingMode(); sync();
-        };
-        current.onmessage = event => {
-          if (current !== socket || event.data !== 'changed') return;
-          ackSocket = current; sync();
-        };
-        current.onerror = () => current.close();
-        current.onclose = () => {
-          if (current !== socket) return;
-          clearTimeout(handshake); socket = undefined; ackSocket = undefined;
-          pollingMode(); reconnect();
-        };
-      } catch { pollingMode(); reconnect(); }
-    }
-    function reconnect() {
-      if (stopped) return;
-      retry = setTimeout(connect, delay + Math.random() * delay * 0.2);
-      delay = Math.min(delay * 2, 25000);
-    }
-    document.getElementById('refresh').addEventListener('click', sync);
-    document.addEventListener('visibilitychange', () => {
-      pollingMode();
-      if (!document.hidden) sync();
+        if (current()) document.getElementById('stale').hidden = false;
+        return false;
+      } finally { clearTimeout(timeout); }
     });
-    window.addEventListener('pagehide', () => {
-      stopped = true; clearTimeout(retry); clearTimeout(handshake); clearInterval(polling); polling = undefined;
-      socket?.close();
-    });
-    window.addEventListener('pageshow', () => { if (stopped) { stopped = false; pollingMode(); connect(); } });
-    pollingMode(); connect();
+    document.getElementById('refresh').addEventListener('click', updates.sync);
   }
   const control = document.getElementById('theme');
   control.value = theme;
@@ -550,6 +573,25 @@ let hosted = false;
 let monitorIds = new Set();
 let requestVersion = 0;
 let sessionGeneration = 0;
+let operatorUpdates;
+let pendingRefresh = false;
+function startOperatorUpdates() {
+  if (operatorUpdates) return;
+  const session = sessionGeneration;
+  operatorUpdates = liveSnapshots('/api/operator/events', current => run('/api/operator', 'GET', undefined, undefined, current), async () => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+      const response = await fetch('/api/operator/events/ticket', { method: 'POST', headers: { Authorization: 'Bearer ' + secret }, signal: controller.signal });
+      if (session !== sessionGeneration) throw new Error('Session ended');
+      if (response.status === 401 || response.status === 403) { signOut(); message.textContent = 'Unauthorized'; throw new Error('Unauthorized'); }
+      if (!response.ok) throw new Error('Subscription unavailable');
+      const grant = await response.json();
+      if (session !== sessionGeneration) throw new Error('Session ended');
+      return grant.ticket;
+    } finally { clearTimeout(timeout); }
+  });
+}
 function updateDeleted() {
   const missing = editingId !== null && !monitorIds.has(editingId);
   byId('monitor-deleted').hidden = !missing;
@@ -605,7 +647,8 @@ function declareMaintenance(monitor) {
   maintenanceForm.hidden = false; updateDeleted(); byId('maintenance-end').focus();
 }
 function signOut() {
-  ++sessionGeneration; ++requestVersion; busy = false;
+  ++sessionGeneration; ++requestVersion; busy = false; pendingRefresh = false;
+  operatorUpdates?.stop(); operatorUpdates = undefined;
   document.querySelectorAll('button, input, select').forEach(control => { control.disabled = false; });
   monitorIds.clear(); selectedHistoryDays.clear(); byId('stale').hidden = true;
   secret = ''; savedSettings = {}; cancelEdit(); byId('heartbeat-path').textContent = ''; maintenanceForm.reset(); maintenanceForm.removeAttribute('data-monitor-id'); byId('maintenance-heading').textContent = 'Maintenance'; maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
@@ -702,28 +745,33 @@ function render(data, savedField) {
   if (focused !== document.body && !focused.isConnected) byId(byId('new-monitor').hidden ? 'refresh' : 'new-monitor').focus();
 }
 
-async function run(path = '/api/operator', method = 'GET', body, after) {
+async function run(path = '/api/operator', method = 'GET', body, after, current = () => true) {
   const reading = method === 'GET';
-  if (busy) return;
+  if (busy) { if (reading) pendingRefresh = true; return; }
   const version = ++requestVersion;
   const session = sessionGeneration;
   const disabled = [...document.querySelectorAll('button, input, select')].filter(control => !control.disabled && control.id !== 'logout');
   if (!reading) { busy = true; disabled.forEach(control => { control.disabled = true; }); }
   if (!reading) message.textContent = '';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
   try {
     const response = await fetch(path, {
+      signal: controller.signal,
       method, headers: { Authorization: 'Bearer ' + secret, 'Content-Type': 'application/json' },
       ...(body === undefined ? {} : { body: JSON.stringify(body) })
     });
     if (session !== sessionGeneration) return;
-    if (response.status === 401) { signOut(); message.textContent = 'Unauthorized'; return; }
+    if (response.status === 401 || (reading && response.status === 403)) { signOut(); message.textContent = 'Unauthorized'; return; }
     if (version !== requestVersion) return;
     const data = await response.json();
     if (session !== sessionGeneration || version !== requestVersion) return;
     if (!response.ok) throw new Error(data.error || 'Request failed');
+    if (reading && !current()) return;
     byId('stale').hidden = true;
     if (data.secret) { byId('heartbeat-credential').textContent = 'Bearer ' + data.secret; }
     else render(data, method === 'PUT' ? (path === '/api/operator' ? 'pageName' : path === '/api/operator/webhook' ? 'webhookUrl' : undefined) : undefined);
+    startOperatorUpdates();
     if (after) after(data);
     if (method !== 'GET') message.textContent = method === 'DELETE' ? (path.endsWith('/maintenance') ? 'Maintenance ended' : 'Deleted') : 'Saved';
   } catch (error) {
@@ -731,10 +779,13 @@ async function run(path = '/api/operator', method = 'GET', body, after) {
       if (reading && !editor.hidden) byId('stale').hidden = false;
       else message.textContent = error.message;
     }
+    return false;
   } finally {
-    if (!reading && version === requestVersion) {
+    clearTimeout(timeout);
+    if (!reading && session === sessionGeneration) {
       busy = false; disabled.forEach(control => { control.disabled = false; });
       updateKind(); updateDeleted();
+      if (pendingRefresh) { pendingRefresh = false; operatorUpdates?.sync(); }
       if (!editor.hidden && document.activeElement === document.body) byId(byId('new-monitor').hidden ? 'refresh' : 'new-monitor').focus();
     }
   }
@@ -875,5 +926,4 @@ byId('rotate-heartbeat').addEventListener('click', () => { if (confirm('Replace 
 byId('cancel-edit').addEventListener('click', cancelEdit);
 byId('refresh').addEventListener('click', () => run());
 byId('logout').addEventListener('click', signOut);
-pollSnapshots(() => { if (secret) run(); });
 `;

@@ -2,6 +2,11 @@
 import { expect, test } from '@playwright/test';
 import { monitorAction } from './actions';
 
+// Snapshot reconciliation runs with transport unavailable; live transport has its own browser coverage.
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript(() => { Object.defineProperty(window, 'WebSocket', { value: class { constructor() { throw new Error('offline'); } } }); });
+});
+
 for (const kind of ['http', 'tcp', 'heartbeat']) {
 test(kind + ' refresh preserves rows, drafts, and focus while reconciling collection changes', async ({ page }) => {
   const data = { pageName: 'Original', webhookUrl: 'https://example.com/hook', monitors: [
@@ -87,7 +92,6 @@ for (const path of ['/', '/operator']) {
           { date: '2026-11-16', state: 'up', successes: 1, failures: 0, maintenance: 0 },
         ] } },
     ], incidents: [] as { monitorId: string; openedAt: number; closedAt: number | null }[] };
-    if (path === '/') await page.addInitScript(() => { Object.defineProperty(window, 'WebSocket', { value: class { constructor() { throw new Error('offline'); } } }); });
     await page.clock.install();
     await page.addInitScript(() => {
       Object.defineProperty(document, 'hidden', { configurable: true, value: false });

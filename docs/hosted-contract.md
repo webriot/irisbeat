@@ -253,3 +253,76 @@ remain unchanged.
 
 Implementation references: [Cloudflare Hibernation WebSockets](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)
 and [Hono upgrade middleware caveat](https://hono.dev/docs/helpers/websocket).
+
+## Operator subscriptions
+
+Contract 1 adds an authenticated handoff for `GET /api/operator/events`. Open a
+same-origin WebSocket, then obtain `POST /api/operator/events/ticket` using the
+same authorization as `GET /api/operator`. The personal Worker checks the
+installation Bearer secret; hosted Workers call `HostedAdapter.resolve` on every
+ticket request, including renewal. Both readers and editors can obtain tickets;
+null permission returns 401. The response is uncached JSON `{ ticket, expiresAt }`.
+Tickets are random, expire **30 seconds after issuance**, and are consumed once by
+an atomic Durable Object operation. They are bound to the resolved context,
+operator audience, exact application origin and resolved reader/editor permission.
+
+The **first** socket message must be JSON `{ "type": "auth", "ticket": "…" }`.
+Before it succeeds, the socket receives no notifications, including private
+activity. Success returns the fixed text `authorized`; immediately fetch the
+current authorized `/api/operator` snapshot. Notifications use the same fixed
+`changed` and `ack` protocol as public subscriptions, with one pending notice and
+one dirty bit. They carry no configuration, identifiers or credentials. Operators
+receive private Monitor/configuration/results/history/Incident/Maintenance/pause
+changes in their context. Readers do not receive webhook-only change activity.
+A permission change discards previously queued dirty activity before the client
+resynchronizes. Public and other-context subscribers remain isolated.
+
+Authorization lasts at most **five minutes from ticket issuance**, enforced by
+server alarms and checked before every operator message or notification. Obtain
+a fresh HTTP-authorized ticket before expiry and send
+`{ "type": "renew", "ticket": "…" }` on the **same socket**. `authorized` confirms
+the new lease and permission scope; fetch another authorized snapshot. The supplied
+browser renews after four minutes. Renewal does not require reconnecting. Invalid,
+reused, expired, wrong-origin or wrong-context tickets, wrong first messages and
+expired leases close with 1008. An expired lease cannot be revived by renewal.
+
+These durations are application authorization policy, not Hono or Cloudflare
+connection limits. Hosted role changes/revocation take effect on the next HTTP
+request; an already issued ticket/lease can permit notifications until its
+five-minute deadline. Consumers must resolve current permissions on each ticket
+issuance and must not cache authorization beyond their intended revocation policy.
+There is no push revocation hook or account/session infrastructure in this public
+engine. A consumer requiring immediate server-side account revocation must arrange
+that separately; snapshot reads and every mutation always retain independent
+request-time authorization and existing reader/editor projections. Socket messages
+cannot mutate application state or bypass monitor allowances.
+
+The trusted URL origin and HTTPS/WSS rules match public subscriptions; no Origin,
+a cross-origin browser, or insecure nonlocal upgrade returns 403. Forwarded host
+headers never override the application origin. Serve the Worker at the trusted
+application origin, and validate host/context identity in the hosted adapter.
+Upgrade query strings and WebSocket subprotocols are rejected with 400. Never put
+installation secrets, account bearer credentials, or tickets in socket URLs,
+protocols, logs or persistent browser storage. Only the short-lived ticket crosses
+the socket, inside an authentication/renewal message; browser credentials and
+tickets remain in memory. The ticket endpoint checks Origin when supplied so
+non-browser authenticated consumers can also use the handoff.
+
+Each context bounds operator sockets to 128, including at most 16 awaiting
+authentication, and pending tickets to 128. Excess requests return 503. An
+unauthenticated socket must authenticate within ten seconds. Attachments retain
+audience, context, origin, permission, expiry and coalescing state across
+hibernation. A shared storage alarm handles authorization deadlines, Maintenance
+expiry and UTC history rollover; private deadlines never wake public subscribers.
+Closed sockets are cleaned up by the runtime, expired tickets are pruned on the
+next issuance, and consumed tickets are deleted immediately.
+
+The operator browser shares reconnect/backoff, visible-page polling fallback,
+manual/visibility resynchronization and bounded coalescing with the public page.
+It preserves drafts, focus, open menus, selected history days and Monitor
+validation. Failed snapshots retain the last view with Updates unavailable.
+Sign-out or authorization loss closes the socket, stops renewal/reconnect/polling,
+and clears private UI state. Session guards reject late ticket and snapshot
+responses. Consumer UIs must implement the same teardown on sign-out and denied
+renewal; they must not leave a valid lease running after local authorization loss.
+All writes continue through existing authorized HTTP routes.

@@ -96,6 +96,10 @@ export type Status = ReturnType<MonitoringContext["status"]>;
 type StoredContext = { pageName: string; monitors: Monitor[]; webhookUrl?: string | null; paused?: boolean; policyRevision?: number; pauseGeneration?: number };
 type LegacyContext = { webhookUrl?: string | null; monitor: (Monitor & { pageName: string }) | null };
 
+type Subscription = { pending: boolean; dirty: boolean; audience?: "operator"; origin?: string;
+  contextId?: string; permission?: "reader" | "editor"; expiresAt?: number; authenticated?: boolean };
+type Ticket = { origin: string; contextId: string; permission: "reader" | "editor"; expiresAt: number; leaseEndsAt: number };
+
 export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableObject<E> {
   constructor(ctx: DurableObjectState, env: E) {
     super(ctx, env);
@@ -105,6 +109,9 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS observations (
       id INTEGER PRIMARY KEY, monitorId TEXT NOT NULL, at INTEGER NOT NULL, outcome TEXT NOT NULL
     )`);
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS subscription_tickets (
+      token TEXT PRIMARY KEY, scope TEXT NOT NULL, expiresAt INTEGER NOT NULL
+    )`);
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS observations_monitor_at ON observations (monitorId, at)");
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS observations_at ON observations (at)");
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS incidents_opened ON incidents (openedAt DESC, id)");
@@ -112,65 +119,130 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       ctx.storage.sql.exec("ALTER TABLE incidents ADD COLUMN monitorName TEXT");
     }
   }
+  issueSubscriptionTicket(contextId: string, origin: string, permission: "reader" | "editor") {
+    const now = Date.now();
+    this.ctx.storage.sql.exec("DELETE FROM subscription_tickets WHERE expiresAt <= ?", now);
+    if (this.ctx.storage.sql.exec<{ count: number }>("SELECT count(*) AS count FROM subscription_tickets").one().count >= 128) return null;
+    const ticket = crypto.randomUUID();
+    const scope: Ticket = { contextId, origin, permission, expiresAt: now + 30_000, leaseEndsAt: now + 300_000 };
+    this.ctx.storage.sql.exec("INSERT INTO subscription_tickets VALUES (?, ?, ?)", ticket, JSON.stringify(scope), scope.expiresAt);
+    return { ticket, expiresAt: scope.expiresAt };
+  }
+
   fetch(request: Request) {
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket")
       return new Response(null, { status: 426 });
-    if (this.ctx.getWebSockets("public").length >= 128)
+    const operator = new URL(request.url).pathname === "/api/operator/events";
+    const audience = operator ? "operator" : "public";
+    this.expireSubscriptions();
+    const active = this.ctx.getWebSockets(audience);
+    if (active.length >= 128 || (operator && active.filter(socket => !socket.deserializeAttachment()?.authenticated).length >= 16))
       return new Response(null, { status: 503 });
     const { 0: client, 1: server } = new WebSocketPair();
-    server.serializeAttachment({ pending: false, dirty: false });
-    this.ctx.acceptWebSocket(server, ["public"]);
-    this.schedulePublicAlarm();
+    server.serializeAttachment({ pending: false, dirty: false, ...(operator ? {
+      audience, origin: new URL(request.url).origin, authenticated: false, expiresAt: Date.now() + 10_000,
+    } : {}) });
+    this.ctx.acceptWebSocket(server, [audience]);
+    this.scheduleSubscriptionAlarm();
     return new Response(null, { status: 101, webSocket: client });
   }
 
   webSocketMessage(socket: WebSocket, message: string | ArrayBuffer) {
-    const state = socket.deserializeAttachment() as { pending: boolean; dirty: boolean };
+    const state = socket.deserializeAttachment() as Subscription;
+    if (state.audience === "operator") {
+      if (!this.subscriptionValid(socket, state)) return;
+      if (!state.authenticated || message !== "ack") {
+        let input;
+        try { input = typeof message === "string" && message.length <= 256 ? JSON.parse(message) : null; } catch { input = null; }
+        if (input?.type !== (state.authenticated ? "renew" : "auth") || typeof input.ticket !== "string") {
+          socket.close(1008, "Invalid authorization"); return;
+        }
+        // One synchronous DELETE both consumes and returns the grant, including across hibernation.
+        const row = this.ctx.storage.sql.exec<{ scope: string }>("DELETE FROM subscription_tickets WHERE token = ? RETURNING scope", input.ticket).toArray()[0];
+        const scope = row ? JSON.parse(row.scope) as Ticket : null;
+        if (!scope || scope.expiresAt <= Date.now() || scope.origin !== state.origin ||
+            (state.contextId !== undefined && scope.contextId !== state.contextId)) {
+          socket.close(1008, "Invalid authorization"); return;
+        }
+        socket.serializeAttachment({ ...state, ...scope, dirty: state.permission === scope.permission && state.dirty,
+          audience: "operator", authenticated: true, expiresAt: scope.leaseEndsAt });
+        socket.send("authorized");
+        this.scheduleSubscriptionAlarm();
+        return;
+      }
+    }
     if (message !== "ack" || !state?.pending) {
       socket.close(1008, "Read-only subscription");
       return;
     }
     if (state.dirty) socket.send("changed");
-    socket.serializeAttachment({ pending: state.dirty, dirty: false });
+    socket.serializeAttachment({ ...state, pending: state.dirty, dirty: false });
   }
 
-  webSocketClose(socket: WebSocket) { socket.close(1000, ""); this.schedulePublicAlarm(); }
-  webSocketError(socket: WebSocket) { socket.close(1011, "Subscription closed"); }
+  webSocketClose(socket: WebSocket) { socket.close(1000, ""); this.scheduleSubscriptionAlarm(); }
+  webSocketError(socket: WebSocket) { socket.close(1011, "Subscription closed"); this.scheduleSubscriptionAlarm(); }
 
-  private publicSnapshot(state: StoredContext) {
+  private subscriptionValid(socket: WebSocket, state: Subscription) {
+    if (!state.expiresAt || state.expiresAt <= Date.now()) { socket.close(1008, "Authorization expired"); return false; }
+    return true;
+  }
+
+  private expireSubscriptions() {
+    for (const socket of this.ctx.getWebSockets("operator")) {
+      if (socket.readyState === WebSocket.OPEN) this.subscriptionValid(socket, socket.deserializeAttachment());
+    }
+  }
+
+  private subscriptionSnapshot(state: StoredContext) {
     const at = Date.now();
-    return { at, value: JSON.stringify(this.project(state, false, false, at)) };
+    return { at, value: JSON.stringify(this.project(state, false, false, at)), operator: JSON.stringify(this.project(state, true, true, at)), reader: JSON.stringify(this.project(state, true, false, at)) };
   }
 
-  private schedulePublicAlarm() {
+  private scheduleSubscriptionAlarm() {
     const now = Date.now();
-    const monitors = this.read().monitors.filter(monitor => monitor.published);
-    const subscribed = this.ctx.getWebSockets("public").some(socket => socket.readyState === WebSocket.OPEN);
-    // Only public time boundaries can wake subscribers; private work never changes this clock.
-    const at = Math.min((Math.floor(now / DAY) + 1) * DAY,
-      ...monitors.flatMap(monitor => monitor.maintenance ? [monitor.maintenance.endsAt] : []));
-    this.ctx.waitUntil(subscribed && monitors.length ? this.ctx.storage.setAlarm(at) : this.ctx.storage.deleteAlarm());
+    const monitors = this.read().monitors;
+    const boundary = (selected: Monitor[]) => selected.length ? Math.min((Math.floor(now / DAY) + 1) * DAY,
+      ...selected.flatMap(monitor => monitor.maintenance ? [monitor.maintenance.endsAt] : [])) : Infinity;
+    const hasPublic = this.ctx.getWebSockets("public").some(socket => socket.readyState === WebSocket.OPEN);
+    const operators = this.ctx.getWebSockets("operator").filter(socket => socket.readyState === WebSocket.OPEN);
+    const previous = this.ctx.storage.kv.get<{ publicAt: number; operatorAt: number }>("subscription-boundaries");
+    const publicAt = hasPublic ? Math.min(boundary(monitors.filter(monitor => monitor.published)),
+      previous && previous.publicAt <= now ? previous.publicAt : Infinity) : Infinity;
+    const operatorAt = operators.some(socket => socket.deserializeAttachment()?.authenticated) ? Math.min(boundary(monitors),
+      previous && previous.operatorAt <= now ? previous.operatorAt : Infinity) : Infinity;
+    // Separate clocks prevent private authorization alarms from announcing public activity.
+    this.ctx.storage.kv.put("subscription-boundaries", { publicAt, operatorAt });
+    const at = Math.min(publicAt, operatorAt, ...operators.map(socket => (socket.deserializeAttachment() as Subscription).expiresAt!));
+    this.ctx.waitUntil(Number.isFinite(at) ? this.ctx.storage.setAlarm(at) : this.ctx.storage.deleteAlarm());
   }
 
   alarm() {
+    const boundaries = this.ctx.storage.kv.get<{ publicAt: number; operatorAt: number }>("subscription-boundaries");
+    this.expireSubscriptions();
     this.read();
-    this.broadcast();
-    this.schedulePublicAlarm();
+    if (boundaries && boundaries.publicAt <= Date.now()) this.broadcast("public");
+    if (boundaries && boundaries.operatorAt <= Date.now()) this.broadcast("operator");
+    this.ctx.storage.kv.delete("subscription-boundaries");
+    this.scheduleSubscriptionAlarm();
   }
 
-  private notify(before: { at: number; value: string }) {
-    if (before.value === JSON.stringify(this.project(this.read(before.at), false, false, before.at))) return;
-    this.broadcast();
-    this.schedulePublicAlarm();
+  private notify(before: { at: number; value: string; operator: string; reader: string }) {
+    const state = this.read(before.at);
+    if (before.value !== JSON.stringify(this.project(state, false, false, before.at))) this.broadcast("public");
+    if (before.operator !== JSON.stringify(this.project(state, true, true, before.at)))
+      this.broadcast("operator", before.reader === JSON.stringify(this.project(state, true, false, before.at)));
+    this.scheduleSubscriptionAlarm();
   }
 
-  private broadcast() {
-    for (const socket of this.ctx.getWebSockets("public")) {
+  private broadcast(audience: "public" | "operator", editorsOnly = false) {
+    for (const socket of this.ctx.getWebSockets(audience)) {
       try {
         if (socket.readyState !== WebSocket.OPEN) continue;
-        const state = socket.deserializeAttachment() as { pending: boolean; dirty: boolean };
+        const state = socket.deserializeAttachment() as Subscription;
+        if (audience === "operator" && (!this.subscriptionValid(socket, state) || !state.authenticated)) continue;
+        if (editorsOnly && state.permission !== "editor") continue;
         if (!state.pending) socket.send("changed");
-        socket.serializeAttachment({ pending: true, dirty: state.pending });
+        socket.serializeAttachment({ ...state, pending: true, dirty: state.pending });
       } catch { socket.close(1011, "Subscription closed"); }
     }
   }
@@ -225,7 +297,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     }
     // Compare and persist policy together, without awaiting external I/O or another RPC.
     const state = this.read();
-    const before = this.publicSnapshot(state);
+    const before = this.subscriptionSnapshot(state);
     state.policyRevision = policyRevision;
     if (!!state.paused === paused) {
       this.ctx.storage.kv.put("context", state);
@@ -251,7 +323,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (!value || typeof value !== "object") return undefined;
     const fields = value as Record<string, unknown>;
     const state = this.read();
-    const before = this.publicSnapshot(state);
+    const before = this.subscriptionSnapshot(state);
     let configuration: Configuration | { pageName: string };
     if (Object.keys(fields).length === 1 && "pageName" in fields) {
       if (typeof fields.pageName !== "string" || !fields.pageName.trim() || fields.pageName.length > 120) return undefined;
@@ -283,7 +355,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   create(configuration: MonitorConfiguration, limit?: number) {
     const state = this.read();
-    const before = this.publicSnapshot(state);
+    const before = this.subscriptionSnapshot(state);
     // No await between allowance check and synchronous persistence: concurrent RPCs serialize.
     if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0 || state.monitors.length >= limit)) return null;
     state.monitors.push(this.newMonitor(configuration));
@@ -294,14 +366,16 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   configureWebhook(url: string | null) {
     const state = this.read();
+    const before = this.subscriptionSnapshot(state);
     state.webhookUrl = url;
     this.ctx.storage.kv.put("context", state);
+    this.notify(before);
     return this.status(true);
   }
 
   edit(id: string, value: unknown) {
     const state = this.read();
-    const before = this.publicSnapshot(state);
+    const before = this.subscriptionSnapshot(state);
     const monitor = state.monitors.find(monitor => monitor.id === id);
     if (!monitor) return null;
     const patch = parseMonitorPatch(value, monitor);
@@ -322,7 +396,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   maintenance(id: string, value: unknown, end = false) {
     const at = Date.now();
     const state = this.read(at);
-    const before = this.publicSnapshot(state);
+    const before = this.subscriptionSnapshot(state);
     const monitor = state.monitors.find(monitor => monitor.id === id);
     if (!monitor) return null;
     if (end) {
@@ -360,7 +434,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   remove(id: string) {
     const state = this.read();
-    const before = this.publicSnapshot(state);
+    const before = this.subscriptionSnapshot(state);
     if (!state.monitors.some(monitor => monitor.id === id)) return null;
     state.monitors = state.monitors.filter(monitor => monitor.id !== id);
     this.ctx.storage.kv.put("context", state);
@@ -434,7 +508,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     await this.record(current, monitor, at, success, attempt.failureThreshold, attempt.recoveryThreshold, observation.maintenance, (monitor.scheduleRevision ?? 0) !== (attempt.scheduleRevision ?? 0));
   }
 
-  private async record(current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number, maintenance = !!monitor.maintenance, resetProgress = false, before = this.publicSnapshot(current)) {
+  private async record(current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number, maintenance = !!monitor.maintenance, resetProgress = false, before = this.subscriptionSnapshot(current)) {
     if (current.paused) return;
     const pauseGeneration = current.pauseGeneration ?? 0;
     monitor.lastResult = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" };
@@ -537,7 +611,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const current = this.read();
     const monitor = current.monitors.find(monitor => monitor.id === id);
     if (!monitor || monitor.kind !== "heartbeat") return false;
-    const before = this.publicSnapshot(current);
+    const before = this.subscriptionSnapshot(current);
     monitor.lastSeen = at;
     if (current.paused) {
       this.ctx.storage.kv.put("context", current);
@@ -890,28 +964,39 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   app.get("/app.css", getOnly, () => new Response(styleSheet, { headers: { "Content-Type": "text/css; charset=utf-8" } }));
   app.get("/theme.js", getOnly, () => new Response(themeScript, { headers: { "Content-Type": "text/javascript; charset=utf-8" } }));
   app.get("/operator.js", getOnly, () => new Response(operatorScript, { headers: { "Content-Type": "text/javascript; charset=utf-8" } }));
-  app.get("/api/status/events", getOnly, async (c: Context<HttpEnv<E>>) => {
+  const subscribe: MiddlewareHandler<HttpEnv<E>> = async (c: Context<HttpEnv<E>>) => {
     const url = new URL(c.req.url);
     if (c.req.header("Origin") !== url.origin) return new Response(null, { status: 403 });
     if (url.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))
       return new Response(null, { status: 403 });
+    if (url.search || c.req.header("Sec-WebSocket-Protocol")) return new Response(null, { status: 400 });
     return c.get("context").fetch(c.req.raw);
-  });
+  };
+  app.get("/api/status/events", getOnly, subscribe);
+  app.get("/api/operator/events", getOnly, subscribe);
   app.get("/api/status", getOnly, async (c: Context<HttpEnv<E>>) => Response.json(await c.get("context").status()));
 
   const monitorPath = "/api/operator/monitors/:id";
   const maintenancePath = monitorPath + "/maintenance";
   const rotationPath = monitorPath + "/heartbeat-secret";
   const previewPath = "/api/operator/schedule-preview";
-  const operatorPaths = [previewPath, "/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
+  const ticketPath = "/api/operator/events/ticket";
+  const operatorPaths = [ticketPath, previewPath, "/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
   for (const path of operatorPaths) app.use(path, async (c, next) => {
     const resolved = c.get("resolved");
     if (path === rotationPath && !resolved) return c.notFound();
     const permission = resolved ? resolved.permission : await authorized(c.req.raw, c.env.INSTALLATION_SECRET) ? "editor" : null;
     if (!permission) return Response.json({ error: "Unauthorized" }, { status: 401 });
-    if (permission !== "editor" && c.req.method !== "GET") return Response.json({ error: "Forbidden" }, { status: 403 });
+    if (permission !== "editor" && c.req.method !== "GET" && path !== ticketPath) return Response.json({ error: "Forbidden" }, { status: 403 });
     c.set("permission", permission);
     await next();
+  });
+  app.post(ticketPath, async c => {
+    const url = new URL(c.req.url);
+    if ((c.req.header("Origin") && c.req.header("Origin") !== url.origin) ||
+        (url.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))) return new Response(null, { status: 403 });
+    const grant = await c.get("context").issueSubscriptionTicket(c.get("resolved")?.id ?? "personal", url.origin, c.get("permission"));
+    return grant ? Response.json(grant) : new Response(null, { status: 503 });
   });
   const readBody: MiddlewareHandler<HttpEnv<E>> = async (c: Context<HttpEnv<E>>, next) => {
     const request = c.req.raw;

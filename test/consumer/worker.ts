@@ -9,6 +9,7 @@ export class MonitoringContext extends EngineContext {
   }
 }
 type Policy = { paused: boolean; policyRevision: number };
+const operatorPermissions = new Map<string, "editor" | "reader" | null>();
 const requestPause = new Map<string, Policy>();
 const schedulePause = new Map<string, Policy>();
 let delayContexts = false;
@@ -19,7 +20,7 @@ const app = createHostedWorker({
     const host = new URL(request.url).hostname;
     if (!['a.example', 'b.example', 'ordering.example'].includes(host)) return null;
     const token = request.headers.get('authorization');
-    const identity = { id: host, permission: token === 'Bearer editor' ? 'editor' as const : token === 'Bearer reader' ? 'reader' as const : null, monitorLimit: 2 };
+    const identity = { id: host, permission: operatorPermissions.has(host) ? operatorPermissions.get(host)! : token === 'Bearer editor' ? 'editor' as const : token === 'Bearer reader' ? 'reader' as const : null, monitorLimit: 2 };
     // This test-only query substitutes trusted policy snapshots from an untyped consumer.
     const query = new URL(request.url).searchParams;
     const policy: Policy | undefined = query.has('test-policy') ? JSON.parse(query.get('test-policy')!) : requestPause.get(host);
@@ -49,6 +50,12 @@ export default {
         try { createHostedWorker({ contractVersion: '2', resolve: () => null, contexts: () => [] }); }
         catch { return new Response(null, { status: 409 }); }
         return new Response(null, { status: 200 });
+      }
+      if (url.pathname === '/test-operator-permission') {
+        const value = url.searchParams.get('value');
+        if (value === 'reset') operatorPermissions.delete(url.hostname);
+        else operatorPermissions.set(url.hostname, value === 'reader' ? 'reader' : value === 'editor' ? 'editor' : null);
+        return new Response(null, { status: 204 });
       }
       if (url.pathname === '/test-contexts') {
         contextOverride = url.searchParams.has('value') ? JSON.parse(url.searchParams.get('value')!) : undefined;
