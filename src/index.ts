@@ -182,15 +182,25 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     this.ctx.storage.kv.put("context", state);
   }
 
-  configure(configuration: Configuration | { pageName: string }, expectedMonitorId: string | null = null) {
+  configure(value: unknown, expectedMonitorId: string | null = null) {
+    if (!value || typeof value !== "object") return undefined;
+    const fields = value as Record<string, unknown>;
     const state = this.read();
-    // Keep the original single-Monitor save contract for existing clients.
-    if ("name" in configuration) {
+    let configuration: Configuration | { pageName: string };
+    if (Object.keys(fields).length === 1 && "pageName" in fields) {
+      if (typeof fields.pageName !== "string" || !fields.pageName.trim() || fields.pageName.length > 120) return undefined;
+      configuration = { pageName: fields.pageName.trim() };
+    } else {
+      // Keep the original single-Monitor save contract for existing clients.
       const monitor = state.monitors[0];
       // A legacy save must never move to a sibling while the request is in flight.
       if ((monitor?.id ?? null) !== expectedMonitorId) return null;
-      if (monitor && monitor.kind !== configuration.kind) return undefined;
-      const { pageName: _pageName, ...settings } = configuration;
+      const schedule = monitor?.scheduleMode === "calendar" && fields.scheduleMode === undefined
+        ? { scheduleMode: monitor.scheduleMode, cron: monitor.cron, timezone: monitor.timezone } : {};
+      const parsed = parseConfiguration({ ...schedule, ...fields }, monitor?.kind);
+      if (!parsed || !validKindFields(fields, parsed.kind) || (monitor && monitor.kind !== parsed.kind)) return undefined;
+      configuration = parsed;
+      const { pageName: _pageName, ...settings } = parsed;
       if (monitor) this.applyEdit(monitor, settings);
       else state.monitors.push(this.newMonitor(settings));
     }
@@ -923,14 +933,8 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     }
     if (c.get("resolved")) return Response.json({ error: "Use the Monitor collection" }, { status: 400 });
     const selectedMonitor = c.get("selectedMonitor");
-    const legacyFields = value as Record<string, unknown>;
-    const schedule = selectedMonitor && "scheduleMode" in selectedMonitor && selectedMonitor.scheduleMode === "calendar" && legacyFields?.scheduleMode === undefined
-      ? { scheduleMode: selectedMonitor.scheduleMode, cron: selectedMonitor.cron, timezone: selectedMonitor.timezone } : {};
-    const configuration = parseConfiguration({ ...schedule, ...legacyFields }, selectedMonitor?.kind);
-    if (!configuration || !validKindFields(value as Record<string, unknown>, configuration.kind))
-      return Response.json({ error: "Enter a page name, Monitor name and HTTP(S)/TCP target or Heartbeat settings" }, { status: 400 });
-    const result = await context.configure(configuration, selectedMonitor?.id ?? null);
-    if (result === undefined) return Response.json({ error: "Monitor type cannot change" }, { status: 400 });
+    const result = await context.configure(value, selectedMonitor?.id ?? null);
+    if (result === undefined) return Response.json({ error: "Enter a page name, Monitor name and HTTP(S)/TCP target or Heartbeat settings; type cannot change" }, { status: 400 });
     return result ? operatorResponse(c, result) : Response.json({ error: "Monitor changed; reload before saving" }, { status: 409 });
   });
   for (const path of operatorPaths) app.all(path, () => methodNotAllowed(

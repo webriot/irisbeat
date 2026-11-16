@@ -16,6 +16,15 @@ test('operator configures Calendar HTTP with authoritative live explanation and 
   await expect(page.locator('#schedule-explanation')).toContainText('day-of-month 15 OR Monday');
   await expect(page.locator('#schedule-occurrences time')).toHaveCount(3);
   await expect(page.locator('#schedule-occurrences')).toContainText('America/New_York');
+  await page.getByLabel('Cron', { exact: true }).fill('0 9 */1 * 1');
+  await expect(page.locator('#schedule-explanation')).toHaveText('At 09:00; Monday; every month (America/New_York).');
+  await page.getByLabel('Cron', { exact: true }).fill('0 9 */2 * 1');
+  await expect(page.locator('#schedule-explanation')).toContainText(' AND Monday');
+  await page.getByLabel('Cron', { exact: true }).fill('0 9 15 * */2');
+  await expect(page.locator('#schedule-explanation')).toContainText('day-of-month 15 AND Sunday, Tuesday, Thursday, Saturday');
+  await page.getByLabel('Cron', { exact: true }).fill('0 0 31 2 */1');
+  await expect(page.locator('#schedule-explanation')).toContainText('no possible calendar date');
+  await expect(page.locator('#schedule-occurrences time')).toHaveCount(0);
   await page.getByLabel('Cron', { exact: true }).fill('@daily');
   await expect(page.locator('#schedule-explanation')).toContainText('five cron fields');
   await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();

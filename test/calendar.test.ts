@@ -47,6 +47,63 @@ it('supports lists, ranges, steps, Sunday 7 and OR day semantics with explicit e
   expect(await (await preview('0 0 * * 7', 'UTC', '2026-11-13T00:00:00Z')).json()).toMatchObject({ explanation: expect.stringContaining('Sunday') });
 });
 
+it.each([
+  ['0 9 */1 * 1', 'Monday', ['2026-11-23', '2026-11-30', '2026-12-07']],
+  ['0 9 23 * */1', 'day-of-month 23', ['2026-11-23', '2026-12-23', '2027-01-23']],
+  ['0 9 */2 * 1', ' AND Monday', ['2026-11-23', '2026-12-07', '2026-12-21']],
+  ['0 9 20-23 * */2', ' AND Sunday, Tuesday, Thursday, Saturday', ['2026-11-21', '2026-11-22', '2026-12-20']],
+  ['0 9 */2 * */2', ' AND Sunday, Tuesday, Thursday, Saturday', ['2026-11-17', '2026-11-19', '2026-11-21']],
+])('uses wildcard day matching for preview and dispatch: %s', async (cron, explanation, dates) => {
+  const after = '2026-11-16T10:00:00Z';
+  const occurrences = dates.map(date => Date.parse(date + 'T09:00:00Z'));
+  const response = await preview(cron, 'UTC', after);
+  expect(response.status).toBe(200);
+  const result = await response.json();
+  expect(result).toMatchObject({ explanation: expect.stringContaining(explanation), occurrences });
+  expect(result).toMatchObject({ explanation: expect.not.stringContaining(' OR ') });
+  vi.spyOn(Date, 'now').mockReturnValue(Date.parse(after));
+  expect((await create({ cron })).status).toBe(201);
+  let attempts = 0;
+  network.use(http.get('https://target.example/', () => { attempts++; return new HttpResponse(null, { status: 204 }); }));
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  await tick(occurrences[0] - 60_000);
+  expect(attempts).toBe(0);
+  for (const [index, at] of occurrences.entries()) {
+    await tick(at);
+    await tick(at);
+    expect(attempts).toBe(index + 1);
+    await tick(occurrences[index + 1] === undefined ? at + 60_000 : occurrences[index + 1] - 60_000);
+    expect(attempts).toBe(index + 1);
+  }
+});
+
+it('accepts wildcard-step leap days beyond a single leap year and the skipped-century gap', async () => {
+  const after = '2088-03-01T00:00:00Z';
+  const cron = '0 0 29 2 */7'; // Sunday leap days: the skipped century creates a forty-year gap.
+  const response = await preview(cron, 'UTC', after);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({ occurrences: [Date.parse('2128-02-29T00:00:00Z'), Date.parse('2156-02-29T00:00:00Z'), Date.parse('2184-02-29T00:00:00Z')] });
+  vi.spyOn(Date, 'now').mockReturnValue(Date.parse(after));
+  expect((await create({ cron })).status).toBe(201);
+  let attempts = 0;
+  network.use(http.get('https://target.example/', () => { attempts++; return new HttpResponse(null, { status: 204 }); }));
+  await tick(Date.parse('2128-02-28T00:00:00Z'));
+  expect(attempts).toBe(0);
+  await tick(Date.parse('2128-02-29T00:00:00Z'));
+  expect(attempts).toBe(1);
+});
+
+it('rejects impossible wildcard-step dates without saving any legacy or collection fields', async () => {
+  await create();
+  const before = await read();
+  for (const cron of ['0 0 31 2 */1', '0 0 31 2 */2']) {
+    expect((await preview(cron)).status).toBe(400);
+    expect((await request('/api/operator/monitors/' + before.monitor!.id, 'PATCH', { name: 'Invalid', cron })).status).toBe(400);
+    expect((await request('/api/operator', 'PUT', { pageName: 'Invalid', name: 'Invalid', url: 'https://target.example/', cron })).status).toBe(400);
+    expect(await read()).toEqual(before);
+  }
+});
+
 it('previews only first occurrences across hour and half-hour fall-back transitions', async () => {
   expect(await (await preview('30 1 * * *', 'America/New_York', '2026-11-01T04:00:00Z')).json()).toMatchObject({ occurrences: [Date.parse('2026-11-01T05:30:00Z'), Date.parse('2026-11-02T06:30:00Z'), Date.parse('2026-11-03T06:30:00Z')] });
   expect(await (await preview('30 1 * * *', 'America/New_York', '2026-11-01T05:31:00Z')).json()).toMatchObject({ occurrences: [Date.parse('2026-11-02T06:30:00Z'), Date.parse('2026-11-03T06:30:00Z'), Date.parse('2026-11-04T06:30:00Z')] });
@@ -215,6 +272,35 @@ it('preserves Calendar settings through legacy omitted-field saves and rejects i
     expect((await request('/api/operator/monitors/' + id, 'PATCH', { name: 'Invalid', ...patch })).status).toBe(400);
     expect(await read()).toEqual(before);
   }
+});
+
+it('preserves the latest Calendar schedule, due time and detector progress during a streamed legacy save', async () => {
+  const start = Date.UTC(2026, 10, 16, 8);
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+  await create({ cron: '0 9 * * *' });
+  const id = (await read()).monitor!.id;
+  let attempts = 0;
+  network.use(http.get('https://target.example/', () => { attempts++; return new HttpResponse(null, { status: 503 }); }));
+  // A zero-sized queue starts pulling only when the route reads the body, after selecting its Monitor.
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      expect((await request('/api/operator/monitors/' + id, 'PATCH', { cron: '0 10 * * *', timeoutSeconds: 5 })).status).toBe(200);
+      await tick(Date.UTC(2026, 10, 16, 10));
+      expect((await read()).incidents).toEqual([]);
+      clock.mockReturnValue(Date.UTC(2026, 10, 17, 11)); // The next due occurrence is now overdue.
+      controller.enqueue(new TextEncoder().encode(JSON.stringify({ pageName: 'Legacy', name: 'Legacy Calendar', url: 'https://target.example/' })));
+      controller.close();
+    },
+  }, { highWaterMark: 0 });
+  const saved = await worker.fetch(new Request('https://irisbeat.example/api/operator', {
+    method: 'PUT', headers: { authorization: 'Bearer test-installation-secret', 'Content-Type': 'application/json' }, body,
+  }), env);
+  expect(saved.status).toBe(200);
+  expect((await read()).monitor).toMatchObject({ id, name: 'Legacy Calendar', cron: '0 10 * * *', timeoutSeconds: 5 });
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  await tick(Date.UTC(2026, 10, 17, 11));
+  expect(attempts).toBe(2); // An omitted save must not move the overdue Check to tomorrow.
+  expect((await read()).incidents).toMatchObject([{ openedAt: Date.UTC(2026, 10, 17, 11), closedAt: null }]);
 });
 
 it('does not seed a changed schedule with a late starting-configuration result', async () => {

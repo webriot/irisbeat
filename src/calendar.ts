@@ -31,15 +31,16 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
     const parts = Object.fromEntries(formatter.formatToParts(at).map(part => [part.type, part.value]));
     return Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute), Number(parts.second));
   };
+  const dayOr = !sources[2].includes('*') && !sources[4].includes('*');
   const matchesDay = (date: Date) => {
     if (!fields[3].includes(date.getUTCMonth() + 1)) return false;
     const dom = fields[2].includes(date.getUTCDate());
     const dow = fields[4].includes(date.getUTCDay());
-    return sources[2] === '*' ? dow : sources[4] === '*' ? dom : dom || dow;
+    return dayOr ? dom || dow : dom && dow;
   };
-  // With OR day semantics, one leap year covers all possible month/day combinations.
+  // A Gregorian cycle covers every month/date/weekday combination, including wildcard steps.
   let possible = false;
-  for (let day = Date.UTC(2000, 0, 1); day < Date.UTC(2001, 0, 1); day += DAY) {
+  for (let day = Date.UTC(2000, 0, 1); day < Date.UTC(2400, 0, 1); day += DAY) {
     if (matchesDay(new Date(day))) { possible = true; break; }
   }
   if (!possible) throw new Error('Cron expression has no possible calendar date');
@@ -47,8 +48,8 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
     const result: number[] = [];
     const localAfter = local(after);
     const start = Math.floor(localAfter / DAY) * DAY;
-    // Eight years covers the longest leap-day gap, including a skipped century leap year.
-    for (let day = start; day <= start + (count + 1) * 8 * 366 * DAY; day += DAY) {
+    // Wildcard day steps can filter leap days by weekday; search a full Gregorian cycle per occurrence.
+    for (let day = start; day <= start + count * 400 * 366 * DAY; day += DAY) {
       if (!matchesDay(new Date(day))) continue;
       const offsets = new Set<number>();
       for (const delta of [-2, -1, 0, 1, 2]) {
@@ -76,7 +77,9 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
     : `${sources[0] === '*' ? 'Every minute' : 'At minutes ' + list(0)}; ${sources[1] === '*' ? 'every hour' : 'hours ' + list(1)}`;
   const dom = 'day-of-month ' + list(2);
   const dow = fields[4].map(value => names[value]).join(', ');
-  const days = sources[2] === '*' && sources[4] === '*' ? 'every day'
-    : sources[2] === '*' ? dow : sources[4] === '*' ? dom : dom + ' OR ' + dow;
+  const allDom = fields[2].length === 31;
+  const allDow = fields[4].length === 7;
+  const days = dayOr ? dom + ' OR ' + dow
+    : allDom && allDow ? 'every day' : allDom ? dow : allDow ? dom : dom + ' AND ' + dow;
   return { cron: sources.join(' '), timezone, next, explanation: `${time}; ${days}; ${sources[3] === '*' ? 'every month' : 'months ' + list(3)} (${timezone}).` };
 }
