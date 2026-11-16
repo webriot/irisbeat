@@ -2,6 +2,7 @@
 /** @jsxRuntime automatic */
 /** @jsxImportSource hono/jsx */
 import type { AvailabilityHistory, Status } from "./index";
+import { createOperatorSession } from "./operator-session";
 import type { Child } from "hono/jsx";
 
 const stateLabel = {
@@ -513,6 +514,7 @@ h1 { margin: 24px 0 20px; font-size: 24px; }
 `;
 
 export const operatorScript = `
+const createOperatorSession = ${createOperatorSession.toString()};
 const historyMarkup = ${historyMarkup.toString()};
 const byId = id => document.getElementById(id);
 const login = byId('login');
@@ -566,33 +568,10 @@ for (const input of form.querySelectorAll('[data-duration]')) {
     displayDuration(input, seconds, control.value);
   });
 }
-let secret = '';
 let savedSettings = {};
 let editingId = null;
-let busy = false;
 let hosted = false;
 let monitorIds = new Set();
-let requestVersion = 0;
-let sessionGeneration = 0;
-let operatorUpdates;
-let pendingRefresh = false;
-function startOperatorUpdates() {
-  if (operatorUpdates) return;
-  const session = sessionGeneration;
-  operatorUpdates = liveSnapshots('/api/operator/events', current => run('/api/operator', 'GET', undefined, undefined, current), async () => {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
-    try {
-      const response = await fetch('/api/operator/events/ticket', { method: 'POST', headers: { Authorization: 'Bearer ' + secret }, signal: controller.signal });
-      if (session !== sessionGeneration) throw new Error('Session ended');
-      if (response.status === 401 || response.status === 403) { signOut(); message.textContent = 'Unauthorized'; throw new Error('Unauthorized'); }
-      if (!response.ok) throw new Error('Subscription unavailable');
-      const grant = await response.json();
-      if (session !== sessionGeneration) throw new Error('Session ended');
-      return grant.ticket;
-    } finally { clearTimeout(timeout); }
-  });
-}
 function updateDeleted() {
   const missing = editingId !== null && !monitorIds.has(editingId);
   byId('monitor-deleted').hidden = !missing;
@@ -631,7 +610,7 @@ function edit(monitor = null) {
   byId('name').focus();
 }
 function focusActions(id) { (document.getElementById('actions-' + id) || byId('new-monitor')).focus(); }
-function cancelEdit() { previewSequence++; clearTimeout(previewTimer); byId('cron').setCustomValidity(''); const id = editingId; byId('heartbeat-credential').textContent = ''; editingId = null; form.reset(); form.hidden = true; byId('new-monitor-panel').append(form); focusActions(id); }
+function cancelEdit() { session.cancelPreview(); byId('cron').setCustomValidity(''); const id = editingId; byId('heartbeat-credential').textContent = ''; editingId = null; form.reset(); form.hidden = true; byId('new-monitor-panel').append(form); focusActions(id); }
 function localMinute(date) { return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16); }
 function declareMaintenance(monitor) {
   maintenanceForm.querySelector('label').textContent = 'End time (' + browserTimeZone + ')';
@@ -647,12 +626,10 @@ function declareMaintenance(monitor) {
   document.getElementById('history-' + monitor.id).append(maintenanceForm);
   maintenanceForm.hidden = false; updateDeleted(); byId('maintenance-end').focus();
 }
-function signOut() {
-  ++sessionGeneration; ++requestVersion; busy = false; pendingRefresh = false;
-  operatorUpdates?.stop(); operatorUpdates = undefined;
+function clearSession() {
   document.querySelectorAll('button, input, select').forEach(control => { control.disabled = false; });
   monitorIds.clear(); selectedHistoryDays.clear(); byId('stale').hidden = true;
-  secret = ''; savedSettings = {}; cancelEdit(); byId('heartbeat-path').textContent = ''; maintenanceForm.reset(); maintenanceForm.removeAttribute('data-monitor-id'); byId('maintenance-heading').textContent = 'Maintenance'; maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
+  savedSettings = {}; cancelEdit(); byId('heartbeat-path').textContent = ''; maintenanceForm.reset(); maintenanceForm.removeAttribute('data-monitor-id'); byId('maintenance-heading').textContent = 'Maintenance'; maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
   showSettings(false); byId('operator-navigation').hidden = true;
   byId('new-monitor-panel').append(maintenanceForm);
   byId('monitor-rows').replaceChildren(); byId('incidents').replaceChildren();
@@ -746,51 +723,48 @@ function render(data, savedField) {
   if (focused !== document.body && !focused.isConnected) byId(byId('new-monitor').hidden ? 'refresh' : 'new-monitor').focus();
 }
 
-async function run(path = '/api/operator', method = 'GET', body, after, current = () => true) {
-  const reading = method === 'GET';
-  if (busy) { if (reading) pendingRefresh = true; return; }
-  const version = ++requestVersion;
-  const session = sessionGeneration;
-  const disabled = [...document.querySelectorAll('button, input, select')].filter(control => !control.disabled && control.id !== 'logout');
-  if (!reading) { busy = true; disabled.forEach(control => { control.disabled = true; }); }
-  if (!reading) message.textContent = '';
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10000);
-  try {
-    const response = await fetch(path, {
-      signal: controller.signal,
-      method, headers: { Authorization: 'Bearer ' + secret, 'Content-Type': 'application/json' },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) })
-    });
-    if (session !== sessionGeneration) return;
-    if (response.status === 401 || (reading && response.status === 403)) { signOut(); message.textContent = 'Unauthorized'; return; }
-    if (version !== requestVersion) return;
-    const data = await response.json();
-    if (session !== sessionGeneration || version !== requestVersion) return;
-    if (!response.ok) throw new Error(data.error || 'Request failed');
-    if (reading && !current()) return;
+const session = createOperatorSession(liveSnapshots, {
+  received(data, savedField) {
     byId('stale').hidden = true;
-    if (data.secret) { byId('heartbeat-credential').textContent = 'Bearer ' + data.secret; }
-    else render(data, method === 'PUT' ? (path === '/api/operator' ? 'pageName' : path === '/api/operator/webhook' ? 'webhookUrl' : undefined) : undefined);
-    startOperatorUpdates();
-    if (after) after(data);
-    if (method !== 'GET') message.textContent = method === 'DELETE' ? (path.endsWith('/maintenance') ? 'Maintenance ended' : 'Deleted') : 'Saved';
-  } catch (error) {
-    if (version === requestVersion) {
-      if (reading && !editor.hidden) byId('stale').hidden = false;
-      else message.textContent = error.message;
-    }
-    return false;
-  } finally {
-    clearTimeout(timeout);
-    if (!reading && session === sessionGeneration) {
-      busy = false; disabled.forEach(control => { control.disabled = false; });
+    if (data.secret) byId('heartbeat-credential').textContent = 'Bearer ' + data.secret;
+    else render(data, savedField);
+  },
+  signedOut: clearSession,
+  failed(error, reading) {
+    if (reading && !editor.hidden) byId('stale').hidden = false;
+    else message.textContent = error;
+  },
+  writing() {
+    const disabled = [...document.querySelectorAll('button, input, select')].filter(control => !control.disabled && control.id !== 'logout');
+    disabled.forEach(control => { control.disabled = true; });
+    message.textContent = '';
+    return () => {
+      disabled.forEach(control => { control.disabled = false; });
       updateKind(); updateDeleted();
-      if (pendingRefresh) { pendingRefresh = false; operatorUpdates?.sync(); }
       if (!editor.hidden && document.activeElement === document.body) byId(byId('new-monitor').hidden ? 'refresh' : 'new-monitor').focus();
-    }
-  }
-}
+    };
+  },
+  saved(path, method) {
+    message.textContent = method === 'DELETE' ? (path.endsWith('/maintenance') ? 'Maintenance ended' : 'Deleted') : 'Saved';
+  },
+  previewed(data) {
+    byId('schedule-explanation').textContent = data.explanation;
+    const format = new Intl.DateTimeFormat(undefined, { timeZone: data.timezone, dateStyle: 'medium', timeStyle: 'long' });
+    byId('schedule-occurrences').replaceChildren(...data.occurrences.map(at => {
+      const item = document.createElement('li');
+      const time = document.createElement('time');
+      time.dataset.schedulePreview = '';
+      time.dateTime = new Date(at).toISOString();
+      time.textContent = format.format(at) + ' (' + data.timezone + ')';
+      item.append(time); return item;
+    }));
+  },
+  previewFailed(error) {
+    byId('schedule-explanation').textContent = error;
+    byId('cron').setCustomValidity(error);
+  },
+});
+const run = session.run;
 function updateKind() {
   const kind = byId('kind').value;
   const heartbeat = kind === 'heartbeat';
@@ -820,42 +794,15 @@ function updateKind() {
   byId('intervalSeconds-unit').setAttribute('aria-label', heartbeat ? 'Expectation unit' : 'Interval unit');
   document.querySelector('label[for="recoveryThreshold"]').textContent = heartbeat ? calendar ? 'Consecutive successful occurrences' : 'Recovery receipts' : 'Consecutive successes';
 }
-let previewSequence = 0;
-let previewTimer;
-async function previewSchedule() {
-  const sequence = ++previewSequence;
-  const session = sessionGeneration;
-  clearTimeout(previewTimer);
+function previewSchedule() {
   byId('cron').setCustomValidity('');
   byId('schedule-explanation').textContent = '';
   byId('schedule-occurrences').replaceChildren();
-  if (byId('scheduleMode').value !== 'calendar' || !secret) return;
   const cron = byId('cron').value;
   const timezone = byId('timezone').value;
-  previewTimer = setTimeout(async () => {
-    try {
-      const response = await fetch('/api/operator/schedule-preview', { method: 'POST', headers: { Authorization: 'Bearer ' + secret, 'Content-Type': 'application/json' }, body: JSON.stringify({ cron, timezone, ...(byId('kind').value === 'heartbeat' ? { graceSeconds: validateDuration(byId('graceSeconds')) } : {}) }) });
-      if (session !== sessionGeneration) return;
-      if (response.status === 401) { signOut(); message.textContent = 'Unauthorized'; return; }
-      const data = await response.json();
-      if (session !== sessionGeneration || sequence !== previewSequence) return;
-      if (!response.ok) throw new Error(data.error || 'Preview unavailable');
-      byId('schedule-explanation').textContent = data.explanation;
-      const format = new Intl.DateTimeFormat(undefined, { timeZone: data.timezone, dateStyle: 'medium', timeStyle: 'long' });
-      byId('schedule-occurrences').replaceChildren(...data.occurrences.map(at => {
-        const item = document.createElement('li');
-        const time = document.createElement('time');
-        time.dataset.schedulePreview = '';
-        time.dateTime = new Date(at).toISOString();
-        time.textContent = format.format(at) + ' (' + data.timezone + ')';
-        item.append(time); return item;
-      }));
-    } catch (error) {
-      if (sequence !== previewSequence) return;
-      byId('schedule-explanation').textContent = error.message;
-      byId('cron').setCustomValidity(error.message);
-    }
-  }, 200);
+  session.preview(byId('scheduleMode').value !== 'calendar' ? null : () => ({
+    cron, timezone, ...(byId('kind').value === 'heartbeat' ? { graceSeconds: validateDuration(byId('graceSeconds')) } : {}),
+  }));
 }
 for (const field of ['cron', 'timezone', 'graceSeconds']) byId(field).addEventListener('input', previewSchedule);
 byId('graceSeconds-unit').addEventListener('change', previewSchedule);
@@ -863,8 +810,8 @@ byId('scheduleMode').addEventListener('change', () => { updateKind(); previewSch
 document.getElementById('kind').addEventListener('change', () => { updateKind(); previewSchedule(); });
 updateKind();
 login.addEventListener('submit', async event => {
-  event.preventDefault(); ++sessionGeneration; secret = byId('secret').value;
-  await run(); byId('secret').value = '';
+  event.preventDefault();
+  await session.signIn(byId('secret').value); byId('secret').value = '';
   if (!editor.hidden) byId(byId('new-monitor').hidden ? 'refresh' : 'new-monitor').focus();
 });
 form.addEventListener('submit', async event => {
@@ -922,5 +869,5 @@ byId('new-monitor').addEventListener('click', () => edit());
 byId('rotate-heartbeat').addEventListener('click', () => { if (confirm('Replace this Monitor’s heartbeat secret?')) run('/api/operator/monitors/' + encodeURIComponent(editingId) + '/heartbeat-secret', 'POST'); });
 byId('cancel-edit').addEventListener('click', cancelEdit);
 byId('refresh').addEventListener('click', () => run());
-byId('logout').addEventListener('click', signOut);
+byId('logout').addEventListener('click', session.signOut);
 `;
