@@ -328,7 +328,7 @@ it("presents the selected Status ledger with separate operator Settings", async 
   await tick(0);
   const page = await (await request("/")).text();
   expect(page).toContain("All services operational");
-  expect(page).toContain('<article aria-labelledby="monitor-name">');
+  expect(page).toMatch(/<article[^>]*aria-labelledby="monitor-name"/);
   expect(page.indexOf("All services operational")).toBeLessThan(
     page.indexOf('id="monitor-name"'),
   );
