@@ -322,13 +322,18 @@ function edit(monitor = null) {
   byId('name').focus();
 }
 function cancelEdit() { byId('heartbeat-credential').textContent = ''; editingId = null; form.reset(); form.hidden = true; }
+function localMinute(date) { return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16); }
 function declareMaintenance(monitor) {
   maintenanceForm.querySelector('label').textContent = 'End time (' + browserTimeZone + ')';
   maintenanceForm.dataset.monitorId = monitor.id;
   byId('maintenance-heading').textContent = monitor.name + ' — Maintenance';
   byId('save-maintenance').textContent = monitor.maintenance ? 'Replace Maintenance' : 'Declare Maintenance';
   const end = new Date(monitor.maintenance?.endsAt ?? Date.now() + 3600000);
-  byId('maintenance-end').value = new Date(end.getTime() - end.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  const input = byId('maintenance-end');
+  input.value = localMinute(end);
+  input.dataset.originalValue = input.value;
+  input.dataset.originalInstant = String(end.getTime());
+  input.setCustomValidity('');
   maintenanceForm.hidden = false; byId('maintenance-end').focus();
 }
 function signOut() {
@@ -455,8 +460,25 @@ form.addEventListener('submit', async event => {
 });
 maintenanceForm.addEventListener('submit', async event => {
   event.preventDefault();
-  await run('/api/operator/monitors/' + encodeURIComponent(maintenanceForm.dataset.monitorId) + '/maintenance', 'PUT', { endsAt: new Date(byId('maintenance-end').value).getTime() }, () => { maintenanceForm.hidden = true; });
+  const input = byId('maintenance-end');
+  let endsAt = Number(input.dataset.originalInstant);
+  if (input.value !== input.dataset.originalValue) {
+    const end = new Date(input.value);
+    // Offset changes around the entered day expose a second occurrence of the same local minute.
+    const ambiguous = Number.isFinite(end.getTime()) && [-86400000, 86400000].some(delta => {
+      const offsetChange = new Date(end.getTime() + delta).getTimezoneOffset() - end.getTimezoneOffset();
+      return offsetChange !== 0 && localMinute(new Date(end.getTime() + offsetChange * 60000)) === input.value;
+    });
+    if (!Number.isFinite(end.getTime()) || localMinute(end) !== input.value || ambiguous) {
+      input.setCustomValidity('Choose an unambiguous local time that exists in ' + browserTimeZone + '.');
+      input.reportValidity();
+      return;
+    }
+    endsAt = end.getTime();
+  }
+  await run('/api/operator/monitors/' + encodeURIComponent(maintenanceForm.dataset.monitorId) + '/maintenance', 'PUT', { endsAt }, () => { maintenanceForm.hidden = true; });
 });
+byId('maintenance-end').addEventListener('input', event => event.target.setCustomValidity(''));
 byId('cancel-maintenance').addEventListener('click', () => { maintenanceForm.hidden = true; });
 webhook.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator/webhook', 'PUT', { url: byId('webhookUrl').value }); });
 pageForm.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator', 'PUT', { pageName: byId('pageName').value }); });

@@ -149,3 +149,37 @@ test('fall daylight-saving repeated hours retain distinct exact instants', async
   await expect(page.locator('time').nth(1)).toHaveAttribute('datetime', '2026-11-01T09:30:00.000Z');
   await context.close();
 });
+
+
+test('Maintenance preserves an unchanged fold instant and rejects gap or ambiguous edits', async ({ browser }) => {
+  const context = await browser.newContext({ timezoneId: 'America/Los_Angeles' });
+  const page = await context.newPage();
+  const data = snapshot();
+  Object.assign(data.monitors[0], { maintenance: { endsAt: Date.parse('2027-11-07T09:30:25Z') } });
+  const writes: unknown[] = [];
+  await page.route('**/api/operator', route => route.fulfill({ json: data }));
+  await page.route('**/web/maintenance', route => {
+    writes.push(route.request().postDataJSON());
+    return route.fulfill({ json: data });
+  });
+  await page.goto('/operator');
+  await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await page.getByRole('button', { name: 'Replace Maintenance Website', exact: true }).click();
+  await expect(page.locator('#maintenance-end')).toHaveValue('2027-11-07T01:30');
+  await page.locator('#save-maintenance').click();
+  await expect(page.locator('#maintenance')).toBeHidden();
+  expect(writes).toEqual([{ endsAt: Date.parse('2027-11-07T09:30:25Z') }]);
+  await page.getByRole('button', { name: 'Replace Maintenance Website', exact: true }).click();
+  for (const value of ['2027-03-14T02:30', '2027-11-07T01:45']) {
+    await page.locator('#maintenance-end').fill(value);
+    await page.locator('#save-maintenance').click();
+    await expect(page.locator('#maintenance-end')).toHaveJSProperty('validationMessage', 'Choose an unambiguous local time that exists in America/Los_Angeles.');
+    expect(writes).toHaveLength(1);
+  }
+  await page.locator('#maintenance-end').fill('2027-11-07T02:30');
+  await page.locator('#save-maintenance').click();
+  await expect(page.locator('#maintenance')).toBeHidden();
+  expect(writes[1]).toEqual({ endsAt: Date.parse('2027-11-07T10:30:00Z') });
+  await context.close();
+});
