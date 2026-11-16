@@ -97,7 +97,8 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
       }
     },
     cancelPreview() {
-      ++previewSequence; clearTimeout(previewTimer);
+      ++previewSequence;
+      if (previewTimer !== undefined) clearTimeout(previewTimer);
     },
     preview(input: (() => ScheduleInput) | null) {
       session.cancelPreview();
