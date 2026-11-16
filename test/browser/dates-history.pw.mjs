@@ -61,7 +61,7 @@ for (const scenario of [
       await expect(page.locator('#maintenance-end')).toHaveValue(scenario.beforeLocal);
       await page.locator('#maintenance-end').fill(scenario.afterLocal);
       await page.locator('#save-maintenance').click();
-      expect(writes.at(-1)).toEqual({ endsAt: Date.parse(scenario.after) });
+      await expect.poll(() => writes.at(-1)).toEqual({ endsAt: Date.parse(scenario.after) });
     });
   });
 }
@@ -104,7 +104,7 @@ for (const scenario of [
       await page.getByRole('button', { name: 'Replace Maintenance Website', exact: true }).click();
       await expect(page.getByLabel('End time (' + (scenario.zoneLabel || scenario.timezoneId) + ')', { exact: true })).toHaveValue(scenario.local);
       await page.locator('#save-maintenance').click();
-      expect(writes.at(-1)).toEqual({ endsAt: at });
+      await expect.poll(() => writes.at(-1)).toEqual({ endsAt: at });
     });
     test('inspects UTC buckets through one keyboard entry and keeps the selection on refresh', async ({ page }) => {
       const data = snapshot();
