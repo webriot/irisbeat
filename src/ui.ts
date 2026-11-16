@@ -343,6 +343,7 @@ let session = 0;
 let monitors = [];
 let canEdit = false;
 let hosted = false;
+// A reopened editor is a new draft even when its values match.
 let panelVersion = 0;
 let panelMonitorId = null;
 let returnMonitorId = null;
@@ -470,7 +471,16 @@ function render(data) {
         });
       }]] : []),
       [monitor.published ? 'Unpublish' : 'Publish', () => run(path, 'PATCH', { published: !monitor.published })],
-      ['Delete', () => { const version = panelVersion; if (confirm('Delete “' + monitor.name + '” (' + monitor.id + ')? Checks and publication will stop. Incident history will be retained.')) run(path, 'DELETE', undefined, () => { if (version !== panelVersion) return; if (editingId === monitor.id) cancelEdit(); if (maintenanceForm.dataset.monitorId === monitor.id) maintenanceForm.hidden = true; }); }]
+      ['Delete', () => {
+        const version = panelVersion;
+        const monitorDraft = JSON.stringify([...new FormData(form)]);
+        const maintenanceDraft = byId('maintenance-end').value;
+        if (confirm('Delete “' + monitor.name + '” (' + monitor.id + ')? Checks and publication will stop. Incident history will be retained.')) run(path, 'DELETE', undefined, () => {
+          if (version !== panelVersion) return;
+          if (editingId === monitor.id && monitorDraft === JSON.stringify([...new FormData(form)])) cancelEdit();
+          if (maintenanceForm.dataset.monitorId === monitor.id && maintenanceDraft === byId('maintenance-end').value) maintenanceForm.hidden = true;
+        });
+      }]
     ] : [])) {
       const button = document.createElement('button'); button.type = 'button'; button.textContent = label;
       button.setAttribute('aria-label', label + ' ' + monitor.name);

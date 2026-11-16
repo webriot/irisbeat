@@ -332,3 +332,20 @@ it('does not expose a pending Heartbeat credential in a different inline draft',
   expect(name.value).toBe('Next draft');
   expect(doc.activeElement).toBe(name);
 });
+
+it.each(['Monitor', 'Maintenance'])('keeps a %s draft changed while Delete is pending and blocks saving the deleted Monitor', async kind => {
+  const { window, doc } = await mount();
+  action(doc, kind === 'Monitor' ? 'Edit Website' : 'Declare Maintenance Website');
+  const input = doc.querySelector<HTMLInputElement>(kind === 'Monitor' ? '#name' : '#maintenance-end')!;
+  const value = kind === 'Monitor' ? 'New draft' : '2030-11-16T12:30';
+  window.eval('window.confirm = () => true');
+  let resolve!: (response: InstanceType<typeof window.Response>) => void;
+  window.fetch = (() => new Promise(done => { resolve = done; })) as typeof window.fetch;
+  action(doc, 'Delete Website');
+  input.value = value; input.focus();
+  resolve(new window.Response(JSON.stringify(snapshot({ monitors: [] })))); await settle();
+  expect(doc.querySelector(kind === 'Monitor' ? '#configuration' : '#maintenance')!.hasAttribute('hidden')).toBe(false);
+  expect(input.value).toBe(value);
+  expect(doc.activeElement).toBe(input);
+  expect(doc.querySelector<HTMLButtonElement>(kind === 'Monitor' ? '#save-monitor' : '#save-maintenance')!.disabled).toBe(true);
+});
