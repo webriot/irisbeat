@@ -328,7 +328,7 @@ it("presents the selected Status ledger with Monitor configuration beside page s
   await tick(0);
   const page = await (await request("/")).text();
   expect(page).toContain("All services operational");
-  expect(page).toContain('<article aria-labelledby="monitor-name">');
+  expect(page).toMatch(/<article data-key="[^"]+" aria-labelledby="monitor-name">/);
   expect(page.indexOf("All services operational")).toBeLessThan(
     page.indexOf('id="monitor-name"'),
   );
@@ -593,7 +593,7 @@ it('saves one context webhook independently and keeps it out of public responses
   await configure();
   await evictDurableObject(env.MONITORING.getByName('personal'));
   expect(await (await request('/api/operator', { headers: { authorization } })).json()).toMatchObject({ webhookUrl: url });
-  for (const path of ['/api/status', '/', '/operator', '/operator.js']) {
+  for (const path of ['/api/status', '/', '/operator', '/operator.js', '/status.js']) {
     expect(await (await request(path)).text()).not.toContain(url);
   }
 });

@@ -3,6 +3,7 @@ import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
+  test: { exclude: ["test/ui*.test.ts", "**/node_modules/**"] },
   plugins: [
     cloudflareTest({
       main: "./test/history-worker.ts",

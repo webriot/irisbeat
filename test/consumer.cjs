@@ -178,7 +178,11 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     }
     deliveries.length = 0; webhooks.length = 0;
     assert.equal((await request('a.example', '/test-unsupported-version')).status, 409);
-    new (require('node:vm').Script)(await (await request('a.example', '/operator.js')).text());
+    for (const path of ['/operator.js', '/status.js']) {
+      const script = await request('a.example', path);
+      assert.equal(script.headers.get('Content-Type'), 'text/javascript; charset=utf-8');
+      new (require('node:vm').Script)(await script.text());
+    }
     await request('a.example', '/api/operator/monitors', 'POST', { name: 'Private API', url: 'https://target.example/', published: false });
     await request('a.example', '/api/operator/webhook', 'PUT', { url: 'https://webhook.example/private-token' });
     await request('b.example', '/api/operator/monitors', 'POST', { name: 'Other API', url: 'https://other.example/', failureThreshold: 100 });
