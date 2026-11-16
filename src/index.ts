@@ -34,6 +34,7 @@ const timingDefaults = {
   recoveryThreshold: 2,
   silenceSeconds: 180,
   recoverySpacingSeconds: 60,
+  graceSeconds: 30,
 };
 const timingBounds = {
   intervalSeconds: [60, 86_400],
@@ -42,6 +43,7 @@ const timingBounds = {
   recoveryThreshold: [1, 100],
   silenceSeconds: [60, 86_400],
   recoverySpacingSeconds: [60, 86_400],
+  graceSeconds: [1, 86_400],
 } as const;
 type Timing = typeof timingDefaults;
 type Target =
@@ -105,6 +107,13 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS observations (
       id INTEGER PRIMARY KEY, monitorId TEXT NOT NULL, at INTEGER NOT NULL, outcome TEXT NOT NULL
     )`);
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS calendar_receipts (
+      monitorId TEXT NOT NULL, occurrence INTEGER NOT NULL, PRIMARY KEY (monitorId, occurrence)
+    )`);
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS calendar_maintenance (
+      id INTEGER PRIMARY KEY, monitorId TEXT NOT NULL, startedAt INTEGER NOT NULL, endsAt INTEGER NOT NULL
+    )`);
+    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS calendar_maintenance_monitor ON calendar_maintenance (monitorId, endsAt)");
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS observations_monitor_at ON observations (monitorId, at)");
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS observations_at ON observations (at)");
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS incidents_opened ON incidents (openedAt DESC, id)");
@@ -176,7 +185,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         monitor.failures = 0;
         monitor.successes = 0;
         monitor.recoveryReceiptAt = null;
-        if (monitor.scheduleMode === "calendar") monitor.nextDue = calendar(monitor.cron, monitor.timezone).next(Date.now())[0];
+        if (monitor.scheduleMode === "calendar") {
+          monitor.nextDue = calendar(monitor.cron, monitor.timezone).next(Date.now())[0];
+          this.resetCalendarEvidence(monitor);
+        }
       }
     }
     this.ctx.storage.kv.put("context", state);
@@ -197,8 +209,9 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       if ((monitor?.id ?? null) !== expectedMonitorId) return null;
       const schedule = monitor?.scheduleMode === "calendar" && fields.scheduleMode === undefined
         ? { scheduleMode: monitor.scheduleMode, cron: monitor.cron, timezone: monitor.timezone } : {};
-      const parsed = parseConfiguration({ ...schedule, ...fields }, monitor?.kind);
-      if (!parsed || !validKindFields(fields, parsed.kind) || (monitor && monitor.kind !== parsed.kind)) return undefined;
+      const grace = monitor?.kind === "heartbeat" && (fields.scheduleMode ?? monitor.scheduleMode) === "calendar" ? { graceSeconds: monitor.graceSeconds } : {};
+      const parsed = parseConfiguration({ ...schedule, ...grace, ...fields }, monitor?.kind);
+      if (!parsed || !validKindFields({ ...fields, scheduleMode: parsed.scheduleMode ?? "interval" }, parsed.kind) || (monitor && monitor.kind !== parsed.kind)) return undefined;
       configuration = parsed;
       const { pageName: _pageName, ...settings } = parsed;
       if (monitor) this.applyEdit(monitor, settings);
@@ -243,6 +256,8 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   private endMaintenance(monitor: Monitor) {
     monitor.maintenance = null;
+    // Calendar catch-up applies the reset at the retained window's chronological boundary.
+    if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") return;
     monitor.failures = 0;
     monitor.successes = 0;
     monitor.recoveryReceiptAt = null;
@@ -253,14 +268,19 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const state = this.read(at);
     const monitor = state.monitors.find(monitor => monitor.id === id);
     if (!monitor) return null;
+    if (!end && (!value || typeof value !== "object" || Array.isArray(value) ||
+        Object.keys(value).length !== 1 || !("endsAt" in value) ||
+        typeof value.endsAt !== "number" || !Number.isSafeInteger(value.endsAt) ||
+        value.endsAt <= at || value.endsAt > 8_640_000_000_000_000)) return undefined;
+    if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
+      // Retain actual overlap, not the replaced window's cancelled future portion.
+      this.ctx.storage.sql.exec("UPDATE calendar_maintenance SET endsAt = MIN(endsAt, ?) WHERE monitorId = ? AND endsAt > ?", at, id, at);
+      if (!end) this.ctx.storage.sql.exec("INSERT INTO calendar_maintenance (monitorId, startedAt, endsAt) VALUES (?, ?, ?)", id, at, (value as { endsAt: number }).endsAt);
+    }
     if (end) {
       if (monitor.maintenance) this.endMaintenance(monitor);
     } else {
-      if (!value || typeof value !== "object" || Array.isArray(value) ||
-          Object.keys(value).length !== 1 || !("endsAt" in value) ||
-          typeof value.endsAt !== "number" || !Number.isSafeInteger(value.endsAt) ||
-          value.endsAt <= at || value.endsAt > 8_640_000_000_000_000) return undefined;
-      monitor.maintenance = { startedAt: at, endsAt: value.endsAt };
+      monitor.maintenance = { startedAt: at, endsAt: (value as { endsAt: number }).endsAt };
       const attempt = this.checking.get(id);
       if (attempt) attempt.maintenance = true;
     }
@@ -268,11 +288,25 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return this.status(true);
   }
 
+  private clearCalendarEvidence(id: string) {
+    this.ctx.storage.sql.exec("DELETE FROM calendar_receipts WHERE monitorId = ?", id);
+    this.ctx.storage.sql.exec("DELETE FROM calendar_maintenance WHERE monitorId = ?", id);
+  }
+
+  private resetCalendarEvidence(monitor: Monitor) {
+    this.clearCalendarEvidence(monitor.id);
+    if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar" && monitor.maintenance) {
+      this.ctx.storage.sql.exec("INSERT INTO calendar_maintenance (monitorId, startedAt, endsAt) VALUES (?, ?, ?)", monitor.id, monitor.maintenance.startedAt, monitor.maintenance.endsAt);
+    }
+  }
+
   private applyEdit(monitor: Monitor, patch: Partial<MonitorConfiguration>) {
-    const changed = (["scheduleMode", "cron", "timezone"] as const).some(key => patch[key] !== undefined && patch[key] !== monitor[key]);
+    const changed = (["scheduleMode", "cron", "timezone", "graceSeconds"] as const).some(key => patch[key] !== undefined && patch[key] !== monitor[key]);
     if (changed) {
       Object.assign(monitor, patch);
       if (monitor.scheduleMode === "interval") { delete monitor.cron; delete monitor.timezone; }
+      this.resetCalendarEvidence(monitor);
+      monitor.recoveryReceiptAt = null;
       monitor.scheduleRevision = (monitor.scheduleRevision ?? 0) + 1;
       monitor.nextDue = monitor.scheduleMode === "calendar" ? calendar(monitor.cron, monitor.timezone).next(Date.now())[0] : Date.now() + monitor.intervalSeconds * 1000;
       monitor.failures = 0;
@@ -288,6 +322,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   remove(id: string) {
     const state = this.read();
     if (!state.monitors.some(monitor => monitor.id === id)) return null;
+    this.clearCalendarEvidence(id);
     state.monitors = state.monitors.filter(monitor => monitor.id !== id);
     this.ctx.storage.kv.put("context", state);
     return this.status(true);
@@ -305,6 +340,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const attempt = state.monitors.find(monitor => monitor.id === id);
     if (!attempt || state.paused) return;
     if (attempt.kind === "heartbeat") {
+      if (attempt.scheduleMode === "calendar") {
+        await this.checkCalendarHeartbeat(id, at);
+        return;
+      }
       if (at >= (attempt.lastSeen ?? attempt.createdAt) + attempt.silenceSeconds * 1000) {
         attempt.recoveryReceiptAt = null;
         await this.record(state, attempt, at, false, 1, attempt.recoveryThreshold);
@@ -359,25 +398,59 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     await this.record(current, monitor, at, success, attempt.failureThreshold, attempt.recoveryThreshold, observation.maintenance, (monitor.scheduleRevision ?? 0) !== (attempt.scheduleRevision ?? 0));
   }
 
+  private calendarChecking = new Set<string>();
+
+  private async checkCalendarHeartbeat(id: string, at: number) {
+    if (this.calendarChecking.has(id)) return;
+    this.calendarChecking.add(id);
+    const initial = this.read(at);
+    const revision = initial.monitors.find(monitor => monitor.id === id)?.scheduleRevision ?? 0;
+    const pauseGeneration = initial.pauseGeneration ?? 0;
+    try {
+      // Persist the cursor with each outcome before delivery; later dispatch resumes the batch.
+      for (let processed = 0; processed < 128; processed++) {
+        const current = this.read(at);
+        const monitor = current.monitors.find(monitor => monitor.id === id);
+        if (!monitor || current.paused || (current.pauseGeneration ?? 0) !== pauseGeneration || monitor.scheduleMode !== "calendar" || (monitor.scheduleRevision ?? 0) !== revision) return;
+        const occurrence = monitor.nextDue;
+        const deadline = occurrence + monitor.graceSeconds * 1000;
+        if (at <= deadline) return;
+        const success = this.ctx.storage.sql.exec("SELECT 1 FROM calendar_receipts WHERE monitorId = ? AND occurrence = ?", id, occurrence).toArray().length > 0;
+        const maintenance = this.ctx.storage.sql.exec("SELECT 1 FROM calendar_maintenance WHERE monitorId = ? AND startedAt <= ? AND endsAt > ? AND endsAt > startedAt LIMIT 1", id, deadline, occurrence).toArray().length > 0;
+        monitor.nextDue = calendar(monitor.cron, monitor.timezone).next(occurrence)[0];
+        const endedBetweenWindows = this.ctx.storage.sql.exec("SELECT 1 FROM calendar_maintenance WHERE monitorId = ? AND endsAt > ? AND endsAt <= ? LIMIT 1", id, monitor.lastResult?.at ?? monitor.createdAt, occurrence).toArray().length > 0;
+        if (maintenance || endedBetweenWindows) { monitor.failures = 0; monitor.successes = 0; }
+        await this.record(current, monitor, deadline, success, 1, monitor.recoveryThreshold, maintenance);
+      }
+    } finally {
+      this.calendarChecking.delete(id);
+    }
+  }
+
   private async record(current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number, maintenance = !!monitor.maintenance, resetProgress = false) {
     if (current.paused) return;
     const pauseGeneration = current.pauseGeneration ?? 0;
-    monitor.lastResult = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" };
-    this.ctx.storage.sql.exec("INSERT INTO observations (monitorId, at, outcome) VALUES (?, ?, ?)", monitor.id, at, monitor.lastResult.outcome);
-    // Bounded cleanup keeps the entire current UTC day and never touches Incidents.
-    this.ctx.storage.sql.exec(
-      "DELETE FROM observations WHERE id IN (SELECT id FROM observations WHERE at < ? ORDER BY at LIMIT 1000)",
-      historyStart(Math.max(at, Date.now())),
-    );
-    if (maintenance) {
-      this.ctx.storage.kv.put("context", current);
-      return;
-    }
-    monitor.failures = success ? 0 : monitor.failures + 1;
-    monitor.successes = success ? monitor.successes + 1 : 0;
     let transition: "opened" | "recovered" | undefined;
     let transitionedIncident: Incident | undefined;
     this.ctx.storage.transactionSync(() => {
+      monitor.lastResult = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" };
+      if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
+        this.ctx.storage.sql.exec("DELETE FROM calendar_receipts WHERE monitorId = ? AND occurrence < ?", monitor.id, monitor.nextDue);
+        this.ctx.storage.sql.exec("DELETE FROM calendar_maintenance WHERE monitorId = ? AND endsAt <= ?", monitor.id, at);
+      }
+      if (monitor.kind !== "heartbeat" || monitor.scheduleMode !== "calendar" || at >= historyStart(Math.max(at, Date.now())))
+        this.ctx.storage.sql.exec("INSERT INTO observations (monitorId, at, outcome) VALUES (?, ?, ?)", monitor.id, at, monitor.lastResult.outcome);
+      // Bounded cleanup keeps the entire current UTC day and never touches Incidents.
+      this.ctx.storage.sql.exec(
+        "DELETE FROM observations WHERE id IN (SELECT id FROM observations WHERE at < ? ORDER BY at LIMIT 1000)",
+        historyStart(Math.max(at, Date.now())),
+      );
+      if (maintenance) {
+        this.ctx.storage.kv.put("context", current);
+        return;
+      }
+      monitor.failures = success ? 0 : monitor.failures + 1;
+      monitor.successes = success ? monitor.successes + 1 : 0;
       const open = this.ctx.storage.sql
         .exec<Incident>(
           "SELECT * FROM incidents WHERE monitorId = ? AND closedAt IS NULL LIMIT 1",
@@ -408,18 +481,18 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       } else if (!open && success) {
         monitor.state = "up";
       }
+      if (resetProgress) { monitor.failures = 0; monitor.successes = 0; }
       this.ctx.storage.kv.put("context", current);
     });
-    if (resetProgress) {
-      monitor.failures = 0; monitor.successes = 0;
-      this.ctx.storage.kv.put("context", current);
-    }
+    if (maintenance) return;
     // Delivery follows the committed transition; transport failure cannot undo detection.
     if (transition && current.webhookUrl)
       await this.deliverWebhook(current.webhookUrl, monitor.name, transition);
     // Pause/resume during a submitted webhook must also suppress its still-pending hosted hook.
     const deliveryState = this.read();
-    if (transition && transitionedIncident && !deliveryState.paused && (deliveryState.pauseGeneration ?? 0) === pauseGeneration && !deliveryState.monitors.some(candidate => candidate.id === monitor.id && candidate.maintenance)) {
+    // Calendar receipt windows already determine exclusion; later Maintenance cannot erase old hooks.
+    const maintenanceBlocksHook = !(monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") && deliveryState.monitors.some(candidate => candidate.id === monitor.id && candidate.maintenance);
+    if (transition && transitionedIncident && !deliveryState.paused && (deliveryState.pauseGeneration ?? 0) === pauseGeneration && !maintenanceBlocksHook) {
       try {
         await this.onIncidentTransition({ contextId: this.ctx.id.toString(), incident: transitionedIncident, transition, at });
       } catch {
@@ -461,7 +534,15 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const monitor = current.monitors.find(monitor => monitor.id === id);
     if (!monitor || monitor.kind !== "heartbeat") return false;
     monitor.lastSeen = at;
-    if (current.paused) {
+    if (monitor.scheduleMode === "calendar") {
+      if (!current.paused) {
+        const occurrence = calendar(monitor.cron, monitor.timezone).next(at - monitor.graceSeconds * 1000 - 1)[0];
+        if (occurrence <= at && occurrence >= monitor.nextDue) {
+          this.ctx.storage.sql.exec("INSERT OR IGNORE INTO calendar_receipts (monitorId, occurrence) VALUES (?, ?)", id, occurrence);
+        }
+      }
+      this.ctx.storage.kv.put("context", current);
+    } else if (current.paused) {
       this.ctx.storage.kv.put("context", current);
     } else if (monitor.maintenance) {
       await this.record(current, monitor, at, true, 1, monitor.recoveryThreshold);
@@ -537,9 +618,9 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         published: monitor.published,
         scheduleMode: monitor.scheduleMode ?? "interval",
         ...(monitor.scheduleMode === "calendar" ? { cron: monitor.cron, timezone: monitor.timezone ?? "UTC" } : {}),
-        intervalSeconds: monitor.intervalSeconds, recoveryThreshold: monitor.recoveryThreshold,
+        ...(monitor.kind !== "heartbeat" || monitor.scheduleMode !== "calendar" ? { intervalSeconds: monitor.intervalSeconds } : {}), recoveryThreshold: monitor.recoveryThreshold,
         ...(monitor.kind === "heartbeat"
-          ? { silenceSeconds: monitor.silenceSeconds, recoverySpacingSeconds: monitor.recoverySpacingSeconds }
+          ? monitor.scheduleMode === "calendar" ? { graceSeconds: monitor.graceSeconds } : { silenceSeconds: monitor.silenceSeconds, recoverySpacingSeconds: monitor.recoverySpacingSeconds }
           : { timeoutSeconds: monitor.timeoutSeconds, failureThreshold: monitor.failureThreshold }),
       } : {}),
     }));
@@ -622,9 +703,10 @@ function parseConfiguration(value: unknown, existingKind: Configuration["kind"] 
       schedule.scheduleMode = fields.scheduleMode as Schedule["scheduleMode"];
     }
     if (fields.scheduleMode === "calendar") {
-      if (kind !== "http") return null;
+      if (kind !== "http" && kind !== "heartbeat") return null;
       const parsed = calendar(fields.cron, fields.timezone === undefined ? "UTC" : fields.timezone);
       parsed.next(Date.now());
+      if (kind === "heartbeat" && !parsed.acceptsGrace(timing.graceSeconds ?? timingDefaults.graceSeconds, Date.now())) return null;
       schedule.cron = parsed.cron; schedule.timezone = parsed.timezone;
     } else if ("cron" in fields || "timezone" in fields) return null;
     return { pageName: pageName.trim(), name: name.trim(), ...target, ...timing, ...schedule };
@@ -634,11 +716,12 @@ function parseConfiguration(value: unknown, existingKind: Configuration["kind"] 
 }
 
 function validKindFields(fields: Record<string, unknown>, kind: Configuration["kind"]) {
-  return (kind === "http" || !("url" in fields)) &&
+  return (fields.scheduleMode !== "interval" || !("graceSeconds" in fields)) &&
+    (kind !== "heartbeat" || fields.scheduleMode !== "calendar" || !("intervalSeconds" in fields || "silenceSeconds" in fields || "recoverySpacingSeconds" in fields)) && (kind === "http" || !("url" in fields)) &&
     (kind === "tcp" || !("hostname" in fields || "port" in fields)) &&
     (kind === "heartbeat"
       ? !("timeoutSeconds" in fields || "failureThreshold" in fields)
-      : !("silenceSeconds" in fields || "recoverySpacingSeconds" in fields));
+      : !("silenceSeconds" in fields || "recoverySpacingSeconds" in fields || "graceSeconds" in fields));
 }
 
 function parseMonitorPatch(value: unknown, current?: MonitorConfiguration): Partial<MonitorConfiguration> | null {
@@ -652,7 +735,7 @@ function parseMonitorPatch(value: unknown, current?: MonitorConfiguration): Part
     delete merged.cron; delete merged.timezone;
   }
   const configuration = parseConfiguration(merged);
-  if (!configuration || (current && configuration.kind !== current.kind) || !validKindFields(fields, configuration.kind)) return null;
+  if (!configuration || (current && configuration.kind !== current.kind) || !validKindFields({ ...fields, scheduleMode: merged.scheduleMode ?? "interval" }, configuration.kind)) return null;
   const patch: Record<string, unknown> = {};
   for (const key of ["name", "published", ...Object.keys(timingDefaults)]) {
     if (key in fields) patch[key] = key === "published" ? fields[key] : configuration[key as keyof Configuration];
@@ -902,6 +985,8 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
       const after = value.after === undefined ? Date.now() : value.after;
       if (typeof after !== "number" || !Number.isSafeInteger(after) || after < 0 || after > Date.UTC(9990, 0, 1)) throw new Error("Enter a valid preview timestamp");
       const parsed = calendar(value.cron, value.timezone === undefined ? "UTC" : value.timezone);
+      if ("graceSeconds" in value && (typeof value.graceSeconds !== "number" || !Number.isInteger(value.graceSeconds) || value.graceSeconds < 1 || value.graceSeconds > 86400 || !parsed.acceptsGrace(value.graceSeconds, after)))
+        throw new Error("Grace must be 1–86400 whole seconds and shorter than every occurrence gap");
       return Response.json({ cron: parsed.cron, timezone: parsed.timezone, explanation: parsed.explanation, occurrences: parsed.next(after, 3) });
     } catch (error) {
       return Response.json({ error: error instanceof Error ? error.message : "Enter a valid Calendar Schedule" }, { status: 400 });

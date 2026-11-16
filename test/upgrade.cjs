@@ -93,6 +93,24 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
       await tick(start+620000);
       assert.equal((await (await request('/api/operator')).json()).monitors[1].state,'down');
       assert.equal(attempts,0);
+      // Enable Calendar on the migrated identity without inventing earlier occurrences.
+      const legacyIncident = (await (await request('/api/operator')).json()).incidents.find(row => row.monitorId === 'website' && row.closedAt === null);
+      assert.ok(legacyIncident);
+      assert.equal((await request('/api/operator/monitors/website', 'PATCH', { scheduleMode: 'calendar', cron: '*/5 * * * *' }, start + 650000)).status, 200);
+      const beforeCalendar = (await (await request('/api/operator', 'GET', undefined, start + 650000)).json()).monitors[0];
+      assert.equal(beforeCalendar.graceSeconds, 30);
+      await tick(start + 899999);
+      assert.deepEqual((await (await request('/api/operator')).json()).monitors[0].lastResult, beforeCalendar.lastResult);
+      for (const occurrence of [900000, 1200000, 1500000]) {
+        await request('/heartbeat/website', 'POST', undefined, start + occurrence + 30000);
+        await mf.setOptions(options((await bundle(join(project, 'src/index.ts'))) + '\n// Calendar receipt restart ' + occurrence));
+        await tick(start + occurrence + 30001);
+      }
+      const calendarRecovered = await (await request('/api/operator')).json();
+      assert.equal(calendarRecovered.monitors[0].id, 'website');
+      assert.equal(calendarRecovered.incidents.find(row => row.id === legacyIncident.id).closedAt, start + 1530000);
+      assert.equal(calendarRecovered.monitors[0].scheduleMode, 'calendar');
+      console.log('PASS: migrated Heartbeat enables Calendar prospectively and retains identity, Incident, thresholds and persisted receipt evidence');
       console.log(`PASS: ${base} -> current; heartbeat identity, creation anchor, freshness, recovery count/spacing, Incident and webhook retained`);
       return;
     }

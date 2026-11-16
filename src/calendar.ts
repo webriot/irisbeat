@@ -70,6 +70,49 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
     }
     throw new Error('No future calendar occurrence');
   };
+  const acceptsGrace = (seconds: number, after: number) => {
+    // Future cron instants are minute-aligned; sub-minute windows cannot overlap.
+    if (seconds < 60) return true;
+    const limit = seconds * 1000;
+    const minutes = fields[1].flatMap(hour => fields[0].map(minute => hour * 60 + minute));
+    const insideGap = Math.min(...minutes.slice(1).map((minute, i) => (minute - minutes[i]) * 60_000));
+    const start = Math.floor(local(after) / DAY) * DAY;
+    const fixedUTC = formatter.resolvedOptions().timeZone === 'UTC';
+    const offsets = new Map<number, number>();
+    const offsetAt = (day: number) => {
+      if (!offsets.has(day)) {
+        const sample = day + DAY / 2;
+        offsets.set(day, local(sample) - sample);
+      }
+      return offsets.get(day)!;
+    };
+    let previous: number | undefined;
+    // Inspect a full Gregorian cycle, including timezone transitions, without enumerating
+    // every minute of dense schedules. Ordinary days need only their first/last instant.
+    for (let day = start; day <= start + 400 * 366 * DAY; day += DAY) {
+      if (!matchesDay(new Date(day))) continue;
+      const candidates = fixedUTC ? [0] : [...new Set([-2, -1, 0, 1, 2].map(delta => offsetAt(day + delta * DAY)))];
+      let first: number;
+      let last: number;
+      if (candidates.length === 1) {
+        if (insideGap <= limit) return false;
+        first = day + minutes[0] * 60_000 - candidates[0];
+        last = day + minutes[minutes.length - 1] * 60_000 - candidates[0];
+      } else {
+        const instants = minutes.map(minute => {
+          const wall = day + minute * 60_000;
+          return Math.min(...candidates.map(offset => wall - offset).filter(at => local(at) === wall));
+        }).filter(Number.isFinite).sort((a, b) => a - b);
+        if (!instants.length) continue;
+        if (instants.slice(1).some((at, i) => at - instants[i] <= limit)) return false;
+        first = instants[0]; last = instants[instants.length - 1];
+      }
+      if (previous !== undefined && first - previous <= limit) return false;
+      previous = last;
+      for (const cached of offsets.keys()) if (cached < day - 2 * DAY) offsets.delete(cached);
+    }
+    return true;
+  };
   const names = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
   const list = (index: number) => fields[index].join(', ');
   const time = fields[0].length === 1 && fields[1].length === 1
@@ -81,5 +124,5 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
   const allDow = fields[4].length === 7;
   const days = dayOr ? dom + ' OR ' + dow
     : allDom && allDow ? 'every day' : allDom ? dow : allDow ? dom : dom + ' AND ' + dow;
-  return { cron: sources.join(' '), timezone, next, explanation: `${time}; ${days}; ${sources[3] === '*' ? 'every month' : 'months ' + list(3)} (${timezone}).` };
+  return { cron: sources.join(' '), timezone, next, acceptsGrace, explanation: `${time}; ${days}; ${sources[3] === '*' ? 'every month' : 'months ' + list(3)} (${timezone}).` };
 }

@@ -123,6 +123,7 @@ function Operator({ hosted }: { hosted: boolean }) {
           <DurationControl field="timeoutSeconds" label="Timeout" min={1} max={60} value={10} />
           <label for="failureThreshold">Consecutive failures</label><input id="failureThreshold" name="failureThreshold" type="number" min="1" max="100" step="1" value="2" required />
           <label for="recoveryThreshold">Consecutive successes</label><input id="recoveryThreshold" name="recoveryThreshold" type="number" min="1" max="100" step="1" value="2" required />
+          <DurationControl field="graceSeconds" label="Grace" min={1} max={86400} value={30} />
           <DurationControl field="silenceSeconds" label="Silence" min={60} max={86400} value={180} />
           <DurationControl field="recoverySpacingSeconds" label="Recovery spacing" min={60} max={86400} value={60} />
           <label class="checkbox" for="published"><input id="published" name="published" type="checkbox" checked />Published</label>
@@ -439,7 +440,7 @@ const pageForm = byId('page-configuration');
 const webhook = byId('webhook');
 const maintenanceForm = byId('maintenance');
 const message = byId('message');
-const timingDefaults = { intervalSeconds: 60, timeoutSeconds: 10, failureThreshold: 2, recoveryThreshold: 2, silenceSeconds: 180, recoverySpacingSeconds: 60 };
+const timingDefaults = { intervalSeconds: 60, timeoutSeconds: 10, failureThreshold: 2, recoveryThreshold: 2, silenceSeconds: 180, recoverySpacingSeconds: 60, graceSeconds: 30 };
 const durationFactors = { seconds: 1, minutes: 60, hours: 3600, days: 86400 };
 const durations = new Map();
 function durationSeconds(input) {
@@ -683,10 +684,10 @@ async function run(path = '/api/operator', method = 'GET', body, after) {
 function updateKind() {
   const kind = byId('kind').value;
   const heartbeat = kind === 'heartbeat';
-  const calendar = kind === 'http' && byId('scheduleMode').value === 'calendar';
-  byId('schedule-mode').hidden = kind !== 'http';
-  byId('schedule-mode').disabled = kind !== 'http';
-  byId('scheduleMode').disabled = kind !== 'http';
+  const calendar = kind !== 'tcp' && byId('scheduleMode').value === 'calendar';
+  byId('schedule-mode').hidden = kind === 'tcp';
+  byId('schedule-mode').disabled = kind === 'tcp';
+  byId('scheduleMode').disabled = kind === 'tcp';
   byId('calendar-schedule').hidden = !calendar;
   byId('calendar-schedule').disabled = !calendar;
   for (const field of ['cron', 'timezone']) byId(field).disabled = !calendar;
@@ -698,9 +699,9 @@ function updateKind() {
     byId(target + '-target').disabled = kind !== target;
   }
   byId('kind').disabled = !!editingId;
-  for (const field of ['timeoutSeconds', 'failureThreshold', 'silenceSeconds', 'recoverySpacingSeconds']) {
+  for (const field of ['timeoutSeconds', 'failureThreshold', 'silenceSeconds', 'recoverySpacingSeconds', 'graceSeconds']) {
     const input = document.getElementById(field);
-    const hidden = ['silenceSeconds', 'recoverySpacingSeconds'].includes(field) ? !heartbeat : heartbeat;
+    const hidden = field === 'graceSeconds' ? !heartbeat || !calendar : ['silenceSeconds', 'recoverySpacingSeconds'].includes(field) ? !heartbeat || calendar : heartbeat;
     input.disabled = hidden; input.hidden = hidden;
     if (durations.has(input)) {
       input.closest('.duration').hidden = hidden;
@@ -710,7 +711,7 @@ function updateKind() {
   }
   document.querySelector('label[for="intervalSeconds"]').textContent = heartbeat ? 'Expectation' : 'Interval';
   byId('intervalSeconds-unit').setAttribute('aria-label', heartbeat ? 'Expectation unit' : 'Interval unit');
-  document.querySelector('label[for="recoveryThreshold"]').textContent = heartbeat ? 'Recovery receipts' : 'Consecutive successes';
+  document.querySelector('label[for="recoveryThreshold"]').textContent = heartbeat ? calendar ? 'Consecutive successful occurrences' : 'Recovery receipts' : 'Consecutive successes';
 }
 let previewSequence = 0;
 let previewTimer;
@@ -721,12 +722,12 @@ async function previewSchedule() {
   byId('cron').setCustomValidity('');
   byId('schedule-explanation').textContent = '';
   byId('schedule-occurrences').replaceChildren();
-  if (byId('kind').value !== 'http' || byId('scheduleMode').value !== 'calendar' || !secret) return;
+  if (byId('kind').value === 'tcp' || byId('scheduleMode').value !== 'calendar' || !secret) return;
   const cron = byId('cron').value;
   const timezone = byId('timezone').value;
   previewTimer = setTimeout(async () => {
     try {
-      const response = await fetch('/api/operator/schedule-preview', { method: 'POST', headers: { Authorization: 'Bearer ' + secret, 'Content-Type': 'application/json' }, body: JSON.stringify({ cron, timezone }) });
+      const response = await fetch('/api/operator/schedule-preview', { method: 'POST', headers: { Authorization: 'Bearer ' + secret, 'Content-Type': 'application/json' }, body: JSON.stringify({ cron, timezone, ...(byId('kind').value === 'heartbeat' ? { graceSeconds: validateDuration(byId('graceSeconds')) } : {}) }) });
       if (session !== sessionGeneration) return;
       if (response.status === 401) { signOut(); message.textContent = 'Unauthorized'; return; }
       const data = await response.json();
@@ -749,7 +750,8 @@ async function previewSchedule() {
     }
   }, 200);
 }
-for (const field of ['cron', 'timezone']) byId(field).addEventListener('input', previewSchedule);
+for (const field of ['cron', 'timezone', 'graceSeconds']) byId(field).addEventListener('input', previewSchedule);
+byId('graceSeconds-unit').addEventListener('change', previewSchedule);
 byId('scheduleMode').addEventListener('change', () => { updateKind(); previewSchedule(); });
 document.getElementById('kind').addEventListener('change', () => { updateKind(); previewSchedule(); });
 updateKind();
@@ -764,7 +766,10 @@ form.addEventListener('submit', async event => {
   const body = { name: byId('name').value, kind: byId('kind').value, published: byId('published').checked };
   if (body.kind === 'tcp') { body.hostname = byId('hostname').value; body.port = Number(byId('port').value); }
   else if (body.kind === 'http') {
-    body.url = byId('url').value; body.scheduleMode = byId('scheduleMode').value;
+    body.url = byId('url').value;
+  }
+  if (body.kind !== 'tcp') {
+    body.scheduleMode = byId('scheduleMode').value;
     if (body.scheduleMode === 'calendar') { body.cron = byId('cron').value; body.timezone = byId('timezone').value; }
   }
   for (const field of Object.keys(timingDefaults)) {
