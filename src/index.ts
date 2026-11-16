@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { operatorPage, operatorScript, statusPage, styleSheet, themeScript } from "./ui";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
+import { calendar, type Schedule } from "./calendar";
 import { connect } from "cloudflare:sockets";
 import { DurableObject } from "cloudflare:workers";
 
@@ -47,7 +48,7 @@ type Target =
   | { kind: "http"; url: string; hostname?: never; port?: never }
   | { kind: "tcp"; hostname: string; port: number; url?: never }
   | { kind: "heartbeat"; url?: never; hostname?: never; port?: never };
-type MonitorConfiguration = { name: string; published?: boolean } & Target & Partial<Timing>;
+type MonitorConfiguration = { name: string; published?: boolean } & Target & Partial<Timing> & Schedule;
 type Configuration = MonitorConfiguration & { pageName: string };
 
 export type Incident = {
@@ -78,6 +79,7 @@ type Monitor = MonitorConfiguration & Timing & {
   lastSeen: number | null;
   recoveryReceiptAt: number | null;
   heartbeatDigest?: ArrayBuffer;
+  scheduleRevision?: number;
 };
 const DAY = 86_400_000;
 const historyStart = (at: number) => Math.floor(at / DAY) * DAY - 89 * DAY;
@@ -114,7 +116,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const stored = this.ctx.storage.kv.get<StoredContext | LegacyContext>("context");
     if (!stored) return { pageName: "Irisbeat", monitors: [] };
     if ("monitors" in stored) {
-      stored.monitors = stored.monitors.map(monitor => { monitor.kind ??= "http"; return { ...timingDefaults, ...monitor, createdAt: monitor.createdAt ?? 0, lastSeen: monitor.lastSeen ?? null, recoveryReceiptAt: monitor.recoveryReceiptAt ?? null }; });
+      stored.monitors = stored.monitors.map(monitor => { monitor.kind ??= "http"; return { ...timingDefaults, scheduleMode: "interval", ...monitor, createdAt: monitor.createdAt ?? 0, lastSeen: monitor.lastSeen ?? null, recoveryReceiptAt: monitor.recoveryReceiptAt ?? null }; });
       let changed = false;
       for (const monitor of stored.monitors) {
         if (monitor.maintenance && at >= monitor.maintenance.endsAt) {
@@ -136,7 +138,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (stored.monitor) {
       stored.monitor.kind ??= "http";
       const { pageName: _pageName, ...monitor } = stored.monitor;
-      state.monitors.push({ ...timingDefaults, ...monitor, createdAt: monitor.createdAt ?? 0, lastSeen: monitor.lastSeen ?? null, recoveryReceiptAt: monitor.recoveryReceiptAt ?? null, published: true });
+      state.monitors.push({ ...timingDefaults, scheduleMode: "interval", ...monitor, createdAt: monitor.createdAt ?? 0, lastSeen: monitor.lastSeen ?? null, recoveryReceiptAt: monitor.recoveryReceiptAt ?? null, published: true });
     }
     this.ctx.storage.transactionSync(() => {
       if (stored.monitor) this.ctx.storage.sql.exec(
@@ -174,20 +176,31 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         monitor.failures = 0;
         monitor.successes = 0;
         monitor.recoveryReceiptAt = null;
+        if (monitor.scheduleMode === "calendar") monitor.nextDue = calendar(monitor.cron, monitor.timezone).next(Date.now())[0];
       }
     }
     this.ctx.storage.kv.put("context", state);
   }
 
-  configure(configuration: Configuration | { pageName: string }, expectedMonitorId: string | null = null) {
+  configure(value: unknown, expectedMonitorId: string | null = null) {
+    if (!value || typeof value !== "object") return undefined;
+    const fields = value as Record<string, unknown>;
     const state = this.read();
-    // Keep the original single-Monitor save contract for existing clients.
-    if ("name" in configuration) {
+    let configuration: Configuration | { pageName: string };
+    if (Object.keys(fields).length === 1 && "pageName" in fields) {
+      if (typeof fields.pageName !== "string" || !fields.pageName.trim() || fields.pageName.length > 120) return undefined;
+      configuration = { pageName: fields.pageName.trim() };
+    } else {
+      // Keep the original single-Monitor save contract for existing clients.
       const monitor = state.monitors[0];
       // A legacy save must never move to a sibling while the request is in flight.
       if ((monitor?.id ?? null) !== expectedMonitorId) return null;
-      if (monitor && monitor.kind !== configuration.kind) return undefined;
-      const { pageName: _pageName, ...settings } = configuration;
+      const schedule = monitor?.scheduleMode === "calendar" && fields.scheduleMode === undefined
+        ? { scheduleMode: monitor.scheduleMode, cron: monitor.cron, timezone: monitor.timezone } : {};
+      const parsed = parseConfiguration({ ...schedule, ...fields }, monitor?.kind);
+      if (!parsed || !validKindFields(fields, parsed.kind) || (monitor && monitor.kind !== parsed.kind)) return undefined;
+      configuration = parsed;
+      const { pageName: _pageName, ...settings } = parsed;
       if (monitor) this.applyEdit(monitor, settings);
       else state.monitors.push(this.newMonitor(settings));
     }
@@ -197,8 +210,8 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   private newMonitor(configuration: MonitorConfiguration): Monitor {
-    return { ...timingDefaults, ...configuration, id: crypto.randomUUID(), published: configuration.published ?? true, state: "unknown", lastResult: null,
-      failures: 0, successes: 0, nextDue: 0, createdAt: Date.now(), lastSeen: null, recoveryReceiptAt: null };
+    return { ...timingDefaults, scheduleMode: "interval", ...configuration, id: crypto.randomUUID(), published: configuration.published ?? true, state: "unknown", lastResult: null,
+      failures: 0, successes: 0, nextDue: configuration.scheduleMode === "calendar" ? calendar(configuration.cron, configuration.timezone).next(Date.now())[0] : 0, createdAt: Date.now(), lastSeen: null, recoveryReceiptAt: null };
   }
 
   create(configuration: MonitorConfiguration, limit?: number) {
@@ -256,8 +269,18 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   private applyEdit(monitor: Monitor, patch: Partial<MonitorConfiguration>) {
+    const changed = (["scheduleMode", "cron", "timezone"] as const).some(key => patch[key] !== undefined && patch[key] !== monitor[key]);
+    if (changed) {
+      Object.assign(monitor, patch);
+      if (monitor.scheduleMode === "interval") { delete monitor.cron; delete monitor.timezone; }
+      monitor.scheduleRevision = (monitor.scheduleRevision ?? 0) + 1;
+      monitor.nextDue = monitor.scheduleMode === "calendar" ? calendar(monitor.cron, monitor.timezone).next(Date.now())[0] : Date.now() + monitor.intervalSeconds * 1000;
+      monitor.failures = 0;
+      monitor.successes = 0;
+      return;
+    }
     // Preserve #3's last-dispatch anchor, including a running attempt.
-    if (monitor.nextDue && patch.intervalSeconds !== undefined)
+    if (monitor.scheduleMode !== "calendar" && monitor.nextDue && patch.intervalSeconds !== undefined)
       monitor.nextDue += (patch.intervalSeconds - monitor.intervalSeconds) * 1000;
     Object.assign(monitor, patch);
   }
@@ -291,7 +314,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (this.checking.has(id) || at < attempt.nextDue) return;
     const observation = { maintenance: !!attempt.maintenance, paused: false };
     this.checking.set(id, observation);
-    attempt.nextDue = at + attempt.intervalSeconds * 1000;
+    attempt.nextDue = attempt.scheduleMode === "calendar" ? calendar(attempt.cron, attempt.timezone).next(at)[0] : at + attempt.intervalSeconds * 1000;
     this.ctx.storage.kv.put("context", state);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), attempt.timeoutSeconds * 1000);
@@ -333,10 +356,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     // Record the executed attempt without overwriting newer configuration.
     const monitor = current.monitors.find(monitor => monitor.id === attempt.id);
     if (!monitor || current.paused || observation.paused) return;
-    await this.record(current, monitor, at, success, attempt.failureThreshold, attempt.recoveryThreshold, observation.maintenance);
+    await this.record(current, monitor, at, success, attempt.failureThreshold, attempt.recoveryThreshold, observation.maintenance, (monitor.scheduleRevision ?? 0) !== (attempt.scheduleRevision ?? 0));
   }
 
-  private async record(current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number, maintenance = !!monitor.maintenance) {
+  private async record(current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number, maintenance = !!monitor.maintenance, resetProgress = false) {
     if (current.paused) return;
     const pauseGeneration = current.pauseGeneration ?? 0;
     monitor.lastResult = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" };
@@ -387,6 +410,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
       this.ctx.storage.kv.put("context", current);
     });
+    if (resetProgress) {
+      monitor.failures = 0; monitor.successes = 0;
+      this.ctx.storage.kv.put("context", current);
+    }
     // Delivery follows the committed transition; transport failure cannot undo detection.
     if (transition && current.webhookUrl)
       await this.deliverWebhook(current.webhookUrl, monitor.name, transition);
@@ -508,6 +535,8 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         kind: monitor.kind,
         ...(monitor.kind === "tcp" ? { hostname: monitor.hostname, port: monitor.port } : monitor.kind === "http" ? { url: monitor.url } : {}),
         published: monitor.published,
+        scheduleMode: monitor.scheduleMode ?? "interval",
+        ...(monitor.scheduleMode === "calendar" ? { cron: monitor.cron, timezone: monitor.timezone ?? "UTC" } : {}),
         intervalSeconds: monitor.intervalSeconds, recoveryThreshold: monitor.recoveryThreshold,
         ...(monitor.kind === "heartbeat"
           ? { silenceSeconds: monitor.silenceSeconds, recoverySpacingSeconds: monitor.recoverySpacingSeconds }
@@ -586,7 +615,19 @@ function parseConfiguration(value: unknown, existingKind: Configuration["kind"] 
         return null;
       timing[key] = input;
     }
-    return { pageName: pageName.trim(), name: name.trim(), ...target, ...timing };
+    const fields = value as Record<string, unknown>;
+    const schedule: Schedule = {};
+    if (fields.scheduleMode !== undefined) {
+      if (!["interval", "calendar"].includes(fields.scheduleMode as string)) return null;
+      schedule.scheduleMode = fields.scheduleMode as Schedule["scheduleMode"];
+    }
+    if (fields.scheduleMode === "calendar") {
+      if (kind !== "http") return null;
+      const parsed = calendar(fields.cron, fields.timezone === undefined ? "UTC" : fields.timezone);
+      parsed.next(Date.now());
+      schedule.cron = parsed.cron; schedule.timezone = parsed.timezone;
+    } else if ("cron" in fields || "timezone" in fields) return null;
+    return { pageName: pageName.trim(), name: name.trim(), ...target, ...timing, ...schedule };
   } catch {
     return null;
   }
@@ -603,13 +644,22 @@ function validKindFields(fields: Record<string, unknown>, kind: Configuration["k
 function parseMonitorPatch(value: unknown, current?: MonitorConfiguration): Partial<MonitorConfiguration> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const fields = value as Record<string, unknown>;
-  if (!Object.keys(fields).length || Object.keys(fields).some(key => !["name", "kind", "url", "hostname", "port", "published", ...Object.keys(timingDefaults)].includes(key))) return null;
+  if (!Object.keys(fields).length || Object.keys(fields).some(key => !["name", "kind", "url", "hostname", "port", "published", "scheduleMode", "cron", "timezone", ...Object.keys(timingDefaults)].includes(key))) return null;
   if ("published" in fields && typeof fields.published !== "boolean") return null;
-  const configuration = parseConfiguration({ pageName: "Irisbeat", name: "Monitor", ...current, ...fields });
+  const merged: Record<string, unknown> = { pageName: "Irisbeat", name: "Monitor", ...current, ...fields };
+  if (fields.scheduleMode === "interval") {
+    if ("cron" in fields || "timezone" in fields) return null;
+    delete merged.cron; delete merged.timezone;
+  }
+  const configuration = parseConfiguration(merged);
   if (!configuration || (current && configuration.kind !== current.kind) || !validKindFields(fields, configuration.kind)) return null;
   const patch: Record<string, unknown> = {};
   for (const key of ["name", "published", ...Object.keys(timingDefaults)]) {
     if (key in fields) patch[key] = key === "published" ? fields[key] : configuration[key as keyof Configuration];
+  }
+  if (fields.scheduleMode === "interval") Object.assign(patch, { scheduleMode: "interval" });
+  else for (const key of ["scheduleMode", "cron", "timezone"] as const) {
+    if (key in fields || (fields.scheduleMode === "calendar" && key === "timezone")) patch[key] = configuration[key];
   }
   if (["kind", "url", "hostname", "port"].some(key => key in fields)) {
     Object.assign(patch, configuration.kind === "tcp"
@@ -762,7 +812,8 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   const monitorPath = "/api/operator/monitors/:id";
   const maintenancePath = monitorPath + "/maintenance";
   const rotationPath = monitorPath + "/heartbeat-secret";
-  const operatorPaths = ["/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
+  const previewPath = "/api/operator/schedule-preview";
+  const operatorPaths = [previewPath, "/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
   for (const path of operatorPaths) app.use(path, async (c, next) => {
     const resolved = c.get("resolved");
     if (path === rotationPath && !resolved) return c.notFound();
@@ -844,6 +895,18 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     if (result === undefined) return Response.json({ error: "Enter a future end time in epoch milliseconds" }, { status: 400 });
     return result ? operatorResponse(c, result) : Response.json({ error: "Monitor not found" }, { status: 404 });
   });
+  app.post(previewPath, readBody, (c: Context<HttpEnv<E>>) => {
+    try {
+      const value = c.get("value") as Record<string, unknown>;
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Enter a valid Calendar Schedule");
+      const after = value.after === undefined ? Date.now() : value.after;
+      if (typeof after !== "number" || !Number.isSafeInteger(after) || after < 0 || after > Date.UTC(9990, 0, 1)) throw new Error("Enter a valid preview timestamp");
+      const parsed = calendar(value.cron, value.timezone === undefined ? "UTC" : value.timezone);
+      return Response.json({ cron: parsed.cron, timezone: parsed.timezone, explanation: parsed.explanation, occurrences: parsed.next(after, 3) });
+    } catch (error) {
+      return Response.json({ error: error instanceof Error ? error.message : "Enter a valid Calendar Schedule" }, { status: 400 });
+    }
+  });
   app.patch(monitorPath, readBody, async (c: Context<HttpEnv<E>>) => {
     const result = await c.get("context").edit(monitorId(c), c.get("value"));
     if (result === undefined) return Response.json({ error: "Enter valid Monitor settings and an HTTP(S)/TCP target or Heartbeat settings; type cannot change" }, { status: 400 });
@@ -870,15 +933,12 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     }
     if (c.get("resolved")) return Response.json({ error: "Use the Monitor collection" }, { status: 400 });
     const selectedMonitor = c.get("selectedMonitor");
-    const configuration = parseConfiguration(value, selectedMonitor?.kind);
-    if (!configuration || !validKindFields(value as Record<string, unknown>, configuration.kind))
-      return Response.json({ error: "Enter a page name, Monitor name and HTTP(S)/TCP target or Heartbeat settings" }, { status: 400 });
-    const result = await context.configure(configuration, selectedMonitor?.id ?? null);
-    if (result === undefined) return Response.json({ error: "Monitor type cannot change" }, { status: 400 });
+    const result = await context.configure(value, selectedMonitor?.id ?? null);
+    if (result === undefined) return Response.json({ error: "Enter a page name, Monitor name and HTTP(S)/TCP target or Heartbeat settings; type cannot change" }, { status: 400 });
     return result ? operatorResponse(c, result) : Response.json({ error: "Monitor changed; reload before saving" }, { status: 409 });
   });
   for (const path of operatorPaths) app.all(path, () => methodNotAllowed(
-    path === rotationPath ? "POST" : path === maintenancePath ? "PUT, DELETE" : path === monitorPath ? "PATCH, DELETE" : path === "/api/operator/monitors" ? "GET, POST" : "GET, PUT",
+    (path === rotationPath || path === previewPath) ? "POST" : path === maintenancePath ? "PUT, DELETE" : path === monitorPath ? "PATCH, DELETE" : path === "/api/operator/monitors" ? "GET, POST" : "GET, PUT",
   ));
   return app;
 }
