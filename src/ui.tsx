@@ -22,7 +22,7 @@ function Document({ title, operator = false, children }: { title: string; operat
       <a href="/operator" aria-current={operator ? "page" : undefined}>Operator</a>
     </nav></header>
     <main>{children}<span id="stale" role="status" hidden>Updates unavailable</span>{!operator && <><span id="updates-mode" role="status">Polling</span><button id="refresh" type="button">Refresh</button></>}</main>
-    <footer><a href="https://github.com/webriot/irisbeat/releases/download/v0.1.0/irisbeat-0.1.0-source.tar.gz">Source (AGPL-3.0-only)</a>
+    <footer><a href="https://github.com/webriot/irisbeat/releases/download/v0.2.0/irisbeat-0.2.0-source.tar.gz">Source (AGPL-3.0-only)</a>
       <label class="theme-control">Theme <select id="theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
     </footer>
   </body></html>;

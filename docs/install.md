@@ -32,7 +32,7 @@ real install drill. Do not put a credential in Wrangler vars or a repository.
 ## Exact-source CLI installation
 
 Requires Node >=22.12, npm, a Cloudflare account and its workers.dev subdomain.
-Download `irisbeat-0.1.0-source.tar.gz`, `release.json` and `SHA256SUMS` from the
+Download `irisbeat-0.2.0-source.tar.gz`, `release.json` and `SHA256SUMS` from the
 reviewed release, verifying that the manifest's full revision is the intended one.
 For an unpublished candidate, use the artifacts produced by `release:prepare`
 from its reviewed Git revision instead of a release download.
@@ -40,8 +40,8 @@ Download the engine tarball too if checking the entire checksum file.
 
 ```sh
 sha256sum --check SHA256SUMS
-tar -xzf irisbeat-0.1.0-source.tar.gz
-cd irisbeat-0.1.0
+tar -xzf irisbeat-0.2.0-source.tar.gz
+cd irisbeat-0.2.0
 npm ci
 npm run check
 npm run build
@@ -146,8 +146,8 @@ no Cloudflare deployment or third-party delivery. `dist/` is ignored.
 
 | Artifact | Use |
 | --- | --- |
-| `irisbeat-0.1.0-source.tar.gz` | Exact committed source, lockfile, config, tests, build/install instructions, LICENSE and NOTICE |
-| `irisbeat-0.1.0.tgz` | Source-only hosted engine package; no test adapter/fixtures or credentials |
+| `irisbeat-0.2.0-source.tar.gz` | Exact committed source, lockfile, config, tests, build/install instructions, LICENSE and NOTICE |
+| `irisbeat-0.2.0.tgz` | Source-only hosted engine package; no test adapter/fixtures or credentials |
 | `release.json` | Full Git revision, version, contract 1, SHA-256 hashes and engine npm SHA-512 integrity |
 | `SHA256SUMS` | SHA-256 integrity for both archives and the manifest |
 
@@ -218,12 +218,12 @@ Regenerate artifacts from the **final** clean release revision and
 repeat `npm run release:verify`; integration candidate bytes do not represent a
 later merge commit. Set version/source links together for future releases.
 
-Only after authorization, create tag `v0.1.0` on that exact revision and a draft
+Only after authorization, create tag `v0.2.0` on that exact revision and a draft
 GitHub release, attach all four artifacts, verify downloaded hashes, then publish.
 For example, after creating and pushing the reviewed tag:
 
 ```sh
-gh release create v0.1.0 --verify-tag --draft --title 'Irisbeat 0.1.0' --notes-file <reviewed-notes-file> dist/irisbeat-0.1.0.tgz dist/irisbeat-0.1.0-source.tar.gz dist/release.json dist/SHA256SUMS --repo Webriot/irisbeat
+gh release create v0.2.0 --verify-tag --draft --title 'Irisbeat 0.2.0' --notes-file <reviewed-notes-file> dist/irisbeat-0.2.0.tgz dist/irisbeat-0.2.0-source.tar.gz dist/release.json dist/SHA256SUMS --repo Webriot/irisbeat
 ```
 
 Follow [GitHub release guidance](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository).

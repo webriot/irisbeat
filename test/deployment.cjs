@@ -84,7 +84,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     assert.equal((await request(heartbeat, 'POST')).status, 204);
     const html = await (await request('/', 'GET', undefined, '')).text();
     assert.ok(html.includes('Personal acceptance'));
-    assert.ok(html.includes('irisbeat-0.1.0-source.tar.gz'), 'network users can obtain Corresponding Source after publication');
+    assert.ok(html.includes('irisbeat-0.2.0-source.tar.gz'), 'network users can obtain Corresponding Source after publication');
     new (require('node:vm').Script)(await (await request('/operator.js')).text());
     for (const publicBody of [html, JSON.stringify(await status('/api/status'))]) {
       for (const privateValue of [secret, 'http-target.example', 'controlled.example', 'webhook.example']) assert.ok(!publicBody.includes(privateValue));
