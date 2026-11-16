@@ -215,7 +215,7 @@ it('bounds observation cleanup per execution while preserving the unfinished UTC
   expect((await status()).monitor!.history!.days.at(-1)?.successes).toBe(2);
   clock.mockReturnValue(today - 100 * day);
   expect((await status()).monitor!.history!.percentage).toBeNull();
-});
+}, 30_000); // The retention boundary requires 1,001 sequential HTTP receipts on shared CI runners.
 
 it('keeps percentages per Monitor and uses down for failure with Maintenance', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(today);
