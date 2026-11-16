@@ -479,6 +479,8 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     assert.equal(deliveries.length, hookBefore, 'pause generation suppresses delayed hosted hook after resume');
     await request('a.example', '/api/operator/monitors/' + queued.monitor.id, 'DELETE');
     await policy('omit');
+    // Resume wall-clock time for socket callbacks/alarms outside HTTP test-clock scopes.
+    now = Date.now();
     // The installed consumer subclass inherits subscription handlers without adapter changes.
     const subscribe = async host => {
       const response = await mf.dispatchFetch('https://' + host + '/api/status/subscribe', { headers: { Upgrade: 'websocket', 'x-test-at': String(now) } });
@@ -487,17 +489,45 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       const messages = []; socket.addEventListener('message', event => { messages.push(event.data); });
       return { socket, messages };
     };
+    const operatorSubscribe = async (host, token) => {
+      const ticketResponse = await request(host, '/api/operator/subscription', 'POST', undefined, token);
+      assert.equal(ticketResponse.status, 200);
+      const { ticket } = await ticketResponse.json();
+      const url = 'https://' + host + '/api/operator/subscribe?ticket=' + ticket;
+      assert.equal((await mf.dispatchFetch('https://b.example/api/operator/subscribe?ticket=' + ticket, { headers: { Upgrade: 'websocket', 'x-test-at': String(now) } })).status, 401);
+      const response = await mf.dispatchFetch(url, { headers: { Upgrade: 'websocket', 'x-test-at': String(now) } });
+      assert.equal(response.status, 101);
+      assert.equal((await mf.dispatchFetch(url, { headers: { Upgrade: 'websocket', 'x-test-at': String(now) } })).status, 401);
+      const socket = response.webSocket; socket.accept();
+      const messages = []; socket.addEventListener('message', event => { messages.push(event.data); });
+      return { socket, messages };
+    };
+    assert.equal((await request('a.example', '/api/operator/subscription', 'POST', undefined, 'revoked')).status, 401);
+    const editorSubscription = await operatorSubscribe('a.example', 'editor');
+    const readerSubscription = await operatorSubscribe('a.example', 'reader');
     const aSubscription = await subscribe('a.example');
     const bSubscription = await subscribe('b.example');
     try {
+      await request('a.example', '/api/operator/webhook', 'PUT', { url: 'https://webhook.example/secret-subscription' });
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.deepEqual(editorSubscription.messages, ['{"type":"status-changed"}']);
+      assert.deepEqual(readerSubscription.messages, [], 'reader cannot infer editor-only webhook changes');
+      assert.deepEqual(aSubscription.messages, [], 'private writes do not wake public subscriptions');
+      editorSubscription.socket.send('resync'); await new Promise(resolve => setTimeout(resolve, 50)); editorSubscription.messages.length = 0;
       const privateMonitor = await (await request('a.example', '/api/operator/monitors', 'POST', { name: 'Private subscription test', kind: 'heartbeat', published: false })).json();
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.deepEqual(editorSubscription.messages, ['{"type":"status-changed"}']);
+      assert.deepEqual(readerSubscription.messages, ['{"type":"status-changed"}'], 'private Monitor changes reach authorized readers');
+      assert.deepEqual(aSubscription.messages, [], 'private Monitor activity stays silent on the anonymous socket');
+      const readerSnapshot = await (await request('a.example', '/api/operator', 'GET', undefined, 'reader')).json();
+      assert.equal(readerSnapshot.permission, 'reader'); assert.equal('webhookUrl' in readerSnapshot, false);
       await request('a.example', '/api/operator', 'PUT', { pageName: 'Live hosted page' });
       await new Promise(resolve => setTimeout(resolve, 50));
       assert.deepEqual(aSubscription.messages, ['{"type":"status-changed"}']);
       assert.deepEqual(bSubscription.messages, [], 'subscription identity comes from the hosted adapter');
       assert.equal((await (await request('a.example', '/api/status')).json()).pageName, 'Live hosted page');
       await request('a.example', '/api/operator/monitors/' + privateMonitor.monitors.at(-1).id, 'DELETE');
-    } finally { aSubscription.socket.close(1000); bSubscription.socket.close(1000); }
+    } finally { aSubscription.socket.close(1000); bSubscription.socket.close(1000); editorSubscription.socket.close(1000); readerSubscription.socket.close(1000); }
     console.log('PASS packed irisbeat@0.1.0: reproducible artifact, pinned integrity, consumer typecheck, isolated scheduling/Incidents, HTTP/TCP/heartbeat hooks, failure isolation, webhooks rotated tenant credentials and three-kind Maintenance suppression and HTTP/TCP boundary overlap of both delivery paths, persisted pause/resume and omission, paused history, Maintenance precedence, in-flight checks and delivery suppression');
   } finally { await mf.dispose(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -287,11 +287,68 @@ function reconcile(parent, desired) {
   }
   while (cursor) { const next = cursor.nextSibling; cursor.remove(); cursor = next; }
 }
-function pollVisible(refresh, active = () => true) {
-  let timer;
-  const schedule = () => { clearTimeout(timer); if (!document.hidden) timer = setTimeout(async () => { if (active()) await refresh(); schedule(); }, 60000); };
-  document.addEventListener('visibilitychange', () => { schedule(); if (!document.hidden && active()) refresh(); });
-  schedule();
+function liveUpdates(refresh, active = () => true, authorize) {
+  let socket, retry, polling, handshake, acknowledgement, handoff, stopped = true, generation = 0;
+  let backoff = 1000;
+  function connected() { return socket && socket.readyState === 1; }
+  function schedulePolling() {
+    if (stopped || !active() || document.hidden || connected()) { clearTimeout(polling); polling = undefined; return; }
+    if (polling === undefined)
+      polling = setTimeout(async () => { polling = undefined; await refresh(); schedulePolling(); }, 60000);
+  }
+  async function connect() {
+    if (stopped || typeof WebSocket === 'undefined') return;
+    const attempt = ++generation;
+    let current, disconnectedOnce = false;
+    const disconnected = () => {
+      if (disconnectedOnce || socket !== current || stopped || attempt !== generation) return;
+      disconnectedOnce = true;
+      socket = undefined;
+      clearTimeout(handshake); clearTimeout(acknowledgement);
+      current?.close();
+      schedulePolling();
+      retry = setTimeout(connect, backoff);
+      backoff = Math.min(backoff * 2, 30000);
+    };
+    try {
+      handoff = new AbortController();
+      handshake = setTimeout(() => { handoff.abort(); disconnected(); }, 10000);
+      const path = authorize ? await authorize(handoff.signal) : '/api/status/subscribe';
+      if (disconnectedOnce || stopped || attempt !== generation || !active()) return;
+      clearTimeout(handshake);
+      current = new WebSocket(new URL(path, location.href).href.replace(/^http/, 'ws'));
+      socket = current;
+      handshake = setTimeout(disconnected, 10000);
+      const reconcileSubscription = async () => {
+        if (!await refresh()) { disconnected(); return; }
+        if (socket !== current || stopped || attempt !== generation) return;
+        // Acknowledging after the read keeps changes during that read pending on the server.
+        clearTimeout(acknowledgement);
+        acknowledgement = setTimeout(() => { if (socket === current && connected()) current.send('resync'); }, 250);
+      };
+      current.onopen = () => {
+        if (socket !== current || stopped || attempt !== generation) return;
+        clearTimeout(handshake); backoff = 1000; schedulePolling(); reconcileSubscription();
+      };
+      current.onmessage = event => {
+        if (socket === current && event.data === '{"type":"status-changed"}') reconcileSubscription();
+      };
+      current.onclose = disconnected;
+      current.onerror = disconnected;
+    } catch { disconnected(); }
+  }
+  function stop() {
+    stopped = true; generation++; clearTimeout(retry); clearTimeout(polling); clearTimeout(handshake); clearTimeout(acknowledgement);
+    polling = undefined; handoff?.abort(); socket?.close(); socket = undefined;
+  }
+  function start() {
+    if (!stopped || !active()) return;
+    stopped = false; connect(); schedulePolling();
+  }
+  document.addEventListener('visibilitychange', () => { schedulePolling(); if (!document.hidden && active()) refresh(); });
+  window.addEventListener('pagehide', stop);
+  window.addEventListener('pageshow', () => { if (active()) { start(); refresh(); } });
+  return { start, stop };
 }
 `;
 
@@ -302,8 +359,7 @@ const timeMarkup = ${timeMarkup.toString()};
 const stateLabel = ${JSON.stringify(stateLabel)};
 const historyMarkup = ${historyMarkup.toString()};
 const statusMarkup = ${statusMarkup.toString()};
-let reading, readController, again = false, socket, retry, polling, handshake, acknowledgement, stopped = false;
-let backoff = 1000;
+let reading, readController, again = false, stopped = false;
 async function readSnapshot() {
   const controller = new AbortController(); readController = controller;
   const deadline = setTimeout(() => controller.abort(), 15000);
@@ -331,54 +387,11 @@ function refresh() {
   })().finally(() => { reading = undefined; });
   return reading;
 }
-function connected() { return socket && socket.readyState === 1; }
-function schedulePolling() {
-  if (stopped || document.hidden || connected()) { clearTimeout(polling); polling = undefined; return; }
-  if (polling === undefined)
-    polling = setTimeout(async () => { polling = undefined; await refresh(); schedulePolling(); }, 60000);
-}
-function connect() {
-  if (stopped || typeof WebSocket === 'undefined') return;
-  let current;
-  const disconnected = () => {
-    if (socket !== current || stopped) return;
-    socket = undefined;
-    clearTimeout(handshake); clearTimeout(acknowledgement);
-    current?.close();
-    schedulePolling();
-    retry = setTimeout(connect, backoff);
-    backoff = Math.min(backoff * 2, 30000);
-  };
-  try {
-    current = new WebSocket(new URL('/api/status/subscribe', location.href).href.replace(/^http/, 'ws'));
-    socket = current;
-    handshake = setTimeout(disconnected, 10000);
-    const reconcileSubscription = async () => {
-      if (!await refresh()) { disconnected(); return; }
-      if (socket !== current || stopped) return;
-      // Acknowledging after the read keeps changes during that read pending on the server.
-      clearTimeout(acknowledgement);
-      acknowledgement = setTimeout(() => { if (socket === current && connected()) current.send('resync'); }, 250);
-    };
-    current.onopen = () => {
-      if (socket !== current || stopped) return;
-      clearTimeout(handshake); backoff = 1000; schedulePolling(); reconcileSubscription();
-    };
-    current.onmessage = event => {
-      if (socket === current && event.data === '{"type":"status-changed"}') reconcileSubscription();
-    };
-    current.onclose = disconnected;
-    current.onerror = disconnected;
-  } catch { disconnected(); }
-}
+window.addEventListener('pagehide', () => { stopped = true; readController?.abort(); });
+window.addEventListener('pageshow', () => { stopped = false; });
+const updates = liveUpdates(refresh);
 document.getElementById('refresh').addEventListener('click', refresh);
-document.addEventListener('visibilitychange', () => { schedulePolling(); if (!document.hidden) refresh(); });
-window.addEventListener('pagehide', () => {
-  stopped = true; clearTimeout(retry); clearTimeout(polling); clearTimeout(handshake); clearTimeout(acknowledgement);
-  polling = undefined; readController?.abort(); socket?.close(); socket = undefined;
-});
-window.addEventListener('pageshow', () => { if (stopped) { stopped = false; connect(); refresh(); schedulePolling(); } });
-connect(); schedulePolling();
+updates.start();
 `;
 
 export const operatorScript = `
@@ -482,6 +495,7 @@ function declareMaintenance(monitor) {
   maintenanceForm.hidden = false; byId('maintenance-end').focus();
 }
 function signOut() {
+  updates.stop(); operatorRead?.abort();
   session++; requestId++; busy = false; hydrated = false; monitors = []; canEdit = false; hosted = false; byId('stale').hidden = true;
   secret = ''; window.IrisbeatPresentation.clear(); cancelEdit(); maintenanceForm.reset(); delete maintenanceForm.dataset.monitorId; byId('maintenance-heading').textContent = 'Maintenance'; byId('paused').hidden = true; maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
   panelMonitorId = returnMonitorId = null;
@@ -492,6 +506,7 @@ function signOut() {
   message.textContent = ''; byId('secret').value = ''; byId('secret').focus();
 }
 function render(data) {
+  if (!editor.hidden && canEdit !== (data.permission !== 'reader')) updates.stop();
   login.hidden = true; editor.hidden = false;
   hosted = !!data.hosted;
   byId('paused').hidden = !data.paused;
@@ -599,9 +614,12 @@ async function run(path = '/api/operator', method = 'GET', body, after) {
   const focused = document.activeElement;
   const focusedMonitor = focused.closest('tr[data-monitor-id]')?.dataset.monitorId;
   if (mutation) busy = true;
+  const controller = mutation ? undefined : new AbortController();
+  if (controller) operatorRead = controller;
+  const deadline = controller ? setTimeout(() => controller.abort(), 15000) : undefined;
   try {
     const response = await fetch(path, {
-      method, headers: { Authorization: 'Bearer ' + credential, 'Content-Type': 'application/json' },
+      method, signal: controller?.signal, headers: { Authorization: 'Bearer ' + credential, 'Content-Type': 'application/json' },
       ...(body === undefined ? {} : { body: JSON.stringify(body) })
     });
     if (currentSession !== session) return;
@@ -619,14 +637,35 @@ async function run(path = '/api/operator', method = 'GET', body, after) {
     if (after) after();
     if (mutation && !focused.isConnected && document.activeElement === document.body) focusAction(focusedMonitor);
     if (mutation) message.textContent = method === 'DELETE' ? (path.endsWith('/maintenance') ? 'Maintenance ended' : 'Deleted') : 'Saved';
+    updates.start();
+    return true;
   } catch (error) {
     if (id !== requestId) return;
     byId('stale').hidden = false;
     if (mutation) message.textContent = error.message;
-  } finally { if (mutation && currentSession === session) busy = false; }
+  } finally { clearTimeout(deadline); if (mutation && currentSession === session) busy = false; }
 }
-function refresh() { return run(); }
-pollVisible(refresh, () => !!secret);
+let reading, operatorRead, again = false;
+window.addEventListener('pagehide', () => { operatorRead?.abort(); });
+function refresh() {
+  if (reading) { again = true; return reading; }
+  reading = (async () => {
+    let success;
+    do { again = false; success = await run(); } while (again && secret);
+    return success;
+  })().finally(() => { reading = undefined; });
+  return reading;
+}
+const updates = liveUpdates(refresh, () => !!secret, async signal => {
+  const currentSession = session;
+  const response = await fetch('/api/operator/subscription', { method: 'POST', headers: { Authorization: 'Bearer ' + secret }, signal });
+  if (currentSession !== session) throw new Error('Session changed');
+  if (response.status === 401 || response.status === 403) { signOut(); message.textContent = 'Sign in required'; throw new Error('Unauthorized'); }
+  if (!response.ok) throw new Error('Subscription unavailable');
+  const { ticket } = await response.json();
+  if (typeof ticket !== 'string' || !ticket) throw new Error('Subscription unavailable');
+  return '/api/operator/subscribe?ticket=' + encodeURIComponent(ticket);
+});
 function updateKind() {
   const kind = byId('kind').value;
   const heartbeat = kind === 'heartbeat';

@@ -209,16 +209,15 @@ regenerated after integration changes, before #12 publishes anything.
 trusted `resolve` runs for this request, including host validation and pause
 policy propagation; callers cannot choose a context via query, body or headers.
 Unrecognized hosts remain 404. Public subscriptions are anonymous even when an
-operator credential accompanies the handshake. No operator subscription is
-implemented (#31); private Monitors, targets, webhook/heartbeat credentials,
+operator credential accompanies the handshake. Private Monitors, targets, webhook/heartbeat credentials,
 policy revisions and other contexts never appear in this channel.
 
 The resolved context's `MonitoringContext.fetch` accepts a hibernating socket
 with the `public` tag. Subclasses inherit `fetch`, `webSocketMessage`,
 `webSocketClose`, `webSocketError` and `alarm`; consumers overriding those handlers
-must forward engine subscriptions and the engine's public clock alarm to `super`.
-The engine now owns the context alarm for published Maintenance expiry and UTC
-history rollover. No new binding or migration is required. Forward WebSocket
+must forward engine subscriptions and the engine's alarm to `super`.
+The engine owns the context alarm for independent public/operator Maintenance expiry and UTC
+history rollover, plus operator authorization expiry. No new binding or migration is required. Forward WebSocket
 upgrades through the consumer's host/proxy and preserve the response's `webSocket`
 when wrapping responses. Requests without an upgrade return 426; non-GET returns
 405. A context permits 256 simultaneous public sockets, returning 503 above that
@@ -258,10 +257,75 @@ visibility return reconcile immediately. A failed subscription snapshot restarts
 require another public change. Socket failure alone does not mark data
 stale: failed snapshot reads retain the last ledger and show “Updates unavailable”.
 Page exit clears timers, aborts its read and closes its socket; persisted-page
-return reconnects. Writes stay on HTTP, and the operator refresh/draft path is
-unchanged. Theme, keyboard history selection, dates and keyed DOM identity remain
+return reconnects. Writes stay on HTTP. Both views use the same connection lifecycle and retain the existing operator refresh/draft path. Theme, keyboard history selection, dates and keyed DOM identity remain
 owned by the existing presentation/reconciler.
 
 Implementation follows Cloudflare's [hibernating WebSocket guidance](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)
 and [Durable Object state APIs](https://developers.cloudflare.com/durable-objects/api/state/),
 verified against the installed Workers types and workerd runtime tests.
+
+
+## Operator subscriptions
+
+[#31](https://github.com/Webriot/irisbeat/issues/31) extends contract 1 additively;
+existing adapters need no new hook, binding, migration, or identity infrastructure.
+
+1. Authenticate `POST /api/operator/subscription` through the existing trusted
+   `resolve`. A reader or editor receives JSON `{ ticket }`; anonymous requests
+   receive 401 and other methods receive 405. Personal installations use their
+   existing installation Bearer secret on this HTTP request only.
+2. Connect to `GET /api/operator/subscribe?ticket=…` with a WebSocket upgrade.
+   The capability is scoped to the resolved context, exact request origin, and
+   reader/editor audience captured at issuance. It expires after 15 seconds and
+   is consumed synchronously once, including across object recreation. Missing,
+   expired, replayed, wrong-context, or wrong-origin tickets receive 401. The
+   anonymous endpoint always remains public and cannot consume this capability.
+3. Fetch the existing authorized `GET /api/operator` on open, reconnect and each
+   notification, then send `resync` after reading. Every snapshot and HTTP write
+   still passes through current `resolve` permission checks. Reader snapshots
+   omit editor secrets; readers cannot mutate. No socket frame can request a
+   snapshot or perform a write. Frame shape/coalescing match the public channel.
+4. Renew by repeating the authenticated HTTP handoff after socket closure.
+   Tickets, authorization headers and installation secrets belong only in memory;
+   never put long-lived credentials in socket URLs/protocols or browser storage.
+   The engine's error logging uses pathnames, excluding ticket queries. Consumers
+   should redact ticket queries in their own access logging and telemetry.
+
+Socket authorization is a **bounded lease**, ending 60 seconds after ticket
+issuance (not redemption). Changes to permission, session validity, or installation
+credentials may take up to the remainder of that lease to stop notifications.
+This is the explicit revocation bound, not immediate push revocation: a consumer
+requiring immediate revocation needs an additional trusted invalidation design.
+Until expiry, the socket retains its issuance audience. Expiry closes it with
+4001, even with no snapshot requests or incoming frames. The independent alarm
+survives hibernation; every notification and acknowledgement also checks expiry,
+so a delayed alarm cannot send private activity past the deadline. Current HTTP
+authorization is required for renewal; denial signs the supplied UI out and clears
+privileged data/drafts, closes sockets, cancels pending handoffs and ignores late
+responses. Permission downgrades reconcile through current reader snapshots,
+clearing editor forms and secrets and replacing the old audience subscription. Ordinary reconnects preserve unsaved edits.
+Consumers must make `resolve` reflect their current trusted session/permission
+state on handoff and snapshot requests; the engine never persists their account
+credentials or implements their session infrastructure.
+
+Operator comparisons use the same fixed operation instant and committed history
+facts as public comparisons, but include private Monitors, targets/timing,
+retained Incidents, Maintenance and pause. Webhook-only changes notify editors
+only, since readers' projection excludes the destination. Credential rotation,
+unchanged facts/policy revisions and presentation history failures stay silent.
+Each context allows 256 reader and 256 editor sockets, and at most 256 unexpired
+handoff tickets (503 at capacity). Attachments retain only pending/dirty flags and
+authorization deadline. Tickets retain only capability, origin, audience and
+expiry deadlines. No shared revision or operator activity enters the public
+channel. Independent public and operator clock deadlines share the single DO
+alarm by scheduling their minimum together with authorization expiry; a private
+subscription/change/expiry cannot consume or replace a public clock deadline.
+
+The operator UI shares reconnect/backoff, immediate resync, notification
+coalescing, 15-second snapshot reads, 10-second handoffs/handshakes and visible
+60-second disconnected polling with the public UI. All mutations remain HTTP.
+Rendered runtime/browser tests cover draft and focus retention, history selection,
+menus, themes, signout and reconnection; workerd tests cover capability boundaries,
+lease expiry without reads, recreation, audience/context isolation and public
+notification timing regressions. The packed consumer fixture verifies inheritance,
+reader/editor handoffs and projection isolation using the installed package.

@@ -115,8 +115,9 @@ it.each(['GET', 'PUT'])('does not let an old session %s response revoke a new si
 
 it('polls only visible pages every minute and immediately resynchronizes on return', async () => {
   const window = new Window({ url: 'https://status.example/operator' }); windows.push(window);
+  Object.defineProperty(window, 'WebSocket', { value: undefined });
   const timers = new Map<number, () => void>(); let timerId = 0;
-  window.setTimeout = ((callback: () => void, delay: number) => { expect(delay).toBe(60000); timers.set(++timerId, callback); return timerId; }) as unknown as typeof window.setTimeout;
+  window.setTimeout = ((callback: () => void, delay: number) => { expect([15000, 60000]).toContain(delay); timers.set(++timerId, callback); return timerId; }) as unknown as typeof window.setTimeout;
   window.clearTimeout = ((id: number) => { timers.delete(id); }) as unknown as typeof window.clearTimeout;
   window.document.write(operatorPage());
   let reads = 0;
@@ -134,7 +135,7 @@ it('polls only visible pages every minute and immediately resynchronizes on retu
   doc.dispatchEvent(new window.Event('visibilitychange')); await settle();
   expect(reads).toBe(3); expect(timers.size).toBe(1);
   doc.querySelector<HTMLButtonElement>('#logout')!.click();
-  const signedOutTick = timers.values().next().value!; timers.clear(); signedOutTick(); await settle(); expect(reads).toBe(3);
+  expect(timers.size).toBe(0); await settle(); expect(reads).toBe(3);
 });
 
 it('refreshes the public ledger, history and Incidents in place without a document reload', async () => {
@@ -418,4 +419,43 @@ it('caps reconnect backoff without postponing the visible fallback and cleans up
   window.dispatchEvent(new window.Event('pagehide')); expect(timers.size).toBe(0);
   window.dispatchEvent(new window.Event('pageshow')); await settle();
   expect(reads).toBe(2); expect([...timers.values()].some(timer => timer.delay === 60000)).toBe(true);
+});
+
+it('subscribes operators with an HTTP ticket, preserves live drafts, and closes and clears on authorization loss', async () => {
+  const window = new Window({ url: 'https://status.example/operator' }); windows.push(window);
+  const doc = window.document; doc.write(operatorPage());
+  const sockets: Socket[] = [];
+  class Socket {
+    readyState = 0; onopen?: () => void; onmessage?: (event: { data: string }) => void;
+    constructor(readonly url: string) { sockets.push(this); }
+    send() {} close() { this.readyState = 3; }
+  }
+  Object.defineProperty(window, 'WebSocket', { value: Socket });
+  let data = snapshot(), authorized = true;
+  window.fetch = (async (path, options) => {
+    if (!authorized) return new window.Response('{}', { status: 401 });
+    if (path === '/api/operator/subscription') {
+      expect(options?.method).toBe('POST'); expect((options?.headers as Record<string, string>).Authorization).toBe('Bearer private-secret');
+      return new window.Response(JSON.stringify({ ticket: 'single-use' }));
+    }
+    return new window.Response(JSON.stringify(data));
+  }) as typeof window.fetch;
+  window.eval(presentationScript); window.eval(operatorScript);
+  doc.querySelector<HTMLInputElement>('#secret')!.value = 'private-secret';
+  doc.querySelector('#login')!.dispatchEvent(new window.Event('submit', { cancelable: true })); await settle();
+  expect(sockets).toHaveLength(1); expect(sockets[0].url).toBe('wss://status.example/api/operator/subscribe?ticket=single-use');
+  sockets[0].readyState = 1; sockets[0].onopen!(); await settle();
+  action(doc, 'Edit Website'); const input = doc.querySelector<HTMLInputElement>('#name')!; input.value = 'Unsaved'; input.focus();
+  const row = doc.querySelector(rowSelector);
+  data = snapshot({ monitors: [{ ...monitor, state: 'down' }] });
+  sockets[0].onmessage!({ data: '{"type":"status-changed"}' }); await settle();
+  expect(row!.textContent).toContain('Unavailable'); expect(input.value).toBe('Unsaved'); expect(doc.activeElement).toBe(input);
+  data = snapshot({ permission: 'reader', webhookUrl: undefined });
+  sockets[0].onmessage!({ data: '{"type":"status-changed"}' }); await settle();
+  expect(sockets[0].readyState).toBe(3); expect(sockets).toHaveLength(2);
+  expect(doc.querySelector<HTMLInputElement>('#webhookUrl')!.value).toBe('');
+  sockets[1].readyState = 1; sockets[1].onopen!(); await settle();
+  authorized = false; sockets[1].onmessage!({ data: '{"type":"status-changed"}' }); await settle();
+  expect(sockets[0].readyState).toBe(3); expect(doc.querySelector('#editor')!.hasAttribute('hidden')).toBe(true);
+  expect(doc.querySelector('#monitor-rows')!.textContent).toBe(''); expect(input.value).toBe('');
 });

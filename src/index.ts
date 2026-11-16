@@ -91,6 +91,8 @@ export type AvailabilityHistory = { days: HistoryDay[]; percentage: number | nul
 type DailyCounts = { day: number; successes: number; failures: number; maintenance: number };
 export type Status = ReturnType<MonitoringContext["status"]>;
 type StoredContext = { pageName: string; monitors: Monitor[]; webhookUrl?: string | null; paused?: boolean; policyRevision?: number; pauseGeneration?: number };
+type Subscription = { pending: boolean; dirty: boolean; expiresAt?: number };
+type Ticket = { ticket: string; origin: string; audience: "reader" | "editor"; expiresAt: number; authorizedUntil: number };
 type LegacyContext = { webhookUrl?: string | null; monitor: (Monitor & { pageName: string }) | null };
 
 export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableObject<E> {
@@ -109,52 +111,86 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       ctx.storage.sql.exec("ALTER TABLE incidents ADD COLUMN monitorName TEXT");
     }
   }
+  subscription(audience: "reader" | "editor", origin: string) {
+    const now = Date.now();
+    const tickets = (this.ctx.storage.kv.get<Ticket[]>("operator-tickets") ?? []).filter(ticket => ticket.expiresAt > now);
+    if (tickets.length >= 256) return null;
+    const ticket = crypto.randomUUID();
+    tickets.push({ ticket, origin, audience, expiresAt: now + 15000, authorizedUntil: now + 60000 });
+    this.ctx.storage.kv.put("operator-tickets", tickets);
+    return { ticket };
+  }
   // Each socket has at most one outstanding notification and one dirty bit.
   fetch(request: Request) {
-    if (new URL(request.url).pathname !== "/api/status/subscribe") return new Response(null, { status: 404 });
+    const url = new URL(request.url);
+    const operator = url.pathname === "/api/operator/subscribe";
+    if (!operator && url.pathname !== "/api/status/subscribe") return new Response(null, { status: 404 });
     if (request.method !== "GET") return new Response(null, { status: 405, headers: { Allow: "GET" } });
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket")
       return new Response(null, { status: 426, headers: { Upgrade: "websocket" } });
-    if (this.ctx.getWebSockets("public").length >= 256) return new Response(null, { status: 503 });
+    let audience = "public", expiresAt: number | undefined;
+    if (operator) {
+      const tickets = this.ctx.storage.kv.get<Ticket[]>("operator-tickets") ?? [];
+      const ticket = tickets.find(ticket => ticket.ticket === url.searchParams.get("ticket") && ticket.origin === url.origin);
+      if (!ticket || ticket.expiresAt <= Date.now()) return new Response(null, { status: 401 });
+      this.ctx.storage.kv.put("operator-tickets", tickets.filter(value => value !== ticket));
+      audience = ticket.audience; expiresAt = ticket.authorizedUntil;
+    }
+    if (this.ctx.getWebSockets(audience).length >= 256) return new Response(null, { status: 503 });
     const { 0: client, 1: server } = new WebSocketPair();
-    this.ctx.acceptWebSocket(server, ["public"]);
-    server.serializeAttachment({ pending: false, dirty: false });
-    this.schedulePublicClock();
+    this.ctx.acceptWebSocket(server, [audience]);
+    server.serializeAttachment({ pending: false, dirty: false, expiresAt });
+    if (operator) this.scheduleOperatorClock(); else this.schedulePublicClock();
     return new Response(null, { status: 101, webSocket: client });
   }
 
   webSocketMessage(socket: WebSocket, message: string | ArrayBuffer) {
+    if (!this.subscriptionActive(socket)) return;
     if (message !== "resync") { socket.close(1008, "Notifications only"); return; }
-    const { dirty } = socket.deserializeAttachment() as { dirty: boolean };
-    socket.serializeAttachment({ pending: false, dirty: false });
-    if (dirty) this.sendPublicChange(socket);
+    const attachment = socket.deserializeAttachment() as Subscription;
+    const { dirty } = attachment;
+    socket.serializeAttachment({ ...attachment, pending: false, dirty: false });
+    if (dirty) this.sendChange(socket);
   }
-  webSocketClose(socket: WebSocket) { socket.close(1000); this.schedulePublicClock(); }
+  webSocketClose(socket: WebSocket) {
+    socket.close(1000);
+    if ((socket.deserializeAttachment() as Subscription).expiresAt === undefined) this.schedulePublicClock();
+    else this.scheduleOperatorClock(false);
+  }
   webSocketError(socket: WebSocket) { socket.close(1011, "Connection failed"); }
 
-  private sendPublicChange(socket: WebSocket) {
+  private subscriptionActive(socket: WebSocket) {
+    const { expiresAt } = socket.deserializeAttachment() as Subscription;
+    if (expiresAt !== undefined && Date.now() >= expiresAt) { socket.close(4001, "Authorization expired"); return false; }
+    return socket.readyState === WebSocket.OPEN;
+  }
+  private sendChange(socket: WebSocket) {
     try {
-      const { pending } = socket.deserializeAttachment() as { pending: boolean };
-      socket.serializeAttachment({ pending: true, dirty: pending });
+      if (!this.subscriptionActive(socket)) return;
+      const attachment = socket.deserializeAttachment() as Subscription;
+      const { pending } = attachment;
+      socket.serializeAttachment({ ...attachment, pending: true, dirty: pending });
       if (!pending) socket.send('{"type":"status-changed"}');
     } catch { socket.close(1011, "Connection failed"); }
   }
   // Notification equality uses committed facts, never fallible presentation history.
-  private publicValue(at: number) {
-    const status = this.statusAt(false, false, at, false);
+  private notificationValue(at: number, audience = "public") {
+    const status = this.statusAt(audience !== "public", audience === "editor", at, false);
     const start = historyStart(at);
     return JSON.stringify({ ...status, history: status.monitors.map(monitor =>
       this.committedHistory(monitor.id, start, start + 90 * DAY)) });
   }
-  private publicSnapshot(at = Date.now()) {
-    return { at, value: this.ctx.getWebSockets("public").length ? this.publicValue(at) : undefined };
+  private changeSnapshot(at = Date.now()) {
+    return { at, values: ["public", "reader", "editor"].map(audience => ({ audience,
+      value: this.ctx.getWebSockets(audience).some(socket => this.subscriptionActive(socket)) ? this.notificationValue(at, audience) : undefined })) };
   }
-  private publicChange(before: { at: number; value: string | undefined }) {
-    if (before.value === undefined) return;
-    const after = this.publicValue(before.at);
-    if (before.value === after) return;
-    for (const socket of this.ctx.getWebSockets("public")) this.sendPublicChange(socket);
-    this.schedulePublicClock(false, before.at);
+  private notifyChanges(before: ReturnType<MonitoringContext["changeSnapshot"]>) {
+    for (const { audience, value } of before.values) {
+      if (value === undefined || value === this.notificationValue(before.at, audience)) continue;
+      for (const socket of this.ctx.getWebSockets(audience)) this.sendChange(socket);
+      if (audience === "public") this.schedulePublicClock(false, before.at);
+      else this.scheduleOperatorClock(false, before.at);
+    }
   }
   private schedulePublicClock(notifyClock = true, now = Date.now()) {
     const sockets = this.ctx.getWebSockets("public");
@@ -162,19 +198,40 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const monitors = state.monitors.filter(monitor => monitor.published);
     if (!sockets.length || !monitors.length) {
       this.ctx.storage.kv.delete("public-clock-deadline");
-      this.ctx.waitUntil(this.ctx.storage.deleteAlarm());
+      this.scheduleAlarm();
       return;
     }
     const deadline = this.ctx.storage.kv.get<number>("public-clock-deadline");
     if (notifyClock && deadline !== undefined && now >= deadline)
-      for (const socket of sockets) this.sendPublicChange(socket);
+      for (const socket of sockets) this.sendChange(socket);
     // A public write must not consume an overdue independent clock transition.
     const next = Math.min(!notifyClock && deadline !== undefined && deadline <= now ? deadline : Infinity, (Math.floor(now / DAY) + 1) * DAY,
       ...monitors.flatMap(monitor => monitor.maintenance && monitor.maintenance.endsAt > now ? [monitor.maintenance.endsAt] : []));
     this.ctx.storage.kv.put("public-clock-deadline", next);
-    this.ctx.waitUntil(this.ctx.storage.setAlarm(next));
+    this.scheduleAlarm();
   }
-  async alarm() { this.schedulePublicClock(); }
+  private scheduleOperatorClock(notifyClock = true, now = Date.now()) {
+    const sockets = [...this.ctx.getWebSockets("reader"), ...this.ctx.getWebSockets("editor")].filter(socket => this.subscriptionActive(socket));
+    const monitors = this.read(now).monitors;
+    const deadline = this.ctx.storage.kv.get<number>("operator-clock-deadline");
+    if (notifyClock && deadline !== undefined && now >= deadline)
+      for (const socket of sockets) this.sendChange(socket);
+    if (sockets.length && monitors.length) {
+      const next = Math.min(!notifyClock && deadline !== undefined && deadline <= now ? deadline : Infinity,
+        (Math.floor(now / DAY) + 1) * DAY,
+        ...monitors.flatMap(monitor => monitor.maintenance && monitor.maintenance.endsAt > now ? [monitor.maintenance.endsAt] : []));
+      this.ctx.storage.kv.put("operator-clock-deadline", next);
+    } else this.ctx.storage.kv.delete("operator-clock-deadline");
+    this.scheduleAlarm();
+  }
+  private scheduleAlarm() {
+    const deadlines = [this.ctx.storage.kv.get<number>("public-clock-deadline"), this.ctx.storage.kv.get<number>("operator-clock-deadline"),
+      ...[...this.ctx.getWebSockets("reader"), ...this.ctx.getWebSockets("editor")].filter(socket => this.subscriptionActive(socket))
+        .map(socket => (socket.deserializeAttachment() as Subscription).expiresAt)];
+    const next = Math.min(...deadlines.filter((value): value is number => value !== undefined));
+    this.ctx.waitUntil(Number.isFinite(next) ? this.ctx.storage.setAlarm(next) : this.ctx.storage.deleteAlarm());
+  }
+  async alarm() { this.schedulePublicClock(); this.scheduleOperatorClock(); }
 
   private read(at = Date.now()): StoredContext {
     const stored = this.ctx.storage.kv.get<StoredContext | LegacyContext>("context");
@@ -215,7 +272,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   setPaused(paused: boolean, policyRevision: number) {
-    const before = this.publicSnapshot();
+    const before = this.changeSnapshot();
     if (!validPolicy({ paused, policyRevision }) || typeof paused !== "boolean") throw new Error("Invalid pause policy");
     const prior = this.ctx.storage.kv.get<StoredContext>("context");
     if (prior?.policyRevision !== undefined) {
@@ -230,7 +287,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     state.policyRevision = policyRevision;
     if (!!state.paused === paused) {
       this.ctx.storage.kv.put("context", state);
-      this.publicChange(before);
+      this.notifyChanges(before);
       return;
     }
     state.paused = paused;
@@ -245,11 +302,11 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
     }
     this.ctx.storage.kv.put("context", state);
-    this.publicChange(before);
+    this.notifyChanges(before);
   }
 
   configure(configuration: Configuration | { pageName: string }, expectedMonitorId: string | null = null) {
-    const before = this.publicSnapshot();
+    const before = this.changeSnapshot();
     const state = this.read(before.at);
     // Keep the original single-Monitor save contract for existing clients.
     if ("name" in configuration) {
@@ -263,7 +320,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     }
     state.pageName = configuration.pageName;
     this.ctx.storage.kv.put("context", state);
-    this.publicChange(before);
+    this.notifyChanges(before);
     return this.status(true);
   }
 
@@ -273,25 +330,27 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   create(configuration: MonitorConfiguration, limit?: number) {
-    const before = this.publicSnapshot();
+    const before = this.changeSnapshot();
     const state = this.read(before.at);
     // No await between allowance check and synchronous persistence: concurrent RPCs serialize.
     if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0 || state.monitors.length >= limit)) return null;
     state.monitors.push(this.newMonitor(configuration, before.at));
     this.ctx.storage.kv.put("context", state);
-    this.publicChange(before);
+    this.notifyChanges(before);
     return this.status(true);
   }
 
   configureWebhook(url: string | null) {
-    const state = this.read();
+    const before = this.changeSnapshot();
+    const state = this.read(before.at);
     state.webhookUrl = url;
     this.ctx.storage.kv.put("context", state);
+    this.notifyChanges(before);
     return this.status(true);
   }
 
   edit(id: string, value: unknown) {
-    const before = this.publicSnapshot();
+    const before = this.changeSnapshot();
     const state = this.read(before.at);
     const monitor = state.monitors.find(monitor => monitor.id === id);
     if (!monitor) return null;
@@ -299,7 +358,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (!patch) return undefined;
     this.applyEdit(monitor, patch);
     this.ctx.storage.kv.put("context", state);
-    this.publicChange(before);
+    this.notifyChanges(before);
     return this.status(true);
   }
 
@@ -311,7 +370,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   maintenance(id: string, value: unknown, end = false) {
-    const before = this.publicSnapshot();
+    const before = this.changeSnapshot();
     const at = before.at;
     const state = this.read(at);
     const monitor = state.monitors.find(monitor => monitor.id === id);
@@ -328,7 +387,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       if (attempt) attempt.maintenance = true;
     }
     this.ctx.storage.kv.put("context", state);
-    this.publicChange(before);
+    this.notifyChanges(before);
     return this.status(true);
   }
 
@@ -340,12 +399,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   remove(id: string) {
-    const before = this.publicSnapshot();
+    const before = this.changeSnapshot();
     const state = this.read(before.at);
     if (!state.monitors.some(monitor => monitor.id === id)) return null;
     state.monitors = state.monitors.filter(monitor => monitor.id !== id);
     this.ctx.storage.kv.put("context", state);
-    this.publicChange(before);
+    this.notifyChanges(before);
     return this.status(true);
   }
 
@@ -357,7 +416,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   private async checkMonitor(id: string, at: number) {
-    const before = this.publicSnapshot(at);
+    const before = this.changeSnapshot(at);
     const state = this.read(before.at);
     const attempt = state.monitors.find(monitor => monitor.id === id);
     if (!attempt || state.paused) return;
@@ -409,7 +468,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
       this.checking.delete(id);
     }
-    const completed = this.publicSnapshot(Math.max(at, Date.now()));
+    const completed = this.changeSnapshot(Math.max(at, Date.now()));
     const current = this.read(completed.at);
     // Record the executed attempt without overwriting newer configuration.
     const monitor = current.monitors.find(monitor => monitor.id === attempt.id);
@@ -417,7 +476,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     await this.record(completed, current, monitor, at, success, attempt.failureThreshold, attempt.recoveryThreshold, observation.maintenance);
   }
 
-  private async record(before: ReturnType<MonitoringContext["publicSnapshot"]>, current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number, maintenance = !!monitor.maintenance) {
+  private async record(before: ReturnType<MonitoringContext["changeSnapshot"]>, current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number, maintenance = !!monitor.maintenance) {
     if (current.paused) return;
     const pauseGeneration = current.pauseGeneration ?? 0;
     monitor.lastResult = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" };
@@ -429,7 +488,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     );
     if (maintenance) {
       this.ctx.storage.kv.put("context", current);
-      this.publicChange(before);
+      this.notifyChanges(before);
       return;
     }
     monitor.failures = success ? 0 : monitor.failures + 1;
@@ -469,7 +528,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
       this.ctx.storage.kv.put("context", current);
     });
-    this.publicChange(before);
+    this.notifyChanges(before);
     // Delivery follows the committed transition; transport failure cannot undo detection.
     if (transition && current.webhookUrl)
       await this.deliverWebhook(current.webhookUrl, monitor.name, transition);
@@ -513,14 +572,14 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   async heartbeat(id: string, at: number) {
-    const before = this.publicSnapshot(at);
+    const before = this.changeSnapshot(at);
     const current = this.read(before.at);
     const monitor = current.monitors.find(monitor => monitor.id === id);
     if (!monitor || monitor.kind !== "heartbeat") return false;
     monitor.lastSeen = at;
     if (current.paused) {
       this.ctx.storage.kv.put("context", current);
-      this.publicChange(before);
+      this.notifyChanges(before);
     } else if (monitor.maintenance) {
       await this.record(before, current, monitor, at, true, 1, monitor.recoveryThreshold);
     } else if (monitor.state !== "down" || monitor.recoveryReceiptAt === null ||
@@ -529,7 +588,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       await this.record(before, current, monitor, at, true, 1, monitor.recoveryThreshold);
     } else {
       this.ctx.storage.kv.put("context", current);
-      this.publicChange(before);
+      this.notifyChanges(before);
     }
     return true;
   }
@@ -801,7 +860,14 @@ async function handleRequest(request: Request, env: EngineEnv, resolved?: Resolv
   const path = new URL(request.url).pathname;
   const context = env.MONITORING.getByName(resolved?.id ?? "personal");
   if (resolved?.paused !== undefined) await context.setPaused(resolved.paused, resolved.policyRevision);
-  if (path === "/api/status/subscribe") return context.fetch(request);
+  if (path === "/api/status/subscribe" || path === "/api/operator/subscribe") return context.fetch(request);
+  if (path === "/api/operator/subscription") {
+    const permission = resolved ? resolved.permission : await authorized(request, env.INSTALLATION_SECRET) ? "editor" : null;
+    if (!permission) return new Response(null, { status: 401 });
+    if (request.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST" } });
+    const ticket = await context.subscription(permission, new URL(request.url).origin);
+    return ticket ? Response.json(ticket) : new Response(null, { status: 503 });
+  }
   if (resolved && path === "/heartbeat") {
     if (request.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST" } });
     const accepted = await context.hostedHeartbeat(request.headers.get("authorization") ?? "", Date.now());

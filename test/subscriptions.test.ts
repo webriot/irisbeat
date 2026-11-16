@@ -247,3 +247,158 @@ it('keeps unchanged hosted pause revisions and credential rotation silent at exp
   await runDurableObjectAlarm(env.MONITORING.getByName('clock-policy'));
   await flush(); expect(messages).toEqual(['{"type":"status-changed"}']);
 });
+
+it('hands off authenticated single-use operator tickets without exposing the installation credential', async () => {
+  const anonymous = await worker.fetch(new Request('https://status.example/api/operator/subscription', { method: 'POST' }), env);
+  expect(anonymous.status).toBe(401);
+  const response = await request('/api/operator/subscription', 'POST');
+  expect(response.status).toBe(200);
+  const { ticket } = await response.json() as { ticket: string };
+  expect(ticket).toBeTruthy(); expect(ticket).not.toContain('test-installation-secret');
+  const upgrade = () => worker.fetch(new Request('https://status.example/api/operator/subscribe?ticket=' + ticket, { headers: { Upgrade: 'websocket' } }), env);
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  const accepted = await upgrade(); expect(accepted.status).toBe(101);
+  accepted.webSocket!.accept(); sockets.push(accepted.webSocket!);
+  expect((await upgrade()).status).toBe(401);
+});
+
+async function operatorSubscription(app = worker, host = 'status.example', credential = 'test-installation-secret') {
+  const response = await app.fetch(new Request('https://' + host + '/api/operator/subscription', { method: 'POST', headers: { authorization: 'Bearer ' + credential } }), env);
+  expect(response.status).toBe(200);
+  const { ticket } = await response.json() as { ticket: string };
+  const upgraded = await app.fetch(new Request('https://' + host + '/api/operator/subscribe?ticket=' + ticket, { headers: { Upgrade: 'websocket' } }), env);
+  expect(upgraded.status).toBe(101);
+  const socket = upgraded.webSocket!; socket.accept(); sockets.push(socket);
+  const messages: string[] = []; socket.addEventListener('message', event => { messages.push(String(event.data)); });
+  return { socket, messages };
+}
+it('notifies private operator facts and isolates editor-only webhook activity from readers and public sockets', async () => {
+  const app = createHostedWorker({ contractVersion: '1', resolve: request => ({ id: new URL(request.url).hostname, permission: request.headers.get('authorization') === 'Bearer reader' ? 'reader' : 'editor', monitorLimit: 10 }), contexts: () => [] });
+  const reader = await operatorSubscription(app, 'a.example', 'reader');
+  const editor = await operatorSubscription(app, 'a.example', 'editor');
+  const other = await operatorSubscription(app, 'b.example');
+  const anonymous = await subscribe(app, 'a.example');
+  const write = (path: string, body: unknown) => app.fetch(new Request('https://a.example' + path, { method: path.endsWith('monitors') ? 'POST' : 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }), env);
+  await write('/api/operator/webhook', { url: 'https://secret.example/token' });
+  await flush(); expect(editor.messages).toHaveLength(1); expect(reader.messages).toEqual([]); expect(anonymous.messages).toEqual([]);
+  editor.socket.send('resync'); await flush(); editor.messages.length = 0;
+  await write('/api/operator/monitors', { name: 'Private', kind: 'heartbeat', published: false });
+  await flush(); expect(editor.messages).toEqual(['{"type":"status-changed"}']); expect(reader.messages).toEqual(editor.messages);
+  expect(other.messages).toEqual([]); expect(anonymous.messages).toEqual([]);
+});
+
+it('rejects expired tickets and cross-context/origin/audience redemption after object recreation', async () => {
+  const now = Date.now(); const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+  const app = createHostedWorker({ contractVersion: '1', resolve: request => ({ id: new URL(request.url).hostname === 'alias.example' ? 'a.example' : new URL(request.url).hostname, permission: 'reader', monitorLimit: 2 }), contexts: () => [] });
+  const issued = await app.fetch(new Request('https://a.example/api/operator/subscription', { method: 'POST' }), env);
+  const { ticket } = await issued.json() as { ticket: string };
+  const redeem = (host: string, path = '/api/operator/subscribe') => app.fetch(new Request('https://' + host + path + '?ticket=' + ticket, { headers: { Upgrade: 'websocket' } }), env);
+  expect((await redeem('b.example')).status).toBe(401);
+  expect((await redeem('alias.example')).status).toBe(401);
+  // An anonymous endpoint cannot consume an operator capability or reveal private facts.
+  const publicResponse = await redeem('a.example', '/api/status/subscribe');
+  expect(publicResponse.status).toBe(101); publicResponse.webSocket!.accept(); sockets.push(publicResponse.webSocket!);
+  await evictDurableObject(env.MONITORING.getByName('a.example'));
+  clock.mockReturnValue(now + 15000);
+  expect((await redeem('a.example')).status).toBe(401);
+});
+it('expires revoked sockets without snapshot requests and preserves independent public clock alarms', async () => {
+  const now = Date.now(); const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+  let permission: 'editor' | null = 'editor';
+  const app = createHostedWorker({ contractVersion: '1', resolve: () => ({ id: 'lease', permission, monitorLimit: 2 }), contexts: () => [] });
+  const write = (path: string, body: unknown) => app.fetch(new Request('https://lease.example' + path, { method: path.endsWith('monitors') ? 'POST' : 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }), env);
+  const created = await (await write('/api/operator/monitors', { name: 'Public', kind: 'heartbeat' })).json() as { monitor: { id: string } };
+  await write('/api/operator/monitors/' + created.monitor.id + '/maintenance', { endsAt: now + 120000 });
+  const anonymous = await subscribe(app, 'lease.example');
+  const operator = await operatorSubscription(app, 'lease.example');
+  const closed = new Promise<number>(resolve => operator.socket.addEventListener('close', event => resolve(event.code)));
+  permission = null;
+  const stub = env.MONITORING.getByName('lease'); await evictDurableObject(stub);
+  clock.mockReturnValue(now + 60000); expect(await runDurableObjectAlarm(stub)).toBe(true);
+  expect(await closed).toBe(4001); expect(operator.messages).toEqual([]); expect(anonymous.messages).toEqual([]);
+  expect((await app.fetch(new Request('https://lease.example/api/operator/subscription', { method: 'POST' }), env)).status).toBe(401);
+  clock.mockReturnValue(now + 120000); expect(await runDurableObjectAlarm(stub)).toBe(true);
+  await flush(); expect(anonymous.messages).toEqual(['{"type":"status-changed"}']);
+});
+
+it('coalesces private observations, Incidents and Maintenance across hibernation without public timing signals', async () => {
+  const now = Date.now(); const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+  const created = await (await request('/api/operator/monitors', 'POST', { name: 'Private producer', kind: 'heartbeat', published: false, recoveryThreshold: 1 })).json() as { monitor: { id: string } };
+  const id = created.monitor.id, path = '/api/operator/monitors/' + id;
+  const operator = await operatorSubscription(); const anonymous = await subscribe();
+  const sync = async (operation: () => Promise<unknown>) => {
+    operator.socket.send('resync'); await flush(); operator.messages.length = 0;
+    await operation(); await flush(); expect(operator.messages).toEqual(['{"type":"status-changed"}']); expect(anonymous.messages).toEqual([]);
+  };
+  await sync(() => request('/heartbeat/' + id, 'POST'));
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  await sync(() => worker.scheduled({ scheduledTime: now + 180000 } as ScheduledController, env));
+  expect(await (await request('/api/operator')).json()).toMatchObject({ incidents: [{ closedAt: null }] });
+  await sync(() => request(path + '/maintenance', 'PUT', { endsAt: now + 10000 }));
+  operator.socket.send('resync'); await flush(); operator.messages.length = 0;
+  clock.mockReturnValue(now + 10000);
+  expect(await runDurableObjectAlarm(env.MONITORING.getByName('personal'))).toBe(true);
+  await flush(); expect(operator.messages).toHaveLength(1); expect(anonymous.messages).toEqual([]);
+  await sync(() => request('/heartbeat/' + id, 'POST'));
+  expect(await (await request('/api/operator')).json()).toMatchObject({ incidents: [{ closedAt: now + 10000 }] });
+  await sync(() => request(path, 'PATCH', { name: 'Renamed', silenceSeconds: 300 }));
+  await sync(() => request(path, 'DELETE'));
+});
+it('renews hosted permissions through HTTP and never carries editor audience into a reader lease', async () => {
+  const now = Date.now(); const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+  let permission: 'reader' | 'editor' | null = 'editor';
+  const app = createHostedWorker({ contractVersion: '1', resolve: () => ({ id: 'downgrade', permission, monitorLimit: 2 }), contexts: () => [] });
+  const old = await operatorSubscription(app);
+  permission = 'reader'; clock.mockReturnValue(now + 60000);
+  const closed = new Promise<number>(resolve => old.socket.addEventListener('close', event => resolve(event.code)));
+  await runDurableObjectAlarm(env.MONITORING.getByName('downgrade')); expect(await closed).toBe(4001);
+  const reader = await operatorSubscription(app);
+  const response = await app.fetch(new Request('https://status.example/api/operator'), env);
+  expect(await response.json()).toMatchObject({ permission: 'reader' });
+  permission = 'editor';
+  await app.fetch(new Request('https://status.example/api/operator/webhook', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: 'https://secret.example/new' }) }), env);
+  await flush(); expect(reader.messages).toEqual([]); expect(old.messages).toEqual([]);
+  permission = null;
+  expect((await app.fetch(new Request('https://status.example/api/operator'), env)).status).toBe(401);
+});
+
+it('requires operator capabilities on upgrades, fixes the ticket audience and bounds lifetime from issuance', async () => {
+  const now = Date.now(); const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+  expect((await worker.fetch(new Request('https://status.example/api/operator/subscription', { method: 'POST', headers: { authorization: 'Bearer wrong' } }), env)).status).toBe(401);
+  expect((await request('/api/operator/subscription')).status).toBe(405);
+  expect((await request('/api/operator/subscribe')).status).toBe(426);
+  expect((await worker.fetch(new Request('https://status.example/api/operator/subscribe', { headers: { Upgrade: 'websocket', authorization: 'Bearer test-installation-secret' } }), env)).status).toBe(401);
+  const app = createHostedWorker({ contractVersion: '1', resolve: request => ({ id: 'audience', permission: request.headers.get('authorization') === 'Bearer editor' ? 'editor' : 'reader', monitorLimit: 2 }), contexts: () => [] });
+  const issued = await app.fetch(new Request('https://status.example/api/operator/subscription', { method: 'POST' }), env);
+  const { ticket } = await issued.json() as { ticket: string };
+  clock.mockReturnValue(now + 14999);
+  const response = await app.fetch(new Request('https://status.example/api/operator/subscribe?ticket=' + ticket + '&audience=editor&context=other', { headers: { Upgrade: 'websocket', authorization: 'Bearer editor' } }), env);
+  expect(response.status).toBe(101); const socket = response.webSocket!; socket.accept(); sockets.push(socket);
+  const messages: string[] = []; socket.addEventListener('message', event => { messages.push(String(event.data)); });
+  await app.fetch(new Request('https://status.example/api/operator/webhook', { method: 'PUT', headers: { authorization: 'Bearer editor', 'content-type': 'application/json' }, body: JSON.stringify({ url: 'https://secret.example/audience' }) }), env);
+  await flush(); expect(messages).toEqual([]);
+  const closed = new Promise<number>(resolve => socket.addEventListener('close', event => resolve(event.code)));
+  clock.mockReturnValue(now + 60000);
+  // Frame-time guard works even before the alarm runs, and never releases queued notifications.
+  socket.send('resync'); expect(await closed).toBe(4001); expect(messages).toEqual([]);
+});
+it('keeps operator pause and private UTC rollover scoped while rejecting application writes over sockets', async () => {
+  const now = Math.floor(Date.now() / 86400000) * 86400000 + 86400000 - 30000;
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+  let paused = false, policyRevision = 1;
+  const app = createHostedWorker({ contractVersion: '1', resolve: () => ({ id: 'operator-clock', permission: 'editor', monitorLimit: 2, paused, policyRevision }), contexts: () => [] });
+  const call = (path: string, body?: unknown) => app.fetch(new Request('https://status.example' + path, { method: body ? 'POST' : 'GET', headers: { 'content-type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}) }), env);
+  await call('/api/operator/monitors', { name: 'Private', kind: 'heartbeat', published: false });
+  const operator = await operatorSubscription(app), anonymous = await subscribe(app);
+  clock.mockReturnValue(now + 30000);
+  await runDurableObjectAlarm(env.MONITORING.getByName('operator-clock')); await flush();
+  expect(operator.messages).toEqual(['{"type":"status-changed"}']); expect(anonymous.messages).toEqual([]);
+  operator.socket.send('resync'); await flush(); operator.messages.length = 0;
+  paused = true; policyRevision++; await call('/api/operator'); await flush();
+  expect(operator.messages).toHaveLength(1); expect(anonymous.messages).toHaveLength(1); // Pause is a public context fact.
+  operator.socket.send('resync'); await flush(); operator.messages.length = 0;
+  policyRevision++; await call('/api/operator'); await flush(); expect(operator.messages).toEqual([]);
+  const closed = new Promise<number>(resolve => operator.socket.addEventListener('close', event => resolve(event.code)));
+  operator.socket.send('{"pageName":"Injected"}'); expect(await closed).toBe(1008);
+  expect(await (await call('/api/operator')).json()).toMatchObject({ pageName: 'Irisbeat', paused: true });
+});
