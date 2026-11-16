@@ -202,3 +202,7 @@ coverage verifies suppression of both delivery paths for all three check kinds.
 The hook observes committed detector transitions, not every raw observation.
 [History #9](history-api.md) adds the same filtered per-Monitor series to personal and hosted status, including readers; it does not change credentials, permissions, allowances or delivery. The release candidate must be
 regenerated after integration changes, before #12 publishes anything.
+
+### HTTP Calendar compatibility
+
+Contract 1 also accepts HTTP `scheduleMode`, `cron` and `timezone` through the same authorized collection routes as personal installations. Existing consumers and omitted fields remain Interval-compatible. `/api/operator/schedule-preview` requires editor permission and returns authoritative explanation/three future instants without mutation. Calendar configuration is operator-only; private/public visibility and allowances are unchanged. Persisted pause skips occurrences, and resume anchors at the next future occurrence without catch-up Checks or observations. Calendar Maintenance uses the existing observation exclusion and transition suppression. See [HTTP Calendar API](monitor-api.md#http-calendar-schedules).

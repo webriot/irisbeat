@@ -2,9 +2,9 @@
 // Manual upgrade regression: uses the foundation commit from local Git history.
 const { createRequire } = require('node:module');
 const { execFileSync } = require('node:child_process');
-const { mkdtempSync, writeFileSync, rmSync } = require('node:fs');
+const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require('node:fs');
 const { tmpdir } = require('node:os');
-const { join } = require('node:path');
+const { join, dirname } = require('node:path');
 const assert = require('node:assert/strict');
 const project = process.cwd();
 // Use the runtime/bundler shipped with the installed Cloudflare test plugin.
@@ -15,7 +15,12 @@ const base = process.argv[2] || '6fb95ccec52d9c5c29b82f82c3d77ed3a7e356d3';
 const tcp = process.argv[3] === 'tcp';
 const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
 (async () => {
-  for (const file of ['index.ts', 'ui.ts']) writeFileSync(join(temporary, file), execFileSync('git', ['show', `${base}:src/${file}`]));
+  const sources = execFileSync('git', ['ls-tree', '-r', '--name-only', base, 'src'], { encoding: 'utf8' }).trim().split('\n');
+  for (const source of sources) {
+    const destination = join(temporary, source.slice(4));
+    mkdirSync(dirname(destination), { recursive: true });
+    writeFileSync(destination, execFileSync('git', ['show', `${base}:${source}`]));
+  }
   const wrapper = index => `import app from ${JSON.stringify(index)}; export {MonitoringContext} from ${JSON.stringify(index)}; export default { async fetch(request, env, ctx) { const url = new URL(request.url); if(url.pathname === '/test-tick') { await app.scheduled({scheduledTime:Number(url.searchParams.get('at'))}, env, ctx); return new Response('checked'); } const testAt = request.headers.get('x-test-at'); const now = Date.now; if (testAt) Date.now = () => Number(testAt); try { return await app.fetch(request, env, ctx); } finally { Date.now = now; } } };`;
   const socketTarget = {
     name: 'substitute-tcp-target',
@@ -35,6 +40,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
   };
   const bundle = async index => (await build({
     stdin: { contents: wrapper(index), resolveDir: project, loader: 'ts' },
+    nodePaths: [join(project, 'node_modules')],
     bundle: true, write: false, format: 'esm', platform: 'neutral',
     external: ['cloudflare:workers', ...(tcp ? [] : ['cloudflare:sockets'])],
     plugins: tcp ? [socketTarget] : [],
@@ -111,6 +117,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     else { assert.equal(after.monitors[0].kind,'http'); assert.equal(after.monitors[0].url,'https://target.example/health'); }
     assert.equal(after.monitors[0].state,'down');
     assert.equal(after.monitors[0].intervalSeconds,60);
+    assert.equal(after.monitors[0].scheduleMode,'interval');
     assert.equal(after.monitors[0].timeoutSeconds,beforeTiming.monitor.timeoutSeconds ?? 10);
     assert.equal(after.monitors[0].failureThreshold,2);
     assert.equal(after.monitors[0].recoveryThreshold,2);
