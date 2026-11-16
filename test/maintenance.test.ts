@@ -153,8 +153,8 @@ it('renders ledger Maintenance controls and published banners with open outage p
   expect(operatorHtml).toContain('type="datetime-local"');
   const script = await (await request('/operator.js')).text();
   expect(script).toContain('/maintenance');
-  expect(script).toContain('End Maintenance');
-  expect(script).toContain('Replace Maintenance');
+  expect(operatorHtml).toContain('End Maintenance');
+  expect(script).toContain('Update end date');
 });
 it('keeps healthy state, skips missing executions, and makes repeated early end harmless', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(start);

@@ -19,8 +19,8 @@ function Document({ title, operator = false, children }: { title: string; operat
       <a href="/" aria-current={operator ? undefined : "page"}>Status page</a>
       <a href="/operator" aria-current={operator ? "page" : undefined}>Operator</a>
     </nav></header>
-    <main><div id="stale" hidden><span>Updates unavailable</span><button id="retry" type="button">Retry</button></div>{children}<span id="sync-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></span>{!operator && <span id="updates-mode" role="status">Polling</span>}</main>
-    <footer><a href="https://github.com/webriot/irisbeat/releases/download/v0.2.1/irisbeat-0.2.1-source.tar.gz">Source (AGPL-3.0-only)</a>
+    <main><div class="page-clock"><time id="page-clock"></time></div><div id="stale" hidden><span>Updates unavailable</span><button id="retry" type="button">Retry</button></div>{children}<span id="sync-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></span>{!operator && <span id="updates-mode" role="status">Polling</span>}</main>
+    <footer><a href="https://github.com/webriot/irisbeat/releases/download/v0.2.2/irisbeat-0.2.2-source.tar.gz">Source (AGPL-3.0-only)</a>
       <label class="theme-control">Theme <select id="theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
     </footer>
   </body></html>;
@@ -42,12 +42,12 @@ function Operator({ hosted }: { hosted: boolean }) {
       <h2 id="paused" hidden>Monitoring paused</h2>
       <div id="workspace">
         <div id="new-monitor-panel"></div>
-      <table aria-label="Monitors"><thead><tr><th scope="col">Monitor</th><th scope="col">State</th><th scope="col">Publication</th><th scope="col">Actions</th></tr></thead><tbody id="monitor-rows"></tbody></table>
-      <form id="maintenance" hidden aria-labelledby="maintenance-heading">
+      <table aria-label="Monitors"><colgroup><col class="monitor-column" /><col class="state-column" /><col class="publication-column" /><col class="actions-column" /></colgroup><thead><tr><th scope="col">Monitor</th><th scope="col">State</th><th scope="col">Publication</th><th scope="col">Actions</th></tr></thead><tbody id="monitor-rows"></tbody></table>
+      <dialog id="maintenance-dialog" aria-labelledby="maintenance-heading"><form id="maintenance" hidden aria-labelledby="maintenance-heading">
         <h2 id="maintenance-heading">Maintenance</h2>
         <label for="maintenance-end">End time</label><input id="maintenance-end" type="datetime-local" required />
-        <p id="maintenance-deleted" role="status" hidden>This Monitor was deleted. Copy your draft or cancel.</p><button id="save-maintenance">Declare Maintenance</button><button id="cancel-maintenance" type="button">Cancel</button>
-      </form>
+        <p id="maintenance-deleted" role="status" hidden>This Monitor was deleted. Copy your draft or cancel.</p><p id="maintenance-error" role="status"></p><button id="save-maintenance">Start Maintenance</button><button id="end-maintenance" type="button" class="danger" hidden>End Maintenance</button><button id="cancel-maintenance" type="button">Cancel</button>
+      </form></dialog>
 
         <form id="configuration" hidden aria-labelledby="monitor-settings">
           <h2 id="monitor-settings">New Monitor</h2>
@@ -76,7 +76,7 @@ function Operator({ hosted }: { hosted: boolean }) {
           <label class="checkbox" for="published"><input id="published" name="published" type="checkbox" checked />Published</label>
           <p id="monitor-deleted" role="status" hidden>This Monitor was deleted. Copy your draft or cancel.</p><button id="save-monitor">Save Monitor</button><button id="cancel-edit" type="button">Cancel</button>
         </form>
-      <section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2><ul id="incidents" class="incidents"></ul></section>
+      <section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2><div id="incidents"></div></section>
       </div>
       <section id="settings" hidden>
         <section aria-labelledby="page-settings"><h2 id="page-settings">Status page</h2>
@@ -251,13 +251,35 @@ function liveSnapshots(path, read, authorize) {
 }
 const selectedHistoryDays = new Map(Object.entries(history.state?.irisbeatDays || {}));
 const instantFormat = new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
+const timeFormat = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
+const localDateFormat = new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'numeric', day: 'numeric' });
 const bucketFormat = new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' });
 const browserTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-function initializeDisplay() {
-  document.querySelectorAll('time[datetime]:not([data-schedule-preview])').forEach(time => {
-    const label = instantFormat.format(new Date(time.dateTime));
+function updateTimeDisplays() {
+  const now = new Date();
+  const clock = document.getElementById('page-clock');
+  clock.dateTime = now.toISOString();
+  clock.textContent = instantFormat.format(now) + ' (' + browserTimeZone + ')';
+  document.querySelectorAll('time[datetime]:not([data-schedule-preview]):not(#page-clock)').forEach(time => {
+    const at = new Date(time.dateTime);
+    const incident = time.closest('.incident');
+    const duration = incident?.querySelector('.incident-duration');
+    const crossDay = duration && localDateFormat.format(new Date(Number(duration.dataset.start))) !== localDateFormat.format(new Date(Number(duration.dataset.end ?? now.getTime())));
+    const format = !crossDay && time.dataset.incidentTime === 'compact' && localDateFormat.format(at) === localDateFormat.format(now) ? timeFormat : instantFormat;
+    const label = format.format(at);
     if (time.textContent !== label) time.textContent = label;
   });
+  document.querySelectorAll('.incident-duration').forEach(duration => {
+    const seconds = Math.max(0, Math.floor((Number(duration.dataset.end ?? now.getTime()) - Number(duration.dataset.start)) / 1000));
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+    const days = Math.floor(hours / 24);
+    const label = days ? days + ' d ' + hours % 24 + ' h ' + minutes % 60 + ' min' : hours ? hours + ' h ' + minutes % 60 + ' min' : minutes ? minutes + ' min' : seconds + ' s';
+    if (duration.textContent !== label) duration.textContent = label;
+  });
+}
+function initializeDisplay() {
+  updateTimeDisplays();
   document.querySelectorAll('.history').forEach(strip => {
     const days = [...strip.children];
     if (!days.length) return;
@@ -273,8 +295,17 @@ function initializeDisplay() {
         const current = String(item === day);
         if (item.getAttribute('aria-current') !== current) item.setAttribute('aria-current', current);
       });
-      const label = day.getAttribute('aria-label');
-      if (detail.textContent !== label) detail.textContent = label;
+      const start = new Date(day.dataset.date + 'T00:00:00Z');
+      const end = new Date(start.getTime() + 86400000);
+      const today = new Date().toISOString().slice(0, 10);
+      const counts = Number(day.dataset.successes) + Number(day.dataset.failures) + Number(day.dataset.maintenance)
+        ? day.dataset.successes + ' successful · ' + day.dataset.failures + ' failed' + (Number(day.dataset.maintenance) ? ' · ' + day.dataset.maintenance + ' Maintenance' : '')
+        : 'No observations';
+      const label = (day.dataset.date === today ? '' : bucketFormat.format(start) + ' UTC · ') + counts;
+      const text = detail.querySelector('.history-counts');
+      if (text.textContent !== label) text.textContent = label;
+      detail.querySelector('.utc-range').textContent = day.dataset.date + ' 00:00 UTC → ' + end.toISOString().slice(0, 10) + ' 00:00 UTC';
+      detail.querySelector('.local-range').textContent = instantFormat.format(start) + ' → ' + instantFormat.format(end) + ' (' + browserTimeZone + ')';
     }
     days.forEach(day => {
       const start = new Date(day.dataset.date + 'T00:00:00Z');
@@ -305,6 +336,11 @@ try {
 document.documentElement.dataset.theme = theme;
 document.addEventListener('DOMContentLoaded', () => {
   initializeDisplay();
+  setInterval(() => {
+    const previous = document.getElementById('page-clock').dateTime.slice(0, 10);
+    if (previous !== new Date().toISOString().slice(0, 10)) initializeDisplay();
+    else updateTimeDisplays();
+  }, 1000);
   if (document.getElementById('public-status')) {
     const updates = liveSnapshots('/api/status/events', async current => {
       const controller = new AbortController();
@@ -382,7 +418,10 @@ h2 { margin: 0; font-size: 16px; font-weight: 650; }
 .ledger-row[data-state="up"] .status, .status[data-state="up"] { color: var(--success); }
 .ledger-row[data-state="down"] .status, .status[data-state="down"] { color: var(--danger); }
 .ledger-row[data-state="maintenance"] .status, .status[data-state="maintenance"], .ledger-row[data-state="paused"] .status, .status[data-state="paused"] { color: var(--info); }
-table { width: 100%; border-spacing: 0; margin-top: 20px; }
+table { width: 100%; table-layout: fixed; border-spacing: 0; margin-top: 20px; }
+.monitor-column { width: auto; }
+.state-column, .publication-column { width: 19%; }
+.actions-column { width: 226px; }
 th, td { padding: 12px 16px; text-align: left; }
 th { font-size: 12px; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--line); }
 tbody tr:nth-child(even):not(:last-child) td { border-bottom: 1px solid var(--line); }
@@ -391,6 +430,9 @@ tbody tr:nth-child(odd) td { padding-bottom: 0; }
 .percentage { font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .history { position: relative; display: grid; grid-template-columns: repeat(90, minmax(0, 1fr)); gap: 3px; list-style: none; padding: 0; margin: 8px 0 0; }
 .history-head { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
+.page-clock { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+.history-detail summary { cursor: pointer; width: fit-content; margin-top: 4px; }
+.history-detail p { margin: 4px 0; }
 .history-detail { color: var(--muted); font-size: 12px; line-height: 1.4; margin: 8px 0 0; min-height: 2.8em; }
 .history-day[aria-current="true"] { outline: 2px solid var(--foreground); outline-offset: 2px; }
 .history-day { cursor: pointer; height: 25px; border-radius: 2px; background: var(--secondary); }
@@ -400,6 +442,8 @@ tbody tr:nth-child(odd) td { padding-bottom: 0; }
 .history-day.maintenance { background: var(--info); }
 .history-day.empty { border: 1px dashed var(--line); }
 .history-unavailable { color: var(--muted); font-size: 12px; }
+.operator-heading h1 { margin-right: auto; }
+#operator-navigation { margin-left: auto; }
 .operator-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 #operator-navigation { display: flex; gap: 8px; }
 #settings { max-width: 620px; }
@@ -408,7 +452,10 @@ tbody tr:nth-child(odd) td { padding-bottom: 0; }
 form, aside { min-width: 0; }
 #configuration, #maintenance, #webhook, #page-configuration, #login { border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; background: var(--card); }
 #configuration, #maintenance { background: var(--secondary); }
-#maintenance { margin-bottom: 20px; }
+#maintenance-dialog { width: min(480px, calc(100% - 32px)); padding: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); color: var(--foreground); }
+#maintenance-dialog::backdrop { background: #0006; }
+#maintenance { border: 0; }
+#maintenance-error:empty { display: none; }
 fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 label { display: block; margin: 12px 0 6px; font-size: 13px; }
 input, select, button { font: inherit; min-height: 40px; max-width: 100%; border: 1px solid var(--line); border-radius: 7px; background: var(--card); color: var(--foreground); }
@@ -429,6 +476,13 @@ form button[type="submit"], form button:not([type]), #new-monitor { background: 
 :focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
 .incidents { list-style: none; padding: 0; margin: 12px 0 0; }
 .incident { padding: 16px 0; border-top: 1px solid var(--line); }
+.incident-top, .incident-facts { display: flex; align-items: baseline; gap: 8px 16px; flex-wrap: wrap; }
+.incident-top h4 { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
+.incident-state { margin-left: auto; }
+.incident-state[data-state="down"] { color: var(--danger); }
+.incident-state[data-state="up"] { color: var(--success); }
+.deleted, .incident-facts { color: var(--muted); font-size: 12px; }
+.incident-facts { margin-top: 8px; }
 .incident p { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
 .actions { justify-content: flex-start; margin-top: 20px; }
 td .actions { margin: 0; gap: 6px; }
@@ -438,12 +492,12 @@ td .actions { margin: 0; gap: 6px; }
 footer { margin-top: 36px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
 .theme-control { display: flex; align-items: center; gap: 8px; margin: 0; }
 .theme-control select { width: auto; }
-/* Shared surfaces for operator action menus and inline panels. */
-.menu { position: relative; }
-summary { list-style: none; cursor: pointer; border-radius: 7px; padding: 8px 13px; }
-summary::-webkit-details-marker { display: none; }
-.menu-items { position: absolute; right: 0; z-index: 5; width: 205px; padding: 5px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); box-shadow: 0 10px 30px #0002; }
-.menu-items button { display: block; width: 100%; text-align: left; border: 0; }
+.monitor-actions { display: grid; grid-template-columns: repeat(4, 44px); gap: 6px; }
+.monitor-action { position: relative; display: grid; place-items: center; width: 44px; min-height: 44px; padding: 10px; border: 0; background: transparent; }
+.monitor-action svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.action-label { display: none; position: absolute; z-index: 6; top: 100%; right: 0; width: max-content; padding: 5px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--card); color: var(--foreground); font-size: 12px; }
+.monitor-action:hover .action-label, .monitor-action:focus .action-label { display: block; }
+@media (hover: none) { .actions-column { width: 290px; } .monitor-actions { grid-template-columns: 44px 64px 88px 44px; } .monitor-action { width: 100%; padding: 6px 0; } .action-label { display: block; position: static; width: auto; padding: 0; border: 0; font-size: 10px; } }
 button.danger { color: var(--danger); }
 [hidden] { display: none !important; }
 @media (max-width: 44rem) {
@@ -486,30 +540,33 @@ function updateDeleted() {
   const maintenanceMissing = !maintenanceForm.hidden && !monitorIds.has(maintenanceForm.dataset.monitorId);
   byId('maintenance-deleted').hidden = !maintenanceMissing;
   byId('save-maintenance').disabled = maintenanceMissing;
+  byId('end-maintenance').disabled = maintenanceMissing;
 }
 
-function focusActions(id) { (document.getElementById('actions-' + id) || byId('new-monitor')).focus(); }
+function focusActions(id) { (document.getElementById('actions-' + id)?.querySelector('button') || byId('new-monitor')).focus(); }
 function localMinute(date) { return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16); }
 function declareMaintenance(monitor) {
   maintenanceForm.querySelector('label').textContent = 'End time (' + browserTimeZone + ')';
   maintenanceForm.dataset.monitorId = monitor.id;
-  byId('maintenance-heading').textContent = monitor.name + ' — Maintenance';
-  byId('save-maintenance').textContent = monitor.maintenance ? 'Replace Maintenance' : 'Declare Maintenance';
+  byId('maintenance-error').textContent = '';
+  byId('end-maintenance').hidden = !monitor.maintenance;
+  byId('save-maintenance').textContent = monitor.maintenance ? 'Update end date' : 'Start Maintenance';
   const end = new Date(monitor.maintenance?.endsAt ?? Date.now() + 3600000);
   const input = byId('maintenance-end');
   input.value = localMinute(end);
   input.dataset.originalValue = input.value;
   input.dataset.originalInstant = String(end.getTime());
   input.setCustomValidity('');
-  document.getElementById('history-' + monitor.id).append(maintenanceForm);
-  maintenanceForm.hidden = false; updateDeleted(); byId('maintenance-end').focus();
+  maintenanceForm.hidden = false; updateDeleted(); byId('maintenance-dialog').showModal(); byId('maintenance-end').focus();
 }
+function closeMaintenance() { byId('maintenance-dialog').close(); maintenanceForm.hidden = true; queueMicrotask(() => (document.getElementById('actions-' + maintenanceForm.dataset.monitorId)?.querySelector('[data-key=maintenance]') || byId('new-monitor')).focus()); }
 function clearSession() {
+  byId('maintenance-dialog').close();
   document.querySelectorAll('button, input, select').forEach(control => { control.disabled = false; });
   monitorIds.clear(); selectedHistoryDays.clear(); byId('stale').hidden = true; byId('sync-announcement').textContent = ''; snapshotPending(false);
   savedSettings = {}; monitorEditor.close(); byId('heartbeat-path').textContent = ''; maintenanceForm.reset(); maintenanceForm.removeAttribute('data-monitor-id'); byId('maintenance-heading').textContent = 'Maintenance'; maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
   showSettings(false); byId('operator-navigation').hidden = true;
-  byId('new-monitor-panel').append(maintenanceForm);
+
   byId('monitor-rows').replaceChildren(); byId('incidents').replaceChildren();
   updateDeleted();
   message.textContent = ''; byId('secret').value = ''; byId('secret').focus();
@@ -520,7 +577,7 @@ function render(data, savedField) {
   hosted = !!data.hosted;
   byId('paused').hidden = !data.paused;
   const canEdit = data.permission !== 'reader';
-  if (!canEdit) { monitorEditor.close(); maintenanceForm.hidden = true; byId('webhookUrl').value = ''; savedSettings.webhookUrl = ''; }
+  if (!canEdit) { monitorEditor.close(); closeMaintenance(); byId('webhookUrl').value = ''; savedSettings.webhookUrl = ''; }
   if (!canEdit) showSettings(false);
   byId('new-monitor').hidden = !canEdit || !byId('settings').hidden; byId('settings-button').hidden = !canEdit || !byId('settings').hidden;
   for (const field of ['pageName', 'webhookUrl']) {
@@ -534,12 +591,9 @@ function render(data, savedField) {
   monitorIds = new Set(data.monitors.map(monitor => monitor.id));
   updateDeleted();
   const focused = document.activeElement;
-  for (const draft of [form, maintenanceForm]) {
-    const id = draft === form ? monitorEditor.id : draft.dataset.monitorId;
-    if (id && !monitorIds.has(id) && draft.parentElement !== byId('new-monitor-panel')) {
-      byId('new-monitor-panel').append(draft);
-      if (draft.contains(focused)) focused.focus();
-    }
+  if (monitorEditor.id && !monitorIds.has(monitorEditor.id) && form.parentElement !== byId('new-monitor-panel')) {
+    byId('new-monitor-panel').append(form);
+    if (form.contains(focused)) focused.focus();
   }
   const rows = data.monitors.flatMap(monitor => {
     const row = document.createElement('tr'); row.dataset.key = monitor.id;
@@ -549,26 +603,23 @@ function render(data, savedField) {
       row.append(cell);
     }
     const actions = document.createElement('td');
-    const group = document.createElement('details'); group.className = 'menu';
-    const trigger = document.createElement('summary'); trigger.textContent = '…'; trigger.id = 'actions-' + monitor.id; trigger.setAttribute('aria-label', 'Actions ' + monitor.name);
-    const items = document.createElement('div'); items.className = 'menu-items';
-    if (canEdit) group.append(trigger, items);
+    const group = document.createElement('div'); group.className = 'monitor-actions'; group.id = 'actions-' + monitor.id; group.setAttribute('role', 'group'); group.setAttribute('aria-label', 'Actions ' + monitor.name);
     const path = '/api/operator/monitors/' + encodeURIComponent(monitor.id);
     for (const [key, label, action] of (canEdit ? [
       ['edit', 'Edit', () => monitorEditor.open(monitor, hosted)],
-      ['maintenance', monitor.maintenance ? 'Replace Maintenance' : 'Declare Maintenance', () => declareMaintenance(monitor)],
-      ...(monitor.maintenance ? [['end-maintenance', 'End Maintenance', () => run(path + '/maintenance', 'DELETE', undefined, () => { maintenanceForm.hidden = true; })]] : []),
       ['publication', monitor.published ? 'Unpublish' : 'Publish', () => run(path, 'PATCH', { published: !monitor.published })],
+      ['maintenance', 'Maintenance', () => declareMaintenance(monitor)],
       ['delete', 'Delete', () => { if (confirm('Delete ' + monitor.name + '? Checks and publication stop. Incident history is retained.')) run(path, 'DELETE'); }]
     ] : [])) {
-      const button = document.createElement('button'); button.type = 'button'; button.dataset.key = key; button.textContent = label;
+      const button = document.createElement('button'); button.type = 'button'; button.dataset.key = key; button.className = 'monitor-action';
+      const icons = { edit: 'M13 3l4 4-9 9-5 1 1-5z M11 5l4 4', publication: monitor.published ? 'M2 2l16 16 M8 4a10 10 0 0 1 10 6 12 12 0 0 1-3 4 M5 5a12 12 0 0 0-3 5 10 10 0 0 0 10 6 M8 8a3 3 0 0 0 4 4' : 'M2 10s3-6 8-6 8 6 8 6-3 6-8 6-8-6-8-6z M13 10a3 3 0 1 1-6 0 3 3 0 0 1 6 0', maintenance: 'M12 3a5 5 0 0 0-5 6l-5 5a2 2 0 0 0 4 4l5-5a5 5 0 0 0 6-6l-3 3-3-3 3-3z', delete: 'M3 5h14 M7 5V2h6v3 M5 5l1 13h8l1-13 M8 8v7 M12 8v7' };
+      button.innerHTML = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="' + icons[key] + '"/></svg>';
+      const tooltip = document.createElement('span'); tooltip.className = 'action-label'; tooltip.textContent = label; tooltip.setAttribute('aria-hidden', 'true'); button.append(tooltip);
+      button.title = label;
       button.setAttribute('aria-label', label + ' ' + monitor.name);
-      if (key === 'delete') button.className = 'danger';
-      button.onclick = event => {
-        const menu = event.currentTarget.closest('details');
-        menu.open = false; menu.querySelector('summary').focus(); action();
-      };
-      items.append(button);
+      if (key === 'delete') button.classList.add('danger');
+      button.onclick = () => action();
+      group.append(button);
     }
     actions.append(group); row.append(actions);
     const historyRow = document.createElement('tr'); historyRow.dataset.key = monitor.id + ':history';
@@ -583,20 +634,9 @@ function render(data, savedField) {
     cell.colSpan = 4; cell.textContent = 'No Monitors'; row.append(cell); rows.push(row);
   }
   reconcileNodes(byId('monitor-rows'), rows);
-  const incidents = data.incidents.map(incident => {
-    const item = document.createElement('li'); item.className = 'incident'; item.dataset.key = incident.monitorId + ':' + incident.openedAt;
-    const monitor = data.monitors.find(monitor => monitor.id === incident.monitorId);
-    item.append((monitor?.name || incident.monitorName || incident.monitorId) + (monitor ? '' : ' (deleted)') + ' — Unavailable since ');
-    const appendTime = at => {
-      const time = document.createElement('time'); time.dateTime = new Date(at).toISOString(); item.append(time);
-    };
-    appendTime(incident.openedAt);
-    if (incident.closedAt === null) item.append(' — Ongoing');
-    else { item.append(' — Recovered '); appendTime(incident.closedAt); }
-    return item;
-  });
-  if (!incidents.length) { const item = document.createElement('li'); item.textContent = 'No Incidents'; incidents.push(item); }
-  reconcileNodes(byId('incidents'), incidents);
+  const incidentContent = document.createElement('div');
+  incidentContent.innerHTML = statusLedger.incidents(data, true);
+  reconcile(byId('incidents'), incidentContent);
   initializeDisplay();
   if (focused !== document.body && !focused.isConnected) byId(byId('new-monitor').hidden ? 'operator-title' : 'new-monitor').focus();
 }
@@ -613,12 +653,12 @@ const session = createOperatorSession(liveSnapshots, {
   signedOut: clearSession,
   failed(error, reading) {
     if (reading) snapshotFailure(true);
-    else message.textContent = error;
+    else { message.textContent = error; if (byId('maintenance-dialog').open) byId('maintenance-error').textContent = error; }
   },
   writing() {
     const disabled = [...document.querySelectorAll('button, input, select')].filter(control => !control.disabled && control.id !== 'logout');
     disabled.forEach(control => { control.disabled = true; });
-    message.textContent = '';
+    message.textContent = ''; byId('maintenance-error').textContent = '';
     return () => {
       disabled.forEach(control => { control.disabled = false; });
       updateDeleted();
@@ -657,10 +697,12 @@ maintenanceForm.addEventListener('submit', async event => {
     }
     endsAt = end.getTime();
   }
-  await run('/api/operator/monitors/' + encodeURIComponent(maintenanceForm.dataset.monitorId) + '/maintenance', 'PUT', { endsAt }, () => { maintenanceForm.hidden = true; focusActions(maintenanceForm.dataset.monitorId); });
+  await run('/api/operator/monitors/' + encodeURIComponent(maintenanceForm.dataset.monitorId) + '/maintenance', 'PUT', { endsAt }, closeMaintenance);
 });
 byId('maintenance-end').addEventListener('input', event => event.target.setCustomValidity(''));
-byId('cancel-maintenance').addEventListener('click', () => { maintenanceForm.hidden = true; focusActions(maintenanceForm.dataset.monitorId); });
+byId('cancel-maintenance').addEventListener('click', closeMaintenance);
+byId('maintenance-dialog').addEventListener('cancel', event => { event.preventDefault(); closeMaintenance(); });
+byId('end-maintenance').addEventListener('click', () => { if (monitorIds.has(maintenanceForm.dataset.monitorId)) run('/api/operator/monitors/' + encodeURIComponent(maintenanceForm.dataset.monitorId) + '/maintenance', 'DELETE', undefined, closeMaintenance); });
 webhook.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator/webhook', 'PUT', { url: byId('webhookUrl').value }); });
 pageForm.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator', 'PUT', { pageName: byId('pageName').value }); });
 function showSettings(settings) {
@@ -671,8 +713,6 @@ function showSettings(settings) {
 }
 byId('settings-button').addEventListener('click', () => { showSettings(true); byId('pageName').focus(); });
 byId('back-monitors').addEventListener('click', () => { showSettings(false); byId('settings-button').focus(); });
-document.addEventListener('click', event => { document.querySelectorAll('details.menu[open]').forEach(menu => { if (!menu.contains(event.target)) menu.open = false; }); });
-document.addEventListener('keydown', event => { if (event.key === 'Escape') document.querySelectorAll('details.menu[open]').forEach(menu => { menu.open = false; menu.querySelector('summary').focus(); }); });
 byId('new-monitor').addEventListener('click', () => monitorEditor.open(null, hosted));
 byId('retry').addEventListener('click', () => run());
 byId('logout').addEventListener('click', session.signOut);
