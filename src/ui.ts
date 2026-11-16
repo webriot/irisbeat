@@ -467,7 +467,11 @@ function render(data) {
         const draft = byId('maintenance-end').value;
         const version = panelVersion;
         run(path + '/maintenance', 'DELETE', undefined, () => {
-          if (version === panelVersion && submittedId === monitor.id && submittedId === maintenanceForm.dataset.monitorId && draft === byId('maintenance-end').value) maintenanceForm.hidden = true;
+          if (version === panelVersion && submittedId === monitor.id && submittedId === maintenanceForm.dataset.monitorId && draft === byId('maintenance-end').value) {
+            const focused = maintenanceForm.contains(document.activeElement);
+            maintenanceForm.hidden = true;
+            if (focused) focusAction(submittedId);
+          }
         });
       }]] : []),
       [monitor.published ? 'Unpublish' : 'Publish', () => run(path, 'PATCH', { published: !monitor.published })],
