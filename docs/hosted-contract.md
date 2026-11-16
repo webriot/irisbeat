@@ -200,3 +200,68 @@ coverage verifies suppression of both delivery paths for all three check kinds.
 The hook observes committed detector transitions, not every raw observation.
 [History #9](history-api.md) adds the same filtered per-Monitor series to personal and hosted status, including readers; it does not change credentials, permissions, allowances or delivery. The release candidate must be
 regenerated after integration changes, before #12 publishes anything.
+
+
+## Public Status subscriptions
+
+[#30](https://github.com/Webriot/irisbeat/issues/30) adds
+`GET /api/status/subscribe` with `Upgrade: websocket` to contract 1. The existing
+trusted `resolve` runs for this request, including host validation and pause
+policy propagation; callers cannot choose a context via query, body or headers.
+Unrecognized hosts remain 404. Public subscriptions are anonymous even when an
+operator credential accompanies the handshake. No operator subscription is
+implemented (#31); private Monitors, targets, webhook/heartbeat credentials,
+policy revisions and other contexts never appear in this channel.
+
+The resolved context's `MonitoringContext.fetch` accepts a hibernating socket
+with the `public` tag. Subclasses inherit `fetch`, `webSocketMessage`,
+`webSocketClose`, `webSocketError` and `alarm`; consumers overriding those handlers
+must forward engine subscriptions and the engine's public clock alarm to `super`.
+The engine now owns the context alarm for published Maintenance expiry and UTC
+history rollover. No new binding or migration is required. Forward WebSocket
+upgrades through the consumer's host/proxy and preserve the response's `webSocket`
+when wrapping responses. Requests without an upgrade return 426; non-GET returns
+405. A context permits 256 simultaneous public sockets, returning 503 above that
+application limit. HTTP snapshots remain available.
+
+The only server frame is the literal JSON `{"type":"status-changed"}`. It has no
+revision, timestamp, context/Monitor identifier, snapshot or delta. Notifications
+occur only when the public projection changes (including publication, page name,
+visible observations/history/Incidents, Maintenance and pause). Comparisons use a
+fixed instant throughout each synchronous mutation stage, including state reads
+and expiry processing, so unrelated private writes cannot trigger a clock
+notification. Notification equality uses committed public observation counts,
+independently of fallible presentation history queries. History failure/recovery
+alone is silent; snapshots still return null series and log query failures. Real
+committed-comparison storage errors propagate rather than becoming empty history.
+Clock alarms depend only on published data, and public writes preserve overdue
+clock deadlines for the independent clock path. Target/timing-only
+edits, private observations, webhook saves, credential rotation and unchanged
+policy revisions remain silent. Public Heartbeat freshness is part of the existing
+snapshot, including receipts during pause, so changes to published `lastSeen`
+notify even when history remains frozen.
+
+Clients must fetch `GET /api/status` immediately on open/reconnect and after a
+notification, then send the literal text `resync` **after** the read completes.
+Each socket retains at most one outstanding notification plus a dirty bit; changes
+while its read is in flight cause one more notification after `resync`. This
+closes the snapshot/subscription race without a replay log. Any other client frame
+closes with 1008 and cannot write application data. Pending/dirty attachments
+survive hibernation. Runtime/deployment disconnects require a new connection and
+snapshot; no persisted revision or in-memory baseline is required.
+
+The supplied public UI uses one snapshot read plus one coalesced trailing read,
+a 15-second snapshot deadline, a 250-ms acknowledgement delay, a 10-second socket
+handshake deadline and reconnect delays capped at 30 seconds (1, 2, 4, 8, 16, 30).
+While disconnected it polls every 60 seconds only while visible; connection and
+visibility return reconcile immediately. A failed subscription snapshot restarts the connection so recovery does not
+require another public change. Socket failure alone does not mark data
+stale: failed snapshot reads retain the last ledger and show “Updates unavailable”.
+Page exit clears timers, aborts its read and closes its socket; persisted-page
+return reconnects. Writes stay on HTTP, and the operator refresh/draft path is
+unchanged. Theme, keyboard history selection, dates and keyed DOM identity remain
+owned by the existing presentation/reconciler.
+
+Implementation follows Cloudflare's [hibernating WebSocket guidance](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)
+and [Durable Object state APIs](https://developers.cloudflare.com/durable-objects/api/state/),
+verified against the installed Workers types and workerd runtime tests.

@@ -302,23 +302,83 @@ const timeMarkup = ${timeMarkup.toString()};
 const stateLabel = ${JSON.stringify(stateLabel)};
 const historyMarkup = ${historyMarkup.toString()};
 const statusMarkup = ${statusMarkup.toString()};
-let requestId = 0;
-async function refresh() {
-  const id = ++requestId;
+let reading, readController, again = false, socket, retry, polling, handshake, acknowledgement, stopped = false;
+let backoff = 1000;
+async function readSnapshot() {
+  const controller = new AbortController(); readController = controller;
+  const deadline = setTimeout(() => controller.abort(), 15000);
   try {
-    const response = await fetch('/api/status');
+    const response = await fetch('/api/status', { signal: controller.signal });
     if (!response.ok) throw new Error('Request failed');
     const data = await response.json();
-    if (id !== requestId) return;
+    if (stopped) return false;
     const desired = document.createElement('div'); desired.innerHTML = statusMarkup(data, timeMarkup);
     reconcile(document.getElementById('public-status'), desired);
     window.IrisbeatPresentation.initialize(document.getElementById('public-status'));
     document.title = data.pageName;
     document.getElementById('stale').hidden = true;
-  } catch { if (id === requestId) document.getElementById('stale').hidden = false; }
+    return true;
+  } catch { if (!stopped) document.getElementById('stale').hidden = false; return false; }
+  finally { clearTimeout(deadline); }
+}
+function refresh() {
+  if (stopped) return Promise.resolve();
+  if (reading) { again = true; return reading; }
+  reading = (async () => {
+    let success;
+    do { again = false; success = await readSnapshot(); } while (again && !stopped);
+    return success;
+  })().finally(() => { reading = undefined; });
+  return reading;
+}
+function connected() { return socket && socket.readyState === 1; }
+function schedulePolling() {
+  if (stopped || document.hidden || connected()) { clearTimeout(polling); polling = undefined; return; }
+  if (polling === undefined)
+    polling = setTimeout(async () => { polling = undefined; await refresh(); schedulePolling(); }, 60000);
+}
+function connect() {
+  if (stopped || typeof WebSocket === 'undefined') return;
+  let current;
+  const disconnected = () => {
+    if (socket !== current || stopped) return;
+    socket = undefined;
+    clearTimeout(handshake); clearTimeout(acknowledgement);
+    current?.close();
+    schedulePolling();
+    retry = setTimeout(connect, backoff);
+    backoff = Math.min(backoff * 2, 30000);
+  };
+  try {
+    current = new WebSocket(new URL('/api/status/subscribe', location.href).href.replace(/^http/, 'ws'));
+    socket = current;
+    handshake = setTimeout(disconnected, 10000);
+    const reconcileSubscription = async () => {
+      if (!await refresh()) { disconnected(); return; }
+      if (socket !== current || stopped) return;
+      // Acknowledging after the read keeps changes during that read pending on the server.
+      clearTimeout(acknowledgement);
+      acknowledgement = setTimeout(() => { if (socket === current && connected()) current.send('resync'); }, 250);
+    };
+    current.onopen = () => {
+      if (socket !== current || stopped) return;
+      clearTimeout(handshake); backoff = 1000; schedulePolling(); reconcileSubscription();
+    };
+    current.onmessage = event => {
+      if (socket === current && event.data === '{"type":"status-changed"}') reconcileSubscription();
+    };
+    current.onclose = disconnected;
+    current.onerror = disconnected;
+  } catch { disconnected(); }
 }
 document.getElementById('refresh').addEventListener('click', refresh);
-pollVisible(refresh);
+document.addEventListener('visibilitychange', () => { schedulePolling(); if (!document.hidden) refresh(); });
+window.addEventListener('pagehide', () => {
+  stopped = true; clearTimeout(retry); clearTimeout(polling); clearTimeout(handshake); clearTimeout(acknowledgement);
+  polling = undefined; readController?.abort(); socket?.close(); socket = undefined;
+});
+window.addEventListener('pageshow', () => { if (stopped) { stopped = false; connect(); refresh(); schedulePolling(); } });
+connect(); schedulePolling();
 `;
 
 export const operatorScript = `
