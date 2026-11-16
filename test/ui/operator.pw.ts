@@ -55,6 +55,12 @@ for (const mobile of [false, true]) {
       else { await actions.focus(); await actions.press('ArrowDown'); }
       const menu = page.locator('details').filter({ has: actions });
       await expect(menu.locator('button').first()).toHaveText('Edit');
+      const bounds = await menu.locator('.menu-items').evaluate(node => {
+        const rect = node.getBoundingClientRect();
+        return { left: rect.left, right: rect.right, viewport: innerWidth };
+      });
+      expect(bounds.left).toBeGreaterThanOrEqual(0);
+      expect(bounds.right).toBeLessThanOrEqual(bounds.viewport);
       await menu.getByRole('button', { name: 'Edit Action Monitor', exact: true }).click();
       await expect(menu).not.toHaveAttribute('open', '');
       await expect(page.getByLabel('Monitor name', { exact: true })).toBeFocused();

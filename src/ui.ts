@@ -248,6 +248,7 @@ button.danger { color: var(--danger); }
   th, td { padding: 8px 12px; }
   tbody tr:nth-child(odd) { padding-top: 8px; }
   tbody tr:nth-child(even) td { padding-bottom: 16px; }
+  .menu-items { left: 0; right: auto; }
   .operator-heading { margin: 20px 0; }
   .operator-heading h1 { margin: 0; }
   footer { align-items: flex-start; }
