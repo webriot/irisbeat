@@ -107,8 +107,8 @@ it('shows overlapping published Incidents newest first in UTC and retains older/
   expect(publicData.incidents.map(incident => incident.monitorId)).toEqual([recent.id, ongoing.id]);
   const html = await (await request('/')).text();
   expect(html).toContain('2026-08-14T00:00:00.000Z');
-  expect(html.indexOf('Recent — Open')).toBeLessThan(html.indexOf('Older still open — Open'));
-  for (const name of ['Old recovered —', 'Ends at boundary —', 'Secret monitor', 'Deleted monitor']) expect(html).not.toContain(name);
+  expect(html.indexOf('<h4>Recent</h4>')).toBeLessThan(html.indexOf('<h4>Older still open</h4>'));
+  for (const name of ['<h4>Old recovered</h4>', '<h4>Ends at boundary</h4>', 'Secret monitor', 'Deleted monitor']) expect(html).not.toContain(name);
   const operator = await status(true);
   expect(operator.incidents).toHaveLength(6);
   expect(operator.incidents.find(incident => incident.monitorId === old.id)?.closedAt).toBe(first - day);
@@ -134,7 +134,8 @@ it.each(['missing', 'failed'])('keeps rendered current state and Incidents when 
   expect(data.incidents).toHaveLength(1);
   const html = await (await request('/')).text();
   expect(html).toContain('Services unavailable');
-  expect(html).toContain('Website — Open');
+  expect(html).toContain('<h4>Website</h4>');
+  expect(html).toContain('aria-label="Ongoing"');
   expect(html).toContain('Bars unavailable');
   expect(html).not.toContain('Private outage');
   expect(html).not.toContain('100.00%');

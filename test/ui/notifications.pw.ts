@@ -49,12 +49,16 @@ test('real public notifications preserve row identity, history selection and foc
     const day = strip.locator('li').nth(88);
     await day.focus();
     const selected = await day.getAttribute('data-date');
+    const range = strip.locator('..').getByText('Exact time range', { exact: true });
+    await range.click();
+    await day.focus();
     const node = await strip.elementHandle();
     await request.patch(path, { headers, data: { name: 'Live renamed producer' } });
     await expect(page.getByText('Live renamed producer', { exact: true })).toBeVisible();
     await expect(strip.locator('[aria-current="true"]')).toHaveAttribute('data-date', selected!);
     await expect(day).toBeFocused();
     expect(await node!.evaluate(element => element.isConnected)).toBe(true);
+    await expect(range.locator('..')).toHaveAttribute('open', '');
   } finally { await request.delete(path, { headers }); }
 });
 test('failed reconnect attempts back off without postponing visible fallback polling', async ({ page }) => {
