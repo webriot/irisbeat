@@ -178,7 +178,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     }
     deliveries.length = 0; webhooks.length = 0;
     assert.equal((await request('a.example', '/test-unsupported-version')).status, 409);
-    for (const path of ['/operator.js', '/status.js']) {
+    for (const path of ['/operator.js', '/status.js', '/presentation.js', '/theme.js']) {
       const script = await request('a.example', path);
       assert.equal(script.headers.get('Content-Type'), 'text/javascript; charset=utf-8');
       new (require('node:vm').Script)(await script.text());

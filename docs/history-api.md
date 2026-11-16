@@ -27,16 +27,27 @@ plus the previous 89 UTC calendar days. Both endpoints and the ledger share this
 range. Public filtering happens before series reads, so private/deleted Monitors
 never acquire public bars. Hosted readers receive the operator view with unchanged
 secret filtering and no editing controls. The UI formats a counted percentage to
-two decimals; null percentage displays “Unavailable”, null history displays
-“Bars unavailable”. Each bar exposes its UTC date, state and observation counts
-to assistive technology and a title tooltip. Operator bars span the ledger width
-beneath their Monitor row; Incidents follow the ledger.
+two decimals; null percentage displays “No observations”, null history displays
+“Bars unavailable”. Each strip has one tab entry. Left/Right arrows inspect adjacent
+days, Home/End inspect the endpoints, and tap selects a day. Day details expose the
+localized UTC bucket date, state, observation counts, and the bucket's start/end in
+the browser timezone. Operator bars span the ledger width beneath their Monitor
+row; Incidents follow the ledger.
 
 Public Incidents have `openedAt < next UTC midnight` and either no recovery or
 `closedAt > first displayed UTC midnight`. Recovery exactly at the range start
 does not overlap. Incidents remain newest first (`openedAt DESC`, ID tie-break),
-with UTC times. Operators receive all retained Incidents, including older and
+with exact UTC instants in machine-readable timestamps and localized browser-time
+display. Operators receive all retained Incidents, including older and
 deleted-Monitor names. No page-wide percentage is added.
+
+`/presentation.js` initializes localized timestamps and history controls on both
+pages. After patching snapshot markup, call
+`window.IrisbeatPresentation.initialize(container)` on the containing element
+(or omit the argument for the document). It retains selected UTC dates by Monitor
+ID across node replacements and temporary missing history. A date that leaves
+retention falls back to the newest bucket. Call `clear()` at sign-out. This state
+stays in memory and carries no credentials.
 
 ## Storage and failure boundary
 
