@@ -30,3 +30,9 @@ export type DeadLetter = NotificationDeliveryIdentity & {
   attempts: number;
   reason: ExhaustionReason;
 };
+
+export type NotificationOutcomeMessage = {
+  identity: NotificationDeliveryIdentity;
+  submissionReport: SubmissionReport;
+  exhaustion?: ExhaustionReason;
+};

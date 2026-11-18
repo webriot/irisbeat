@@ -10,7 +10,10 @@
       "queue": "irisbeat-notifications",
       "max_retries": 10,
     }],
-    "producers": [{ "binding": "NOTIFICATION_DLQ", "queue": "irisbeat-notifications-dead-letter" }],
+    "producers": [
+      { "binding": "NOTIFICATION_DLQ", "queue": "irisbeat-notifications-dead-letter" },
+      { "binding": "NOTIFICATION_OUTCOMES", "queue": "irisbeat-notifications" },
+    ],
   },
   "durable_objects": {
     "bindings": [{ "name": "NOTIFICATION_RECOVERY", "class_name": "NotificationRecovery" }],

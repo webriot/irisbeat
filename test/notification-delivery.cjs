@@ -68,6 +68,13 @@ async function main() {
     import delivery, { NotificationRecovery as Recovery } from './src/notification-delivery.ts';
     export class NotificationRecovery extends Recovery {
       constructor(ctx, env) { super(ctx, faultDLQ(env)); }
+      async record(identity, report, letter) {
+        const response = await this.env.GATE.fetch('https://test.example/persist', {
+          method: 'POST', body: JSON.stringify(identity),
+        });
+        if (!response.ok) throw new Error('Injected recovery persistence failure');
+        return super.record(identity, report, letter);
+      }
     }
     function faultDLQ(env) {
       return { ...env, NOTIFICATION_DLQ: { async send(letter) {
@@ -109,6 +116,7 @@ async function main() {
   let holdBatch, holdProvider, heldEventTime, providerStartedAt;
   let completedBatches = 0;
   const reportFaults = new Map();
+  const recoveryFaults = new Map();
   const dlqFaults = new Set();
   const reportAttempts = [], dlqAttempts = [];
   const gate = async request => {
@@ -122,6 +130,12 @@ async function main() {
         return new Response(null, { status: 503 });
       }
       return new Response(null, { status: 204 });
+    }
+    if (path === '/persist') {
+      const { deliveryId } = await request.json();
+      const remaining = recoveryFaults.get(deliveryId) ?? 0;
+      if (remaining) recoveryFaults.set(deliveryId, remaining - 1);
+      return new Response(null, { status: remaining ? 503 : 204 });
     }
     if (path === '/dlq-write') {
       const { deliveryId } = await request.json();
@@ -168,11 +182,11 @@ async function main() {
       { name: 'delivery', modules: true, script: consumer, compatibilityDate: '2026-11-18',
         durableObjects: { NOTIFICATION_RECOVERY: { className: 'NotificationRecovery', useSQLite: true } },
         queueConsumers: {
-          notifications: { maxBatchTimeout: 0.1, maxRetries: 10, deadLetterQueue: 'dead-letters' },
-          'final-notifications': { maxBatchTimeout: 0.1, maxRetries: 0, deadLetterQueue: 'dead-letters' },
+          notifications: { maxBatchTimeout: 0.1, maxRetries: 10 },
+          'final-notifications': { maxBatchTimeout: 0.1, maxRetries: 0 },
           'dead-letters': { maxBatchTimeout: 0.1 },
         },
-        queueProducers: { NOTIFICATION_DLQ: 'dead-letters' },
+        queueProducers: { NOTIFICATION_DLQ: 'dead-letters', NOTIFICATION_OUTCOMES: 'notifications' },
         serviceBindings: {
           NOTIFICATION_DELIVERY: { name: 'monitoring', entrypoint: 'NotificationDelivery' },
           GATE: gate,
@@ -573,41 +587,67 @@ async function main() {
     await until(async () => (await json(host, path)).destinations[0].latestSubmission.status === 'accepted', 9000);
     assert.equal(reportAttempts.filter(id => id === reported.deliveryId).length, 2);
 
-    const stale = job(firstOrigin, 'older-attempt', 8000);
-    const newerRetry = job(firstOrigin, 'newer-retry-event', 9000);
-    const beforeRace = submissions.length;
-    let releaseOldFailure;
-    holdProvider = new Promise(resolve => { releaseOldFailure = resolve; });
-    heldEventTime = 'Held old attempt';
-    // Pause only the older copy of this delivery while the newer attempt returns 429.
-    providerStatuses.set(first.url, 429);
-    let racingAttempts;
-    try {
-      controls.set(stale.deliveryId, [{ attempts: 1 }, { attempts: 2 }]);
-      racingAttempts = sendBatch([{ ...stale, event: { ...stale.event, monitorName: heldEventTime } }, stale]);
-      await until(() => submissions.length === beforeRace + 2);
-      const deadline = Date.now() + 5000;
-      while ((await json(host, path)).destinations[0].latestSubmission.status !== 'retrying') {
-        assert.ok(Date.now() < deadline, 'the newer attempt must record Retry while the older one is held');
-        await new Promise(resolve => setTimeout(resolve, 25));
+    for (const outage of [false, true]) {
+      const stale = job(firstOrigin, 'older-attempt-' + outage, 8000 + 500 * Number(outage));
+      const newerRetry = job(firstOrigin, 'newer-retry-event-' + outage, 8100 + 500 * Number(outage));
+      const beforeErrors = errors.length;
+      if (outage) reportFaults.set(stale.deliveryId, 1);
+      const beforeRace = submissions.length;
+      let releaseOldFailure;
+      holdProvider = new Promise(resolve => { releaseOldFailure = resolve; });
+      heldEventTime = 'Held old attempt';
+      // Pause only the older copy of this delivery while the newer attempt returns 429.
+      providerStatuses.set(first.url, 429);
+      let racingAttempts;
+      try {
+        controls.set(stale.deliveryId, [{ attempts: 1 }, { attempts: 2 }]);
+        racingAttempts = sendBatch([{ ...stale, event: { ...stale.event, monitorName: heldEventTime } }, stale]);
+        await until(() => submissions.length === beforeRace + 2);
+        if (outage) {
+          await until(() => errors.slice(beforeErrors).some(error => error.includes('notification_submission_report_failed')));
+        } else {
+          await until(async () => (await json(host, path)).destinations[0].latestSubmission.status === 'retrying');
+        }
+      } finally {
+        releaseOldFailure();
+        holdProvider = heldEventTime = undefined;
       }
-    } finally {
-      releaseOldFailure();
-      holdProvider = heldEventTime = undefined;
+      const raceActions = await racingAttempts;
+      assert.ok(raceActions.some(action => action.retry?.delaySeconds === 10), 'attempt two requests its retry');
+      const afterRace = (await json(host, path)).destinations[0].latestSubmission;
+      if (outage) {
+        assert.notEqual(afterRace.reason, 'provider_rejected', 'a failed retry report cannot let the older 403 close the delivery');
+        await until(() => reportAttempts.filter(id => id === stale.deliveryId).length === 2, 9000);
+        assert.equal((await json(host, path)).destinations[0].latestSubmission.status, 'retrying');
+      } else {
+        assert.equal(afterRace.status, 'retrying', 'the late 403 cannot replace the newer retry');
+      }
+      await sendBatch([newerRetry], [{ attempts: 1 }]);
+      providerStatuses.set(first.url, 204);
+      await sendBatch([stale], [{ attempts: 3 }]);
+      assert.equal(submissions.length, beforeRace + 4, 'the late 403 cannot close a newer retry');
     }
-    await racingAttempts;
-    assert.equal((await json(host, path)).destinations[0].latestSubmission.status, 'retrying',
-      'the late 403 cannot replace the newer attempt result');
-    await sendBatch([newerRetry], [{ attempts: 1 }]);
-    providerStatuses.set(first.url, 204);
-    await sendBatch([stale], [{ attempts: 3 }]);
-    assert.equal(submissions.length, beforeRace + 4, 'the late 403 cannot close a newer retry');
+
+    for (const [status, attempts, reason] of [[403, 1, 'provider_rejected'], [429, 10, 'attempts_exhausted']]) {
+      const terminal = job(firstOrigin, 'terminal-report-outage-' + status, 8800 + status);
+      const beforeTerminal = submissions.length;
+      const beforeReports = reportAttempts.length;
+      reportFaults.set(terminal.deliveryId, 1);
+      providerStatuses.set(first.url, status);
+      assert.deepEqual(await sendBatch([terminal], [{ attempts }]), [{ id: terminal.deliveryId, ack: true }]);
+      assert.equal(reportAttempts[beforeReports], terminal.deliveryId);
+      assert.notEqual((await json(host, path)).destinations[0].latestSubmission.reason, reason);
+      assert.deepEqual(await sendBatch([terminal], [{ attempts: 1 }]), [{ id: terminal.deliveryId, ack: true }]);
+      assert.equal(submissions.length, beforeTerminal + 1, 'terminal failures close submission during a result RPC outage');
+      await until(async () => (await json(host, path)).destinations[0].latestSubmission.reason === reason, 9000);
+    }
 
     const finalProducer = await mf.getQueueProducer('FINAL_QUEUE', 'monitoring');
     const final = job(firstOrigin, 'final-dlq-outage', 10_000);
     const beforeFinal = submissions.length;
     const beforeLetters = deadLetters.length;
     const beforeFinalBatch = completedBatches;
+    const beforeFinalResult = (await json(host, path)).destinations[0].latestSubmission;
     controls.set(final.deliveryId, { attempts: 11 });
     dlqFaults.add(final.deliveryId);
     reportFaults.set(final.deliveryId, 1);
@@ -617,7 +657,10 @@ async function main() {
     assert.ok(dlqAttempts.includes(final.deliveryId), 'the final delivery exercised the failing DLQ producer');
     assert.ok(reportAttempts.includes(final.deliveryId), 'the result RPC ran independently of the failing DLQ producer');
     assert.deepEqual(actions.at(-1), { id: final.deliveryId, ack: true }, 'only diagnostic recovery remains after final delivery');
-    await until(async () => (await json(host, path)).destinations[0].latestSubmission.reason === 'attempts_exhausted', 9000);
+    await until(async () => {
+      const result = (await json(host, path)).destinations[0].latestSubmission;
+      return result.reason === 'attempts_exhausted' && result.at !== beforeFinalResult.at;
+    }, 9000);
     assert.equal(reportAttempts.filter(id => id === final.deliveryId).length, 2);
     assert.equal(deadLetters.length, beforeLetters, 'terminal feedback recovers while the DLQ is still unavailable');
     dlqFaults.delete(final.deliveryId);
@@ -626,6 +669,40 @@ async function main() {
     assert.equal(deadLetters.at(-1).deliveryId, final.deliveryId);
     assert.equal(deadLetters.at(-1).attempts, 11);
     assert.doesNotMatch(JSON.stringify(deadLetters.at(-1)) + errors.join('\n'), /Retry Monitor|target-secret|sensitive provider response|https:\/\//);
+
+    const unavailable = job(firstOrigin, 'final-persistence-outage', 11_000);
+    const beforeFallback = completedBatches;
+    const beforeFallbackResult = (await json(host, path)).destinations[0].latestSubmission;
+    controls.set(unavailable.deliveryId, { attempts: 11 });
+    recoveryFaults.set(unavailable.deliveryId, 2);
+    reportFaults.set(unavailable.deliveryId, 1);
+    await finalProducer.send(unavailable);
+    await until(() => completedBatches > beforeFallback);
+    assert.ok(actions.some(action => action.id === unavailable.deliveryId && action.ack),
+      'the broker’s final delivery hands off the outcome before acknowledging the source');
+    await until(() => deadLetters.some(letter => letter.deliveryId === unavailable.deliveryId), 15_000);
+    const diagnostic = deadLetters.find(letter => letter.deliveryId === unavailable.deliveryId);
+    assert.deepEqual(Object.keys(diagnostic).sort(), ['attempts', 'contextId', 'deliveryId', 'destinationId', 'queuedAt', 'reason']);
+    assert.equal(diagnostic.attempts, 11);
+    assert.equal(diagnostic.reason, 'attempts_exhausted');
+    await until(async () => {
+      const result = (await json(host, path)).destinations[0].latestSubmission;
+      return result.reason === 'attempts_exhausted' && result.at !== beforeFallbackResult.at;
+    }, 15_000);
+    assert.equal(reportAttempts.filter(id => id === unavailable.deliveryId).length, 2);
+    const handoffs = batches.flat().filter(body => body.identity?.deliveryId === unavailable.deliveryId);
+    assert.equal(handoffs.length, 2, 'the sanitized handoff survives its own transient persistence failure');
+    assert.deepEqual(handoffs[0], handoffs[1]);
+    assert.deepEqual(handoffs[0], {
+      identity: { contextId: unavailable.contextId, destinationId: unavailable.destinationId, deliveryId: unavailable.deliveryId },
+      submissionReport: {
+        eventAt: unavailable.event.at, queuedAt: diagnostic.queuedAt, attempt: 11,
+        result: { status: 'failed', reason: 'attempts_exhausted', at: (await json(host, path)).destinations[0].latestSubmission.at },
+      },
+      exhaustion: 'attempts_exhausted',
+    });
+    assert.equal(submissions.length, beforeFinal, 'bookkeeping retries cannot call the provider');
+    assert.doesNotMatch(JSON.stringify(diagnostic) + errors.join('\n'), /Retry Monitor|target-secret|sensitive provider response|https:\/\//);
 
     const beforeRestart = submissions.length;
     options.workers[0].script += '\n// Restart monitoring after acceptance';

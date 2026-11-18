@@ -74,6 +74,7 @@ variable values above. Keep deployment-specific configuration out of version con
 | `wrangler.jsonc` | `queues.producers[0].queue` | `IRISBEAT_QUEUE_NAME` |
 | `wrangler.delivery.jsonc` | `queues.consumers[0].queue` | `IRISBEAT_QUEUE_NAME` |
 | `wrangler.delivery.jsonc` | `queues.producers[0].queue` | `IRISBEAT_DLQ_NAME` |
+| `wrangler.delivery.jsonc` | `queues.producers[1].queue` | `IRISBEAT_QUEUE_NAME` |
 | `wrangler.delivery.jsonc` | `services[0].service` | `IRISBEAT_WORKER_NAME` |
 
 Keep the binding names, `NotificationDelivery` entrypoint and migrations from
@@ -163,8 +164,9 @@ with exponential delays, up to ten attempts and one hour from Queue acceptance.
 Permanent failures stop immediately. Exhausted jobs go to the dead-letter Queue,
 which has no automatic replay. Keep both Queues in the same jurisdiction.
 Monitor Workers Logs for sanitized `notification_enqueue_failed`,
-`notification_submission_failed`, `notification_submission_report_failed` and
-`notification_dead_letter_failed` events. The Incident remains committed if Queue
+`notification_submission_failed`, `notification_submission_report_failed`,
+`notification_dead_letter_failed`, `notification_outcome_persistence_failed`
+and `notification_outcome_enqueue_failed` events. The Incident remains committed if Queue
 handoff fails.
 
 For upgrades, retain the same Worker, `MONITORING` binding, class and migration

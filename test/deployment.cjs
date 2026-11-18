@@ -32,7 +32,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     const deliveryPath = join(source, 'wrangler.delivery.jsonc');
     experimental_patchConfig(monitoringPath, { queues: { producers: [{ queue: queueName }] } }, false);
     experimental_patchConfig(deliveryPath, {
-      queues: { consumers: [{ queue: queueName }], producers: [{ queue: dlqName }] },
+      queues: { consumers: [{ queue: queueName }], producers: [{ queue: dlqName }, { queue: queueName }] },
       services: [{ service: monitoringName }],
     }, false);
     const producerConfig = unstable_readConfig({ config: monitoringPath });
@@ -47,9 +47,11 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     }
     const [queueProducer] = producerConfig.queues.producers;
     const [queueConsumer] = consumerConfig.queues.consumers;
-    const [dlqProducer] = consumerConfig.queues.producers;
+    const [dlqProducer, outcomeProducer] = consumerConfig.queues.producers;
     const [deliveryService] = consumerConfig.services;
     const [recovery] = consumerConfig.durable_objects.bindings;
+    assert.equal(outcomeProducer.binding, 'NOTIFICATION_OUTCOMES');
+    assert.equal(outcomeProducer.queue, queueConsumer.queue);
     assert.equal(queueConsumer.dead_letter_queue, undefined, 'source jobs must not be transferred with their full bodies');
     assert.ok(consumerConfig.migrations.some(migration => migration.new_sqlite_classes?.includes(recovery.class_name)));
     const delivery = (await build({ entryPoints: [join(source, 'src/notification-delivery.ts')], bundle: true, write: false, format: 'esm', platform: 'neutral', external: ['cloudflare:workers'] })).outputFiles[0].text;
@@ -96,7 +98,9 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
         queueConsumers: { [queueConsumer.queue]: {
           maxBatchTimeout: 0.1, maxRetries: queueConsumer.max_retries,
         } },
-        queueProducers: { [dlqProducer.binding]: dlqProducer.queue },
+        queueProducers: {
+          [dlqProducer.binding]: dlqProducer.queue, [outcomeProducer.binding]: outcomeProducer.queue,
+        },
         serviceBindings: { [deliveryService.binding]: { name: deliveryService.service, entrypoint: deliveryService.entrypoint } },
         outboundService: async request => {
           assert.equal(request.url, 'https://webhook.example/controlled');

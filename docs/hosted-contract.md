@@ -85,12 +85,10 @@ installation secret and ignores bodies.
 ## Incident notifications
 
 Use one Queue for the monitoring Worker's `NOTIFICATION_QUEUE` producer and
-the isolated delivery Worker's consumer trigger. Configure a second Queue in
-the same jurisdiction for the delivery Worker's `NOTIFICATION_DLQ` producer.
-Leave native dead-letter routing unset on the source Queue because it forwards
-the original job body. If the recovery store is unavailable through the last
-Queue delivery, the source can be dropped after logging a sanitized persistence
-failure. Use `irisbeat/notification-delivery` as the delivery Worker
+the isolated delivery Worker's consumer trigger and `NOTIFICATION_OUTCOMES`
+producer. Configure a second Queue in the same jurisdiction for the delivery
+Worker's `NOTIFICATION_DLQ` producer. Keep native dead-letter routing unset
+because it forwards the original job body. Use `irisbeat/notification-delivery` as the delivery Worker
 entrypoint and bind its exported SQLite Durable Object `NotificationRecovery`
 as `NOTIFICATION_RECOVERY`, with a SQLite class migration. Export
 `NotificationDelivery` from the hosted monitoring Worker and bind the delivery
@@ -119,18 +117,24 @@ enqueue logs `notification_enqueue_failed` and leaves the Incident committed.
 Queue acceptance starts durable delivery. Each attempt rechecks eligibility and
 completed delivery identities. Provider acceptance and permanent rejection end
 retries. Temporary submission failures back off exponentially, up to ten
-attempts and one hour from Queue acceptance. The delivery Worker persists
-terminal outcomes and acknowledges the source message once recovery is durable.
-Result reporting and sanitized dead-letter writes recover independently through
-the delivery Durable Object. The object retains recovery data for up to 14 days.
+provider attempts and one hour from Queue acceptance. The delivery Worker
+persists attempt ordering before checking eligibility and closes current terminal
+outcomes before reporting to Settings. It acknowledges the source once the
+outcome is durable in the Recovery object or on the source Queue as a sanitized
+outcome message. That message has its own broker retry budget and can only
+recover result reporting and dead-letter writes. Those operations also recover
+independently through the delivery Durable Object, which retains recovery data
+for up to 14 days.
 Keep job bodies free of addresses and credentials. The dead-letter Queue has
 no automatic replay.
 
 Editor snapshots expose the optional `destinations[].latestSubmission` with
 `status`, `at` (Unix milliseconds) and a safe `reason` for failures.
-Acceptance records provider submission. Once the delivery Worker durably records
-acceptance, duplicate Queue copies skip provider submission even during a result
-RPC outage. A crash before durable recording can still cause duplicates.
+Acceptance records provider submission. Duplicate Queue copies skip provider
+submission after the delivery Worker records a current terminal outcome, including
+during a result RPC outage. An acceptance from an already submitted request is
+preserved even if a newer attempt started. A crash before durable recording can
+still cause duplicates.
 
 Hosted and self-hosted Incident notifications require explicit Monitor selections
 and the Queue and delivery Worker above. Monitoring and Incident recording
