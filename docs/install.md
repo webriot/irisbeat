@@ -162,6 +162,33 @@ authenticated API in private storage. This is not a database/Incident backup or
 restore tool. Code rollback does not roll back Durable Object data; review migration
 compatibility before rollback. Never delete/recreate a production namespace to upgrade.
 
+## Optional email confirmation
+
+- In Cloudflare, onboard a sending domain and choose a sender address on that domain.
+  Workers Paid is required for arbitrary recipients. Account-verified recipients can
+  receive mail on the Free plan using a routing domain. Cloudflare verifies account
+  destinations for transport eligibility. Irisbeat requires the recipient to confirm
+  separately for each monitoring context.
+  [Cloudflare pricing](https://developers.cloudflare.com/email-service/platform/pricing/) and
+  [send binding restrictions](https://developers.cloudflare.com/email-service/configuration/send-bindings/).
+- In your private delivery Worker configuration, add `send_email: [{ "name": "EMAIL" }]`
+  and set the `EMAIL_FROM` variable to the sender address. Deploy the delivery Worker
+  with the existing Queue consumer and `NOTIFICATION_DELIVERY` service binding.
+- In your private monitoring Worker configuration, set `NOTIFICATION_PUBLIC_ORIGIN`
+  to the installation's public HTTPS origin without a path. Add a service binding
+  named `NOTIFICATION_EMAIL` pointing to the delivery Worker's
+  `NotificationEmailCapability` entrypoint. The Workers can first be deployed with
+  webhooks, then the monitoring Worker can be redeployed with the optional reverse binding.
+- Open Operator Settings and choose **Add email**. The recipient opens the message
+  and clicks **Confirm email** on the confirmation page. The inbox can then be
+  selected on individual Monitors. Pending inboxes offer **Resend confirmation**.
+  Resending replaces the previous link. The five-minute cooldown applies within
+  the installation even if the inbox is removed and re-added.
+
+`npm run test:delivery` captures confirmation messages locally without contacting
+Email Service. The delivery Worker logs sanitized `email_confirmation_submission_failed`
+events for failed confirmation submissions.
+
 ## Prepare and verify a release (no publication)
 
 Commit all tracked changes first. From a Git checkout of that exact clean revision (release preparation requires

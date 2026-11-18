@@ -46,8 +46,10 @@ Local cron dispatch can be triggered at `/__scheduled?cron=*+*+*+*+*`. Deployed 
 | `PATCH /api/operator/monitors/:id` | Edit name, kind-specific target, publication, timing, `destinationIds` or `destinationChanges`; returns full operator status |
 | `DELETE /api/operator/monitors/:id` | Remove configuration; return full operator status with retained Incidents |
 | `GET /api/operator/destinations` | Operator snapshot with saved destinations for editors |
-| `POST /api/operator/destinations` | Create an HTTPS webhook destination with `{ url }` |
+| `POST /api/operator/destinations` | Create a webhook with `{ url }` or, when email is configured, an inbox with `{ channel: "email", address }` |
 | `PUT /api/operator/destinations/:id` or `DELETE /api/operator/destinations/:id` | Replace or remove a destination and clear prior selections |
+| `POST /api/operator/destinations/:id/confirmation` | Request a new confirmation for a pending inbox, subject to a five-minute cooldown |
+| `GET /notifications/confirm` and `POST /notifications/confirm` | Display the recipient consent form and explicitly accept a single-use confirmation |
 | `PUT /api/operator/webhook` | Manage the compatibility destination with `{ url }`; empty string removes it |
 | `POST /heartbeat/:id` | Refresh an active Heartbeat with the installation Bearer secret; ignore the body; 204 on success, 404 for unknown/deleted/wrong-kind IDs |
 | Worker `scheduled` | Dispatch due HTTP/TCP attempts and evaluate Heartbeat silence independently, including private Monitors |
@@ -74,7 +76,13 @@ Each Calendar occurrence owns one authenticated receipt window from its schedule
 
 Any actual Maintenance overlap with a receipt window excludes its whole occurrence. Durable overlap evidence survives replacement, early end, expiry and receipts arriving before declaration; Maintenance between windows resets recovery at its chronological boundary. Creation, Calendar schedule or grace changes, and hosted resume begin at the next future occurrence, clear pending evidence and detector progress, and preserve identity, results and Incidents. Resume retains unexpired Maintenance. Authentication, credential rotation and publication keep their existing contracts. Incident notifications use the same Queue path as other Monitor kinds. See [Calendar Heartbeat integration](docs/heartbeat-api.md#calendar-heartbeats).
 
-Saved webhooks become available for Monitor selection. New Monitors and upgraded
+Saved webhooks and confirmed inboxes become available for Monitor selection.
+In Settings, **Add email** appears when the installation has configured the
+[optional email bindings](docs/install.md#optional-email-confirmation). The recipient
+must explicitly confirm before selection. Confirmation links expire after 24 hours.
+Resend replaces the previous link and has a five-minute cooldown per inbox.
+A paused context suppresses confirmation sends, including queued confirmations
+from before pause. An editor can explicitly resend after resume. New Monitors and upgraded
 legacy webhooks start without subscriptions. Editors choose zero or more
 destinations through `destinationIds`. Replacing a webhook address clears its old
 selections. The editor snapshot includes saved addresses and selections. Public
@@ -101,7 +109,7 @@ The configuration declares the public application runtime only: one Worker, a on
 
 The public application owns the monitoring engine and hosted extension interfaces. Private hosted consumers integrate versioned public releases rather than duplicate the engine. [Hosted contract 1](docs/hosted-contract.md) documents trusted context/permission/allowance resolution, tenant heartbeat issuance/rotation and Queue-based Incident notifications. `npm run test:consumer` prepares a reproducible local `irisbeat@0.2.2` tarball and verifies a separately installed, integrity-pinned consumer in workerd. Context pause/resume is included, with durable trusted policy revisions. Final publication and live deployment acceptance remain parent-owned under #12.
 
-Hosted consumers own account integration, organization roles, entitlements, subscription provisioning, monitor allowances, email delivery, custom hostnames and hosted deployment. The public application remains independently self-hostable. Infrastructure and secrets belong outside this repository.
+Hosted consumers own account integration, organization roles, entitlements, subscription provisioning, monitor allowances, sender and domain provisioning, custom hostnames and hosted deployment. The public application remains independently self-hostable. Infrastructure and secrets belong outside this repository.
 
 ## Engineering workflow
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { calendar, type Schedule } from "./calendar";
-import type { NotificationDestination, NotificationSelection } from "./notification-jobs";
+import { selectableDestination, type NotificationDestination, type NotificationSelection } from "./notification-jobs";
 
 export const timingDefaults = {
   intervalSeconds: 60,
@@ -151,7 +151,7 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
         if ("destinationIds" in value || !changes || typeof changes !== "object" || Array.isArray(changes)) return undefined;
         const entries = Object.entries(changes);
         if (entries.some(([id, selected]) => typeof selected !== "boolean" ||
-            (selected && !state.destinations?.some(destination => destination.id === id)))) return undefined;
+            (selected && !state.destinations?.some(destination => destination.id === id && selectableDestination(destination))))) return undefined;
         const selections = new Map(monitor.notificationSelections?.map(selection => [selection.destinationId, selection]));
         for (const [destinationId, selected] of entries) {
           if (!selected) selections.delete(destinationId);
@@ -161,7 +161,7 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
       }
       if (value && typeof value === "object" && "destinationIds" in value) {
         const ids = value.destinationIds;
-        if (!Array.isArray(ids) || ids.some(id => !state.destinations?.some(destination => destination.id === id)) ||
+        if (!Array.isArray(ids) || ids.some(id => !state.destinations?.some(destination => destination.id === id && selectableDestination(destination))) ||
             new Set(ids).size !== ids.length) return undefined;
         const existing = monitor.notificationSelections ?? [];
         monitor.notificationSelections = ids.map(destinationId =>

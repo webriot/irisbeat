@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import worker, { MonitoringContext as EngineContext, type NotificationJob } from '../src/index';
+import worker, { MonitoringContext as EngineContext, type NotificationQueueJob } from '../src/index';
 
 // Test-only series fault injection; production exports no control endpoint.
 let mode = 'available';
-let queued: NotificationJob[] = [];
+let queued: NotificationQueueJob[] = [];
 let queueUnavailable = false;
 export class MonitoringContext extends EngineContext {
   constructor(ctx: DurableObjectState, env: Env) {

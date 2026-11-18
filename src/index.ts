@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { operatorPage, operatorScript, statusPage, styleSheet, themeScript } from "./ui";
+import { confirmationPage, confirmationScript, operatorPage, operatorScript, statusPage, styleSheet, themeScript } from "./ui";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
 import { MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
 import { connect } from "cloudflare:sockets";
-import type { NotificationDestination, NotificationJob } from "./notification-jobs";
+import { parseEmailAddress, type ConfirmationJob, type NewNotificationDestination, type NotificationDestination, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 
 export const CONTRACT_VERSION = "1" as const;
 export interface EngineEnv {
   MONITORING: DurableObjectNamespace<MonitoringContext>;
   INSTALLATION_SECRET?: string;
-  NOTIFICATION_QUEUE?: Pick<Queue<NotificationJob>, "sendBatch">;
+  NOTIFICATION_PUBLIC_ORIGIN?: string;
+  NOTIFICATION_EMAIL?: { isConfigured(): Promise<boolean> };
+  NOTIFICATION_QUEUE?: Pick<Queue<NotificationQueueJob>, "sendBatch">;
 }
 type PausePolicy = { paused: boolean; policyRevision: number } | { paused?: undefined; policyRevision?: undefined };
 export type ScheduledContext = { id: string } & PausePolicy;
@@ -23,6 +25,7 @@ function validPolicy(value: { paused?: unknown; policyRevision?: unknown }) {
 export type ResolvedContext = ScheduledContext & {
   permission: "editor" | "reader" | null;
   monitorLimit: number;
+  notificationOrigin?: string;
 };
 export interface HostedAdapter<E extends EngineEnv = EngineEnv> {
   contractVersion: string;
@@ -44,7 +47,7 @@ export type IncidentTransition = {
   transition: "opened" | "recovered";
   at: number;
 };
-export type { NotificationDestination, NotificationJob } from "./notification-jobs";
+export type { ConfirmationJob, NotificationDestination, NotificationJob, NotificationQueueJob } from "./notification-jobs";
 export type { MaintenanceWindow } from "./monitor-configuration";
 const DAY = 86_400_000;
 const historyStart = (at: number) => Math.floor(at / DAY) * DAY - 89 * DAY;
@@ -58,12 +61,17 @@ export type HistoryDay = {
 export type AvailabilityHistory = { days: HistoryDay[]; percentage: number | null };
 type DailyCounts = { day: number; successes: number; failures: number; maintenance: number };
 export type Status = ReturnType<MonitoringContext["status"]>;
+const CONFIRMATION_COOLDOWN = 5 * 60_000;
+const CONFIRMATION_PATH = "/notifications/confirm";
+type ConfirmationInvitation = { id: string; token: string; origin: string; expiresAt: number; submitted?: boolean };
 type StoredContext = {
   pageName: string;
   monitors: Monitor[];
   webhookUrl?: string | null;
   legacyDestinationId?: string;
   destinations?: NotificationDestination[];
+  emailConfirmations?: Record<string, ConfirmationInvitation>;
+  confirmationCooldowns?: Record<string, number>;
   paused?: boolean;
   policyRevision?: number;
   pauseGeneration?: number;
@@ -363,27 +371,123 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return true;
   }
 
-  configureDestination(id: string | null, url: string | null, legacy = false) {
+  async configureDestination(id: string | null, address: NewNotificationDestination | null, legacy = false, origin?: string) {
     const state = this.read();
     const destinationId = legacy ? state.legacyDestinationId : id;
     const destinations = state.destinations ?? [];
     const existing = destinations.find(destination => destination.id === destinationId);
     if (destinationId && !existing) return null;
-    if (existing?.url === url) return this.status(true);
+    if (address?.channel === "webhook" && existing?.channel === "webhook" && existing.url === address.url ||
+        address?.channel === "email" && existing?.channel === "email" && existing.address === address.address) return this.status(true);
     const before = this.subscriptionSnapshot(state);
-    const replacement: NotificationDestination | null = url ? { id: crypto.randomUUID(), channel: "webhook", url } : null;
+    const replacement = address && {
+      id: crypto.randomUUID(), ...(address.channel === "email" ? { ...address, confirmed: false } : address),
+    };
+    let job: ConfirmationJob | undefined;
+    if (replacement?.channel === "email") {
+      if (destinations.some(destination => destination !== existing && destination.channel === "email" &&
+          destination.address.toLowerCase() === replacement.address.toLowerCase())) return "duplicate" as const;
+      if (!origin) return "unconfigured" as const;
+      if (!state.paused) {
+        job = this.prepareConfirmation(state, replacement, origin);
+        if (!job) return "cooldown" as const;
+      }
+    }
     state.destinations = existing
       ? destinations.flatMap(destination => destination !== existing ? [destination] : replacement ? [replacement] : [])
       : replacement ? [...destinations, replacement] : destinations;
-    if (legacy || (existing && existing.id === state.legacyDestinationId)) state.legacyDestinationId = replacement?.id;
+    if (legacy || (existing && existing.id === state.legacyDestinationId)) {
+      state.legacyDestinationId = replacement?.channel === "webhook" ? replacement.id : undefined;
+    }
     if (existing) {
+      if (state.emailConfirmations) delete state.emailConfirmations[existing.id];
       for (const monitor of state.monitors) {
         monitor.notificationSelections = monitor.notificationSelections?.filter(selection => selection.destinationId !== existing.id);
       }
     }
     this.ctx.storage.kv.put("context", state);
     this.notify(before);
+    if (job) await this.enqueueConfirmation(job);
     return this.status(true);
+  }
+
+  async resendConfirmation(id: string, origin: string) {
+    const state = this.read();
+    const destination = state.destinations?.find(candidate => candidate.id === id);
+    if (destination?.channel !== "email" || destination.confirmed) return null;
+    if (state.paused) return "paused" as const;
+    const job = this.prepareConfirmation(state, destination, origin);
+    if (!job) return "cooldown" as const;
+    this.ctx.storage.kv.put("context", state);
+    await this.enqueueConfirmation(job);
+    return this.status(true);
+  }
+
+  private prepareConfirmation(state: StoredContext, destination: Extract<NotificationDestination, { channel: "email" }>, origin: string) {
+    const at = Date.now();
+    const inbox = destination.address.toLowerCase();
+    if ((state.confirmationCooldowns?.[inbox] ?? 0) > at) return;
+    state.confirmationCooldowns = Object.fromEntries(Object.entries(state.confirmationCooldowns ?? {})
+      .filter(([, until]) => until > at));
+    state.confirmationCooldowns[inbox] = at + CONFIRMATION_COOLDOWN;
+    const id = crypto.randomUUID();
+    (state.emailConfirmations ??= {})[destination.id] = { id, origin, token: crypto.randomUUID(), expiresAt: at + DAY };
+    return {
+      kind: "email.confirmation", destinationId: destination.id, deliveryId: id, at,
+      contextId: this.ctx.id.toString(), pauseGeneration: state.pauseGeneration ?? 0,
+    } satisfies ConfirmationJob;
+  }
+
+  private async enqueueConfirmation(job: ConfirmationJob) {
+    try {
+      if (!this.env.NOTIFICATION_QUEUE) throw new Error("Queue binding unavailable");
+      await this.env.NOTIFICATION_QUEUE.sendBatch([{ body: job }]);
+    } catch {
+      console.error(JSON.stringify({ event: "notification_enqueue_failed", kind: job.kind }));
+    }
+  }
+
+  private currentConfirmation(state: StoredContext, job: ConfirmationJob) {
+    if (job.contextId !== this.ctx.id.toString() || state.paused ||
+        (state.pauseGeneration ?? 0) !== job.pauseGeneration) return null;
+    const invitation = state.emailConfirmations?.[job.destinationId];
+    if (invitation?.id !== job.deliveryId || invitation.expiresAt <= Date.now() || invitation.submitted) return null;
+    const destination = state.destinations?.find(candidate => candidate.id === job.destinationId);
+    return destination?.channel === "email" && !destination.confirmed ? { invitation, address: destination.address } : null;
+  }
+
+  resolveConfirmation(job: ConfirmationJob) {
+    const current = this.currentConfirmation(this.read(), job);
+    if (!current) return null;
+    return {
+      address: current.address,
+      url: new URL(CONFIRMATION_PATH + "#" + current.invitation.token, current.invitation.origin).href,
+    };
+  }
+
+  markConfirmationSubmitted(job: ConfirmationJob) {
+    const state = this.read();
+    const current = this.currentConfirmation(state, job);
+    if (!current) return;
+    current.invitation.submitted = true;
+    this.ctx.storage.kv.put("context", state);
+  }
+
+  confirmEmail(token: string, origin: string) {
+    const state = this.read();
+    const now = Date.now();
+    const destination = state.destinations?.find(candidate => {
+      const invitation = state.emailConfirmations?.[candidate.id];
+      return candidate.channel === "email" && !candidate.confirmed &&
+        invitation?.token === token && invitation.origin === origin && invitation.expiresAt > now;
+    });
+    if (destination?.channel !== "email") return false;
+    const before = this.subscriptionSnapshot(state);
+    destination.confirmed = true;
+    delete state.emailConfirmations?.[destination.id];
+    this.ctx.storage.kv.put("context", state);
+    this.notify(before);
+    return true;
   }
 
   async edit(id: string, value: unknown) {
@@ -645,7 +749,8 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (state.paused || (state.pauseGeneration ?? 0) !== job.pauseGeneration) return null;
     const selected = state.monitors.find(monitor => monitor.id === job.monitorId)?.notificationSelections;
     if (!selected?.some(selection => selection.destinationId === job.destinationId && selection.generation === job.generation)) return null;
-    return state.destinations?.find(destination => destination.channel === "webhook" && destination.id === job.destinationId)?.url ?? null;
+    const destination = state.destinations?.find(candidate => candidate.id === job.destinationId);
+    return destination?.channel === "webhook" ? destination.url : null;
   }
 
   async heartbeat(id: string, at: number) {
@@ -751,10 +856,11 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
           : { timeoutSeconds: monitor.timeoutSeconds, failureThreshold: monitor.failureThreshold }),
       } : {}),
     }));
+    const legacy = state.destinations?.find(destination => destination.id === state.legacyDestinationId);
     return {
       ...(secrets ? {
         destinations: state.destinations ?? [],
-        webhookUrl: state.destinations?.find(destination => destination.id === state.legacyDestinationId)?.url ?? null,
+        webhookUrl: legacy?.channel === "webhook" ? legacy.url : null,
       } : {}),
       paused: !!state.paused,
       pageName: state.pageName,
@@ -838,6 +944,16 @@ function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E
 export default createWorker();
 
 export class NotificationDelivery extends WorkerEntrypoint<EngineEnv> {
+  async resolveConfirmation(job: ConfirmationJob) {
+    if (!/^[a-f0-9]{64}$/.test(job.contextId)) return null;
+    return this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId)).resolveConfirmation(job);
+  }
+
+  async markConfirmationSubmitted(job: ConfirmationJob) {
+    if (!/^[a-f0-9]{64}$/.test(job.contextId)) return;
+    await this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId)).markConfirmationSubmitted(job);
+  }
+
   async resolveWebhook(job: NotificationJob) {
     if (!/^[a-f0-9]{64}$/.test(job.contextId)) return null;
     const context = this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId));
@@ -858,6 +974,7 @@ type HttpEnv<E extends EngineEnv> = {
     permission: "editor" | "reader";
     value: unknown;
     selectedMonitor: Status["monitor"] | null;
+    emailOrigin: Promise<string | undefined>;
   };
 };
 
@@ -870,9 +987,57 @@ function methodNotAllowed(allow: string) {
   return new Response(null, { status: 405, headers: { Allow: allow } });
 }
 
-function operatorResponse<E extends EngineEnv>(c: Context<HttpEnv<E>>, result: Status | null, status = 200) {
+function confirmationOrigin<E extends EngineEnv>(c: Context<HttpEnv<E>>) {
+  const cached = c.get("emailOrigin");
+  if (cached) return cached;
+  const origin = configuredConfirmationOrigin(c);
+  c.set("emailOrigin", origin);
+  return origin;
+}
+
+async function configuredConfirmationOrigin<E extends EngineEnv>(c: Context<HttpEnv<E>>) {
   const resolved = c.get("resolved");
-  return Response.json(result && { ...result, ...(resolved ? { hosted: true, permission: resolved.permission } : {}) }, { status });
+  const configured = resolved ? resolved.notificationOrigin : c.env.NOTIFICATION_PUBLIC_ORIGIN;
+  const capability = c.env.NOTIFICATION_EMAIL;
+  if (!configured || !capability || !c.env.NOTIFICATION_QUEUE) return;
+  try {
+    const url = new URL(configured);
+    if (url.username || url.password || url.href !== url.origin + "/" ||
+        (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)))) return;
+    if (await capability.isConfigured()) return url.origin;
+  } catch {
+    console.error(JSON.stringify({ event: "notification_email_check_failed" }));
+  }
+}
+
+async function operatorResponse<E extends EngineEnv>(c: Context<HttpEnv<E>>, result: Status | null, status = 200) {
+  const resolved = c.get("resolved");
+  const emailConfigured = result && c.get("permission") === "editor" && await confirmationOrigin(c);
+  return Response.json(result && { ...result, ...(emailConfigured ? { emailConfigured: true } : {}),
+    ...(resolved ? { hosted: true, permission: resolved.permission } : {}) }, { status });
+}
+
+async function readBoundedBody(request: Request) {
+  if (Number(request.headers.get("Content-Length")) > 4096) return null;
+  const reader = request.body?.getReader();
+  if (!reader) return "";
+  const decoder = new TextDecoder();
+  let body = "";
+  let bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return body + decoder.decode();
+      bytes += value.length;
+      if (bytes > 4096) {
+        await reader.cancel();
+        return null;
+      }
+      body += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
@@ -937,6 +1102,19 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   app.get("/api/operator/events", getOnly, subscribe);
   app.get("/api/status", getOnly, async (c: Context<HttpEnv<E>>) => Response.json(await c.get("context").status()));
 
+  app.get(CONFIRMATION_PATH, getOnly, c => c.html(confirmationPage()));
+  app.get(CONFIRMATION_PATH + ".js", getOnly, () => new Response(confirmationScript, { headers: { "Content-Type": "text/javascript; charset=utf-8" } }));
+  app.post(CONFIRMATION_PATH, async c => {
+    if (c.req.header("Content-Type")?.split(";")[0] !== "application/x-www-form-urlencoded") return new Response(null, { status: 415 });
+    const body = await readBoundedBody(c.req.raw);
+    if (body === null) return new Response(null, { status: 413 });
+    const tokens = new URLSearchParams(body).getAll("token");
+    const [token] = tokens;
+    const confirmed = tokens.length === 1 && /^[a-f0-9-]{36}$/.test(token) &&
+      await c.get("context").confirmEmail(token, new URL(c.req.url).origin);
+    return c.html(confirmationPage(confirmed), confirmed ? 200 : 400);
+  });
+
   const monitorPath = "/api/operator/monitors/:id";
   const maintenancePath = monitorPath + "/maintenance";
   const rotationPath = monitorPath + "/heartbeat-secret";
@@ -944,7 +1122,8 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   const ticketPath = "/api/operator/events/ticket";
   const destinationsPath = "/api/operator/destinations";
   const destinationPath = destinationsPath + "/:id";
-  const operatorPaths = [ticketPath, previewPath, destinationsPath, destinationPath, "/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
+  const resendPath = destinationPath + "/confirmation";
+  const operatorPaths = [ticketPath, previewPath, destinationsPath, destinationPath, resendPath, "/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
   for (const path of operatorPaths) app.use(path, async (c, next) => {
     const resolved = c.get("resolved");
     if (path === rotationPath && !resolved) return c.notFound();
@@ -971,28 +1150,9 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
       return new Response(null, { status: 413 });
     const selectedMonitor: Status["monitor"] | null = c.req.path === "/api/operator" ? (await c.get("context").status(true)).monitor : null;
     c.set("selectedMonitor", selectedMonitor);
+    const body = await readBoundedBody(request);
+    if (body === null) return new Response(null, { status: 413 });
     let value: unknown;
-    const reader = request.body?.getReader();
-    let body = "";
-    let bytes = 0;
-    const decoder = new TextDecoder();
-    if (reader) {
-      try {
-        while (true) {
-          const { done, value: chunk } = await reader.read();
-          if (done) break;
-          bytes += chunk.byteLength;
-          if (bytes > 4096) {
-            await reader.cancel();
-            return new Response(null, { status: 413 });
-          }
-          body += decoder.decode(chunk, { stream: true });
-        }
-        body += decoder.decode();
-      } finally {
-        reader.releaseLock();
-      }
-    }
     try {
       value = JSON.parse(body);
     } catch {
@@ -1025,22 +1185,44 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     const url = value && typeof value === "object" ? (value as Record<string, unknown>).url : undefined;
     const destination = parseWebhook(url);
     if (destination === undefined) return Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
-    return operatorResponse(c, await c.get("context").configureDestination(null, destination, true));
+    return destinationResponse(c, await c.get("context").configureDestination(null, destination ? { channel: "webhook", url: destination } : null, true));
   });
+  function destinationResponse(c: Context<HttpEnv<E>>, result: Status | null | "duplicate" | "unconfigured" | "cooldown" | "paused", status = 200) {
+    if (result === "unconfigured") return Response.json({ error: "Email sending is unavailable" }, { status: 503 });
+    if (result === "duplicate") return Response.json({ error: "This inbox is already a destination" }, { status: 409 });
+    if (result === "paused") return Response.json({ error: "Confirmation is paused" }, { status: 409 });
+    if (result === "cooldown") return Response.json({ error: "Wait five minutes between confirmations for this inbox" }, { status: 429 });
+    return result ? operatorResponse(c, result, status) : Response.json({ error: "Destination not found" }, { status: 404 });
+  }
   const saveDestination = async (c: Context<HttpEnv<E>>) => {
     const value = c.get("value");
-    const url = parseWebhook(value && typeof value === "object" && "url" in value ? value.url : undefined);
-    if (!url) return Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
+    const fields = value && typeof value === "object" ? value as Record<string, unknown> : {};
+    let destination: NewNotificationDestination;
+    let origin: string | undefined;
+    if (fields.channel === "email") {
+      const address = parseEmailAddress(fields.address);
+      if (!address) return Response.json({ error: "Enter an email address" }, { status: 400 });
+      origin = await confirmationOrigin(c);
+      if (!origin) return destinationResponse(c, "unconfigured");
+      destination = { channel: "email", address };
+    } else {
+      const url = parseWebhook(fields.url);
+      if (!url || (fields.channel !== undefined && fields.channel !== "webhook"))
+        return Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
+      destination = { channel: "webhook", url };
+    }
     const creating = c.req.method === "POST";
-    const result = await c.get("context").configureDestination(creating ? null : c.req.path.split("/")[4], url);
-    return result ? operatorResponse(c, result, creating ? 201 : 200)
-      : Response.json({ error: "Destination not found" }, { status: 404 });
+    const result = await c.get("context").configureDestination(creating ? null : monitorId(c), destination, false, origin);
+    return destinationResponse(c, result, creating ? 201 : 200);
   };
   app.post(destinationsPath, readBody, saveDestination);
   app.put(destinationPath, readBody, saveDestination);
+  app.post(resendPath, async c => {
+    const origin = await confirmationOrigin(c);
+    return destinationResponse(c, origin ? await c.get("context").resendConfirmation(monitorId(c), origin) : "unconfigured");
+  });
   app.delete(destinationPath, async c => {
-    const result = await c.get("context").configureDestination(c.req.path.split("/")[4], null);
-    return result ? operatorResponse(c, result) : Response.json({ error: "Destination not found" }, { status: 404 });
+    return destinationResponse(c, await c.get("context").configureDestination(monitorId(c), null));
   });
   app.put(maintenancePath, readBody, async (c: Context<HttpEnv<E>>) => {
     const result = await c.get("context").maintenance(monitorId(c), c.get("value"));
