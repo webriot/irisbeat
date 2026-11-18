@@ -216,10 +216,15 @@ not resume. Checks wholly after resume follow existing due-time rules.
 
 Any pending HTTP/TCP attempt touched by pause is discarded even if resumed before
 completion. Its original due-time anchor and in-flight guard remain in force.
-Pause cancels queued jobs from previous pause generations. Target requests and
-webhooks already submitted remain in flight. Resume starts with an empty
-notification backlog. Maintenance #8 suppresses Incident transitions before the
-engine reaches Queue handoff. Editors use `PUT`/`DELETE /api/operator/monitors/:id/maintenance`.
+Before each provider submission attempt, the delivery Worker checks eligibility
+through the trusted service binding. The monitoring context rejects jobs while
+paused and rejects jobs from an earlier pause generation, including when both
+pause and resume happened between attempts. Resume creates no notification
+backlog. Target requests and provider submissions already in flight cannot be
+recalled. A policy update can race with provider submission after the eligibility
+check, since they are separate operations. Maintenance #8 suppresses Incident
+transitions before the engine reaches Queue handoff. Editors use
+`PUT`/`DELETE /api/operator/monitors/:id/maintenance`.
 See [Maintenance handoff](maintenance-api.md) for status
 fields, observation retention, and the #11 precedence seam. Installed-consumer
 coverage verifies Queue suppression for all three check kinds.
