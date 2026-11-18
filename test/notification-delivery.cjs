@@ -4,7 +4,7 @@ const { createRequire } = require('node:module');
 const { join } = require('node:path');
 const localRequire = createRequire(join(process.cwd(), 'node_modules/@cloudflare/vitest-plugin/package.json'));
 const { build } = localRequire('esbuild');
-const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
+const { Log, LogLevel, Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
 
 async function bundle(contents) {
   return (await build({
@@ -64,20 +64,22 @@ async function main(runFixture, emailEnabled = true) {
     export default {
       async queue(batch, env, ctx) {
         await env.GATE.fetch('https://test.example/batch', { method: 'POST', body: JSON.stringify(batch.messages.map(message => message.body)) });
-        await delivery.queue(batch, { ...env, EMAIL: { send: mail =>
-          env.GATE.fetch('https://test.example/mail', { method: 'POST', body: JSON.stringify(mail) })
-        } }, ctx);
+        await delivery.queue(batch, env, ctx);
         await env.GATE.fetch('https://test.example/done', { method: 'POST' });
       },
     };`);
 
-  const batches = [], submissions = [], errors = [], mail = [];
+  const batches = [], submissions = [], errors = [];
+  const sender = 'alerts@sender.example';
+  const capturedTokens = new Set();
   let targetRequests = 0;
   let healthy = false;
   let holdBatch, holdProvider, providerStartedAt;
   let completedBatches = 0;
   let providerStatus = 204;
   const mf = new Miniflare(convertV4MiniflareOptions({
+    unsafeLocalExplorer: emailEnabled,
+    log: new Log(LogLevel.NONE),
     handleStructuredLogs: log => { if (log.level === 'error') errors.push(log.message); },
     workers: [
       { name: 'monitoring', modules: true, script: monitoring, compatibilityDate: '2026-11-13',
@@ -92,7 +94,7 @@ async function main(runFixture, emailEnabled = true) {
         },
       },
       { name: 'delivery', modules: true, script: consumer, compatibilityDate: '2026-11-18',
-        bindings: { EMAIL_FROM: 'alerts@sender.example' },
+        bindings: { EMAIL_FROM: sender },
         ...(emailEnabled ? { email: { send_email: [{ name: 'EMAIL' }] } } : {}),
         queueConsumers: { notifications: { maxBatchTimeout: 0.1, maxRetries: 0 } },
         serviceBindings: {
@@ -101,8 +103,6 @@ async function main(runFixture, emailEnabled = true) {
             if (new URL(request.url).pathname === '/batch') {
               batches.push(await request.json());
               await holdBatch;
-            } else if (new URL(request.url).pathname === '/mail') {
-              mail.push(await request.json());
             } else {
               completedBatches++;
             }
@@ -125,6 +125,26 @@ async function main(runFixture, emailEnabled = true) {
       },
     ],
   }));
+  const captureEndpoint = '/cdn-cgi/local/explorer/api/local/email/sending?worker=delivery';
+  async function capturedMail(query = '') {
+    const response = await mf.dispatchFetch(new URL(captureEndpoint + query, await mf.ready));
+    assert.equal(response.status, 200, 'Local Explorer email capture request');
+    return (await response.json()).result;
+  }
+
+  async function confirmationLink(message, address) {
+    const mail = await capturedMail('&email_id=' + encodeURIComponent(message.messageId));
+    assert.deepEqual(mail.to, [address]);
+    assert.equal(mail.from, sender);
+    const href = mail.text?.match(/https:\/\/[^\s]+/)?.[0];
+    assert.ok(typeof href === 'string', 'captured plain text contains a confirmation link');
+    assert.ok(mail.html?.includes('href="' + href + '"'), 'captured HTML links to the same confirmation page');
+    assert.ok(/^https:\/\/[a-z.-]+\/notifications\/confirm#[a-f0-9-]{36}$/.test(href), 'captured link has a confirmation fragment');
+    const link = new URL(href);
+    capturedTokens.add(link.hash.slice(1));
+    return link;
+  }
+
   let at = Date.now();
   const path = '/api/operator/destinations';
   const monitors = '/api/operator/monitors';
@@ -144,10 +164,12 @@ async function main(runFixture, emailEnabled = true) {
   }
   async function until(condition, timeout = 5000) {
     const deadline = Date.now() + timeout;
-    while (!condition()) {
+    let result;
+    while (!(result = await condition())) {
       assert.ok(Date.now() < deadline, 'timed out waiting for the Queue consumer');
       await new Promise(resolve => setTimeout(resolve, 25));
     }
+    return result;
   }
   async function holdTransition(host, change) {
     const priorBatches = batches.length;
@@ -172,8 +194,8 @@ async function main(runFixture, emailEnabled = true) {
   try {
     if (runFixture) {
       await runFixture((url, init) => mf.dispatchFetch(url, init), async address => {
-        await until(() => mail.some(message => message.to === address));
-        return mail.find(message => message.to === address).text.match(/https:\/\/[^\s]+/)[0];
+        const message = await until(async () => (await capturedMail()).find(message => message.to.includes(address)));
+        return (await confirmationLink(message, address)).href;
       });
       return;
     }
@@ -408,63 +430,69 @@ async function main(runFixture, emailEnabled = true) {
       const monitorPath = monitors + '/' + monitor.id;
       assert.equal((await request('personal.example', monitorPath, 'PATCH', { destinationIds: [pending.id] })).status, 400);
       assert.equal((await request('personal.example', monitorPath, 'PATCH', { destinationChanges: { [pending.id]: true } })).status, 400);
-      await until(() => mail.length === 1);
-      assert.equal(mail[0].to, inbox);
-      assert.equal(mail[0].from, 'alerts@sender.example');
-      const link = new URL(mail[0].text.match(/https:\/\/[^\s]+/)[0]);
-      assert.ok(mail[0].html.includes(link.href));
+      const message = await until(async () => (await capturedMail())[0]);
+      const link = await confirmationLink(message, inbox);
+      assert.equal(link.origin, 'https://personal.example');
       const token = link.hash.slice(1);
-      assert.ok(token);
-      assert.doesNotMatch(JSON.stringify(batches.at(-1)), /ops\+test|personal\.example/);
-      assert.ok(!JSON.stringify(batches.at(-1)).includes(token));
-      assert.ok(!JSON.stringify(added).includes(token));
-      const recipient = (host, method = 'GET', credential = token) => mf.dispatchFetch('https://' + host + link.pathname, {
+      assert.ok(!/ops\+test|personal\.example/.test(JSON.stringify(batches.at(-1))), 'Queue payload excludes recipient metadata');
+      assert.ok(!JSON.stringify(batches.at(-1)).includes(token), 'Queue payload excludes the confirmation fragment');
+      assert.ok(!JSON.stringify(added).includes(token), 'operator snapshot excludes the confirmation fragment');
+      const recipient = (origin = link.origin, method = 'GET', credential = token) => mf.dispatchFetch(new URL(link.pathname, origin), {
         method,
         ...(method === 'POST' ? { body: new URLSearchParams({ token: credential }) } : {}),
       });
-      assert.equal((await recipient('personal.example')).status, 200);
+      assert.equal((await recipient()).status, 200);
       assert.equal((await json('personal.example', path)).destinations.find(destination => destination.id === pending.id).confirmed, false);
-      assert.equal((await recipient('tenant.example', 'POST')).status, 400);
-      assert.equal((await recipient('personal.example', 'POST')).status, 200);
-      assert.equal((await recipient('personal.example', 'POST')).status, 400);
+      assert.equal((await recipient('https://tenant.example', 'POST')).status, 400);
+      assert.equal((await recipient(link.origin, 'POST')).status, 200);
+      assert.equal((await recipient(link.origin, 'POST')).status, 400);
       assert.equal((await json('personal.example', path)).destinations.find(destination => destination.id === pending.id).confirmed, true);
-      assert.equal(mail.length, 1);
+      assert.equal((await capturedMail()).length, 1);
       assert.deepEqual((await json('personal.example', '/api/operator')).monitor.destinationIds, []);
       await json('personal.example', monitorPath, 'PATCH', { destinationIds: [pending.id] });
       const replacement = await json('personal.example', path + '/' + pending.id, 'PUT', email('replacement@example.net'));
       assert.deepEqual(replacement.monitor.destinationIds, []);
       assert.equal(replacement.destinations.find(destination => destination.address === 'replacement@example.net').confirmed, false);
-      await until(() => completedBatches === batches.length && mail.length === 2);
+      await until(async () => completedBatches === batches.length && (await capturedMail()).length === 2);
 
       const consentHost = 'consent-tenant.example';
+      const consentOrigin = 'https://' + consentHost;
       const addTenant = async (address, search = '') => (await json(consentHost, path + search, 'POST', email(address), 201))
         .destinations.find(destination => destination.address === address);
       const consentDestination = await addTenant(inbox);
       const consentPath = path + '/' + consentDestination.id;
       const resend = () => request(consentHost, consentPath + '/confirmation', 'POST');
-      await until(() => mail.length === 3 && completedBatches === batches.length);
+      await until(async () => (await capturedMail()).length === 3 && completedBatches === batches.length);
       const tenantJob = batches.at(-1)[0];
-      const credential = message => new URL(message.text.match(/https:\/\/[^\s]+/)[0]).hash.slice(1);
-      const previous = credential(mail.at(-1));
+      const latestToken = async address => {
+        const link = await confirmationLink((await capturedMail())[0], address);
+        assert.equal(link.origin, consentOrigin);
+        return link.hash.slice(1);
+      };
+      const previous = await latestToken(inbox);
       const readerResponse = await mf.dispatchFetch('https://' + consentHost + '/api/operator', { headers: { authorization: 'Bearer reader' } });
-      assert.doesNotMatch(await readerResponse.text(), /example\.net|emailConfigured/);
-      assert.doesNotMatch(await (await request(consentHost, '/api/status')).text(), /example\.net/);
+      const readerSnapshot = await readerResponse.text();
+      const publicSnapshot = await (await request(consentHost, '/api/status')).text();
+      assert.ok(!/example\.net|emailConfigured/.test(readerSnapshot) && !readerSnapshot.includes(previous),
+        'reader snapshot excludes email configuration, addresses and confirmation fragments');
+      assert.ok(!publicSnapshot.includes('@example.net') && !publicSnapshot.includes(previous),
+        'public snapshot excludes email addresses and confirmation fragments');
       await setClock(consentHost, tenantJob.at + 299_999);
       assert.equal((await resend()).status, 429);
       assert.equal((await request(consentHost, path, 'POST', email(inbox.toUpperCase()))).status, 409);
       await setClock(consentHost, tenantJob.at + 300_000);
       assert.equal((await resend()).status, 200);
-      assert.equal((await recipient(consentHost, 'POST', previous)).status, 400);
-      await until(() => mail.length === 4 && completedBatches === batches.length);
+      assert.equal((await recipient(consentOrigin, 'POST', previous)).status, 400);
+      await until(async () => (await capturedMail()).length === 4 && completedBatches === batches.length);
       const newJob = batches.at(-1)[0];
-      const next = credential(mail.at(-1));
-      assert.notEqual(next, previous);
+      const next = await latestToken(inbox);
+      assert.ok(next !== previous, 'resend issues a different confirmation fragment');
       const beforeReplay = completedBatches;
       await producer.send(newJob);
       await until(() => completedBatches > beforeReplay);
-      assert.equal(mail.length, 4, 'an already submitted confirmation job does not send again');
+      assert.equal((await capturedMail()).length, 4, 'an already submitted confirmation job does not send again');
       await setClock(consentHost, newJob.at + 86_400_000);
-      assert.equal((await recipient(consentHost, 'POST', next)).status, 400);
+      assert.equal((await recipient(consentOrigin, 'POST', next)).status, 400);
 
       const beforeRemove = completedBatches;
       let release;
@@ -479,13 +507,13 @@ async function main(runFixture, emailEnabled = true) {
         holdBatch = undefined;
       }
       await until(() => completedBatches > beforeRemove);
-      assert.equal(mail.length, 4, 'removal prevents a queued confirmation from submitting');
-      assert.equal((await recipient(consentHost, 'POST', next)).status, 400);
+      assert.equal((await capturedMail()).length, 4, 'removal prevents a queued confirmation from submitting');
+      assert.equal((await recipient(consentOrigin, 'POST', next)).status, 400);
       await setClock(consentHost, newJob.at + 86_400_000 + 300_000);
       const reAdded = await addTenant(inbox);
       assert.notEqual(reAdded.id, consentDestination.id);
-      await until(() => mail.length === 5 && completedBatches === batches.length);
-      assert.equal((await recipient(consentHost, 'POST', credential(mail.at(-1)))).status, 200);
+      await until(async () => (await capturedMail()).length === 5 && completedBatches === batches.length);
+      assert.equal((await recipient(consentOrigin, 'POST', await latestToken(inbox))).status, 200);
 
       const pauseInbox = 'pause@example.net';
       const priorBatch = batches.length;
@@ -495,8 +523,8 @@ async function main(runFixture, emailEnabled = true) {
       assert.equal((await json(consentHost, '/api/operator?test-policy-revision=2')).paused, false);
       assert.equal(batches.length, priorBatch);
       await json(consentHost, path + '/' + paused.id + '/confirmation', 'POST');
-      await until(() => mail.length === 6 && completedBatches === batches.length);
-      assert.equal(mail.at(-1).to, pauseInbox);
+      await until(async () => (await capturedMail()).length === 6 && completedBatches === batches.length);
+      await latestToken(pauseInbox);
 
       const heldInbox = 'held@example.net';
       const beforePause = completedBatches;
@@ -511,7 +539,7 @@ async function main(runFixture, emailEnabled = true) {
         holdBatch = undefined;
       }
       await until(() => completedBatches > beforePause);
-      assert.equal(mail.length, 6, 'pause and resume invalidate a queued confirmation');
+      assert.equal((await capturedMail()).length, 6, 'pause and resume invalidate a queued confirmation');
 
       const resendInbox = 'resend-race@example.net';
       const beforeResend = completedBatches;
@@ -526,8 +554,10 @@ async function main(runFixture, emailEnabled = true) {
         holdBatch = undefined;
       }
       await until(() => completedBatches === beforeResend + 2);
-      assert.equal(mail.filter(message => message.to === resendInbox).length, 1, 'resend invalidates the older queued confirmation');
-      assert.ok(!errors.some(error => error.includes(next) || error.includes(inbox)));
+      assert.equal((await capturedMail()).filter(message => message.to.includes(resendInbox)).length, 1, 'resend invalidates the older queued confirmation');
+      await latestToken(resendInbox);
+      assert.ok(errors.every(error => !error.includes('@example.net') &&
+        [...capturedTokens].every(token => !error.includes(token))), 'error logs exclude confirmation credentials and recipient addresses');
 
       await main(async dispatch => {
         const headers = { authorization: 'Bearer test-installation-secret', 'content-type': 'application/json' };

@@ -171,6 +171,14 @@ compatibility before rollback. Never delete/recreate a production namespace to u
   separately for each monitoring context.
   [Cloudflare pricing](https://developers.cloudflare.com/email-service/platform/pricing/) and
   [send binding restrictions](https://developers.cloudflare.com/email-service/configuration/send-bindings/).
+- Before enabling confirmation mail, turn off **Enable email preview** for the
+  sending domain in Cloudflare under **Compute > Email Service > Email Sending >
+  [sending domain] > Settings**. Keep it off while sending confirmation mail.
+  Cloudflare turns it on for new sending domains and retains previews for about
+  seven days. Previews include the HTML, plain text and raw message, which expose
+  the live confirmation link. This prerequisite applies to self-hosted and hosted
+  deployments. [Domain settings](https://developers.cloudflare.com/email-service/configuration/domains/#email-preview)
+  and [Activity log message previews](https://developers.cloudflare.com/email-service/observability/logs/#message-preview).
 - In your private delivery Worker configuration, add `send_email: [{ "name": "EMAIL" }]`
   and set the `EMAIL_FROM` variable to the sender address. Deploy the delivery Worker
   with the existing Queue consumer and `NOTIFICATION_DELIVERY` service binding.
@@ -185,9 +193,14 @@ compatibility before rollback. Never delete/recreate a production namespace to u
   Resending replaces the previous link. The five-minute cooldown applies within
   the installation even if the inbox is removed and re-added.
 
-`npm run test:delivery` captures confirmation messages locally without contacting
-Email Service. The delivery Worker logs sanitized `email_confirmation_submission_failed`
-events for failed confirmation submissions.
+Cloudflare still processes recipient metadata for transport. Keep addresses and
+confirmation links out of Irisbeat logs and Queue diagnostics. The delivery Worker
+logs sanitized `email_confirmation_submission_failed` events for failed submissions.
+
+`npm run test:delivery` and the rendered Settings acceptance test read HTML, plain
+text and synthetic sender and recipient metadata through the simulated
+`send_email` binding. The tests use local capture without contacting Email Service.
+[Cloudflare local simulation](https://developers.cloudflare.com/email-service/observability/local-development/sending/#local-simulation).
 
 ## Prepare and verify a release (no publication)
 

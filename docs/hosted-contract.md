@@ -127,6 +127,15 @@ Monitor that should send.
 
 ## Email consent
 
+Before enabling hosted confirmation mail, turn off **Enable email preview** in
+the Cloudflare sending domain's settings and keep it off while sending confirmation
+mail. When enabled, the Activity log stores the HTML, plain text and raw message
+with the live confirmation link for about seven days. Cloudflare still processes
+recipient metadata for transport. Keep addresses and confirmation links out of
+Irisbeat logs and Queue diagnostics.
+[Cloudflare domain settings](https://developers.cloudflare.com/email-service/configuration/domains/#email-preview)
+and [Activity log message previews](https://developers.cloudflare.com/email-service/observability/logs/#message-preview).
+
 Follow the sender, Queue and service-binding configuration in
 [optional email confirmation](install.md#optional-email-confirmation).
 For hosted delivery wrappers, re-export `NotificationEmailCapability` from

@@ -3,6 +3,8 @@ import { expect, test } from '@playwright/test';
 import { withDelivery } from '../notification-delivery.cjs';
 import { monitorAction } from './actions';
 
+test.use({ trace: 'off', screenshot: 'off', video: 'off' });
+
 test('Settings sends a captured email and only the recipient POST enables selection', async ({ page, browser }) => {
   await withDelivery(async (dispatch, confirmationLinkFor) => {
     const origin = 'https://personal.example';
@@ -45,7 +47,12 @@ test('Settings sends a captured email and only the recipient POST enables select
     const recipient = await browser.newPage();
     try {
       await connect(recipient);
-      await recipient.goto(await confirmationLinkFor(address));
+      const link = await confirmationLinkFor(address);
+      try {
+        await recipient.goto(link);
+      } catch {
+        throw new Error('Could not open the captured confirmation link');
+      }
       await expect(recipient.getByRole('heading', { name: 'Confirm email notifications' })).toBeVisible();
       await expect(page.getByText('Pending confirmation')).toBeVisible();
       await page.getByRole('button', { name: 'Monitors', exact: true }).click();
