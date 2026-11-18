@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { captureNotifications, selectWebhooks } from "./notification-queue";
 import worker from '../src/index';
 import { env, exports } from 'cloudflare:workers';
 import { createScheduledController, evictDurableObject, reset } from 'cloudflare:test';
@@ -92,11 +93,9 @@ it('preserves history and freshness through prospective timing edits and validat
 it('delivers exactly one webhook per heartbeat transition and resets recovery after evaluated silence', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
   await configure();
-  const events: unknown[] = [];
-  network.use(http.post('https://alerts.example/hook', async ({ request }) => {
-    events.push(await request.json()); return new HttpResponse(null, { status: 204 });
-  }));
+  const notifications = await captureNotifications();
   await request('/api/operator/webhook', { method: 'PUT', headers: { authorization, 'Content-Type': 'application/json' }, body: JSON.stringify({ url: 'https://alerts.example/hook' }) });
+  await selectWebhooks(mutate);
   await tick(180_000);
   const receipt = () => request('/heartbeat/' + heartbeatId, { method: 'POST', headers: { authorization } });
   clock.mockReturnValue(start + 200_000);
@@ -108,7 +107,7 @@ it('delivers exactly one webhook per heartbeat transition and resets recovery af
   clock.mockReturnValue(start + 460_000);
   await receipt();
   await receipt();
-  expect(events).toEqual([{ text: 'Watchdog: Incident opened' }, { text: 'Watchdog: Incident recovered' }]);
+  expect((await notifications.summaries())).toEqual(['Watchdog: Incident opened', 'Watchdog: Incident recovered']);
   expect((await status()).incidents).toMatchObject([{ openedAt: start + 180_000, closedAt: start + 460_000 }]);
 });
 it('applies shorter silence only at the next evaluation and retains omitted heartbeat settings', async () => {
@@ -142,15 +141,15 @@ const create = async (body: unknown) => {
 
 it('isolates mixed collection freshness, silence, recovery spacing, private alerts and retained deletion history by opaque ID', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
-  const events: unknown[] = [];
+  const notifications = await captureNotifications();
   network.use(
     http.get('https://secret-target.example/health', () => new HttpResponse(null, { status: 204 })),
-    http.post('https://alerts.example/hook', async ({ request }) => { events.push(await request.json()); return new HttpResponse(null, { status: 204 }); }),
   );
   await mutate('/api/operator/webhook', 'PUT', { url: 'https://alerts.example/hook' });
   const a = await create({ name: 'Private producer', kind: 'heartbeat', published: false, silenceSeconds: 180, recoverySpacingSeconds: 120 });
   const outbound = await create({ name: 'HTTP', url: 'https://secret-target.example/health' });
   const b = await create({ name: 'Public producer', kind: 'heartbeat', silenceSeconds: 300 });
+  await selectWebhooks(mutate);
   expect(new Set([a.id, b.id, outbound.id]).size).toBe(3);
   expect([a.id, b.id, outbound.id]).not.toContain('website');
   const receipt = (id: string) => request('/heartbeat/' + id, { method: 'POST', headers: { authorization } });
@@ -170,7 +169,7 @@ it('isolates mixed collection freshness, silence, recovery spacing, private aler
   expect((await operatorStatus()).monitors.find(m => m.id === a.id)?.state).toBe('up');
   expect((await operatorStatus()).monitors.find(m => m.id === b.id)?.state).toBe('down');
   clock.mockReturnValue(start + 370_000); await receipt(b.id);
-  expect(events).toEqual([{ text: 'Private producer: Incident opened' }, { text: 'Public producer: Incident opened' }, { text: 'Private producer: Incident recovered' }, { text: 'Public producer: Incident recovered' }]);
+  expect((await notifications.summaries())).toEqual(['Private producer: Incident opened', 'Public producer: Incident opened', 'Private producer: Incident recovered', 'Public producer: Incident recovered']);
   await mutate('/api/operator/monitors/' + b.id, 'PATCH', { name: 'Renamed producer', silenceSeconds: 60 });
   expect((await operatorStatus()).monitors.map(m => m.id)).toEqual([a.id, outbound.id, b.id]);
   await tick(430_000);
@@ -188,7 +187,7 @@ it('isolates mixed collection freshness, silence, recovery spacing, private aler
   expect(c.id).not.toBe(b.id);
   await evictDurableObject(env.MONITORING.getByName('personal'));
   expect((await operatorStatus()).monitors.map(m => m.id)).toEqual([a.id, outbound.id, c.id]);
-  expect(events.at(-1)).toEqual({ text: 'Renamed producer: Incident opened' });
+  expect((await notifications.summaries()).at(-1)).toEqual('Renamed producer: Incident opened');
 });
 
 it('edits heartbeat collection timing prospectively without changing kind, sibling settings', async () => {

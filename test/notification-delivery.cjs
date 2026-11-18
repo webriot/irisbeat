@@ -2,8 +2,9 @@
 const assert = require('node:assert/strict');
 const { createRequire } = require('node:module');
 const { join } = require('node:path');
-const { build } = createRequire(join(process.cwd(), 'node_modules/@cloudflare/vitest-plugin/package.json'))('esbuild');
-const { Miniflare, convertV4MiniflareOptions } = createRequire(join(process.cwd(), 'node_modules/@cloudflare/vitest-plugin/package.json'))('miniflare');
+const localRequire = createRequire(join(process.cwd(), 'node_modules/@cloudflare/vitest-plugin/package.json'));
+const { build } = localRequire('esbuild');
+const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
 
 async function bundle(contents) {
   return (await build({
@@ -43,7 +44,8 @@ async function main() {
 
   const batches = [], submissions = [];
   let healthy = false;
-  let gate;
+  let holdBatch;
+  let completedBatches = 0;
   let providerStatus = 204;
   const mf = new Miniflare(convertV4MiniflareOptions({ workers: [
     { name: 'monitoring', modules: true, script: monitoring, compatibilityDate: '2026-11-13',
@@ -62,9 +64,9 @@ async function main() {
         GATE: async request => {
           if (new URL(request.url).pathname === '/batch') {
             batches.push(await request.json());
-            await gate?.hold;
-          } else if (gate) {
-            gate.done();
+            await holdBatch;
+          } else {
+            completedBatches++;
           }
           return new Response(null, { status: 204 });
         },
@@ -123,7 +125,11 @@ async function main() {
       healthy = true;
       const recoveredAt = at;
       await tick(host);
-      await until(() => submissions.length === before + 2);
+      await until(() => submissions.length === before + 2 && completedBatches === batches.length);
+      const recoveryJobs = batches.at(-1);
+      assert.equal(recoveryJobs.length, 2);
+      assert.equal(new Set(recoveryJobs.map(job => job.event.id)).size, 1);
+      assert.equal(new Set(recoveryJobs.map(job => job.deliveryId)).size, 2);
       const [first, second] = submissions.slice(before).sort((a, b) => a.url.localeCompare(b.url));
       assert.equal(first.url, discord + '/slack');
       assert.equal(second.url, slack);
@@ -134,28 +140,59 @@ async function main() {
       }
       assert.doesNotMatch(JSON.stringify(batches), /internal\.example|8443|target-secret|hooks\.example|\/token/);
 
-      // Hold the batch before the real trigger checks eligibility.
-      let release;
-      let complete;
-      const done = new Promise(resolve => { complete = resolve; });
-      gate = { hold: new Promise(resolve => { release = resolve; }), done: complete };
-      const priorBatches = batches.length;
+      async function holdTransition(change) {
+        const priorBatches = batches.length;
+        let release;
+        holdBatch = new Promise(resolve => { release = resolve; });
+        try {
+          await tick(host);
+          await until(() => batches.length > priorBatches);
+          await change();
+        } finally {
+          release();
+          holdBatch = undefined;
+        }
+        await until(() => completedBatches > priorBatches);
+      }
+
+      // A no-op selection retains eligibility, while deselecting and reselecting does not.
       healthy = false;
       providerStatus = 302;
-      await tick(host);
-      try {
-        await until(() => batches.length > priorBatches);
+      await holdTransition(async () => {
         const committed = (await json(host, '/api/operator')).incidents;
         assert.equal(committed.filter(incident => incident.closedAt === null).length, 1);
         await json(host, monitorPath, 'PATCH', { destinationIds: [ids[1]] });
         await json(host, monitorPath, 'PATCH', { destinationIds: ids });
-      } finally { release(); }
-      await Promise.race([done, until(() => !gate)]);
-      gate = undefined;
+      });
       assert.deepEqual(submissions.slice(before + 2).map(item => item.url), [discord + '/slack']);
-      await json(host, monitorPath, 'DELETE');
+
+      healthy = true;
+      await holdTransition(async () => {
+        await json(host, path + '/' + ids[0], 'PUT', { url: 'https://hooks.example/replaced' });
+        await json(host, path + '/' + ids[1], 'DELETE');
+        const { destinations: addedAgain } = await json(host, path, 'POST', { url: discord }, 201);
+        await json(host, monitorPath, 'PATCH', { destinationIds: addedAgain.map(destination => destination.id) });
+      });
+      assert.equal(submissions.length, before + 3, 'replacement and re-addition cancel already queued jobs');
+
+      if (host === 'personal.example') {
+        healthy = false;
+        await holdTransition(async () => {
+          await json(host, monitorPath, 'DELETE');
+        });
+        assert.equal(submissions.length, before + 3, 'deleting the Monitor cancels already queued jobs');
+      }
     }
-    console.log('PASS Incident fan-out, opt-in, trusted two-Worker Queue delivery, safe content, stale selection cancellation and no redirects');
+    const personalJob = batches[0][0];
+    const tenantJob = batches.find(batch => batch[0].contextId !== personalJob.contextId)[0];
+    assert.notEqual(personalJob.contextId, tenantJob.contextId);
+    const priorSubmissions = submissions.length;
+    const priorBatches = completedBatches;
+    const producer = await mf.getQueueProducer('NOTIFICATION_QUEUE', 'monitoring');
+    await producer.send({ ...personalJob, contextId: tenantJob.contextId });
+    await until(() => completedBatches > priorBatches);
+    assert.equal(submissions.length, priorSubmissions, 'jobs cannot resolve a destination with another context ID');
+    console.log('PASS Incident fan-out, private Monitors, opt-in, trusted two-Worker Queue delivery, safe content, cancellation and no redirects');
   } finally {
     await mf.dispose();
   }

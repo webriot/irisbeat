@@ -1,7 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Deliberately a package import: this fixture must not resolve repository source.
-import { createHostedWorker, MonitoringContext as EngineContext, type IncidentTransition, type ScheduledContext } from 'irisbeat';
+import { createHostedWorker, MonitoringContext as EngineContext, type EngineEnv, type IncidentTransition, type ScheduledContext } from 'irisbeat';
+export { NotificationDelivery } from 'irisbeat';
+
 export class MonitoringContext extends EngineContext {
+  constructor(ctx: DurableObjectState, env: EngineEnv) {
+    super(ctx, {
+      ...env,
+      NOTIFICATION_QUEUE: {
+        async sendBatch(messages) {
+          const response = await fetch('https://queue.example/accepted', {
+            method: 'POST', body: JSON.stringify(Array.from(messages, message => message.body)),
+          });
+          if (!response.ok) throw new Error('Queue unavailable');
+          return { metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } } };
+        },
+      },
+    });
+  }
+
   protected async onIncidentTransition(event: IncidentTransition) {
     // The real hosted consumer supplies its own transport/identity mapping here.
     const response = await fetch('https://delivery.example/transitions', { method: 'POST', body: JSON.stringify(event) });

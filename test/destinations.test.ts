@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { env } from "cloudflare:workers";
-import { evictDurableObject, reset } from "cloudflare:test";
-import { afterEach, expect, it } from "vitest";
+import { createScheduledController, evictDurableObject, reset } from "cloudflare:test";
+import { afterEach, expect, it, vi } from "vitest";
+import { captureNotifications } from "./notification-queue";
 import worker, { createHostedWorker, type Status } from "../src/index";
 
 const hosted = createHostedWorker({
@@ -68,4 +69,36 @@ it("limits destinations and selections to editors of their own context", async (
   const monitor = monitors + "/" + b.monitor!.id;
   expect((await api(monitor, "PATCH", { destinationIds: [destination.id] }, "b.example")).status).toBe(400);
   expect((await api(monitor, "PATCH", { destinationIds: [] }, "b.example", "reader")).status).toBe(403);
+});
+
+it("keeps an Incident committed when Queue acceptance fails and never replays it", async () => {
+  const start = Date.now();
+  const clock = vi.spyOn(Date, "now").mockReturnValue(start);
+  const openedAt = start + 180_000;
+  const created = await status(api(monitors, "POST", { kind: "heartbeat", name: "Producer", recoveryThreshold: 1 }), 201);
+  const id = created.monitor!.id;
+  const { destinations: saved } = await status(api(destinations, "POST", { url: "https://hooks.example/private-token" }), 201);
+  await status(api(monitors + "/" + id, "PATCH", { destinationIds: [saved![0].id] }));
+  const notifications = await captureNotifications(true);
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    await worker.scheduled(createScheduledController({ scheduledTime: openedAt }), env);
+    const [incident] = (await status(api("/api/operator"))).incidents;
+    expect(incident).toMatchObject({ monitorId: id, openedAt, closedAt: null });
+    expect(log.mock.calls).toEqual([[JSON.stringify({ event: "notification_enqueue_failed", eventId: incident.id + ":opened" })]]);
+    expect(await notifications.jobs()).toEqual([]);
+
+    await captureNotifications();
+    await evictDurableObject(env.MONITORING.getByName("personal"));
+    await worker.scheduled(createScheduledController({ scheduledTime: openedAt + 60_000 }), env);
+    expect((await status(api("/api/operator"))).incidents).toEqual([incident]);
+    expect(await notifications.jobs()).toEqual([]);
+    clock.mockReturnValue(openedAt + 120_000);
+    expect((await api("/heartbeat/" + id, "POST")).status).toBe(204);
+    expect(await notifications.jobs()).toMatchObject([{ event: { kind: "incident.recovered", incidentId: incident.id } }]);
+  } finally {
+    clock.mockRestore();
+    log.mockRestore();
+    await captureNotifications();
+  }
 });

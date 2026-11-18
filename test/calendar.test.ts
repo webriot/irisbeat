@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { captureNotifications, selectWebhooks } from "./notification-queue";
 import worker from '../src/index';
 import { exports, env } from 'cloudflare:workers';
 import { createScheduledController, evictDurableObject, reset } from 'cloudflare:test';
@@ -204,9 +205,9 @@ it('records Calendar Maintenance without counting or recovery and preserves webh
   const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
   await create({ cron: '* * * * *', failureThreshold: 1, recoveryThreshold: 2 });
   const path = '/api/operator/monitors/' + (await read()).monitor!.id;
-  const messages: unknown[] = [];
+  const notifications = await captureNotifications();
   await request('/api/operator/webhook', 'PUT', { url: 'https://hooks.example/calendar' });
-  network.use(http.post('https://hooks.example/calendar', async ({ request }) => { messages.push(await request.json()); return new HttpResponse(null, { status: 204 }); }));
+  await selectWebhooks(request);
   network.use(http.get('https://target.example/', () => new HttpResponse(null, { status: 503 })));
   await tick(start + 60_000);
   const incident = (await read()).incidents[0];
@@ -221,7 +222,7 @@ it('records Calendar Maintenance without counting or recovery and preserves webh
   expect((await read()).incidents[0].closedAt).toBeNull();
   await tick(start + 240_000);
   expect((await read()).incidents[0]).toMatchObject({ id: incident.id, closedAt: start + 240_000 });
-  expect(messages).toEqual([{ text: 'Calendar: Incident opened' }, { text: 'Calendar: Incident recovered' }]);
+  expect((await notifications.summaries())).toEqual(['Calendar: Incident opened', 'Calendar: Incident recovered']);
   // A window declared and ended during an active Check still exempts the Check.
   vi.spyOn(globalThis, 'fetch').mockImplementationOnce(async () => {
     clock.mockReturnValue(start + 301_000);
@@ -231,7 +232,7 @@ it('records Calendar Maintenance without counting or recovery and preserves webh
   });
   await tick(start + 300_000);
   expect((await read()).monitor!.lastResult).toEqual({ at: start + 300_000, outcome: 'maintenance' });
-  expect(messages).toHaveLength(2);
+  expect((await notifications.summaries())).toHaveLength(2);
 });
 
 it('dispatches no nonexistent or second repeated wall time', async () => {

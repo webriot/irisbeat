@@ -52,7 +52,7 @@ this change does not synthesize them. Existing Incident history is unchanged.
 `maintenance(id, value, end?)` is a synchronous DO operation. The route uses hosted editor authorization and hides reader controls.
 Retain adapter context resolution, operator metadata, allowance enforcement and
 heartbeat credential rotation. Suppression returns from shared `record` before
-Incident mutation or post-commit delivery; both `deliverWebhook` and
+Incident mutation or post-commit delivery; both Queue submission and
 `onIncidentTransition` remain downstream of it. Installed-consumer tests cover
 both delivery paths for HTTP, TCP and Heartbeat. There are no Maintenance
 transition alert events. A webhook submitted before declaration cannot be recalled;

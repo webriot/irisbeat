@@ -24,9 +24,11 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     assert.equal(readFileSync(join(source, 'package-lock.json'), 'utf8'), readFileSync('package-lock.json', 'utf8'));
     symlinkSync(join(project, 'node_modules'), join(source, 'node_modules'), 'dir');
     execFileSync(join(project, 'node_modules/.bin/wrangler'), ['deploy', '--dry-run', '--outdir', join(temporary, 'build')], { cwd: source, stdio: 'pipe' });
+    execFileSync(join(project, 'node_modules/.bin/wrangler'), ['deploy', '--dry-run', '--config', 'wrangler.delivery.jsonc', '--outdir', join(temporary, 'delivery-build')], { cwd: source, stdio: 'pipe' });
+    const delivery = (await build({ entryPoints: [join(source, 'src/notification-delivery.ts')], bundle: true, write: false, format: 'esm', platform: 'neutral' })).outputFiles[0].text;
     const script = (await build({ stdin: { contents: `
       import worker from './src/index.ts';
-      export { MonitoringContext } from './src/index.ts';
+      export { MonitoringContext, NotificationDelivery } from './src/index.ts';
       let now = ${Date.UTC(2026, 10, 14)};
       Date.now = () => now;
       export default {
@@ -52,15 +54,33 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     let outcome = 503;
     const alerts = [], targets = [];
     const secret = randomBytes(32).toString('hex');
-    mf = new Miniflare(convertV4MiniflareOptions({ modules: true, script, compatibilityDate: '2026-11-13',
-      bindings: { INSTALLATION_SECRET: secret }, durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } },
-      outboundService: async request => {
-        const host = new URL(request.url).hostname;
-        assert.ok(['http-target.example', 'tcp-target.example', 'webhook.example'].includes(host), 'all outbound destinations are substituted');
-        if (host === 'webhook.example') { alerts.push(await request.json()); return new Response(null, { status: 204 }); }
-        targets.push(host); return new Response(null, { status: outcome });
+    mf = new Miniflare(convertV4MiniflareOptions({ workers: [
+      { name: 'monitoring', modules: true, script, compatibilityDate: '2026-11-13',
+        bindings: { INSTALLATION_SECRET: secret }, durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } },
+        queueProducers: { NOTIFICATION_QUEUE: 'notifications' },
+        outboundService: request => {
+          const host = new URL(request.url).hostname;
+          assert.ok(['http-target.example', 'tcp-target.example'].includes(host), 'all targets are substituted');
+          targets.push(host); return new Response(null, { status: outcome });
+        },
       },
-    }));
+      { name: 'delivery', modules: true, script: delivery, compatibilityDate: '2026-11-18',
+        queueConsumers: { notifications: { maxBatchTimeout: 0.1, maxRetries: 0 } },
+        serviceBindings: { NOTIFICATION_DELIVERY: { name: 'monitoring', entrypoint: 'NotificationDelivery' } },
+        outboundService: async request => {
+          assert.equal(request.url, 'https://webhook.example/controlled');
+          alerts.push(await request.json()); return new Response(null, { status: 204 });
+        },
+      },
+    ] }));
+    async function waitForAlerts(count) {
+      const deadline = Date.now() + 5000;
+      while (alerts.length < count) {
+        assert.ok(Date.now() < deadline, 'timed out waiting for Queue delivery');
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      assert.equal(alerts.length, count);
+    }
     let now = Date.UTC(2026, 10, 14);
     const start = now;
     const request = (path, method = 'GET', body, token = secret) => mf.dispatchFetch('https://personal.example' + path, {
@@ -78,7 +98,10 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       { name: 'TCP', kind: 'tcp', hostname: 'controlled.example', port: 5432 },
       { name: 'Producer', kind: 'heartbeat', silenceSeconds: 180 },
     ]) assert.equal((await request('/api/operator/monitors', 'POST', configuration)).status, 201);
-    const monitors = (await status()).monitors;
+    const { monitors, destinations } = await status();
+    for (const monitor of monitors) {
+      assert.equal((await request('/api/operator/monitors/' + monitor.id, 'PATCH', { destinationIds: [destinations[0].id] })).status, 200);
+    }
     const heartbeat = '/heartbeat/' + monitors[2].id;
     assert.equal((await request(heartbeat, 'POST', undefined, 'wrong')).status, 401);
     assert.equal((await request(heartbeat, 'POST')).status, 204);
@@ -93,7 +116,8 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     assert.equal(targets.filter(host => host === 'http-target.example').length, 3);
     assert.equal(targets.filter(host => host === 'tcp-target.example').length, 3);
     assert.equal((await status()).incidents.length, 3);
-    assert.deepEqual(alerts.map(row => row.text).sort(), ['HTTP: Incident opened', 'Producer: Incident opened', 'TCP: Incident opened']);
+    await waitForAlerts(3);
+    assert.deepEqual(alerts.map(row => row.text.split('\n')[0]).sort(), ['`HTTP` · Incident opened', '`Producer` · Incident opened', '`TCP` · Incident opened']);
     const paths = monitors.map(monitor => '/api/operator/monitors/' + monitor.id);
     for (const path of paths) assert.equal((await request(path + '/maintenance', 'PUT', { endsAt: start + 600_000 })).status, 200);
     outcome = 204;
@@ -108,7 +132,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     assert.equal(alerts.length, 3, 'one healthy observation cannot recover');
     await tick(360_000); await request(heartbeat, 'POST');
     const recovered = await status();
-    assert.equal(alerts.length, 6);
+    await waitForAlerts(6);
     assert.ok(recovered.incidents.every(incident => incident.closedAt !== null));
     for (const monitor of recovered.monitors) {
       assert.equal(monitor.history.days.length, 90);
