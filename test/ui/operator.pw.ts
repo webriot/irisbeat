@@ -16,6 +16,7 @@ test('operator navigates Settings independently and edits inline through keyboar
     await page.keyboard.press('Enter');
     await expect(page.getByRole('table', { name: 'Monitors', exact: true })).toBeHidden();
     await page.getByLabel('Page name', { exact: true }).fill('Independent page');
+    await page.getByRole('button', { name: 'Add webhook' }).click();
     await page.getByLabel('HTTPS webhook URL', { exact: true }).fill('http://invalid.example');
     await page.getByRole('button', { name: 'Save page', exact: true }).click();
     await expect(page.locator('#message')).toHaveText('Saved');
@@ -68,44 +69,4 @@ test.describe('touch actions', () => {
       await expect(page.getByRole('button', { name: 'Edit Touch Monitor', exact: true })).toBeFocused();
     } finally { await request.delete('/api/operator/monitors/' + id, { headers }); }
   });
-});
-
-
-test('Tab return updates pristine Settings while each save preserves the other draft', async ({ page }) => {
-  let data = { pageName: 'Original page', webhookUrl: 'https://old.example/hook', monitors: [], incidents: [] };
-  await page.route('**/api/operator', async route => {
-    if (route.request().method() === 'PUT') data = { ...data, ...route.request().postDataJSON() };
-    await route.fulfill({ json: data });
-  });
-  await page.route('**/api/operator/webhook', async route => {
-    data.webhookUrl = route.request().postDataJSON().url;
-    await route.fulfill({ json: data });
-  });
-  await page.goto('/operator');
-  await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
-  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-  await page.getByRole('button', { name: 'Settings', exact: true }).click();
-  const name = page.getByLabel('Page name', { exact: true });
-  const webhook = page.getByLabel('HTTPS webhook URL', { exact: true });
-  data = { ...data, pageName: 'External page', webhookUrl: 'https://external.example/hook' };
-  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
-  await expect(name).toHaveValue('External page');
-  await expect(webhook).toHaveValue('https://external.example/hook');
-  await name.fill('Page draft');
-  await webhook.fill('https://draft.example/hook');
-  await page.getByRole('button', { name: 'Save page', exact: true }).click();
-  await expect(page.locator('#message')).toHaveText('Saved');
-  await expect(webhook).toHaveValue('https://draft.example/hook');
-  data.pageName = 'Updated after save';
-  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
-  await expect(name).toHaveValue('Updated after save');
-  await expect(webhook).toHaveValue('https://draft.example/hook');
-  await name.fill('Another page draft');
-  await page.getByRole('button', { name: 'Save webhook', exact: true }).click();
-  await expect(page.locator('#message')).toHaveText('Saved');
-  await expect(name).toHaveValue('Another page draft');
-  data.webhookUrl = 'https://newer.example/hook';
-  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
-  await expect(name).toHaveValue('Another page draft');
-  await expect(webhook).toHaveValue('https://newer.example/hook');
 });

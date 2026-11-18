@@ -20,7 +20,7 @@ TypeScript-aware Workers bundler (including Wrangler/esbuild) is required; it is
 not a Node.js runtime library. Hono is an installed runtime dependency. For consumer
 TypeScript checks, enable `"jsx": "react-jsx"` and `"jsxImportSource": "hono/jsx"`;
 the packaged page source also declares its JSX runtime for bundlers. Import `createHostedWorker`, `MonitoringContext`,
-`HostedAdapter`, `EngineEnv`, `Status` and `IncidentTransition` from `irisbeat`.
+`HostedAdapter`, `EngineEnv` and `Status` from `irisbeat`.
 Pin the artifact version **and literal `contractVersion: '1'`**; unsupported
 versions throw during factory construction, before requests or scheduling run.
 `private: true` prevents accidental registry publication; versioned GitHub release tarballs are the supported distribution path.
@@ -82,31 +82,47 @@ and commits synchronously before any delivery awaits. A receipt already committe
 before rotation is retained. Personal `/heartbeat/:id` continues using the
 installation secret and ignores bodies.
 
-## Transition delivery and siblings
+## Incident notifications
 
-Export a subclass of `MonitoringContext<YourEnv>` with
-`protected async onIncidentTransition(event: IncidentTransition): Promise<void>`.
-Bind the consumer's MONITORING namespace to that exported subclass, with the same
-SQLite migration as the public app. The default hook does nothing. Each committed
-opening/recovery invokes it independently of publication, alongside the unchanged
-webhook path; HTTP, TCP and Heartbeat use the same detector. The event contains the
-opaque Durable Object `contextId`, complete `incident`, `transition` and observation
-`at`. Map tenant names with `env.MONITORING.idFromName(name).toString()`; never
-infer identity from a Monitor name. Events omit targets and destination/heartbeat
-credentials. The consumer owns bounded delivery and any queue/outbox/recipient
-mapping. Hook exceptions log only `transition_delivery_failed`, never undo the
-Incident, and do not retry/reopen it. Webhooks retain their own ten-second bound.
-Both paths remain best effort: a crash after commit can lose delivery; concurrent
-transitions can arrive out of order. Use Incident ID plus transition for deduping.
+Use one Queue for the monitoring Worker's `NOTIFICATION_QUEUE` producer and
+the isolated delivery Worker's consumer trigger. Use `irisbeat/notification-delivery`
+as the delivery Worker entrypoint. Export `NotificationDelivery` from the hosted
+monitoring Worker and bind the delivery Worker's `NOTIFICATION_DELIVERY` service
+to that named entrypoint. It resolves a webhook only while the original context,
+Monitor, destination and selection remain eligible. Keep the Queue and service
+binding under trusted deployment control. Delivery lookup is available through
+service RPC. Keep Workers Logs enabled on the delivery Worker and disable
+automatic traces because fetch spans can include credential-bearing webhook URLs.
 
-`src/index.ts` adds small seams around existing handlers, DO creation, heartbeat
-authorization and post-commit delivery. The detector and webhook transport remain
-owned here. TCP integration retains the three-kind target union, atomic DO-side patch validation,
-first-Monitor identity pinned before reading legacy bodies and immutable kinds.
-Subsequent siblings should preserve the allowance argument on `create`,
-operator response metadata, secret-safe status views and this post-commit hook
-when merging their target union/atomic patch validation. Relevant paths are the
-existing collection API plus the two hosted heartbeat paths above.
+Editors manage webhook destinations with `POST /api/operator/destinations` and
+`PUT` or `DELETE /api/operator/destinations/:id`. Provide an HTTPS `{ url }` for
+creates and replacements. The authenticated editor snapshot exposes `destinations`
+and each Monitor's `destinationIds`. Use `PATCH /api/operator/monitors/:id`
+with `{ destinationIds: [...] }` to replace the list or `{ destinationChanges: { [id]: true | false } }`
+to change individual selections atomically. `true` requires an existing
+destination, `false` removes the selection if present, and omitted IDs retain
+their current selection. Use one selection field per request.
+A new Monitor starts with zero selections. The previous webhook setting upgrades
+to an unselected destination and its compatibility endpoint manages that entry.
+
+HTTP, TCP and Heartbeat share post-commit Incident enqueueing. A job carries stable
+event and delivery IDs, original event time and safe rendering data. Address
+changes replace the destination identity and clear prior selections. A failed
+enqueue logs `notification_enqueue_failed` and leaves the Incident committed.
+Queue acceptance starts durable delivery. This slice makes one bounded provider
+submission per message and logs `webhook_submission_failed` on failure.
+
+Hosted and self-hosted Incident notifications require explicit Monitor selections
+and the Queue and delivery Worker above. Monitoring and Incident recording
+continue without `NOTIFICATION_QUEUE`. If a selected destination cannot be
+enqueued because the binding is missing, the engine records the same enqueue
+failure as a rejected submission.
+
+The engine no longer invokes `onIncidentTransition` in any configuration. The
+protected method and exported `IncidentTransition` type remain deprecated for
+source compatibility with existing hosted subclasses. To resume sending after
+upgrade, configure the Queue and delivery Worker and select destinations on each
+Monitor that should send.
 
 ## Pause and resume
 
@@ -188,18 +204,13 @@ not resume. Checks wholly after resume follow existing due-time rules.
 
 Any pending HTTP/TCP attempt touched by pause is discarded even if resumed before
 completion. Its original due-time anchor and in-flight guard remain in force.
-Already submitted target requests/webhooks/consumer hooks cannot be recalled;
-their transport remains bounded by the existing attempt/delivery contract. A hook
-waiting behind a submitted webhook is suppressed if pause intervenes, even after
-resume. No missed alert is replayed. Pause alone emits no transition event and
-never fabricates Incident recovery.
-Maintenance #8 returns from shared `record` before Incident mutation and both
-`deliverWebhook` and `onIncidentTransition`; the hosted hook must never bypass that
-guard. Editors use `PUT`/`DELETE /api/operator/monitors/:id/maintenance`; readers
-cannot mutate windows. See [Maintenance handoff](maintenance-api.md) for status
+Pause cancels queued jobs from previous pause generations. Target requests and
+webhooks already submitted remain in flight. Resume starts with an empty
+notification backlog. Maintenance #8 suppresses Incident transitions before the
+engine reaches Queue handoff. Editors use `PUT`/`DELETE /api/operator/monitors/:id/maintenance`.
+See [Maintenance handoff](maintenance-api.md) for status
 fields, observation retention, and the #11 precedence seam. Installed-consumer
-coverage verifies suppression of both delivery paths for all three check kinds.
-The hook observes committed detector transitions, not every raw observation.
+coverage verifies Queue suppression for all three check kinds.
 [History #9](history-api.md) adds the same filtered per-Monitor series to personal and hosted status, including readers; it does not change credentials, permissions, allowances or delivery. The release candidate must be
 regenerated after integration changes, before #12 publishes anything.
 

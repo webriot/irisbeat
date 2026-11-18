@@ -1,0 +1,257 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+import { expect, test } from '@playwright/test';
+import { monitorAction } from './actions';
+
+test('webhook ledger and inline Monitor selections require explicit opt-in', async ({ page, request }) => {
+  const headers = { Authorization: 'Bearer ui-test-secret' };
+  const tag = 'destinations-' + Date.now();
+  const first = 'https://alerts.example.invalid/' + tag + '/first';
+  const second = 'https://alerts.example.invalid/' + tag + '/second';
+  const replacement = first + '-replacement';
+  const ledger = page.getByRole('list', { name: 'Notification destinations' });
+  const snapshot = async () => (await request.get('/api/operator', { headers })).json();
+
+  await page.setViewportSize({ width: 320, height: 900 });
+  await page.emulateMedia({ colorScheme: 'dark' });
+  await page.goto('/operator');
+  await page.getByLabel('Installation secret').fill('ui-test-secret');
+  await page.getByRole('button', { name: 'Sign in' }).click();
+  try {
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    const add = page.getByRole('button', { name: 'Add webhook' });
+    const url = page.getByLabel('HTTPS webhook URL');
+    for (const address of [first, second]) {
+      await add.focus();
+      await page.keyboard.press('Enter');
+      await expect(url).toBeFocused();
+      await url.fill(address);
+      await page.getByRole('button', { name: 'Save webhook' }).click();
+      await expect(ledger.getByText(address, { exact: true })).toBeVisible();
+      await expect(add).toBeFocused();
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+
+    await page.getByRole('button', { name: 'Monitors', exact: true }).click();
+    await page.getByRole('button', { name: 'New Monitor' }).click();
+    await page.getByLabel('Monitor name', { exact: true }).fill(tag);
+    await page.getByLabel('Check type').selectOption('heartbeat');
+    await page.getByRole('button', { name: 'Save Monitor' }).click();
+    await monitorAction(page, 'Edit ' + tag);
+    const choices = page.getByRole('group', { name: 'Notification destinations' });
+    const firstChoice = choices.getByRole('checkbox', { name: first, exact: true });
+    const secondChoice = choices.getByRole('checkbox', { name: second, exact: true });
+    await expect(firstChoice).not.toBeChecked();
+    await expect(secondChoice).not.toBeChecked();
+    await firstChoice.focus();
+    await page.keyboard.press('Space');
+    await secondChoice.check();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await page.getByRole('button', { name: 'Save Monitor' }).click();
+    await monitorAction(page, 'Edit ' + tag);
+    await expect(firstChoice).toBeChecked();
+    await expect(secondChoice).toBeChecked();
+
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByRole('button', { name: 'Replace ' + first, exact: true }).click();
+    await expect(url).toBeFocused();
+    await url.fill(replacement);
+    await page.getByRole('button', { name: 'Replace webhook' }).click();
+    await expect(ledger.getByText(replacement, { exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Replace ' + first, exact: true })).toHaveCount(0);
+    await page.getByRole('button', { name: 'Monitors', exact: true }).click();
+    await expect(choices.getByRole('checkbox', { name: replacement, exact: true })).not.toBeChecked();
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    page.once('dialog', dialog => dialog.dismiss());
+    await page.getByRole('button', { name: 'Remove ' + replacement, exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Remove ' + replacement, exact: true })).toBeFocused();
+    page.once('dialog', dialog => dialog.accept());
+    await page.getByRole('button', { name: 'Remove ' + replacement, exact: true }).click();
+    await expect(ledger.getByText(replacement, { exact: true })).toHaveCount(0);
+
+    await page.getByRole('button', { name: 'Monitors', exact: true }).click();
+    await expect(firstChoice).toHaveCount(0);
+    await expect(secondChoice).toBeChecked();
+    await secondChoice.uncheck();
+    await page.getByRole('button', { name: 'Save Monitor' }).click();
+    await monitorAction(page, 'Edit ' + tag);
+    await expect(secondChoice).not.toBeChecked();
+    expect((await snapshot()).monitors.find((monitor: { name: string }) => monitor.name === tag).destinationIds).toEqual([]);
+  } finally {
+    const data = await snapshot();
+    for (const monitor of data.monitors.filter((monitor: { name: string }) => monitor.name === tag)) {
+      await request.delete('/api/operator/monitors/' + monitor.id, { headers });
+    }
+    for (const destination of data.destinations.filter((item: { url: string }) => item.url.includes(tag))) {
+      await request.delete('/api/operator/destinations/' + destination.id, { headers });
+    }
+  }
+});
+
+test('Monitor selection drafts survive refresh and save failure alongside concurrent selections', async ({ page, request }) => {
+  const headers = { Authorization: 'Bearer ui-test-secret' };
+  const tag = 'concurrent-' + Date.now();
+  const addresses = ['local', 'remote', 'unseen'].map(part => 'https://alerts.example.invalid/' + tag + '/' + part);
+  const ids: string[] = [];
+  for (const url of addresses) {
+    const response = await request.post('/api/operator/destinations', { headers, data: { url } });
+    expect(response.status()).toBe(201);
+    ids.push((await response.json()).destinations.find((destination: { url: string }) => destination.url === url).id);
+  }
+  const created = await request.post('/api/operator/monitors', { headers, data: { name: tag, kind: 'heartbeat' } });
+  const id = (await created.json()).monitors.find((monitor: { name: string }) => monitor.name === tag).id;
+  const path = '/api/operator/monitors/' + id;
+  try {
+    await page.addInitScript(() => { Object.defineProperty(window, 'WebSocket', { value: class { constructor() { throw new Error('offline'); } } }); });
+    await page.goto('/operator');
+    await page.getByLabel('Installation secret').fill('ui-test-secret');
+    await page.getByRole('button', { name: 'Sign in' }).click();
+    await monitorAction(page, 'Edit ' + tag);
+    const [local, remote, unseen] = addresses.map(name => page.getByRole('checkbox', { name, exact: true }));
+    const name = page.getByLabel('Monitor name', { exact: true });
+    await name.fill(tag + ' draft');
+    await local.check();
+    await local.focus();
+    expect((await request.patch(path, { headers, data: { destinationIds: [ids[1]] } })).ok()).toBe(true);
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await expect(remote).toBeChecked();
+    await expect(local).toBeChecked();
+    await expect(local).toBeFocused();
+    await expect(name).toHaveValue(tag + ' draft');
+
+    const save = page.getByRole('button', { name: 'Save Monitor' });
+    await page.route('**' + path, route => route.fulfill({ status: 503, json: { error: 'Save unavailable' } }), { times: 1 });
+    await save.click();
+    await expect(page.getByRole('status').filter({ hasText: 'Save unavailable' })).toBeVisible();
+    await expect(local).toBeChecked();
+    await expect(name).toHaveValue(tag + ' draft');
+    await expect(save).toBeFocused();
+
+    // Another editor changes two checkboxes without this tab receiving an invalidation.
+    expect((await request.patch(path, { headers, data: { destinationIds: [ids[2]] } })).ok()).toBe(true);
+    await expect(unseen).not.toBeChecked();
+    await save.click();
+    await monitorAction(page, 'Edit ' + tag + ' draft');
+    await expect(local).toBeChecked();
+    await expect(remote).not.toBeChecked();
+    await expect(unseen).toBeChecked();
+  } finally {
+    await request.delete(path, { headers });
+    for (const id of ids) await request.delete('/api/operator/destinations/' + id, { headers });
+  }
+});
+
+test('a rejected Monitor save refreshes a destination removed during Live updates', async ({ page, request }) => {
+  const headers = { Authorization: 'Bearer ui-test-secret' };
+  const tag = 'removed-destination-' + Date.now();
+  const url = 'https://alerts.example.invalid/' + tag;
+  const created = await request.post('/api/operator/destinations', { headers, data: { url } });
+  expect(created.status()).toBe(201);
+  const destination = (await created.json()).destinations.find((item: { url: string }) => item.url === url);
+  const monitor = await request.post('/api/operator/monitors', { headers, data: { name: tag, kind: 'heartbeat' } });
+  expect(monitor.status()).toBe(201);
+  const id = (await monitor.json()).monitors.find((item: { name: string }) => item.name === tag).id;
+  const path = '/api/operator/monitors/' + id;
+  let release: (() => void) | undefined;
+  try {
+    await page.goto('/operator');
+    await page.getByLabel('Installation secret').fill('ui-test-secret');
+    await page.getByRole('button', { name: 'Sign in' }).click();
+    await expect(page.locator('#updates-mode')).toBeHidden();
+    await monitorAction(page, 'Edit ' + tag);
+    const choice = page.getByRole('checkbox', { name: url, exact: true });
+    const name = page.getByLabel('Monitor name', { exact: true });
+    const save = page.getByRole('button', { name: 'Save Monitor' });
+    await name.fill(tag + ' draft');
+    await choice.check();
+
+    await page.route('**/api/operator', async route => {
+      await new Promise<void>(resolve => { release = resolve; });
+      await route.continue();
+    }, { times: 1 });
+    expect((await request.delete('/api/operator/destinations/' + destination.id, { headers })).ok()).toBe(true);
+    await expect.poll(() => Boolean(release)).toBe(true);
+    const rejected = page.waitForResponse(response => response.url().endsWith(path) && response.request().method() === 'PATCH');
+    await save.click();
+    expect((await rejected).status()).toBe(400);
+    await expect(save).toBeFocused();
+    release!();
+
+    await expect(choice).toHaveCount(0);
+    await expect(name).toHaveValue(tag + ' draft');
+    await expect(save).toBeFocused();
+    const retried = page.waitForResponse(response => response.url().endsWith(path) && response.request().method() === 'PATCH');
+    await save.click();
+    expect((await retried).status()).toBe(200);
+    await expect(page.getByRole('cell', { name: tag + ' draft', exact: true })).toBeVisible();
+  } finally {
+    release?.();
+    await request.delete(path, { headers });
+    await request.delete('/api/operator/destinations/' + destination.id, { headers });
+  }
+});
+
+test('Settings preserves webhook and page drafts across independent saves, failures and ledger refresh', async ({ page }) => {
+  const original = 'https://example.invalid/original';
+  const current = 'https://example.invalid/current';
+  const draft = 'https://example.invalid/draft';
+  let data = {
+    pageName: 'Status',
+    destinations: [{ id: 'original', channel: 'webhook', url: original }],
+    monitors: [],
+    incidents: [],
+  };
+  await page.addInitScript(() => { Object.defineProperty(window, 'WebSocket', { value: class { constructor() { throw new Error('offline'); } } }); });
+  await page.route('**/api/operator', route => {
+    if (route.request().method() === 'PUT') data = { ...data, pageName: route.request().postDataJSON().pageName };
+    return route.fulfill({ json: data });
+  });
+  await page.route('**/api/operator/destinations/original', route => route.fulfill({ status: 503, json: { error: 'Save unavailable' } }));
+  await page.goto('/operator');
+  await page.getByLabel('Installation secret').fill('ui-test-secret');
+  await page.getByRole('button', { name: 'Sign in' }).click();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+
+  const originalAction = page.getByRole('button', { name: 'Replace ' + original, exact: true });
+  const pageName = page.getByLabel('Page name');
+  const url = page.getByLabel('HTTPS webhook URL');
+  const refresh = () => page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await originalAction.focus();
+  data.destinations = [...data.destinations, { id: 'current', channel: 'webhook', url: current }];
+  await refresh();
+  const currentAction = page.getByRole('button', { name: 'Replace ' + current, exact: true });
+  await expect(currentAction).toBeVisible();
+  await expect(originalAction).toBeFocused();
+  await originalAction.click();
+  await url.fill(draft);
+  await pageName.fill('Saved page');
+  await page.getByRole('button', { name: 'Save page' }).click();
+  await expect(page.getByRole('status').filter({ hasText: /^Saved$/ })).toBeVisible();
+  await expect(url).toHaveValue(draft);
+
+  await pageName.fill('Page draft');
+  const replace = page.getByRole('button', { name: 'Replace webhook', exact: true });
+  await replace.click();
+  await expect(page.getByRole('status').filter({ hasText: 'Save unavailable' })).toBeVisible();
+  await expect(replace).toBeFocused();
+  await expect(url).toHaveValue(draft);
+  await expect(pageName).toHaveValue('Page draft');
+
+  data.destinations = data.destinations.filter(destination => destination.id !== 'original');
+  await url.focus();
+  await refresh();
+  await expect(originalAction).toHaveCount(0);
+  await expect(replace).toBeDisabled();
+  await expect(url).toBeFocused();
+  await expect(url).toHaveValue(draft);
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+
+  await page.getByRole('button', { name: 'Add webhook' }).click();
+  await url.fill(draft);
+  await page.route('**/api/operator/destinations', route => {
+    data.destinations.push({ id: 'saved', channel: 'webhook', url: route.request().postDataJSON().url });
+    return route.fulfill({ status: 201, json: data });
+  });
+  await page.getByRole('button', { name: 'Save webhook', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Replace ' + draft, exact: true })).toBeVisible();
+  await expect(pageName).toHaveValue('Page draft');
+});

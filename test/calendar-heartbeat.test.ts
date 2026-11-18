@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { captureNotifications, selectWebhooks } from "./notification-queue";
 import { calendar } from '../src/calendar';
 import worker, { createHostedWorker } from '../src/index';
 import { exports, env } from 'cloudflare:workers';
@@ -60,9 +61,9 @@ it('chronologically catches up bounded restartable batches without losing later 
   const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
   await create();
   const id = (await read()).monitor!.id;
-  const events: unknown[] = [];
-  const target = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => { events.push(JSON.parse(init!.body as string)); return new Response(null, { status: 204 }); });
+  const notifications = await captureNotifications();
   await request('/api/operator/webhook', 'PUT', { url: 'https://alerts.example/hook' });
+  await selectWebhooks(request);
   for (const minute of [299, 300]) {
     clock.mockReturnValue(start + minute * 60_000);
     await request('/heartbeat/' + id, 'POST');
@@ -83,8 +84,7 @@ it('chronologically catches up bounded restartable batches without losing later 
   expect(final.incidents).toMatchObject([{ openedAt: start + 90_000, closedAt: now - 1 }]);
   await tick(now);
   expect(await read()).toEqual(final);
-  expect(events).toEqual([{ text: 'Job: Incident opened' }, { text: 'Job: Incident recovered' }]);
-  target.mockRestore();
+  expect((await notifications.summaries())).toEqual(['Job: Incident opened', 'Job: Incident recovered']);
 });
 
 it('uses old missed deadlines for detection without inserting observations outside 90 UTC days', async () => {

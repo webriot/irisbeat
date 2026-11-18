@@ -52,12 +52,11 @@ this change does not synthesize them. Existing Incident history is unchanged.
 `maintenance(id, value, end?)` is a synchronous DO operation. The route uses hosted editor authorization and hides reader controls.
 Retain adapter context resolution, operator metadata, allowance enforcement and
 heartbeat credential rotation. Suppression returns from shared `record` before
-Incident mutation or post-commit delivery; both `deliverWebhook` and
-`onIncidentTransition` remain downstream of it. Installed-consumer tests cover
-both delivery paths for HTTP, TCP and Heartbeat. There are no Maintenance
-transition alert events. A webhook submitted before declaration cannot be recalled;
-a hosted hook still waiting behind that delivery is suppressed if Maintenance is
-active when it would start.
+Incident mutation or Queue handoff. Installed-consumer tests cover Queue handoff
+for HTTP, TCP and Heartbeat. There are no Maintenance transition alert events.
+A webhook submitted before declaration cannot be recalled. See the
+[hosted notification contract](hosted-contract.md#incident-notifications) for
+Queue setup and upgrade behavior.
 
 #11 makes pause override Maintenance for checking/recording/display and retains
 unexpired windows for resume. See the [hosted pause contract](hosted-contract.md#pause-and-resume). Do not infer subscriptions or hosted identity from
@@ -79,6 +78,6 @@ success/failure availability denominator. An attempt starting exactly at `endsAt
 has no overlap with that expired window and counts normally unless another window
 intersects it. Open Incidents remain frozen for overlap results; only wholly
 post-window results satisfy normal thresholds. No result is created for a skipped
-execution. Installed-consumer tests exercise both webhook and hosted-hook
-suppression when windows are replaced/ended entirely during a pending attempt and
-when a successful attempt spans replacement/expiry of an open Incident's window.
+execution. Installed-consumer tests exercise notification suppression when windows
+are replaced or ended entirely during a pending attempt and when a successful
+attempt spans replacement or expiry of an open Incident's window.

@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import type { NotificationDestination } from './notification-jobs';
 import type { Monitor } from './monitor-configuration';
 import type { createOperatorSession, SchedulePreview } from './operator-session';
 
 type EditorSession = Pick<ReturnType<typeof createOperatorSession>, 'preview' | 'cancelPreview' | 'run'>;
-type EditableMonitor = Pick<Monitor, 'id' | 'name' | 'kind'> & Partial<Omit<Monitor, 'id' | 'name' | 'kind'>>;
+type EditableMonitor = Pick<Monitor, 'id' | 'name' | 'kind'> & Partial<Omit<Monitor, 'id' | 'name' | 'kind'>> & { destinationIds?: string[] };
 
 // Describe only the DOM members used here, without mixing browser globals into Worker types.
 type EditorControl = {
-  id: string; value: string; checked: boolean; disabled: boolean; hidden: boolean;
+  id: string; value: string; type: string; name: string; className: string; checked: boolean; disabled: boolean; hidden: boolean;
   min: string; max: string; textContent: string | null;
   setCustomValidity(message: string): void;
   reportValidity(): boolean;
@@ -15,6 +16,7 @@ type EditorControl = {
   closest(selector: string): { hidden: boolean } | null;
   focus(): void;
   append(...nodes: unknown[]): void;
+  querySelector(selector: string): EditorControl | null;
   replaceChildren(...nodes: unknown[]): void;
   addEventListener(type: string, listener: (event: Event) => void): void;
 };
@@ -28,12 +30,14 @@ type EditorForm = {
     defaultView: { confirm(message: string): boolean } | null;
     getElementById(id: string): unknown;
     querySelector(selector: string): { hidden: boolean; textContent: string | null } | null;
+    createElement(tag: "label" | "input" | "span"): EditorControl;
     createElement(tag: string): PreviewElement;
+    activeElement: EditorControl;
   };
 };
 
 // Self-contained: ui.tsx embeds this factory into the classic Operator script.
-export function createMonitorEditor(form: EditorForm, session: EditorSession, focusActions: (id: string | null) => void) {
+export function createMonitorEditor(form: EditorForm, session: EditorSession, focusActions: (id: string | null) => void, reconcileNodes: (container: EditorControl, nodes: EditorControl[]) => void) {
   const document = form.ownerDocument;
   const timingDefaults = { intervalSeconds: 60, timeoutSeconds: 10, failureThreshold: 2, recoveryThreshold: 2, silenceSeconds: 180, recoverySpacingSeconds: 60, graceSeconds: 30 };
   type TimingField = keyof typeof timingDefaults;
@@ -42,6 +46,9 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
   const durations = new Map<EditorControl, { control: EditorControl; min: number; max: number; unit: DurationUnit; seconds: number; display: string }>();
   let editingId: string | null = null;
   let monitorIds = new Set<string>();
+  let destinations: NotificationDestination[] = [];
+  let savedSelections = new Set<string>();
+  const selectionChanges = new Map<string, boolean>();
   const controls = {
     get(id: string): EditorControl { return document.getElementById(id) as EditorControl; },
     fields(): TimingField[] {
@@ -102,7 +109,9 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
     get id() { return editingId; },
     open(monitor: EditableMonitor | null = null, hosted = false) {
       editingId = monitor?.id || null;
+      selectionChanges.clear();
       form.reset();
+      monitorEditor.refreshDestinations(destinations, monitor?.destinationIds ?? []);
       controls.get('monitor-settings').textContent = monitor ? 'Edit Monitor' : 'New Monitor';
       controls.get('name').value = monitor?.name || '';
       controls.get('kind').value = monitor?.kind || 'http';
@@ -131,8 +140,38 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
       session.cancelPreview(); controls.get('cron').setCustomValidity('');
       const id = editingId;
       controls.get('heartbeat-credential').textContent = '';
-      editingId = null; form.reset(); form.hidden = true;
+      editingId = null; selectionChanges.clear(); savedSelections.clear(); monitorEditor.refreshDestinations(destinations);
+      form.reset(); form.hidden = true;
       controls.get('new-monitor-panel').append(form); focusActions(id);
+    },
+    refreshDestinations(next: NotificationDestination[], selected?: string[]) {
+      destinations = next;
+      if (selected) savedSelections = new Set(selected);
+      const fieldset = controls.get('destination-selection');
+      const choices = controls.get('destination-choices');
+      const available = editingId ? destinations : [];
+      const availableIds = new Set(available.map(destination => destination.id));
+      for (const id of selectionChanges.keys()) if (!availableIds.has(id)) selectionChanges.delete(id);
+      const focused = document.activeElement;
+      reconcileNodes(choices, available.map(destination => {
+        const label = document.createElement('label');
+        label.className = 'checkbox';
+        label.setAttribute('data-key', destination.id);
+        const input = document.createElement('input');
+        input.type = 'checkbox'; input.name = 'destinationId'; input.value = destination.id;
+        const address = document.createElement('span'); address.textContent = destination.url;
+        label.append(input, address);
+        return label;
+      }));
+      for (const input of form.querySelectorAll('[name="destinationId"]')) {
+        input.checked = selectionChanges.get(input.value) ?? savedSelections.has(input.value);
+      }
+      fieldset.hidden = editingId === null;
+      controls.get('no-destination-choices').hidden = available.length !== 0;
+      if (focused?.name === 'destinationId') {
+        if (availableIds.has(focused.value)) focused.focus();
+        else if (!fieldset.hidden) fieldset.querySelector('legend')?.focus();
+      }
     },
     update(ids = monitorIds) {
       monitorIds = ids;
@@ -202,10 +241,16 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
   for (const field of ['cron', 'timezone', 'graceSeconds']) controls.get(field).addEventListener('input', controls.preview);
   controls.get('graceSeconds-unit').addEventListener('change', controls.preview);
   for (const field of ['scheduleMode', 'kind']) controls.get(field).addEventListener('change', () => { monitorEditor.update(); controls.preview(); });
+  form.addEventListener('change', event => {
+    const input = event.target as unknown as EditorControl;
+    if (input.name !== 'destinationId') return;
+    if (input.checked === savedSelections.has(input.value)) selectionChanges.delete(input.value);
+    else selectionChanges.set(input.value, input.checked);
+  });
   form.addEventListener('submit', async event => {
     event.preventDefault();
     if (editingId && !monitorIds.has(editingId)) return;
-    const body: Record<string, string | number | boolean | null> = { name: controls.get('name').value, kind: controls.get('kind').value, published: controls.get('published').checked };
+    const body: Record<string, string | number | boolean | null | Record<string, boolean>> = { name: controls.get('name').value, kind: controls.get('kind').value, published: controls.get('published').checked };
     if (body.kind === 'tcp') { body.hostname = controls.get('hostname').value; body.port = Number(controls.get('port').value); }
     else if (body.kind === 'http') body.url = controls.get('url').value;
     body.scheduleMode = controls.get('scheduleMode').value;
@@ -215,6 +260,7 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
       body[field] = durations.has(input) ? duration.validate(input) : Number(input.value);
       if (body[field] === null) { input.reportValidity(); return; }
     }
+    if (selectionChanges.size) body.destinationChanges = Object.fromEntries(selectionChanges);
     await session.run('/api/operator/monitors' + (editingId ? '/' + encodeURIComponent(editingId) : ''), editingId ? 'PATCH' : 'POST', body, monitorEditor.close);
   });
   controls.get('cancel-edit').addEventListener('click', monitorEditor.close);

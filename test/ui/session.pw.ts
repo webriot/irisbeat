@@ -2,7 +2,7 @@
 import { expect, test } from '@playwright/test';
 
 const snapshot = {
-  pageName: 'Private page', webhookUrl: 'https://private.example/hook', incidents: [],
+  pageName: 'Private page', destinations: [{ id: 'hook', channel: 'webhook', url: 'https://private.example/hook' }], incidents: [],
   monitors: [{ id: 'private', name: 'Private Monitor', kind: 'http', url: 'https://private.example', state: 'up', published: false }],
 };
 const preview = {
@@ -63,7 +63,7 @@ for (const status of [200, 401, 503]) {
       await expect(page.getByLabel('Cron', { exact: true })).toHaveValue('0 9 * * *');
       await expect(page.locator('#schedule-explanation')).toHaveText(preview.explanation);
       await expect(page.locator('#schedule-occurrences')).toHaveText(occurrences!);
-      await expect(page.locator('#webhookUrl')).toHaveValue(snapshot.webhookUrl);
+      await expect(page.locator('#destination-rows')).toHaveText(/private\.example\/hook/);
       await expect(page.locator('#message')).toBeEmpty();
       await expect(page.locator('#stale')).toBeHidden();
     } finally {

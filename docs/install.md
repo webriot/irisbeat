@@ -27,7 +27,9 @@ is required. Cloudflare account limits and charges apply, including DO usage.
 This follows Cloudflare's documented [Deploy button configuration](https://developers.cloudflare.com/workers/platform/deploy-buttons/),
 including `cloudflare.bindings` descriptions and secret example files. Account
 permissions, repository authorization and the actual build form still require a
-real install drill. Do not put a credential in Wrangler vars or a repository.
+real install drill. The button deploys the monitoring Worker only. For a complete
+webhook installation, use the per-install Queue and delivery Worker setup below.
+Do not put a credential in Wrangler vars or a repository.
 
 ## Exact-source CLI installation
 
@@ -50,10 +52,31 @@ npx wrangler whoami
 ```
 
 Select the intended account using `CLOUDFLARE_ACCOUNT_ID` in the shell, outside
-this repository, if more than one account is available. Set `IRISBEAT_WORKER_NAME` in the shell to an unused Worker name; keep the
-reviewed `wrangler.jsonc`, bindings and migrations unchanged. Before a disposable
-acceptance install, verify that your chosen Worker name is absent in that
-account; never overwrite an existing Worker. Do not use a temporary claim account.
+this repository, if more than one account is available. Choose names unique in
+that account for this installation's two Workers and Queue. For a fresh or
+disposable install, verify that the names are unused before provisioning. Do not
+use a temporary claim account.
+
+```sh
+IRISBEAT_WORKER_NAME="irisbeat-my-install"
+IRISBEAT_DELIVERY_WORKER_NAME="${IRISBEAT_WORKER_NAME}-delivery"
+IRISBEAT_QUEUE_NAME="${IRISBEAT_WORKER_NAME}-notifications"
+npx wrangler queues create "$IRISBEAT_QUEUE_NAME"
+```
+
+In your local extracted source, set the following Wrangler values to the shell
+variable values above. Keep deployment-specific configuration out of version control.
+
+| File | Field | Value |
+| --- | --- | --- |
+| `wrangler.jsonc` | `queues.producers[0].queue` | `IRISBEAT_QUEUE_NAME` |
+| `wrangler.delivery.jsonc` | `queues.consumers[0].queue` | `IRISBEAT_QUEUE_NAME` |
+| `wrangler.delivery.jsonc` | `services[0].service` | `IRISBEAT_WORKER_NAME` |
+
+Keep the binding names, `NotificationDelivery` entrypoint and migrations from
+the reviewed configs. Each install needs its own Queue because Cloudflare
+allows one active consumer per Queue.
+See [Cloudflare's Queue setup instructions](https://developers.cloudflare.com/queues/get-started/#connect-the-consumer-worker-to-your-queue).
 
 For the first upload, create a private temporary directory and generate the
 installation secret into a JSON file readable only by your user. These commands
@@ -73,10 +96,13 @@ NODE
 
 Open that file locally and save the `INSTALLATION_SECRET` value in your password
 manager; you need it to sign in and configure producers. Keep it out of terminal
-recordings, source control and shell command arguments. Deploy code and secret together:
+recordings, source control and shell command arguments. Deploy the monitoring
+Worker and secret together. After that succeeds, deploy the consumer so its
+service binding can resolve the monitoring Worker.
 
 ```sh
-npm run deploy -- --name "$IRISBEAT_WORKER_NAME" --secrets-file "$IRISBEAT_SECRET_FILE"
+npm run deploy -- --name "$IRISBEAT_WORKER_NAME" --secrets-file "$IRISBEAT_SECRET_FILE" &&
+  npm run deploy -- --config wrangler.delivery.jsonc --name "$IRISBEAT_DELIVERY_WORKER_NAME"
 ```
 
 After deployment succeeds and the secret is saved in your password manager,
@@ -106,9 +132,19 @@ still apply (including prohibited ports/addresses).
 POST `/heartbeat/<id>` with `Authorization: Bearer <installation secret>` from a
 producer. Bodies are ignored. Never place the secret in a query string.
 
-Save one HTTPS webhook destination in Operator alerts. It becomes live immediately;
-there is no test-send or replay. Use only a destination controlled for this install.
-The payload is `{ "text": "<Monitor>: Incident opened" }` or `Incident recovered`.
+Webhook delivery uses the separate Worker and the per-install Queue configured
+above. Keep automatic traces disabled on that Worker because
+[fetch spans can include credential-bearing URLs](https://developers.cloudflare.com/workers/observability/traces/spans-and-attributes/#fetch).
+Workers Logs still capture sanitized submission failures. `npm run build:delivery`
+dry-runs the bundle and `npm run test:delivery` exercises both Workers locally.
+
+In Operator Settings, choose Add webhook under Notification destinations. Then
+edit each Monitor that should send Incident notifications, check the desired
+destinations, and save the Monitor. Upgraded webhooks retain their address and
+start unselected on every Monitor. Removing a webhook or replacing its address
+clears its selections. Slack-compatible messages include the Monitor
+name, the transition and its original UTC time. Webhook-only installations need
+no email configuration.
 Declare/replace/end per-Monitor Maintenance in its ledger. Checks continue; detection
 and alerts are suppressed, Incidents retained. History shows 90 UTC calendar days;
 Maintenance is excluded from availability. Delete stops checking but retains
@@ -116,9 +152,9 @@ operator Incidents. Detailed bounds and semantics are in README and the API hand
 
 Cron runs each minute; [new trigger propagation](https://developers.cloudflare.com/workers/configuration/cron-triggers/) can take up to 15 minutes.
 Do not expect a live `/__scheduled` endpoint: it is a Wrangler-local test route.
-Monitor Workers Logs for sanitized `webhook_delivery_failed` events and cron
-errors; check actual public/operator responses. Alerts are best effort, without
-retry or durable outbox. No deployment creates sample Monitors or sends messages.
+Monitor Workers Logs for sanitized `notification_enqueue_failed` and
+`webhook_submission_failed` events and cron errors. The Incident remains committed
+if Queue handoff fails. This slice has one provider submission per message.
 
 For upgrades, retain the same Worker, `MONITORING` binding, class and migration
 history, and deploy the reviewed new source. Back up operational configuration via
@@ -160,7 +196,7 @@ Git archive includes test fixtures in Corresponding Source; npm's explicit files
 allowlist excludes them from the engine package. `private: true` intentionally
 prevents accidental registry publication; consumers install the versioned tarball.
 See [hosted contract 1](hosted-contract.md) for exact version/integrity pinning,
-trusted identity, permissions, allowance, hook and policyRevision requirements.
+trusted identity, permissions, allowance, notification Queue and policyRevision requirements.
 
 ## Candidate runtime acceptance (before publication, pending)
 
@@ -179,13 +215,16 @@ channels or arbitrary public sites. Use default one-minute intervals, thresholds
 2/2, and a Heartbeat with 180-second silence, 60-second recovery spacing and recovery count 2.
 
 1. Install the candidate artifacts through the exact-source CLI path.
-   Confirm a workers.dev URL, binding and cron; no Accounts, Stripe, email or custom DNS.
+   Confirm the monitoring workers.dev URL and cron, and the delivery Worker’s
+   Queue trigger and named service binding.
 2. Verify anonymous operator API writes and wrong-secret heartbeat POSTs return 401;
    correct Bearer configuration works. Name the page, add all three kinds, and prove
    anonymous HTML/JSON omit targets, destinations and credentials. Confirm the named
    anonymous ledger. Record that the versioned Source download is pending release
    publication; verify its availability in the post-publication gate below.
-3. With HTTP 204/TCP accepting and spaced receipts, wait for scheduled observations.
+3. In Settings, add the controlled webhook. Edit each drill Monitor, select the
+   webhook, and save.
+   With HTTP 204/TCP accepting and spaced receipts, wait for scheduled observations.
    Switch HTTP to 503/TCP to refuse, withhold Heartbeats past silence; observe one
    Incident and one opening webhook per Monitor after the required observations.
    Extra failures must not duplicate alerts. Record UTC timestamps and sink JSON.
@@ -198,12 +237,14 @@ channels or arbitrary public sites. Use default one-minute intervals, thresholds
    Redeploy the same reviewed artifact and prove remaining configuration/history
    persists. Local suites cover exact timing/UTC boundaries; live evidence covers
    actual Cloudflare socket/cron/secret/resource behavior.
-6. Stop producers, remove webhook configuration, delete only drill Monitors, then
-   remove only the disposable Worker using `npx wrangler delete <drill-name>`
-   after verifying its name and account. Worker deletion destroys its associated DO data;
-   never run against production. Confirm deletion, remove any separate controlled
-   target service and cloned test build/repository connection, and remove private
-   local credential files. Retain only sanitized evidence and artifact hashes.
+6. Stop producers, remove the drill webhook in Settings, and delete only drill Monitors.
+   Verify both disposable Worker names, the Queue and the account. Delete the
+   delivery Worker first, then the monitoring Worker using
+   `npx wrangler delete <worker-name>`. Delete the disposable Queue with
+   `npx wrangler queues delete <queue-name>`. Worker deletion destroys its
+   associated DO data. Confirm removal, then remove any separate controlled
+   target service, cloned test build/repository connection and private local
+   credential files. Retain only sanitized evidence and artifact hashes.
 
 Bound the live drill to 30 minutes after cron activation (allow up to 15 minutes
 for new cron propagation). If targets/cron fail to initialize, stop and investigate;
@@ -242,8 +283,9 @@ After the reviewed code is on main and the tag, release and artifacts are public
 1. Download all four release artifacts, verify their checksums and manifest revision,
    and confirm the public/operator Source link downloads the matching source archive.
 2. Use the Deploy to Cloudflare button to install into another unused Worker. Record
-   the installed revision, verify the secret prompt and build/deploy configuration,
-   and run the runtime acceptance steps above against that installation.
+   the installed revision and verify the secret prompt and build/deploy configuration.
+   Give that installation its own Queue and deploy its delivery Worker using the
+   exact-source binding steps above, then run runtime acceptance.
 3. Remove the disposable installation and controlled targets using the cleanup step
    above. Record sanitized evidence for both the candidate CLI and published button
    installations. Close #12 only after both gates and source-download verification pass.

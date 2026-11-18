@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { captureNotifications, selectWebhooks } from "./notification-queue";
 import { connect } from "cloudflare:sockets";
 import worker from "../src/index";
 import { env, exports } from "cloudflare:workers";
@@ -179,32 +180,27 @@ it("records synchronous connection errors and tolerates rejected socket cleanup 
   expect(html).not.toContain("db.example");
 });
 
-it("delivers named TCP Incident transitions through the context webhook while edits emit no alerts", async () => {
+it("delivers named TCP Incident transitions through selected webhook jobs while edits emit no alerts", async () => {
   await request("/api/operator/webhook", { method: "PUT", headers: { authorization, "Content-Type": "application/json" }, body: JSON.stringify({ url: "https://alerts.example/tcp" }) });
   await configure();
-  const messages: unknown[] = [];
-  vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
-    expect(url).toBe("https://alerts.example/tcp");
-    expect(init?.method).toBe("POST");
-    messages.push(JSON.parse(String(init?.body)));
-    return new Response(null, { status: 204 });
-  });
+  const notifications = await captureNotifications();
+  await selectWebhooks(mutate);
   let success = false;
   vi.mocked(connect).mockImplementation(() => ({
     opened: success ? Promise.resolve({}) : Promise.reject(new Error("refused")),
     closed: Promise.resolve(), close: async () => {},
   } as Socket));
   await tick(0);
-  expect(messages).toEqual([]);
+  expect((await notifications.summaries())).toEqual([]);
   await tick(60_000);
   await tick(120_000);
-  expect(messages).toEqual([{ text: "Database: Incident opened" }]);
+  expect((await notifications.summaries())).toEqual(["Database: Incident opened"]);
   await configure({ ...config, intervalSeconds: 120 });
-  expect(messages).toHaveLength(1);
+  expect((await notifications.summaries())).toHaveLength(1);
   success = true;
   await tick(240_000);
   await tick(360_000);
-  expect(messages).toEqual([{ text: "Database: Incident opened" }, { text: "Database: Incident recovered" }]);
+  expect((await notifications.summaries())).toEqual(["Database: Incident opened", "Database: Incident recovered"]);
   expect(await (await request("/api/operator", { headers: { authorization } })).json()).toMatchObject({ webhookUrl: "https://alerts.example/tcp" });
 });
 
@@ -296,13 +292,9 @@ it("keeps mixed failures, recoveries and webhook identities independent, includi
   const [web, tcp] = (await operator()).monitors;
   let webUp = false;
   let tcpUp = true;
-  const messages: unknown[] = [];
-  vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
-    if (init?.method === 'POST') {
-      expect(url).toBe('https://alerts.example/mixed');
-      messages.push(JSON.parse(String(init.body)));
-      return new Response(null, { status: 204 });
-    }
+  const notifications = await captureNotifications();
+  await selectWebhooks(mutate);
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
     expect(url).toBe('https://web.example/health');
     return new Response(null, { status: webUp ? 204 : 503 });
   });
@@ -326,12 +318,12 @@ it("keeps mixed failures, recoveries and webhook identities independent, includi
   tcpUp = true;
   await tick(240_000); await tick(300_000);
   expect((await status()).monitors.map(m => m.state)).toEqual(['up', 'up']);
-  expect(messages).toHaveLength(4);
-  expect(messages).toEqual(expect.arrayContaining([
-    { text: 'Web: Incident opened' },
-    { text: 'Web: Incident recovered' },
-    { text: 'Database: Incident opened' },
-    { text: 'Primary database: Incident recovered' },
+  expect((await notifications.summaries())).toHaveLength(4);
+  expect((await notifications.summaries())).toEqual(expect.arrayContaining([
+    'Web: Incident opened',
+    'Web: Incident recovered',
+    'Database: Incident opened',
+    'Primary database: Incident recovered',
   ]));
   await mutate('/api/operator/monitors/' + tcp.id, 'DELETE');
   expect((await status()).incidents.map(i => i.monitorId)).toEqual([web.id]);
@@ -355,12 +347,9 @@ it("discards a deleted TCP Monitor's pending result while other IDs keep checkin
     closed: Promise.resolve(), close: async () => { closed = true; },
   } as Socket));
   let webUp = false;
-  const messages: unknown[] = [];
-  vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
-    if (init?.method === 'POST') {
-      messages.push(JSON.parse(String(init.body)));
-      return new Response(null, { status: 204 });
-    }
+  const notifications = await captureNotifications();
+  await selectWebhooks(mutate);
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
     return new Response(null, { status: webUp ? 204 : 503 });
   });
   await tick(0);
@@ -368,7 +357,7 @@ it("discards a deleted TCP Monitor's pending result while other IDs keep checkin
   expect(await operator()).toMatchObject({ monitors: [{ id: web.id, state: 'up' }], incidents: [{ monitorId: web.id, closedAt: start + 120_000 }] });
   expect((await operator()).monitors).toHaveLength(1);
   expect((await operator()).incidents).toHaveLength(1);
-  expect(messages).toEqual([{ text: 'Web: Incident opened' }, { text: 'Web: Incident recovered' }]);
+  expect((await notifications.summaries())).toEqual(['Web: Incident opened', 'Web: Incident recovered']);
   await tick(180_000);
   expect(vi.mocked(connect)).toHaveBeenCalledTimes(1);
 });
@@ -495,13 +484,9 @@ it('keeps HTTP, private TCP and Heartbeat detection, receipts, alerts and retain
   expect(new Set([web.id, tcp.id, heartbeat.id]).size).toBe(3);
   let webUp = false;
   let tcpUp = true;
-  const messages: unknown[] = [];
-  vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
-    if (init?.method === 'POST') {
-      expect(url).toBe('https://alerts.example/three');
-      messages.push(JSON.parse(String(init.body)));
-      return new Response(null, { status: 204 });
-    }
+  const notifications = await captureNotifications();
+  await selectWebhooks(mutate);
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
     expect(url).toBe('https://web.example/health');
     return new Response(null, { status: webUp ? 204 : 503 });
   });
@@ -525,11 +510,11 @@ it('keeps HTTP, private TCP and Heartbeat detection, receipts, alerts and retain
   clock.mockReturnValue(start + 200_000); await receipt(heartbeat.id);
   tcpUp = true; await tick(200_000);
   expect((await operator()).monitors.map(m => m.state)).toEqual(['up', 'up', 'up']);
-  expect(messages).toHaveLength(6);
-  expect(messages).toEqual(expect.arrayContaining([
-    { text: 'Web: Incident opened' }, { text: 'Web: Incident recovered' },
-    { text: 'Private database: Incident opened' }, { text: 'Private database: Incident recovered' },
-    { text: 'Producer: Incident opened' }, { text: 'Producer: Incident recovered' },
+  expect((await notifications.summaries())).toHaveLength(6);
+  expect((await notifications.summaries())).toEqual(expect.arrayContaining([
+    'Web: Incident opened', 'Web: Incident recovered',
+    'Private database: Incident opened', 'Private database: Incident recovered',
+    'Producer: Incident opened', 'Producer: Incident recovered',
   ]));
   expect((await status()).monitors.map(m => m.id)).toEqual([web.id, heartbeat.id]);
   expect((await status()).incidents.map(i => i.monitorId)).not.toContain(tcp.id);
@@ -546,7 +531,7 @@ it('keeps HTTP, private TCP and Heartbeat detection, receipts, alerts and retain
   expect((await operator()).incidents).toEqual(retained);
   expect((await operator()).monitors.map(m => m.id)).toEqual([web.id]);
   expect((await status()).incidents.map(i => i.monitorId)).toEqual([web.id]);
-  expect(messages).toHaveLength(6);
+  expect((await notifications.summaries())).toHaveLength(6);
 });
 
 it('validates and serializes only timing controls supported by each kind', async () => {

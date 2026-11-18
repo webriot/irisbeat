@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { calendar, type Schedule } from "./calendar";
+import type { NotificationDestination, NotificationSelection } from "./notification-jobs";
 
 export const timingDefaults = {
   intervalSeconds: 60,
@@ -43,6 +44,7 @@ export type Monitor = MonitorConfiguration & Timing & {
   recoveryReceiptAt: number | null;
   heartbeatDigest?: ArrayBuffer;
   scheduleRevision?: number;
+  notificationSelections?: NotificationSelection[];
 };
 
 // Internal synchronous operations owned by MonitoringContext. Only grace validation may yield.
@@ -54,7 +56,7 @@ type ConfigurationRuntime<State, Snapshot, Result> = {
   resetCalendarEvidence(monitor: Monitor): void;
 };
 
-export class MonitorConfigurations<State extends { pageName: string; monitors: Monitor[] }, Snapshot, Result> {
+export class MonitorConfigurations<State extends { pageName: string; monitors: Monitor[]; destinations?: NotificationDestination[] }, Snapshot, Result> {
   constructor(private runtime: ConfigurationRuntime<State, Snapshot, Result>) {}
 
   private graceProof(configuration: Pick<MonitorConfiguration, "kind" | "scheduleMode" | "cron" | "timezone" | "graceSeconds">, current?: MonitorConfiguration) {
@@ -114,6 +116,8 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
   }
 
   async create(value: unknown, limit?: number) {
+    if (value && typeof value === "object" && "destinationIds" in value &&
+        (!Array.isArray(value.destinationIds) || value.destinationIds.length)) return undefined;
     const configuration = parseMonitorPatch(value);
     if (!configuration) return undefined;
     if (this.graceProof(configuration) && !await this.acceptsProof(configuration)) return undefined;
@@ -142,6 +146,28 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
         continue;
       }
       const before = this.runtime.snapshot(state);
+      if (value && typeof value === "object" && "destinationChanges" in value) {
+        const changes = value.destinationChanges;
+        if ("destinationIds" in value || !changes || typeof changes !== "object" || Array.isArray(changes)) return undefined;
+        const entries = Object.entries(changes);
+        if (entries.some(([id, selected]) => typeof selected !== "boolean" ||
+            (selected && !state.destinations?.some(destination => destination.id === id)))) return undefined;
+        const selections = new Map(monitor.notificationSelections?.map(selection => [selection.destinationId, selection]));
+        for (const [destinationId, selected] of entries) {
+          if (!selected) selections.delete(destinationId);
+          else if (!selections.has(destinationId)) selections.set(destinationId, { destinationId, generation: crypto.randomUUID() });
+        }
+        monitor.notificationSelections = [...selections.values()];
+      }
+      if (value && typeof value === "object" && "destinationIds" in value) {
+        const ids = value.destinationIds;
+        if (!Array.isArray(ids) || ids.some(id => !state.destinations?.some(destination => destination.id === id)) ||
+            new Set(ids).size !== ids.length) return undefined;
+        const existing = monitor.notificationSelections ?? [];
+        monitor.notificationSelections = ids.map(destinationId =>
+          existing.find(selection => selection.destinationId === destinationId) ??
+          { destinationId, generation: crypto.randomUUID() });
+      }
       this.applyEdit(monitor, patch);
       return this.runtime.commit(state, before);
     }
@@ -248,8 +274,8 @@ function parseMonitorPatch(value: unknown, current: MonitorConfiguration): Parti
 function parseMonitorPatch(value: unknown, current?: MonitorConfiguration): Partial<MonitorConfiguration> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const fields = value as Record<string, unknown>;
-  if (!Object.keys(fields).length || Object.keys(fields).some(key => !["name", "kind", "url", "hostname", "port", "published", "scheduleMode", "cron", "timezone", ...Object.keys(timingDefaults)].includes(key))) return null;
-  if ((!current && !("name" in fields)) || ("published" in fields && typeof fields.published !== "boolean")) return null;
+  if (!Object.keys(fields).length || Object.keys(fields).some(key => !["name", "kind", "url", "hostname", "port", "published", "scheduleMode", "cron", "timezone", "destinationIds", "destinationChanges", ...Object.keys(timingDefaults)].includes(key))) return null;
+  if ((!current && (!("name" in fields) || "destinationChanges" in fields)) || ("published" in fields && typeof fields.published !== "boolean")) return null;
   const merged: Record<string, unknown> = { pageName: "Irisbeat", name: "Monitor", ...current, ...fields };
   if (fields.scheduleMode === "interval") {
     if ("cron" in fields || "timezone" in fields) return null;

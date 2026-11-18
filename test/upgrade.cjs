@@ -68,6 +68,8 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
       const after = await (await request('/api/operator')).json();
       assert.equal(after.pageName,'Old page');
       assert.equal(after.webhookUrl,destination);
+      assert.deepEqual(after.destinations.map(({ url }) => url), [destination]);
+      assert.deepEqual(after.monitors[0].destinationIds, []);
       assert.equal(after.monitors[0].id,'website');
       assert.equal(after.monitors[0].kind,'heartbeat');
       assert.equal(after.monitors[0].published,true);
@@ -83,7 +85,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
       assert.equal((await (await request('/api/operator')).json()).monitor.state,'down');
       await request('/heartbeat/website','POST',undefined,start+440000);
       assert.equal((await (await request('/api/operator')).json()).incidents[0].closedAt,start+440000);
-      assert.deepEqual(deliveries,[{url:destination,body:{text:'Legacy producer: Incident opened'}},{url:destination,body:{text:'Legacy producer: Incident recovered'}}]);
+      assert.deepEqual(deliveries,[{url:destination,body:{text:'Legacy producer: Incident opened'}}]);
       assert.equal((await request('/api/operator/monitors','POST',{name:'New producer',kind:'heartbeat'},start+440000)).status,201);
       const mixed = await (await request('/api/operator')).json();
       assert.notEqual(mixed.monitors[1].id,'website');
@@ -127,7 +129,11 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     outcome = 204; await tick(start+120000);
     await mf.setOptions(options(await bundle(join(project,'src/index.ts'))));
     const after = await (await request('/api/operator', 'GET', undefined, start + 120000)).json();
-    if (supportsWebhook) assert.equal(after.webhookUrl,destination);
+    if (supportsWebhook) {
+      assert.equal(after.webhookUrl,destination);
+      assert.deepEqual(after.destinations.map(({ url }) => url), [destination]);
+      assert.deepEqual(after.monitors[0].destinationIds, []);
+    }
     assert.equal(after.pageName,'Old page');
     assert.equal(after.monitors[0].id,before.monitor.id);
     assert.equal(after.monitors[0].published,true);
@@ -157,7 +163,6 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     const recovered = await (await request('/api/status')).json();
     if (supportsWebhook) assert.deepEqual(deliveries,[
       {url:destination,body:{text:'Legacy service: Incident opened'}},
-      {url:destination,body:{text:'Legacy service: Incident recovered'}},
     ]);
     assert.equal(recovered.monitors[0].state,'up');
     assert.equal(recovered.incidents[0].closedAt,start+180000);
@@ -169,14 +174,15 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
       mf = new Miniflare(options(await bundle(join(temporary,'index.ts')), 'webhook-only'));
       assert.equal((await request('/api/operator/webhook','PUT',{url:destination})).status,200);
       await mf.setOptions(options(await bundle(join(project,'src/index.ts')), 'webhook-only'));
-      assert.deepEqual(await (await request('/api/operator')).json(),{
-        pageName:'Irisbeat', webhookUrl:destination, paused:false, monitors:[], monitor:null, incidents:[],
-      });
+      const upgraded = await (await request('/api/operator')).json();
+      assert.deepEqual(upgraded.destinations.map(({ url }) => url), [destination]);
+      assert.deepEqual(upgraded.monitors, []);
+      assert.equal(upgraded.webhookUrl, destination);
       assert.equal((await request('/api/operator','PUT',{pageName:'New page'})).status,200);
       assert.equal((await request('/api/operator/monitors','POST',{name:'New service',url:'https://target.example/health'})).status,201);
       assert.equal((await (await request('/api/operator')).json()).webhookUrl,destination);
     }
-    console.log(`PASS: ${base} (${tcp ? 'TCP' : 'HTTP'}) -> current; webhook preservation/delivery ${supportsWebhook ? 'verified' : 'not supported by old bundle'}`);
+    console.log(`PASS: ${base} (${tcp ? 'TCP' : 'HTTP'}) -> current; webhook preservation and explicit opt-in ${supportsWebhook ? 'verified' : 'not supported by old bundle'}`);
     console.log('PASS: real legacy Worker -> current Worker preserves identity, page, target, due time, open Incident, recovery streak, publication and retained deleted history');
   } finally { await mf.dispose(); rmSync(temporary,{recursive:true,force:true}); }
 })().catch(error => { console.error(error); process.exitCode=1; });
