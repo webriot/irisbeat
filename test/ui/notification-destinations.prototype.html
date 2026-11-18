@@ -1,0 +1,674 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Throwaway: Which Settings layout and Monitor picker should #69 use? Open this file with ?variant=A, B or C. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notification destinations · Irisbeat prototype</title>
+<style>
+:root {
+  color-scheme: light;
+  font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
+  --background: light-dark(#f5f7f8, #101417);
+  --foreground: light-dark(#202b30, #e2eaed);
+  --muted: light-dark(#596970, #99a9b1);
+  --card: light-dark(#fff, #171e23);
+  --secondary: light-dark(#edf1f3, #222c33);
+  --line: light-dark(#d9e1e5, #35424a);
+  --control-border: light-dark(#78868d, #788c98);
+  --primary: light-dark(#245e66, #9bd4d6);
+  --on-primary: light-dark(#fff, #142b30);
+  --success: light-dark(#176744, #77d6ab);
+  --danger: light-dark(#b42e3d, #ff96a0);
+  --warning: light-dark(#825b0a, #eac16f);
+  --info: light-dark(#6357a2, #b4a5ee);
+  background: var(--background);
+  color: var(--foreground);
+}
+@media (prefers-color-scheme: dark) { :root { color-scheme: dark; } }
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { max-width: 1088px; margin: auto; padding: 0 24px 108px; overflow-wrap: anywhere; }
+header, footer, .heading, .actions, .row-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+header, footer, .heading { justify-content: space-between; }
+header { padding: 20px 0; border-bottom: 1px solid var(--line); }
+.brand { font-size: 20px; font-weight: 750; letter-spacing: -.6px; }
+.current { background: var(--secondary); border-radius: 6px; font-weight: 600; padding: 8px 10px; }
+h1 { margin: 0; font-size: 28px; line-height: 1.2; letter-spacing: -.8px; font-weight: 650; }
+h2, legend { margin: 0; font-size: 16px; font-weight: 650; }
+h3, p { margin: 0; }
+h3 { font-size: 14px; }
+button, input, select {
+  max-width: 100%; min-height: 40px; padding: 8px 11px; font: inherit;
+  color: var(--foreground); background: var(--card); border: 1px solid var(--line); border-radius: 7px;
+}
+button { cursor: pointer; font-weight: 550; }
+button:hover { background: var(--secondary); }
+button.primary { background: var(--primary); color: var(--on-primary); border-color: var(--primary); }
+:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+button.danger { color: var(--danger); }
+input, select { width: 100%; border-color: var(--control-border); }
+input[type="checkbox"] { width: 17px; min-height: 17px; margin: 0; accent-color: var(--primary); flex: none; }
+:disabled { opacity: .65; }
+fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+label.field { display: block; font-size: 13px; }
+label.field > :is(input, select) { display: block; margin-top: 6px; }
+.stack { display: grid; align-content: start; gap: 16px; min-width: 0; }
+.workspace-heading { margin: 26px 0 20px; }
+.card { border: 1px solid var(--line); background: var(--card); border-radius: 12px; min-width: 0; }
+.padded { padding: 16px 20px; }
+.page-form { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; }
+.page-form label { flex: 1 1 210px; }
+.page-settings { max-width: 620px; }
+.ledger-head, .destination {
+  display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) minmax(100px, auto);
+  gap: 12px 20px; padding: 14px 20px; align-items: start;
+}
+.ledger-head { color: var(--muted); font-size: 12px; padding-block: 10px; }
+.destination { border-top: 1px solid var(--line); }
+.row-actions { justify-content: end; }
+.address { font-weight: 650; }
+.meta, .empty, .event { color: var(--muted); font-size: 13px; }
+.meta, .event { display: block; }
+.result > strong { font-size: 13px; font-weight: 650; display: block; }
+.good { color: var(--success); }
+.bad { color: var(--danger); }
+.waiting { color: var(--warning); }
+.info { color: var(--info); }
+.split { display: grid; grid-template-columns: minmax(220px, 2fr) minmax(0, 3fr); gap: 16px; align-items: start; }
+.library { padding: 6px; display: grid; gap: 3px; }
+.library button { width: 100%; text-align: left; border-color: transparent; }
+.library button[aria-pressed="true"] { border-color: var(--primary); background: var(--secondary); }
+.library-select { display: none !important; }
+.facts { margin: 0; display: grid; gap: 14px; }
+.facts dt { color: var(--muted); font-size: 12px; }
+.facts dd { margin: 3px 0 0; }
+.channel-list { display: grid; gap: 8px; }
+.channel-list .destination { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; padding-inline: 0; }
+.channel-list .row-actions button { flex: 0 0 auto; }
+.form-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.inline-form { background: var(--secondary); padding: 14px; border-radius: 8px; }
+.inline-form .field { max-width: 620px; }
+.editor { margin: 0 14px 14px; background: var(--secondary); }
+.new-editor { margin: 0; }
+.editor-fields, .buckets { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.editor legend { margin-bottom: 6px; }
+.checklist { background: var(--card); border: 1px solid var(--line); border-radius: 8px; }
+.checklist label { display: flex; align-items: center; gap: 10px; padding: 8px 12px; min-height: 44px; cursor: pointer; }
+.checklist label + label { border-top: 1px solid var(--line); }
+.picker-summary { gap: 8px 16px; align-items: start; }
+.bucket { padding: 12px; }
+.bucket h3 { margin-bottom: 4px; }
+.bucket-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 0; }
+.bucket-row + .bucket-row { border-top: 1px solid var(--line); }
+.selected-count { color: var(--muted); font-weight: 500; font-size: 13px; }
+.monitor + .monitor { border-top: 1px solid var(--line); }
+.monitor-head { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr) auto; align-items: center; gap: 8px; }
+.history { display: grid; grid-template-columns: repeat(90, minmax(0, 1fr)); gap: 3px; margin: 10px 0 0; }
+.history i { height: 22px; background: var(--success); border-radius: 2px; }
+.history .degraded { background: var(--warning); }
+.history .missing { background: var(--secondary); }
+.history .maintenance { background: var(--info); }
+.history-label { display: flex; justify-content: space-between; margin-top: 5px; font-size: 12px; color: var(--muted); }
+.incidents article { margin-top: 12px; padding: 12px 0; border-top: 1px solid var(--line); }
+footer { margin-top: 32px; padding-top: 14px; border-top: 1px solid var(--line); }
+footer label { display: flex; align-items: center; gap: 8px; }
+footer select { width: auto; }
+.text-button { border: 0; background: transparent; text-decoration: underline; text-underline-offset: 4px; }
+#notice { margin-top: 12px; }
+#notice:empty { margin: 0; }
+dialog {
+  width: min(480px, calc(100% - 32px)); max-height: calc(100% - 32px);
+  padding: 20px; border: 1px solid var(--line); border-radius: 12px;
+  color: var(--foreground); background: var(--card);
+}
+dialog::backdrop { background: #0007; }
+.inbox-list { display: grid; gap: 6px; }
+.inbox-list button { text-align: left; }
+.switcher {
+  position: fixed; z-index: 1; bottom: max(12px, env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%);
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 6px;
+  width: min(330px, calc(100% - 24px)); padding: 5px; text-align: center;
+  background: #202b30; border: 1px solid #839196; color: #fff; border-radius: 10px;
+  box-shadow: 0 4px 14px #0003;
+}
+.switcher button { color: #fff; background: #36484f; border-color: #627279; }
+.switcher button:focus-visible { outline-color: #fff; }
+.switcher small { display: block; color: #c6d1d6; font-size: 11px; }
+@media (max-width: 680px) {
+  body { padding-inline: 16px; }
+  h1 { font-size: 24px; }
+  .split, .editor-fields, .buckets { grid-template-columns: minmax(0, 1fr); }
+  .library { display: none; }
+  .library-select { display: block !important; }
+  .destination, .channel-list .destination { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .ledger-head { display: none; }
+  .row-actions { justify-content: start; }
+  .padded, .destination { padding-inline: 14px; }
+  .monitor-head { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; }
+  .monitor-head h3 { grid-column: 1 / -1; }
+  .history { gap: 1px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">irisbeat</span>
+  <span class="current">Operator</span>
+</header>
+<main id="app"></main>
+<p id="notice" role="status"></p>
+<footer>
+  <button type="button" class="text-button" id="inbox-button">Demo inbox</button>
+  <label>Theme <select id="theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
+</footer>
+<nav class="switcher" aria-label="Prototype variants">
+  <button type="button" id="previous" aria-label="Previous variant">←</button>
+  <span id="variant-name" role="status"></span>
+  <button type="button" id="next" aria-label="Next variant">→</button>
+</nav>
+<dialog id="dialog" aria-labelledby="dialog-title"></dialog>
+
+<script>
+const variants = { A: 'Destination ledger', B: 'Split detail', C: 'Channel sections' };
+const params = new URLSearchParams(location.search);
+let variant = Object.hasOwn(variants, params.get('variant')) ? params.get('variant') : 'A';
+const emailEnabled = params.get('email') !== 'off';
+let screen = params.get('view') === 'monitors' ? 'monitors' : 'settings';
+let pageName = 'Northstar status';
+let pageDraft = pageName;
+let activeDestination = 'ops';
+let addressDraft = null;
+let monitorDraft = null;
+let pickerDraft = null;
+let nextId = 1;
+
+const destinations = [
+  { id: 'ops', kind: 'email', address: 'oncall@example.com', confirmed: true, result: {
+    label: 'Accepted by provider', tone: 'good', event: 'Website · Incident recovered', time: '14:32 UTC',
+  } },
+  { id: 'noc', kind: 'email', address: 'noc@example.com', confirmed: false, result: {
+    label: 'Accepted by provider', tone: 'good', event: 'Confirmation email', time: '14:39 UTC',
+  } },
+  { id: 'slack', kind: 'webhook', address: 'https://hooks.example.com/slack/••••', result: {
+    label: 'Retry scheduled', tone: 'waiting', event: 'Website · Maintenance started', time: '14:45 UTC',
+  } },
+  { id: 'discord', kind: 'webhook', address: 'https://hooks.example.com/discord/••••', result: {
+    label: 'Failed · final', tone: 'bad', event: 'Backups · Incident opened', time: '13:08 UTC', detail: 'Endpoint rejected the request.',
+  } },
+  { id: 'legacy', kind: 'webhook', address: 'https://hooks.example.com/legacy/••••' },
+];
+const monitors = [
+  { id: 'website', name: 'Website', target: 'https://www.example.com', published: true, kind: 'HTTP(S)', state: 'Maintenance', history: 'maintenance', percent: '99.98%', selected: ['ops', 'slack'] },
+  { id: 'backups', name: 'Backups', target: '', published: false, kind: 'Heartbeat', state: 'Operational', history: 'up', percent: '99.91%', selected: ['discord', 'ops'] },
+];
+
+const app = document.querySelector('#app');
+const dialog = document.querySelector('#dialog');
+const notice = document.querySelector('#notice');
+const escape = value => String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+const findDestination = id => destinations.find(destination => destination.id === id);
+const eligible = () => destinations.filter(destination => destination.kind === 'webhook' || destination.confirmed);
+const channel = kind => kind === 'email' ? 'Email' : 'Webhook';
+const count = total => total === 1 ? '1 Monitor' : total + ' Monitors';
+const usage = id => monitors.filter(monitor => monitor.selected.includes(id)).length;
+const heading = () => app.querySelector('h1');
+const button = (text, action, { id = '', label = '', style = '' } = {}) =>
+  '<button type="button" data-action="' + action + '"' + (id ? ' data-id="' + id + '"' : '') +
+  (label ? ' aria-label="' + escape(label) + '"' : '') + (style ? ' class="' + style + '"' : '') + '>' + escape(text) + '</button>';
+const submit = text => '<button class="primary" type="submit">' + escape(text) + '</button>';
+
+function state(destination) {
+  if (destination.kind === 'webhook') return '<span class="good">Active</span>';
+  return destination.confirmed ? '<span class="good">Confirmed</span>' : '<span class="waiting">Pending confirmation</span>';
+}
+
+function displayAddress(destination) {
+  if (destination.kind === 'email') return destination.address;
+  const url = new URL(destination.address);
+  if (['slack', 'discord', 'legacy'].includes(destination.id)) return destination.address;
+  return url.origin + '/••••' + url.pathname.replace(/\/$/, '').split('/').at(-1).slice(-4);
+}
+
+function resultMarkup(destination) {
+  const result = destination.result;
+  if (!result) return '<p class="empty">No submissions yet</p>';
+  return '<div class="result"><strong class="' + result.tone + '">' + result.label + '</strong>' +
+    '<span class="event">' + result.event + '</span><span class="meta">' + result.time + '</span>' +
+    (result.detail ? '<span class="meta">' + result.detail + '</span>' : '') + '</div>';
+}
+
+function actions(destination) {
+  const { id } = destination;
+  const address = displayAddress(destination);
+  return (destination.kind === 'email' && !destination.confirmed && emailEnabled
+    ? button('Resend', 'resend', { id, label: 'Resend confirmation to ' + address }) : '') +
+    (destination.kind === 'webhook' || emailEnabled
+    ? button('Replace', 'replace', { id, label: 'Replace ' + address }) : '') +
+    button('Remove', 'ask-remove', { id, label: 'Remove ' + address, style: 'danger' });
+}
+
+function addressForm() {
+  const { kind, id, value, choose } = addressDraft;
+  const replacing = findDestination(id);
+  const kindSelect = choose && variant === 'B' && emailEnabled ? '<label class="field">Channel<select name="kind">' +
+    '<option value="webhook">Webhook</option><option value="email"' + (kind === 'email' ? ' selected' : '') +
+    '>Email</option></select></label>' : '';
+  return '<form class="stack inline-form" data-form="address">' +
+    (replacing ? '<h3>Replace ' + escape(displayAddress(replacing)) + '</h3><p class="meta">' +
+      count(usage(id)) + ' will lose this selection.' + (kind === 'email' ? ' The new inbox must confirm.' : '') + '</p>' : '') +
+    kindSelect + '<label class="field">' + (kind === 'email' ? 'Email address' : 'HTTPS webhook URL') +
+    '<input name="address" type="' + (kind === 'email' ? 'email' : 'url') + '" value="' + escape(value) +
+    '" required autocomplete="off" maxlength="2048"></label><div class="form-actions">' +
+    submit(replacing ? (kind === 'email' ? 'Replace and send confirmation' : 'Replace webhook') :
+      (kind === 'email' ? 'Send confirmation' : 'Save webhook')) +
+    button('Cancel', 'cancel-address') + '</div></form>';
+}
+
+function destinationRow(destination, showChannel = true) {
+  return '<article class="destination"><div><h3 class="address">' + escape(displayAddress(destination)) + '</h3>' +
+    '<span class="meta">' + (showChannel ? channel(destination.kind) + ' · ' : '') + state(destination) +
+    ' · ' + count(usage(destination.id)) + '</span></div><div>' + resultMarkup(destination) +
+    '</div><div class="row-actions">' + actions(destination) + '</div></article>';
+}
+
+function addActions() {
+  return '<div class="actions">' + (emailEnabled ? button('Add email', 'add', { id: 'email' }) : '') +
+    button('Add webhook', 'add', { id: 'webhook' }) + '</div>';
+}
+
+function variantA() {
+  return '<section class="stack" aria-labelledby="destination-title"><div class="heading">' +
+    '<h2 id="destination-title">Notification destinations</h2>' + addActions() + '</div>' +
+    (addressDraft ? addressForm() : '') +
+    '<div class="card"><div class="ledger-head"><span>Destination</span><span>Latest submission</span></div>' +
+    (destinations.map(destination => destinationRow(destination)).join('') || '<p class="padded empty">No destinations</p>') + '</div></section>';
+}
+
+function variantB() {
+  const selected = findDestination(activeDestination);
+  const detail = selected ? '<h3 class="address">' + escape(displayAddress(selected)) +
+    '</h3><dl class="facts"><div><dt>' + channel(selected.kind) + '</dt><dd>' + state(selected) +
+    '</dd></div><div><dt>Selected by</dt><dd>' +
+    (monitors.filter(monitor => monitor.selected.includes(selected.id)).map(monitor => escape(monitor.name)).join(', ') || 'No Monitors') +
+    '</dd></div><div><dt>Latest submission</dt><dd>' + resultMarkup(selected) +
+    '</dd></div></dl><div class="actions">' + actions(selected) + '</div>' :
+    '<p class="empty">Select a destination</p>';
+  return '<section class="stack" aria-labelledby="destination-title"><div class="heading">' +
+    '<h2 id="destination-title">Notification destinations</h2>' + button('Add destination', 'add-choose', { style: 'primary' }) +
+    '</div><div class="split"><select class="library-select" name="library" aria-label="Destination">' +
+    '<option value="">Select a destination</option>' +
+    destinations.map(destination => '<option value="' + destination.id + '"' +
+      (destination.id === activeDestination && !addressDraft ? ' selected' : '') + '>' +
+      escape(displayAddress(destination)) + '</option>').join('') + '</select>' +
+    '<div class="card library" aria-label="Destinations" role="group">' +
+    (destinations.map(destination => '<button type="button" data-action="inspect" data-id="' + destination.id +
+      '" aria-pressed="' + (destination.id === activeDestination && !addressDraft) + '">' + escape(displayAddress(destination)) +
+      '<span class="meta">' + channel(destination.kind) + ' · ' + state(destination) + '</span></button>').join('') ||
+      '<p class="padded empty">No destinations</p>') +
+    '</div><div class="card padded stack">' + (addressDraft ? addressForm() : detail) + '</div></div></section>';
+}
+
+function variantC() {
+  return '<section class="stack" aria-labelledby="destination-title"><h2 id="destination-title">Notification destinations</h2>' +
+    ['email', 'webhook'].map(kind => {
+      const rows = destinations.filter(destination => destination.kind === kind);
+      return '<section class="card padded channel-list" aria-label="' + channel(kind) + ' destinations"><div class="heading">' +
+        '<h3>' + (kind === 'email' ? 'Email' : 'Webhooks') + '</h3>' +
+        (kind === 'email' && !emailEnabled ? '<span class="meta">Sending not configured</span>' :
+          button('Add ' + kind, 'add', { id: kind })) + '</div>' +
+        (addressDraft?.kind === kind ? addressForm() : '') +
+        (rows.map(destination => destinationRow(destination, false)).join('') ||
+          '<p class="empty">No ' + (kind === 'email' ? 'inboxes' : 'webhooks') + '</p>') + '</section>';
+    }).join('') + '</section>';
+}
+
+function settings() {
+  return '<div class="stack"><section class="stack page-settings" aria-labelledby="status-title"><h2 id="status-title">Status page</h2>' +
+    '<form class="card padded page-form" data-form="page"><label class="field">Page name<input name="pageName" maxlength="120" required value="' +
+    escape(pageDraft) + '"></label>' + submit('Save page') + '</form></section>' +
+    (!emailEnabled && variant !== 'C' ? '<p class="meta">Email sending not configured</p>' : '') +
+    ({ A: variantA, B: variantB, C: variantC }[variant])() + '</div>';
+}
+
+function checklist(selected, name) {
+  const choices = eligible();
+  return choices.length ? '<div class="checklist">' + choices.map(destination =>
+    '<label><input name="' + name + '" type="checkbox" value="' + destination.id + '"' +
+    (selected.includes(destination.id) ? ' checked' : '') + '><span>' + escape(displayAddress(destination)) +
+    '<span class="meta">' + channel(destination.kind) + '</span></span></label>').join('') + '</div>' :
+    '<p class="empty">No selectable destinations</p>';
+}
+
+function picker() {
+  const selected = monitorDraft.selected;
+  if (variant === 'A') return checklist(selected, 'selection');
+  if (variant === 'B') return '<div class="heading picker-summary">' +
+    (selected.length ? '<div>' + eligible().filter(destination => selected.includes(destination.id))
+      .map(destination => '<div>' + escape(displayAddress(destination)) + '</div>').join('') +
+      '</div>' : '<p class="empty">No destinations selected</p>') + button('Choose destinations', 'choose') + '</div>';
+  return '<div class="buckets">' + [true, false].map(chosen => {
+    const rows = eligible().filter(destination => selected.includes(destination.id) === chosen);
+    return '<section class="card bucket"><h3>' + (chosen ? 'Selected' : 'Available') + '</h3>' +
+      (rows.map(destination => '<div class="bucket-row"><span>' + escape(displayAddress(destination)) +
+        '<span class="meta">' + channel(destination.kind) + '</span></span>' +
+        button(chosen ? 'Remove' : 'Add', 'toggle-selection', { id: destination.id,
+          label: (chosen ? 'Remove ' : 'Add ') + displayAddress(destination) }) + '</div>').join('') ||
+        '<p class="empty">' + (chosen ? 'No destinations selected' : 'No more destinations') + '</p>') + '</section>';
+  }).join('') + '</div>';
+}
+
+function monitorEditor() {
+  const { id, name, kind, target, published, selected } = monitorDraft;
+  const editing = Boolean(id);
+  return '<form class="card padded stack editor' + (editing ? '' : ' new-editor') + '" data-form="monitor">' +
+    '<h2 tabindex="-1" id="editor-title">' + (editing ? 'Edit Monitor' : 'New Monitor') + '</h2>' +
+    '<div class="editor-fields"><label class="field">Monitor name<input name="name" maxlength="120" required value="' + escape(name) + '"></label>' +
+    '<label class="field">Check type<select name="kind"' + (editing ? ' disabled' : '') + '>' +
+    ['HTTP(S)', 'TCP', 'Heartbeat'].map(value => '<option' + (value === kind ? ' selected' : '') + '>' + value + '</option>').join('') +
+    '</select></label>' + (kind === 'Heartbeat' ? '' : '<label class="field">' + (kind === 'TCP' ? 'Hostname' : 'HTTP(S) target') +
+      '<input name="target" type="' + (kind === 'TCP' ? 'text' : 'url') + '" required value="' + escape(target) + '"></label>') +
+    '<label class="actions"><input type="checkbox" name="published"' + (published ? ' checked' : '') + '> Published</label></div>' +
+    '<fieldset><legend>Notification destinations <span class="selected-count" id="selected-count">' + selected.length + ' selected</span></legend>' +
+    picker() + '</fieldset><div class="form-actions">' + submit('Save Monitor') + button('Cancel', 'cancel-monitor') +
+    '</div></form>';
+}
+
+function monitorRow(monitor) {
+  const tone = monitor.state === 'Maintenance' ? 'info' : monitor.state === 'Operational' ? 'good' : 'meta';
+  return '<article class="monitor"><div class="padded"><div class="monitor-head"><h3>' + escape(monitor.name) +
+    '</h3><span class="' + tone + '">' + monitor.state +
+    '</span><span>' + (monitor.published ? 'Published' : 'Private') + '</span>' +
+    button('Edit', 'edit', { id: monitor.id, label: 'Edit ' + monitor.name }) + '</div>' +
+    '<div class="history" aria-hidden="true">' + Array.from({ length: 90 }, (_, day) =>
+      '<i class="' + (monitor.history === 'empty' || day < 8 ? 'missing' : day === 26 || day === 51 ? 'degraded' :
+        day > 85 && monitor.history === 'maintenance' ? 'maintenance' : '') + '"></i>').join('') +
+    '</div><div class="history-label"><span>90 days ago</span><span>' + monitor.percent + '</span><span>Today</span></div></div>' +
+    (monitorDraft?.id === monitor.id ? monitorEditor() : '') + '</article>';
+}
+
+function monitorView() {
+  return '<div class="stack">' + (monitorDraft?.id === '' ? monitorEditor() : '') +
+    '<section class="card" aria-label="Monitors">' + monitors.map(monitorRow).join('') + '</section>' +
+    '<section class="incidents" aria-label="Incidents"><h2>Incidents</h2><article><div class="heading"><h3>Website</h3>' +
+    '<span class="good">Recovered</span></div><span class="meta">Opened 14:19 UTC · Recovered 14:32 UTC</span></article></section></div>';
+}
+
+function render(focus) {
+  const isSettings = screen === 'settings';
+  app.innerHTML = '<div class="heading workspace-heading"><h1 tabindex="-1">' + (isSettings ? 'Settings' : 'Monitors') +
+    '</h1><div class="actions">' + (isSettings ? button('Monitors', 'monitors') :
+      button('New Monitor', 'new-monitor', { style: 'primary' }) + button('Settings', 'settings')) + '</div></div>' +
+    (isSettings ? settings() : monitorView());
+  document.querySelector('#variant-name').innerHTML = '<small>Prototype</small>' + variant + ' · ' + variants[variant];
+  if (focus) ([...app.querySelectorAll(focus)].find(element => element.getClientRects().length) || heading()).focus();
+}
+
+function cycle(direction) {
+  const keys = Object.keys(variants);
+  variant = keys[(keys.indexOf(variant) + direction + keys.length) % keys.length];
+  syncUrl();
+  render(app.contains(document.activeElement) ? 'h1' : undefined);
+}
+
+function syncUrl() {
+  const url = new URL(location.href);
+  url.searchParams.set('variant', variant);
+  url.searchParams.set('view', screen);
+  history.replaceState(null, '', url);
+}
+
+function removeDestination(id) {
+  destinations.splice(destinations.findIndex(destination => destination.id === id), 1);
+  for (const monitor of [...monitors, monitorDraft].filter(Boolean)) {
+    monitor.selected = monitor.selected.filter(selection => selection !== id);
+  }
+  if (activeDestination === id) activeDestination = destinations[0]?.id;
+  if (addressDraft?.id === id) addressDraft = null;
+}
+
+function openDialog(title, contents) {
+  dialog.innerHTML = '<div class="stack"><h2 tabindex="-1" id="dialog-title">' + title + '</h2>' + contents + '</div>';
+  if (!dialog.open) dialog.showModal();
+  dialog.querySelector('h2').focus();
+}
+
+function inbox() {
+  const inboxes = destinations.filter(destination => destination.kind === 'email');
+  openDialog('Demo inbox', '<div class="inbox-list">' + (inboxes.length ? inboxes.map(destination =>
+    button((destination.confirmed ? 'Unsubscribe link for ' : 'Confirmation link for ') + destination.address,
+      'recipient', { id: destination.id })).join('') : '<p class="empty">No email links</p>') +
+    '</div><div class="form-actions">' + button('Close', 'close-dialog') + '</div>');
+}
+
+function recipient(destination) {
+  const id = destination.id;
+  const confirmed = destination.confirmed;
+  openDialog(confirmed ? 'Unsubscribe from Irisbeat' : 'Confirm notifications',
+    '<p>' + escape(destination.address) + '</p><div class="form-actions">' +
+    button(confirmed ? 'Unsubscribe' : 'Confirm email', confirmed ? 'unsubscribe' : 'confirm-email',
+      { id, style: confirmed ? 'danger' : 'primary' }) + button('Back to demo inbox', 'inbox') + '</div>');
+}
+
+function tell(message) { notice.textContent = message; }
+
+function focusAction(action, id) {
+  if (action === 'inspect') return '.library-select, [data-action="inspect"][data-id="' + id + '"]';
+  return '[data-action="' + action + '"]' + (id ? '[data-id="' + id + '"]' : '');
+}
+
+document.addEventListener('click', event => {
+  const control = event.target.closest('[data-action]');
+  if (!control) return;
+  const { action, id } = control.dataset;
+  const destination = findDestination(id);
+  switch (action) {
+    case 'settings':
+    case 'monitors':
+      screen = action;
+      syncUrl();
+      tell('');
+      render('h1');
+      break;
+    case 'inspect':
+      activeDestination = id;
+      addressDraft = null;
+      render(focusAction('inspect', id));
+      break;
+    case 'add':
+    case 'add-choose':
+    case 'replace':
+      addressDraft = { kind: destination?.kind || id || 'webhook', id: destination?.id, value: '', choose: action === 'add-choose' };
+      render(addressDraft.choose && emailEnabled ? 'form[data-form="address"] select' : 'form[data-form="address"] input');
+      break;
+    case 'cancel-address': {
+      const focus = addressDraft.id ? focusAction('replace', addressDraft.id) :
+        variant === 'B' ? focusAction('add-choose') : focusAction('add', addressDraft.kind);
+      addressDraft = null;
+      render(focus);
+      break;
+    }
+    case 'resend':
+      destination.result = { label: 'Queued', tone: 'info', event: 'Confirmation email', time: 'Just now' };
+      render(focusAction('resend', id));
+      tell('Confirmation requested for ' + destination.address + '.');
+      break;
+    case 'ask-remove':
+      openDialog('Remove destination?', '<p>' + escape(displayAddress(destination)) + '</p><p>' +
+        count(usage(id)) + ' will lose this selection.</p><div class="form-actions">' +
+        button('Remove destination', 'remove', { id, style: 'danger' }) + button('Cancel', 'close-dialog') + '</div>');
+      break;
+    case 'remove':
+      removeDestination(id);
+      dialog.close();
+      render(variant === 'B' ? focusAction('inspect', activeDestination) : focusAction('add'));
+      tell('Destination removed.');
+      break;
+    case 'new-monitor':
+    case 'edit': {
+      const monitor = monitors.find(item => item.id === id);
+      monitorDraft = monitor ? { ...monitor, selected: [...monitor.selected] } :
+        { id: '', name: '', kind: 'HTTP(S)', target: '', published: true, selected: [] };
+      tell('');
+      render('#editor-title');
+      break;
+    }
+    case 'cancel-monitor': {
+      const focus = monitorDraft.id ? focusAction('edit', monitorDraft.id) : focusAction('new-monitor');
+      monitorDraft = null;
+      render(focus);
+      break;
+    }
+    case 'choose':
+      pickerDraft = [...monitorDraft.selected];
+      openDialog('Choose destinations', '<fieldset aria-label="Selectable destinations">' + checklist(pickerDraft, 'picker') +
+        '</fieldset><div class="form-actions">' + button('Apply', 'apply', { style: 'primary' }) +
+        button('Cancel', 'close-dialog') + '</div>');
+      break;
+    case 'apply':
+      monitorDraft.selected = pickerDraft;
+      dialog.close();
+      render(focusAction('choose'));
+      break;
+    case 'toggle-selection':
+      monitorDraft.selected = monitorDraft.selected.includes(id)
+        ? monitorDraft.selected.filter(selection => selection !== id) : [...monitorDraft.selected, id];
+      render(focusAction('toggle-selection', id));
+      break;
+    case 'close-dialog':
+      dialog.close();
+      break;
+    case 'inbox':
+      inbox();
+      break;
+    case 'recipient':
+      recipient(destination);
+      break;
+    case 'confirm-email':
+      destination.confirmed = true;
+      render();
+      openDialog('Email confirmed', '<p>' + escape(destination.address) +
+        '</p>' + button('Close', 'close-dialog'));
+      tell('Email available for Monitor selection.');
+      break;
+    case 'unsubscribe':
+      removeDestination(id);
+      render();
+      openDialog('Unsubscribed', '<p>' + escape(destination.address) + '</p>' + button('Close', 'close-dialog'));
+      tell('Email removed from destinations and Monitor selections.');
+      break;
+  }
+});
+
+document.addEventListener('input', event => {
+  const input = event.target;
+  const form = input.form?.dataset.form;
+  if (form === 'page') pageDraft = input.value;
+  if (form === 'address' && input.name === 'address') {
+    addressDraft.value = input.value;
+    input.setCustomValidity('');
+  }
+  if (form === 'monitor' && ['name', 'target', 'published'].includes(input.name)) {
+    monitorDraft[input.name] = input.type === 'checkbox' ? input.checked : input.value;
+  }
+});
+
+document.addEventListener('change', event => {
+  const input = event.target;
+  if (input.name === 'library') {
+    activeDestination = input.value;
+    addressDraft = null;
+    render('.library-select');
+  }
+  if (input.name === 'kind') {
+    if (input.form.dataset.form === 'address') {
+      addressDraft.kind = input.value;
+      addressDraft.value = '';
+      render('form[data-form="address"] select');
+    } else {
+      monitorDraft.kind = input.value;
+      monitorDraft.target = '';
+      render('form[data-form="monitor"] select');
+    }
+  }
+  if (input.name === 'selection' || input.name === 'picker') {
+    const selected = [...document.querySelectorAll('input[name="' + input.name + '"]:checked')].map(choice => choice.value);
+    if (input.name === 'picker') pickerDraft = selected;
+    else {
+      monitorDraft.selected = selected;
+      document.querySelector('#selected-count').textContent = selected.length + ' selected';
+    }
+  }
+});
+
+document.addEventListener('submit', event => {
+  event.preventDefault();
+  const form = event.target;
+  if (form.dataset.form === 'page') {
+    pageName = pageDraft.trim() || pageName;
+    pageDraft = pageName;
+    form.elements.pageName.value = pageName;
+    tell('Page saved.');
+  }
+  if (form.dataset.form === 'address') {
+    const { kind, id } = addressDraft;
+    const input = form.elements.address;
+    const address = input.value.trim();
+    if (kind === 'webhook') {
+      const url = new URL(address);
+      if (url.protocol !== 'https:' || url.username || url.password || url.hash) {
+        input.setCustomValidity('Enter an HTTPS URL without a username, password or fragment.');
+        input.reportValidity();
+        return;
+      }
+    }
+    if (destinations.some(destination => destination.id !== id && destination.address === address)) {
+      input.setCustomValidity('This destination already exists.');
+      input.reportValidity();
+      return;
+    }
+    if (id) removeDestination(id);
+    const destination = { id: 'destination-' + nextId++, address, kind, confirmed: false };
+    if (kind === 'email') destination.result = { label: 'Queued', tone: 'info', event: 'Confirmation email', time: 'Just now' };
+    destinations.push(destination);
+    activeDestination = destination.id;
+    addressDraft = null;
+    render(variant === 'B' ? focusAction('inspect', destination.id) : focusAction('replace', destination.id));
+    tell(kind === 'email' ? 'Confirmation requested for ' + address + '.' : 'Webhook saved.');
+  }
+  if (form.dataset.form === 'monitor') {
+    monitorDraft.name = monitorDraft.name.trim();
+    if (!monitorDraft.name) {
+      form.elements.name.focus();
+      tell('Enter a Monitor name.');
+      return;
+    }
+    const index = monitors.findIndex(monitor => monitor.id === monitorDraft.id);
+    if (index >= 0) monitors[index] = monitorDraft;
+    else monitors.push({ ...monitorDraft, id: 'monitor-' + nextId++, state: 'Awaiting check', percent: 'No observations', history: 'empty' });
+    const id = monitorDraft.id || monitors.at(-1).id;
+    monitorDraft = null;
+    render(focusAction('edit', id));
+    tell('Monitor saved.');
+  }
+});
+
+document.querySelector('#inbox-button').addEventListener('click', inbox);
+document.querySelector('#theme').addEventListener('change', event => {
+  document.documentElement.dataset.theme = event.target.value;
+});
+document.querySelector('#previous').addEventListener('click', () => cycle(-1));
+document.querySelector('#next').addEventListener('click', () => cycle(1));
+document.addEventListener('keydown', event => {
+  if (dialog.open || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey ||
+      event.target.closest('input, textarea, select, [contenteditable]')) return;
+  if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+  event.preventDefault();
+  cycle(event.key === 'ArrowLeft' ? -1 : 1);
+});
+render();
+</script>
+</body>
+</html>
