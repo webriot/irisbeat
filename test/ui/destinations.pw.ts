@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { expect, test } from '@playwright/test';
+import { expect, test, type WebSocketRoute } from '@playwright/test';
 import { monitorAction } from './actions';
 
 test('webhook ledger and inline Monitor selections require explicit opt-in', async ({ page, request }) => {
@@ -152,11 +152,18 @@ test('a rejected Monitor save refreshes a destination removed during Live update
   const id = (await monitor.json()).monitors.find((item: { name: string }) => item.name === tag).id;
   const path = '/api/operator/monitors/' + id;
   let release: (() => void) | undefined;
+  let live!: WebSocketRoute;
   try {
+    // Keep unrelated changes from parallel tests out of this single-invalidation race.
+    await page.routeWebSocket('**/api/operator/events', socket => {
+      live = socket;
+      socket.onMessage(message => { if (message !== 'ack') socket.send('authorized'); });
+    });
     await page.goto('/operator');
     await page.getByLabel('Installation secret').fill('ui-test-secret');
     await page.getByRole('button', { name: 'Sign in' }).click();
     await expect(page.locator('#updates-mode')).toBeHidden();
+    await expect(page.locator('#retry')).toBeEnabled();
     await monitorAction(page, 'Edit ' + tag);
     const choice = page.getByRole('checkbox', { name: url, exact: true });
     const name = page.getByLabel('Monitor name', { exact: true });
@@ -169,7 +176,9 @@ test('a rejected Monitor save refreshes a destination removed during Live update
       await route.continue();
     }, { times: 1 });
     expect((await request.delete('/api/operator/destinations/' + destination.id, { headers })).ok()).toBe(true);
+    live.send('changed');
     await expect.poll(() => Boolean(release)).toBe(true);
+    await expect(choice).toBeChecked();
     const rejected = page.waitForResponse(response => response.url().endsWith(path) && response.request().method() === 'PATCH');
     await save.click();
     expect((await rejected).status()).toBe(400);

@@ -24,17 +24,19 @@ the packaged page source also declares its JSX runtime for bundlers. Import `cre
 Pin the artifact version **and literal `contractVersion: '1'`**; unsupported
 versions throw during factory construction, before requests or scheduling run.
 `private: true` prevents accidental registry publication; versioned GitHub release tarballs are the supported distribution path.
-No Accounts, Stripe, hostname provisioning or email transport is included.
+Hosted consumers own accounts, Stripe, hostname provisioning, and Email Service provisioning. The engine provides email consent and the delivery Worker submits confirmation mail.
 
 ## Trusted adapter
 
 `createHostedWorker(adapter)` returns Worker `fetch` and `scheduled` handlers.
 The adapter supplies just:
 
-- `resolve(request, env)`: return `{ id, permission, monitorLimit, paused?, policyRevision? }` or `null` for
+- `resolve(request, env)`: return `{ id, permission, monitorLimit, paused?, policyRevision?, notificationOrigin? }` or `null` for
   an unrecognized host. `id` is the stable Durable Object name; `permission` is
   `editor`, `reader`, or `null` for an anonymous visitor. `monitorLimit` is a
   nonnegative safe integer. Invalid resolved contexts fail closed with 500.
+  An optional `notificationOrigin` is a trusted canonical HTTPS origin for the
+  context's recipient-facing pages. Leave it unset for a context without email.
 - `contexts(env)`: return stable context names or `{ id, paused?, policyRevision? }` descriptors for
   this scheduled invocation. Identical duplicates are removed; conflicting pause
   state/revision metadata for the same ID rejects the invocation before dispatch. The consumer owns context discovery and
@@ -99,8 +101,7 @@ Editors manage webhook destinations with `POST /api/operator/destinations` and
 creates and replacements. The authenticated editor snapshot exposes `destinations`
 and each Monitor's `destinationIds`. Use `PATCH /api/operator/monitors/:id`
 with `{ destinationIds: [...] }` to replace the list or `{ destinationChanges: { [id]: true | false } }`
-to change individual selections atomically. `true` requires an existing
-destination, `false` removes the selection if present, and omitted IDs retain
+to change individual selections atomically. `true` requires a saved webhook or a confirmed inbox, `false` removes the selection if present, and omitted IDs retain
 their current selection. Use one selection field per request.
 A new Monitor starts with zero selections. The previous webhook setting upgrades
 to an unselected destination and its compatibility endpoint manages that entry.
@@ -127,6 +128,43 @@ protected method and exported `IncidentTransition` type remain deprecated for
 source compatibility with existing hosted subclasses. To resume sending after
 upgrade, configure the Queue and delivery Worker and select destinations on each
 Monitor that should send.
+
+## Email consent
+
+Before enabling hosted confirmation mail, turn off **Enable email preview** in
+the Cloudflare sending domain's settings and keep it off while sending confirmation
+mail. When enabled, the Activity log stores the HTML, plain text and raw message
+with the live confirmation link for about seven days. Cloudflare still processes
+recipient metadata for transport. Keep addresses and confirmation links out of
+Irisbeat logs and Queue diagnostics.
+[Cloudflare domain settings](https://developers.cloudflare.com/email-service/configuration/domains/#email-preview)
+and [Activity log message previews](https://developers.cloudflare.com/email-service/observability/logs/#message-preview).
+
+Follow the sender, Queue and service-binding configuration in
+[optional email confirmation](install.md#optional-email-confirmation).
+For hosted delivery wrappers, re-export `NotificationEmailCapability` from
+`irisbeat/notification-delivery`. Set `ResolvedContext.notificationOrigin`
+from trusted configuration. Resolve unauthenticated requests to
+`/notifications/confirm` at that origin to the same context. Confirmation
+credentials remain in the link's fragment until the recipient submits the form
+and are excluded from status snapshots and Queue payloads.
+
+Editors use the same destination create and replace routes with
+`{ channel: "email", address }`. Editor snapshots report `emailConfigured: true`
+when email setup is available and expose email destinations as
+`{ id, channel: "email", address, confirmed }`. A pending destination can
+be resent via `POST /api/operator/destinations/:id/confirmation`.
+Removal and replacement clear the original invitation and selections. The
+five-minute cooldown is per inbox within the context. Confirmation requires an
+explicit POST, is single-use, and expires 24 hours after the invitation is
+created. It does not change Monitor selections or replay Monitor events.
+A paused context can save pending inboxes. Resume requires an explicit resend
+and never releases a confirmation queued before pause.
+
+The Queue uses `NotificationQueueJob` for both regular Monitor jobs and jobs
+with `kind: "email.confirmation"`. The latter resolve the inbox and its link
+through trusted `NotificationDelivery` RPC using the current invitation
+identity and pause generation.
 
 ## Pause and resume
 

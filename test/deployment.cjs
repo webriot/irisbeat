@@ -47,7 +47,10 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     const [queueProducer] = producerConfig.queues.producers;
     const [queueConsumer] = consumerConfig.queues.consumers;
     const [deliveryService] = consumerConfig.services;
-    const delivery = (await build({ entryPoints: [join(source, 'src/notification-delivery.ts')], bundle: true, write: false, format: 'esm', platform: 'neutral' })).outputFiles[0].text;
+    const delivery = (await build({
+      entryPoints: [join(source, 'src/notification-delivery.ts')],
+      bundle: true, write: false, format: 'esm', platform: 'neutral', external: ['cloudflare:workers'],
+    })).outputFiles[0].text;
     const script = (await build({ stdin: { contents: `
       import worker from './src/index.ts';
       export { MonitoringContext, NotificationDelivery } from './src/index.ts';

@@ -145,8 +145,9 @@ start unselected on every Monitor. Removing a webhook or replacing its address
 clears its selections. Slack-compatible messages include the Monitor
 name, the transition and its original UTC time. Webhook-only installations need
 no email configuration.
-Declare/replace/end per-Monitor Maintenance in its ledger. Checks continue; detection
-and alerts are suppressed, Incidents retained. History shows 90 UTC calendar days;
+Declare, replace or end per-Monitor Maintenance in its ledger. Checks continue,
+Incident detection and alerts are suppressed, and Incidents are retained. Selected
+webhooks receive Maintenance notices. History shows 90 UTC calendar days;
 Maintenance is excluded from availability. Delete stops checking but retains
 operator Incidents. Detailed bounds and semantics are in README and the API handoffs.
 
@@ -176,6 +177,46 @@ producing Maintenance jobs. Keep the Maintenance-aware consumer running until
 all queued and in-flight Maintenance jobs have been handled. Restore the
 previous consumer only after that drain is confirmed. Keep the Maintenance-aware
 consumer in place if any Maintenance jobs could still be delivered or replayed.
+
+## Optional email confirmation
+
+- In Cloudflare, onboard a sending domain and choose a sender address on that domain.
+  Workers Paid is required for arbitrary recipients. Account-verified recipients can
+  receive mail on the Free plan using a routing domain. Cloudflare verifies account
+  destinations for transport eligibility. Irisbeat requires the recipient to confirm
+  separately for each monitoring context.
+  [Cloudflare pricing](https://developers.cloudflare.com/email-service/platform/pricing/) and
+  [send binding restrictions](https://developers.cloudflare.com/email-service/configuration/send-bindings/).
+- Before enabling confirmation mail, turn off **Enable email preview** for the
+  sending domain in Cloudflare under **Compute > Email Service > Email Sending >
+  [sending domain] > Settings**. Keep it off while sending confirmation mail.
+  Cloudflare turns it on for new sending domains and retains previews for about
+  seven days. Previews include the HTML, plain text and raw message, which expose
+  the live confirmation link. This prerequisite applies to self-hosted and hosted
+  deployments. [Domain settings](https://developers.cloudflare.com/email-service/configuration/domains/#email-preview)
+  and [Activity log message previews](https://developers.cloudflare.com/email-service/observability/logs/#message-preview).
+- In your private delivery Worker configuration, add `send_email: [{ "name": "EMAIL" }]`
+  and set the `EMAIL_FROM` variable to the sender address. Deploy the delivery Worker
+  with the existing Queue consumer and `NOTIFICATION_DELIVERY` service binding.
+- In your private monitoring Worker configuration, set `NOTIFICATION_PUBLIC_ORIGIN`
+  to the installation's public HTTPS origin without a path. Add a service binding
+  named `NOTIFICATION_EMAIL` pointing to the delivery Worker's
+  `NotificationEmailCapability` entrypoint. The Workers can first be deployed with
+  webhooks, then the monitoring Worker can be redeployed with the optional reverse binding.
+- Open Operator Settings and choose **Add email**. The recipient opens the message
+  and clicks **Confirm email** on the confirmation page. The inbox can then be
+  selected on individual Monitors. Pending inboxes offer **Resend confirmation**.
+  Resending replaces the previous link. The five-minute cooldown applies within
+  the installation even if the inbox is removed and re-added.
+
+Cloudflare still processes recipient metadata for transport. Keep addresses and
+confirmation links out of Irisbeat logs and Queue diagnostics. The delivery Worker
+logs sanitized `email_confirmation_submission_failed` events for failed submissions.
+
+`npm run test:delivery` and the rendered Settings acceptance test read HTML, plain
+text and synthetic sender and recipient metadata through the simulated
+`send_email` binding. The tests use local capture without contacting Email Service.
+[Cloudflare local simulation](https://developers.cloudflare.com/email-service/observability/local-development/sending/#local-simulation).
 
 ## Prepare and verify a release (no publication)
 
