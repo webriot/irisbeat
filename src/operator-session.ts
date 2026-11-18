@@ -26,7 +26,7 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
   let secret = '';
   let generation = 0;
   let requestVersion = 0;
-  let readingVersion = 0;
+  let readingVersion: number | undefined;
   let busy = false;
   let pendingRefresh = false;
   let updates: ReturnType<LiveSnapshots> | undefined;
@@ -56,7 +56,7 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
   const session = {
     signIn(credential: string) { ++generation; secret = credential; return session.run(); },
     signOut() {
-      ++generation; ++requestVersion; secret = ''; busy = false; pendingRefresh = false;
+      ++generation; ++requestVersion; secret = ''; busy = false; pendingRefresh = false; readingVersion = undefined;
       updates?.stop(); updates = undefined;
       session.cancelPreview();
       ui.signedOut();
@@ -64,6 +64,7 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
     async run(path = '/api/operator', method: Method = 'GET', body?: unknown, after?: (data: OperatorResponse) => void, current = () => true) {
       const reading = method === 'GET';
       if (busy) { if (reading) pendingRefresh = true; return; }
+      const supersedesRead = !reading && readingVersion === requestVersion;
       const version = ++requestVersion;
       const started = generation;
       if (!reading) busy = true;
@@ -93,11 +94,18 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
         if (after) after(data);
         if (!reading) ui.saved(path, method);
       } catch (error) {
-        if (started === generation && version === requestVersion) ui.failed((error as Error).message, reading);
+        if (started === generation && version === requestVersion) {
+          // A failed write has no snapshot to replace the read it superseded.
+          if (supersedesRead) pendingRefresh = true;
+          ui.failed((error as Error).message, reading);
+        }
         return false;
       } finally {
         clearTimeout(timeout);
-        if (reading && started === generation && version === readingVersion) ui.reading?.('idle');
+        if (reading && started === generation && version === readingVersion) {
+          readingVersion = undefined;
+          ui.reading?.('idle');
+        }
         if (!reading && started === generation) {
           busy = false; finishWriting?.();
           if (pendingRefresh) { pendingRefresh = false; updates?.sync(); }

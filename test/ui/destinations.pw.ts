@@ -33,7 +33,7 @@ test('webhook ledger and inline Monitor selections require explicit opt-in', asy
 
     await page.getByRole('button', { name: 'Monitors', exact: true }).click();
     await page.getByRole('button', { name: 'New Monitor' }).click();
-    await page.getByLabel('Monitor name').fill(tag);
+    await page.getByLabel('Monitor name', { exact: true }).fill(tag);
     await page.getByLabel('Check type').selectOption('heartbeat');
     await page.getByRole('button', { name: 'Save Monitor' }).click();
     await monitorAction(page, 'Edit ' + tag);
@@ -107,7 +107,7 @@ test('Monitor selection drafts survive refresh and save failure alongside concur
     await page.getByRole('button', { name: 'Sign in' }).click();
     await monitorAction(page, 'Edit ' + tag);
     const [local, remote, unseen] = addresses.map(name => page.getByRole('checkbox', { name, exact: true }));
-    const name = page.getByLabel('Monitor name');
+    const name = page.getByLabel('Monitor name', { exact: true });
     await name.fill(tag + ' draft');
     await local.check();
     await local.focus();
@@ -137,6 +137,56 @@ test('Monitor selection drafts survive refresh and save failure alongside concur
   } finally {
     await request.delete(path, { headers });
     for (const id of ids) await request.delete('/api/operator/destinations/' + id, { headers });
+  }
+});
+
+test('a rejected Monitor save refreshes a destination removed during Live updates', async ({ page, request }) => {
+  const headers = { Authorization: 'Bearer ui-test-secret' };
+  const tag = 'removed-destination-' + Date.now();
+  const url = 'https://alerts.example.invalid/' + tag;
+  const created = await request.post('/api/operator/destinations', { headers, data: { url } });
+  expect(created.status()).toBe(201);
+  const destination = (await created.json()).destinations.find((item: { url: string }) => item.url === url);
+  const monitor = await request.post('/api/operator/monitors', { headers, data: { name: tag, kind: 'heartbeat' } });
+  expect(monitor.status()).toBe(201);
+  const id = (await monitor.json()).monitors.find((item: { name: string }) => item.name === tag).id;
+  const path = '/api/operator/monitors/' + id;
+  let release: (() => void) | undefined;
+  try {
+    await page.goto('/operator');
+    await page.getByLabel('Installation secret').fill('ui-test-secret');
+    await page.getByRole('button', { name: 'Sign in' }).click();
+    await expect(page.locator('#updates-mode')).toBeHidden();
+    await monitorAction(page, 'Edit ' + tag);
+    const choice = page.getByRole('checkbox', { name: url, exact: true });
+    const name = page.getByLabel('Monitor name', { exact: true });
+    const save = page.getByRole('button', { name: 'Save Monitor' });
+    await name.fill(tag + ' draft');
+    await choice.check();
+
+    await page.route('**/api/operator', async route => {
+      await new Promise<void>(resolve => { release = resolve; });
+      await route.continue();
+    }, { times: 1 });
+    expect((await request.delete('/api/operator/destinations/' + destination.id, { headers })).ok()).toBe(true);
+    await expect.poll(() => Boolean(release)).toBe(true);
+    const rejected = page.waitForResponse(response => response.url().endsWith(path) && response.request().method() === 'PATCH');
+    await save.click();
+    expect((await rejected).status()).toBe(400);
+    await expect(save).toBeFocused();
+    release!();
+
+    await expect(choice).toHaveCount(0);
+    await expect(name).toHaveValue(tag + ' draft');
+    await expect(save).toBeFocused();
+    const retried = page.waitForResponse(response => response.url().endsWith(path) && response.request().method() === 'PATCH');
+    await save.click();
+    expect((await retried).status()).toBe(200);
+    await expect(page.getByRole('cell', { name: tag + ' draft', exact: true })).toBeVisible();
+  } finally {
+    release?.();
+    await request.delete(path, { headers });
+    await request.delete('/api/operator/destinations/' + destination.id, { headers });
   }
 });
 
