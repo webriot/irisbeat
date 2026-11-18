@@ -97,8 +97,11 @@ automatic traces because fetch spans can include credential-bearing webhook URLs
 Editors manage webhook destinations with `POST /api/operator/destinations` and
 `PUT` or `DELETE /api/operator/destinations/:id`. Provide an HTTPS `{ url }` for
 creates and replacements. The authenticated editor snapshot exposes `destinations`
-and each Monitor's `destinationIds`. Set selections using
-`PATCH /api/operator/monitors/:id` with `{ destinationIds: [...] }`.
+and each Monitor's `destinationIds`. Use `PATCH /api/operator/monitors/:id`
+with `{ destinationIds: [...] }` to replace the list or `{ destinationChanges: { [id]: true | false } }`
+to change individual selections atomically. `true` requires an existing
+destination, `false` removes the selection if present, and omitted IDs retain
+their current selection. Use one selection field per request.
 A new Monitor starts with zero selections. The previous webhook setting upgrades
 to an unselected destination and its compatibility endpoint manages that entry.
 

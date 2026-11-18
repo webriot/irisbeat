@@ -138,9 +138,11 @@ above. Keep automatic traces disabled on that Worker because
 Workers Logs still capture sanitized submission failures. `npm run build:delivery`
 dry-runs the bundle and `npm run test:delivery` exercises both Workers locally.
 
-Save HTTPS destinations and explicitly select them on each Monitor that should send
-Incident notifications. Upgraded context-wide webhooks retain their address and
-start unselected on every Monitor. Slack-compatible messages include the Monitor
+In Operator Settings, choose Add webhook under Notification destinations. Then
+edit each Monitor that should send Incident notifications, check the desired
+destinations, and save the Monitor. Upgraded webhooks retain their address and
+start unselected on every Monitor. Removing a webhook or replacing its address
+clears its selections. Slack-compatible messages include the Monitor
 name, the transition and its original UTC time. Webhook-only installations need
 no email configuration.
 Declare/replace/end per-Monitor Maintenance in its ledger. Checks continue; detection
@@ -220,7 +222,8 @@ channels or arbitrary public sites. Use default one-minute intervals, thresholds
    anonymous HTML/JSON omit targets, destinations and credentials. Confirm the named
    anonymous ledger. Record that the versioned Source download is pending release
    publication; verify its availability in the post-publication gate below.
-3. Save the controlled webhook destination and select it for each drill Monitor.
+3. In Settings, add the controlled webhook. Edit each drill Monitor, select the
+   webhook, and save.
    With HTTP 204/TCP accepting and spaced receipts, wait for scheduled observations.
    Switch HTTP to 503/TCP to refuse, withhold Heartbeats past silence; observe one
    Incident and one opening webhook per Monitor after the required observations.
@@ -234,7 +237,7 @@ channels or arbitrary public sites. Use default one-minute intervals, thresholds
    Redeploy the same reviewed artifact and prove remaining configuration/history
    persists. Local suites cover exact timing/UTC boundaries; live evidence covers
    actual Cloudflare socket/cron/secret/resource behavior.
-6. Stop producers, remove webhook configuration and delete only drill Monitors.
+6. Stop producers, remove the drill webhook in Settings, and delete only drill Monitors.
    Verify both disposable Worker names, the Queue and the account. Delete the
    delivery Worker first, then the monitoring Worker using
    `npx wrangler delete <worker-name>`. Delete the disposable Queue with

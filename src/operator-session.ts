@@ -11,7 +11,7 @@ export type LiveSnapshots = (
   authorize: () => Promise<string>,
 ) => { sync(): void; stop(): void };
 export interface OperatorSessionCallbacks {
-  received(data: OperatorResponse, savedField?: 'pageName' | 'webhookUrl'): void;
+  received(data: OperatorResponse, savedField?: 'pageName'): void;
   reading?(state: 'pending' | 'success' | 'idle'): void;
   signedOut(): void;
   failed(message: string, reading: boolean): void;
@@ -82,9 +82,12 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
         if (version !== requestVersion) return;
         const data = await response.json() as OperatorResponse & { error?: string };
         if (started !== generation || version !== requestVersion) return;
-        if (!response.ok) throw new Error(data.error || 'Request failed');
+        if (!response.ok) {
+          if (response.status === 403) pendingRefresh = true;
+          throw new Error(data.error || 'Request failed');
+        }
         if (reading && !current()) return;
-        ui.received(data, method === 'PUT' ? (path === '/api/operator' ? 'pageName' : path === '/api/operator/webhook' ? 'webhookUrl' : undefined) : undefined);
+        ui.received(data, method === 'PUT' && path === '/api/operator' ? 'pageName' : undefined);
         if (reading) ui.reading?.('success');
         lifecycle.startUpdates();
         if (after) after(data);

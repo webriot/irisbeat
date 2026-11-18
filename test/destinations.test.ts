@@ -69,6 +69,30 @@ it("limits destinations and selections to editors of their own context", async (
   const monitor = monitors + "/" + b.monitor!.id;
   expect((await api(monitor, "PATCH", { destinationIds: [destination.id] }, "b.example")).status).toBe(400);
   expect((await api(monitor, "PATCH", { destinationIds: [] }, "b.example", "reader")).status).toBe(403);
+  expect((await api(monitor, "PATCH", { destinationChanges: { [destination.id]: true } }, "b.example")).status).toBe(400);
+  expect((await api(monitor, "PATCH", { destinationChanges: { [destination.id]: false } }, "b.example", "reader")).status).toBe(403);
+});
+
+it("applies individual destination changes atomically and rejects invalid selections", async () => {
+  const [first] = (await status(api(destinations, "POST", { url: "https://hooks.example/first" }), 201)).destinations!;
+  const [_, second] = (await status(api(destinations, "POST", { url: "https://hooks.example/second" }), 201)).destinations!;
+  expect((await api(monitors, "POST", { name: "Producer", kind: "heartbeat", destinationChanges: { [first.id]: true } })).status).toBe(400);
+  const { monitor } = await status(api(monitors, "POST", { name: "Producer", kind: "heartbeat" }), 201);
+  const path = monitors + "/" + monitor!.id;
+  await status(api(path, "PATCH", { destinationIds: [first.id] }));
+  for (const invalid of [
+    { destinationChanges: { missing: true, [first.id]: false } },
+    { destinationChanges: { [second.id]: "true" } },
+    { destinationChanges: [second.id] },
+    { destinationChanges: { [second.id]: true }, destinationIds: [] },
+  ]) {
+    expect((await api(path, "PATCH", { name: "Rejected", ...invalid })).status).toBe(400);
+  }
+  expect((await status(api(destinations))).monitor).toMatchObject({ name: "Producer", destinationIds: [first.id] });
+  const added = await status(api(path, "PATCH", { destinationChanges: { [second.id]: true } }));
+  expect(added.monitor!.destinationIds).toEqual([first.id, second.id]);
+  const removed = await status(api(path, "PATCH", { destinationChanges: { [first.id]: false, missing: false } }));
+  expect(removed.monitor!.destinationIds).toEqual([second.id]);
 });
 
 it("keeps an Incident committed when Queue acceptance fails and never replays it", async () => {

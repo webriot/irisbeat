@@ -110,6 +110,7 @@ test('operator writes keep a failed-read indicator and denied Retry ends the Ope
   await page.locator('#secret').fill('ui-test-secret');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
   await page.locator('#settings-button').click();
+  await page.getByRole('button', { name: 'Add webhook' }).click();
   await page.locator('#webhookUrl').fill('https://example.com/unsaved');
   status = 503;
   await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
