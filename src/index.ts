@@ -512,8 +512,8 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
       if (at >= (attempt.lastSeen ?? attempt.createdAt) + attempt.silenceSeconds * 1000) {
         attempt.recoveryReceiptAt = null;
-        const window = attempt.maintenance;
-        const maintenance = (window && window.startedAt <= at && at < window.endsAt) ||
+        // Active Maintenance suppresses dispatch. Expired windows use the observation time.
+        const maintenance = !!attempt.maintenance ||
           this.ctx.storage.sql.exec("SELECT 1 FROM calendar_maintenance WHERE monitorId = ? AND startedAt <= ? AND endsAt > ? LIMIT 1", id, at, at).toArray().length > 0;
         await this.record(state, attempt, at, false, 1, attempt.recoveryThreshold, maintenance);
       }

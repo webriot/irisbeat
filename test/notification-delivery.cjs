@@ -456,6 +456,27 @@ async function main() {
     await until(() => submissions.length === beforeExpiry + 2 && completedBatches === batches.length);
     assert.match(submissions.at(-1).payload.text, /Incident opened/);
     assert.equal((await json(host, '/api/operator')).incidents.find(incident => incident.monitorId === watchdog.id).openedAt, watchdogEnd);
+
+    const activeHost = 'active-maintenance.example';
+    const { destinations: activeDestinations } = await json(activeHost, path, 'POST', { url: 'https://hooks.example/active' }, 201);
+    const { monitors: [activeWatchdog] } = await json(activeHost, monitors, 'POST', {
+      name: 'Active Maintenance Watchdog', kind: 'heartbeat', published: false,
+    }, 201);
+    const activePath = monitors + '/' + activeWatchdog.id;
+    await json(activeHost, activePath, 'PATCH', { destinationIds: [activeDestinations[0].id] });
+    const activeSilence = wallTime + 180_000;
+    wallTime = activeSilence + 5_000;
+    const activeEnd = activeSilence + 65_000;
+    await json(activeHost, activePath + '/maintenance', 'PUT', { endsAt: activeEnd });
+    await until(() => submissions.at(-1)?.url === 'https://hooks.example/active' && completedBatches === batches.length);
+    at = activeSilence;
+    wallTime = activeSilence + 10_000;
+    await tick(activeHost);
+    const active = await json(activeHost, '/api/operator');
+    assert.deepEqual(active.monitors[0].lastResult, { at: activeSilence, outcome: 'maintenance' });
+    assert.equal(active.monitors[0].maintenance.endsAt, activeEnd);
+    assert.deepEqual(active.incidents, []);
+    assert.deepEqual(batches.flat().filter(job => job.monitorId === activeWatchdog.id).map(job => job.event.kind), ['maintenance.started']);
     console.log('PASS delayed Watchdog silence: Maintenance exclusion, one expiry and normal detection at the window end');
     console.log('PASS Maintenance Queue delivery: private fan-out, safe content, no-op, update, early end, selection cancellation and natural expiry');
   } finally {
