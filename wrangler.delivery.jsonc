@@ -12,7 +12,6 @@
     }],
     "producers": [
       { "binding": "NOTIFICATION_DLQ", "queue": "irisbeat-notifications-dead-letter" },
-      { "binding": "NOTIFICATION_OUTCOMES", "queue": "irisbeat-notifications" },
     ],
   },
   "durable_objects": {

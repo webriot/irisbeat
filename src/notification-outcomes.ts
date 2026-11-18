@@ -22,6 +22,7 @@ export type SubmissionReport = {
   eventAt: number;
   queuedAt: number;
   attempt: number;
+  confirmation?: true;
   result: SubmissionResult;
 };
 

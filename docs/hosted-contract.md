@@ -87,8 +87,7 @@ installation secret and ignores bodies.
 ## Incident notifications
 
 Use one Queue for the monitoring Worker's `NOTIFICATION_QUEUE` producer and
-the isolated delivery Worker's consumer trigger and `NOTIFICATION_OUTCOMES`
-producer. Configure a second Queue in the same jurisdiction for the delivery
+the isolated delivery Worker's consumer trigger. Configure a second Queue in the same jurisdiction for the delivery
 Worker's `NOTIFICATION_DLQ` producer. Keep native dead-letter routing unset
 because it forwards the original job body. Use `irisbeat/notification-delivery`
 as the delivery Worker entrypoint and bind its exported SQLite Durable Object
@@ -116,27 +115,37 @@ HTTP, TCP and Heartbeat share post-commit Incident and Maintenance enqueueing. A
 event and delivery IDs, original event time and safe rendering data. Address
 changes replace the destination identity and clear prior selections. A failed
 enqueue logs `notification_enqueue_failed` and leaves the change committed.
-Queue acceptance starts durable webhook delivery. Each attempt rechecks eligibility and
-completed delivery identities. Provider acceptance and permanent rejection end
-retries. Temporary submission failures back off exponentially, up to ten
-provider attempts and one hour from Queue acceptance. The delivery Worker
-persists attempt ordering before checking eligibility and closes current terminal
-outcomes before reporting to Settings. It acknowledges the source once the
-outcome is durable in the Recovery object or on the source Queue as a sanitized
-outcome message. That message has its own broker retry budget and can only
-recover result reporting and dead-letter writes. Those operations also recover
-independently through the delivery Durable Object, which retains recovery data
-for up to 14 days.
-Keep job bodies free of addresses and credentials. The dead-letter Queue has
-no automatic replay.
+Queue acceptance starts durable delivery for webhooks and email confirmations.
+The delivery Worker rechecks eligibility immediately before it reserves a
+submission in the delivery's SQLite Recovery object and calls the provider.
+Duplicate Queue copies share a ten-submission budget, even at the same broker
+ordinal. No provider call starts once the job is one hour old. Temporary
+failures back off exponentially. Eligibility and Recovery RPC errors can
+consume broker deliveries without spending the provider budget. Keep the broker
+configured for ten retries. Its final delivery is reserved for terminal
+bookkeeping and does not submit to a provider.
+
+The Recovery object records terminal outcomes before the source is acknowledged.
+Result reporting, confirmation marking and sanitized dead-letter writes then
+recover independently through the object's alarm, for up to 14 days. Final broker
+delivery retries transient Recovery RPC failures within the same invocation.
+If Recovery stays unavailable for that entire delivery, the broker can discard
+the exhausted source. A durable provider reservation can also consume a slot if
+the Worker crashes before making the request.
 
 Editor snapshots expose the optional `destinations[].latestSubmission` with
 `status`, `at` (Unix milliseconds) and a safe `reason` for failures.
-Acceptance records provider submission. Duplicate Queue copies skip provider
-submission after the delivery Worker records a current terminal outcome, including
-during a result RPC outage. An acceptance from an already submitted request is
-preserved even if a newer attempt started. A crash before durable recording can
-still cause duplicates.
+A recorded acceptance closes submission while Settings or confirmation marking
+is pending. An acceptance from a request already submitted is preserved even if
+a newer attempt started. A crash before recording the provider outcome, or a
+transport timeout with unknown provider outcome, can still lead to duplicates.
+Acceptance records provider submission.
+
+Confirmation eligibility uses the original invitation and pause generation.
+The Recovery object stores only opaque identities, timestamps, the pause
+generation needed for confirmation marking, and sanitized outcome fields.
+Dead-letter diagnostics include the reserved provider attempt count and have
+no automatic replay.
 
 Hosted and self-hosted notifications require explicit Monitor selections
 and the Queue and delivery Worker above. Monitoring and Incident recording

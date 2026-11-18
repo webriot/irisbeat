@@ -4,7 +4,7 @@ import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
 import { MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
 import { connect } from "cloudflare:sockets";
-import { parseEmailAddress, type ConfirmationJob, type NewNotificationDestination, type NotificationDestination, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
+import { parseEmailAddress, type ConfirmationIdentity, type ConfirmationJob, type NewNotificationDestination, type NotificationDestination, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
 import type { NotificationDeliveryIdentity, SubmissionReport } from "./notification-outcomes";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 
@@ -488,7 +488,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     }
   }
 
-  private currentConfirmation(state: StoredContext, job: ConfirmationJob) {
+  private currentConfirmation(state: StoredContext, job: ConfirmationIdentity) {
     if (job.contextId !== this.ctx.id.toString() || state.paused ||
         (state.pauseGeneration ?? 0) !== job.pauseGeneration) return null;
     const invitation = state.emailConfirmations?.[job.destinationId];
@@ -506,7 +506,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     };
   }
 
-  markConfirmationSubmitted(job: ConfirmationJob) {
+  markConfirmationSubmitted(job: ConfirmationIdentity) {
     const state = this.read();
     const current = this.currentConfirmation(state, job);
     if (!current) return;
@@ -828,8 +828,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const state = this.read();
     const destination = state.destinations?.find(destination => destination.id === job.destinationId);
     if (!destination) return;
-    const current = destination.submission;
     const accepted = report.result.status === "accepted";
+    if (report.confirmation && (destination.channel !== "email" ||
+        (state.emailConfirmations?.[destination.id]?.id !== job.deliveryId && !(accepted && destination.confirmed)))) return;
+    const current = destination.submission;
     const terminal = report.result.status !== "retrying";
     if (report.result.status === "canceled" &&
       (current?.deliveryId !== job.deliveryId || current.result.status !== "retrying")) return;
@@ -1072,7 +1074,7 @@ export class NotificationDelivery extends WorkerEntrypoint<EngineEnv> {
     return this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId)).resolveConfirmation(job);
   }
 
-  async markConfirmationSubmitted(job: ConfirmationJob) {
+  async markConfirmationSubmitted(job: ConfirmationIdentity) {
     if (!/^[a-f0-9]{64}$/.test(job.contextId)) return;
     await this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId)).markConfirmationSubmitted(job);
   }

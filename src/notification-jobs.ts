@@ -70,4 +70,6 @@ export type ConfirmationJob = {
   at: number;
 };
 
+export type ConfirmationIdentity = Pick<ConfirmationJob, "contextId" | "destinationId" | "deliveryId" | "pauseGeneration">;
+
 export type NotificationQueueJob = NotificationJob | ConfirmationJob;

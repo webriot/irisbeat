@@ -74,7 +74,6 @@ variable values above. Keep deployment-specific configuration out of version con
 | `wrangler.jsonc` | `queues.producers[0].queue` | `IRISBEAT_QUEUE_NAME` |
 | `wrangler.delivery.jsonc` | `queues.consumers[0].queue` | `IRISBEAT_QUEUE_NAME` |
 | `wrangler.delivery.jsonc` | `queues.producers[0].queue` | `IRISBEAT_DLQ_NAME` |
-| `wrangler.delivery.jsonc` | `queues.producers[1].queue` | `IRISBEAT_QUEUE_NAME` |
 | `wrangler.delivery.jsonc` | `services[0].service` | `IRISBEAT_WORKER_NAME` |
 
 Keep the binding names, `NotificationDelivery` entrypoint and migrations from
@@ -179,7 +178,7 @@ compatibility before rollback. Never delete/recreate a production namespace to u
 ### Upgrade and roll back notification Workers
 
 On an existing Queue installation, keep the Worker names, source Queue and
-service binding. Configure the dead-letter Queue, outcome producer and Recovery
+service binding. Configure the dead-letter Queue and Recovery
 migration above before upgrading the delivery Worker. Deploy the delivery
 Worker first, then deploy the monitoring Worker. The updated consumer handles
 Incident jobs from the previous producer, so existing Monitor selections can
@@ -225,7 +224,7 @@ unsupported messages can still reach the source Queue.
 
 Cloudflare still processes recipient metadata for transport. Keep addresses and
 confirmation links out of Irisbeat logs and Queue diagnostics. The delivery Worker
-logs sanitized `email_confirmation_submission_failed` events for failed submissions.
+reports sanitized submission results in Settings and records exhausted jobs in the dead-letter Queue.
 
 `npm run test:delivery` and the rendered Settings acceptance test read HTML, plain
 text and synthetic sender and recipient metadata through the simulated

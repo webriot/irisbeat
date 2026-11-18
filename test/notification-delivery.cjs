@@ -19,6 +19,20 @@ async function main(runFixture, emailEnabled = true) {
     import personal, { createHostedWorker, MonitoringContext as EngineContext } from './src/index.ts';
     import { NotificationDelivery as EngineDelivery } from './src/index.ts';
     export class NotificationDelivery extends EngineDelivery {
+      async resolveWebhook(job) {
+        const response = await this.env.GATE.fetch('https://test.example/resolve', {
+          method: 'POST', body: JSON.stringify(job.deliveryId),
+        });
+        if (!response.ok) throw new Error('Injected eligibility outage');
+        return super.resolveWebhook(job);
+      }
+      async markConfirmationSubmitted(job) {
+        const response = await this.env.GATE.fetch('https://test.example/mark-confirmation', {
+          method: 'POST', body: JSON.stringify(job),
+        });
+        if (!response.ok) throw new Error('Injected confirmation bookkeeping failure');
+        return super.markConfirmationSubmitted(job);
+      }
       async reportSubmission(job, report) {
         const response = await this.env.GATE.fetch('https://test.example/report', {
           method: 'POST', body: JSON.stringify({ job, report }),
@@ -81,17 +95,26 @@ async function main(runFixture, emailEnabled = true) {
   const consumer = await bundle(`
     import delivery, { NotificationRecovery as Recovery } from './src/notification-delivery.ts';
     export class NotificationRecovery extends Recovery {
-      constructor(ctx, env) { super(ctx, faultDLQ(env)); }
-      async record(identity, report, letter) {
-        const response = await this.env.GATE.fetch('https://test.example/persist', {
-          method: 'POST', body: JSON.stringify(identity),
-        });
-        if (!response.ok) throw new Error('Injected recovery persistence failure');
-        return super.record(identity, report, letter);
+      constructor(ctx, env) { super(ctx, faultBindings(env)); }
+      async deliver(job, brokerAttempt, queuedAt) {
+        if (brokerAttempt >= 11) {
+          const response = await this.env.GATE.fetch('https://test.example/recovery-admission', {
+            method: 'POST', body: JSON.stringify(job.deliveryId),
+          });
+          if (!response.ok) throw new Error('Injected Recovery RPC outage');
+        }
+        return super.deliver(job, brokerAttempt, queuedAt);
       }
     }
-    function faultDLQ(env) {
-      return { ...env, NOTIFICATION_DLQ: { async send(letter) {
+    function faultBindings(env) {
+      const EMAIL = env.EMAIL && { async send(mail) {
+        const response = await env.GATE.fetch('https://test.example/email-send', {
+          method: 'POST', body: JSON.stringify(mail.to),
+        });
+        if (!response.ok) throw Object.assign(new Error('sensitive provider response'), { code: await response.text() });
+        return env.EMAIL.send(mail);
+      } };
+      return { ...env, EMAIL, NOTIFICATION_DLQ: { async send(letter) {
         const response = await env.GATE.fetch('https://test.example/dlq-write', { method: 'POST', body: JSON.stringify(letter) });
         if (!response.ok) throw new Error('Injected DLQ write failure');
         await env.NOTIFICATION_DLQ.send(letter);
@@ -132,8 +155,16 @@ async function main(runFixture, emailEnabled = true) {
   let healthy = false;
   let holdBatch, holdProvider, heldEventTime, providerStartedAt;
   let completedBatches = 0;
+  let heldProviderStatus = 403;
   const reportFaults = new Map();
   const recoveryFaults = new Map();
+  const recoveryCalls = [];
+  const confirmationFaults = new Map();
+  const confirmationReports = [];
+  const emailFaults = new Map();
+  const emailCalls = [];
+  const resolveFaults = new Map();
+  const resolutionGates = new Map();
   const dlqFaults = new Set();
   const reportAttempts = [], dlqAttempts = [];
   const gate = async request => {
@@ -148,11 +179,37 @@ async function main(runFixture, emailEnabled = true) {
       }
       return new Response(null, { status: 204 });
     }
-    if (path === '/persist') {
-      const { deliveryId } = await request.json();
+    if (path === '/recovery-admission') {
+      const deliveryId = await request.json();
+      recoveryCalls.push(deliveryId);
       const remaining = recoveryFaults.get(deliveryId) ?? 0;
       if (remaining) recoveryFaults.set(deliveryId, remaining - 1);
       return new Response(null, { status: remaining ? 503 : 204 });
+    }
+    if (path === '/resolve') {
+      const deliveryId = await request.json();
+      const gate = resolutionGates.get(deliveryId);
+      if (gate) {
+        gate.enter();
+        await gate.release;
+      }
+      const remaining = resolveFaults.get(deliveryId) ?? 0;
+      if (remaining) resolveFaults.set(deliveryId, remaining - 1);
+      return new Response(null, { status: remaining ? 503 : 204 });
+    }
+    if (path === '/mark-confirmation') {
+      const identity = await request.json();
+      confirmationReports.push(identity);
+      const remaining = confirmationFaults.get(identity.deliveryId) ?? 0;
+      if (remaining) confirmationFaults.set(identity.deliveryId, remaining - 1);
+      return new Response(null, { status: remaining ? 503 : 204 });
+    }
+    if (path === '/email-send') {
+      const address = await request.json();
+      emailCalls.push(address);
+      const code = emailFaults.get(address);
+      emailFaults.delete(address);
+      return code ? new Response(code, { status: 503 }) : new Response(null, { status: 204 });
     }
     if (path === '/dlq-write') {
       const { deliveryId } = await request.json();
@@ -209,7 +266,7 @@ async function main(runFixture, emailEnabled = true) {
           'final-notifications': { maxBatchTimeout: 0.1, maxRetries: 0 },
           'dead-letters': { maxBatchTimeout: 0.1 },
         },
-        queueProducers: { NOTIFICATION_DLQ: 'dead-letters', NOTIFICATION_OUTCOMES: 'notifications' },
+        queueProducers: { NOTIFICATION_DLQ: 'dead-letters' },
         serviceBindings: {
           NOTIFICATION_DELIVERY: { name: 'monitoring', entrypoint: 'NotificationDelivery' },
           GATE: gate,
@@ -224,7 +281,7 @@ async function main(runFixture, emailEnabled = true) {
             providerStartedAt = performance.now();
             const fail = !!heldEventTime;
             await holdProvider;
-            if (fail) return new Response('sensitive provider response', { status: 403 });
+            if (fail) return new Response(heldProviderStatus === 204 ? null : 'sensitive provider response', { status: heldProviderStatus });
           }
           return new Response(status === 204 ? null : 'sensitive provider response', {
             status, headers: { Location: 'https://redirect.example/secret' },
@@ -690,7 +747,33 @@ async function main(runFixture, emailEnabled = true) {
         assert.equal(submissions.length, beforeRace + 4, 'the late 403 cannot close a newer retry');
       }
 
-      for (const [status, attempts, reason] of [[403, 1, 'provider_rejected'], [429, 10, 'attempts_exhausted']]) {
+      const olderAccepted = job(firstOrigin, 'older-provider-acceptance', 8750);
+      const beforeOlderAcceptance = submissions.length;
+      let releaseAcceptance;
+      holdProvider = new Promise(resolve => { releaseAcceptance = resolve; });
+      heldEventTime = 'Held acceptance';
+      heldProviderStatus = 204;
+      providerStatuses.set(first.url, 429);
+      try {
+        const olderCopy = { ...olderAccepted, event: { ...olderAccepted.event, monitorName: heldEventTime } };
+        controls.set(olderAccepted.deliveryId, [{ attempts: 1 }, { attempts: 2 }]);
+        const pending = sendBatch([olderCopy, olderAccepted]);
+        try {
+          await until(() => submissions.length === beforeOlderAcceptance + 2);
+          await until(async () => (await json(host, path)).destinations[0].latestSubmission.status === 'retrying');
+        } finally {
+          releaseAcceptance();
+        }
+        await pending;
+      } finally {
+        holdProvider = heldEventTime = undefined;
+        heldProviderStatus = 403;
+      }
+      assert.equal((await json(host, path)).destinations[0].latestSubmission.status, 'accepted');
+      assert.ok((await sendBatch([olderAccepted], [{ attempts: 3 }]))[0].ack);
+      assert.equal(submissions.length, beforeOlderAcceptance + 2, 'an older accepted request closes newer retries');
+
+      for (const [status, attempts, reason] of [[403, 1, 'provider_rejected'], [429, 11, 'attempts_exhausted']]) {
         const terminal = job(firstOrigin, 'terminal-report-outage-' + status, 8800 + status);
         const beforeTerminal = submissions.length;
         const beforeReports = reportAttempts.length;
@@ -700,9 +783,20 @@ async function main(runFixture, emailEnabled = true) {
         assert.equal(reportAttempts[beforeReports], terminal.deliveryId);
         assert.notEqual((await json(host, path)).destinations[0].latestSubmission.reason, reason);
         assert.deepEqual(await sendBatch([terminal], [{ attempts: 1 }]), [{ id: terminal.deliveryId, ack: true }]);
-        assert.equal(submissions.length, beforeTerminal + 1, 'terminal failures close submission during a result RPC outage');
+        assert.equal(submissions.length, beforeTerminal + Number(attempts === 1), 'terminal failures close submission during a result RPC outage');
         await until(async () => (await json(host, path)).destinations[0].latestSubmission.reason === reason, 9000);
       }
+
+      const accepted = job(firstOrigin, 'acceptance-pending', 9800);
+      const beforePendingAcceptance = submissions.length;
+      providerStatuses.set(first.url, 204);
+      reportFaults.set(accepted.deliveryId, 1);
+      assert.ok((await sendBatch([accepted], [{ attempts: 1 }]))[0].ack);
+      assert.equal(reportAttempts.filter(id => id === accepted.deliveryId).length, 1);
+      assert.ok((await sendBatch([accepted], [{ attempts: 1 }]))[0].ack);
+      assert.equal(reportAttempts.filter(id => id === accepted.deliveryId).length, 1, 'Settings is still waiting for recovery');
+      assert.equal(submissions.length, beforePendingAcceptance + 1, 'a known acceptance closes duplicate submission before Settings recovers');
+      await until(async () => (await json(host, path)).destinations[0].latestSubmission.status === 'accepted', 9000);
 
       const finalProducer = await mf.getQueueProducer('FINAL_QUEUE', 'monitoring');
       const final = job(firstOrigin, 'final-dlq-outage', 10_000);
@@ -729,7 +823,7 @@ async function main(runFixture, emailEnabled = true) {
       await until(() => deadLetters.length > beforeLetters, 20_000);
       assert.deepEqual(Object.keys(deadLetters.at(-1)).sort(), ['attempts', 'contextId', 'deliveryId', 'destinationId', 'queuedAt', 'reason']);
       assert.equal(deadLetters.at(-1).deliveryId, final.deliveryId);
-      assert.equal(deadLetters.at(-1).attempts, 11);
+      assert.equal(deadLetters.at(-1).attempts, 0, 'an exhausted broker does not spend a provider attempt');
       assert.doesNotMatch(JSON.stringify(deadLetters.at(-1)) + errors.join('\n'), /Retry Monitor|target-secret|sensitive provider response|https:\/\//);
 
       const unavailable = job(firstOrigin, 'final-persistence-outage', 11_000);
@@ -745,26 +839,39 @@ async function main(runFixture, emailEnabled = true) {
       await until(() => deadLetters.some(letter => letter.deliveryId === unavailable.deliveryId), 15_000);
       const diagnostic = deadLetters.find(letter => letter.deliveryId === unavailable.deliveryId);
       assert.deepEqual(Object.keys(diagnostic).sort(), ['attempts', 'contextId', 'deliveryId', 'destinationId', 'queuedAt', 'reason']);
-      assert.equal(diagnostic.attempts, 11);
+      assert.equal(diagnostic.attempts, 0);
+      assert.equal(recoveryCalls.filter(id => id === unavailable.deliveryId).length, 3, 'the last broker delivery survives two transient Recovery RPC failures');
       assert.equal(diagnostic.reason, 'attempts_exhausted');
       await until(async () => {
         const result = (await json(host, path)).destinations[0].latestSubmission;
         return result.reason === 'attempts_exhausted' && result.at !== beforeFallbackResult.at;
       }, 15_000);
       assert.equal(reportAttempts.filter(id => id === unavailable.deliveryId).length, 2);
-      const handoffs = batches.flat().filter(body => body.identity?.deliveryId === unavailable.deliveryId);
-      assert.equal(handoffs.length, 2, 'the sanitized handoff survives its own transient persistence failure');
-      assert.deepEqual(handoffs[0], handoffs[1]);
-      assert.deepEqual(handoffs[0], {
-        identity: { contextId: unavailable.contextId, destinationId: unavailable.destinationId, deliveryId: unavailable.deliveryId },
-        submissionReport: {
-          eventAt: unavailable.event.at, queuedAt: diagnostic.queuedAt, attempt: 11,
-          result: { status: 'failed', reason: 'attempts_exhausted', at: (await json(host, path)).destinations[0].latestSubmission.at },
-        },
-        exhaustion: 'attempts_exhausted',
-      });
       assert.equal(submissions.length, beforeFinal, 'bookkeeping retries cannot call the provider');
       assert.doesNotMatch(JSON.stringify(diagnostic) + errors.join('\n'), /Retry Monitor|target-secret|sensitive provider response|https:\/\//);
+
+      const copies = job(firstOrigin, 'same-broker-ordinal', 10_500);
+      const beforeCopies = submissions.length;
+      providerStatuses.set(first.url, 429);
+      for (let i = 0; i < 11; i++) {
+        const [action] = await sendBatch([copies], [{ attempts: 1 }]);
+        if (i < 9) assert.equal(action.retry?.delaySeconds, 5 * 2 ** i);
+        else assert.equal(action.ack, true);
+      }
+      assert.equal(submissions.length, beforeCopies + 10, 'same-ordinal copies share a ten-submission budget');
+      await until(() => deadLetters.some(letter => letter.deliveryId === copies.deliveryId && letter.attempts === 10));
+
+      const unavailableGate = job(firstOrigin, 'eligibility-does-not-spend-a-submission', 10_600);
+      resolveFaults.set(unavailableGate.deliveryId, 8);
+      const beforeUnavailableGate = submissions.length;
+      for (let i = 1; i <= 8; i++) {
+        const [action] = await sendBatch([unavailableGate], [{ attempts: i }]);
+        assert.equal(action.retry?.delaySeconds, 5 * 2 ** (i - 1));
+      }
+      assert.equal(submissions.length, beforeUnavailableGate);
+      const [firstSubmission] = await sendBatch([unavailableGate], [{ attempts: 9 }]);
+      assert.equal(firstSubmission.retry?.delaySeconds, 5, 'the provider budget starts with the first actual submission');
+      assert.equal(submissions.length, beforeUnavailableGate + 1);
 
       const beforeRestart = submissions.length;
       options.workers[0].script += '\n// Restart monitoring after acceptance';
@@ -772,11 +879,47 @@ async function main(runFixture, emailEnabled = true) {
       await mf.setOptions(convertV4MiniflareOptions(options));
       producer = await mf.getQueueProducer('NOTIFICATION_QUEUE', 'monitoring');
       const beforeReplay = actions.length;
-      await producer.sendBatch([older, newer, successfulJob].map(body => ({ body })));
-      await until(() => actions.length === beforeReplay + 3);
+      await producer.sendBatch([older, newer, successfulJob, accepted, copies, olderAccepted].map(body => ({ body })));
+      await until(() => actions.length === beforeReplay + 6);
       assert.ok(actions.slice(beforeReplay).every(action => action.ack));
       assert.equal(submissions.length, beforeRestart, 'completed identities survive restart, including out-of-order completion');
       assert.equal((await json(host, path)).destinations[0].latestSubmission.reason, 'attempts_exhausted');
+      const aging = job(secondOrigin, 'expires-at-final-gate', 12_000);
+      const beforeAging = submissions.length;
+      const closeToExpiry = Date.now() - 3_600_000 + 1000;
+      let releaseAging;
+      let agingEntered;
+      const enteredAging = new Promise(resolve => { agingEntered = resolve; });
+      resolutionGates.set(aging.deliveryId, { enter: agingEntered, release: new Promise(resolve => { releaseAging = resolve; }) });
+      const agingDelivery = sendBatch([aging], [{ timestamp: closeToExpiry }]);
+      await enteredAging;
+      try {
+        await until(() => Date.now() >= closeToExpiry + 3_600_000);
+      } finally {
+        releaseAging();
+        resolutionGates.delete(aging.deliveryId);
+      }
+      assert.ok((await agingDelivery)[0].ack);
+      assert.equal(submissions.length, beforeAging, 'eligibility resolution cannot let a job cross the deadline before submitting');
+      await until(() => deadLetters.some(letter => letter.deliveryId === aging.deliveryId && letter.reason === 'expired'));
+
+      const revoked = job(firstOrigin, 'revoked-at-final-gate', 12_000);
+      const beforeRevoked = submissions.length;
+      let enter, release;
+      const entered = new Promise(resolve => { enter = resolve; });
+      resolutionGates.set(revoked.deliveryId, { enter, release: new Promise(resolve => { release = resolve; }) });
+      const waiting = sendBatch([revoked]);
+      await entered;
+      try {
+        await json(host, monitorPath, 'PATCH', { destinationIds: [second.id] });
+        await json(host, monitorPath, 'PATCH', { destinationIds: [first.id, second.id] });
+      } finally {
+        release();
+        resolutionGates.delete(revoked.deliveryId);
+      }
+      assert.ok((await waiting)[0].ack);
+      assert.equal(submissions.length, beforeRevoked, 'the final eligibility read sees deselection and re-selection');
+
       console.log('PASS real Queue delivery: independent ack/retry, deadline and limits, cancellation, submission ordering, durable result recovery and safe DLQ recovery');
     }
     console.log('PASS real Queue delivery: opt-in, fan-out, safe content, redirects, deadline, tenant isolation, paused configuration, and cancellation before and between attempts');
@@ -941,6 +1084,54 @@ async function main(runFixture, emailEnabled = true) {
       }, false);
       await setClock(consentHost, 0);
       console.log('PASS email confirmation: optional setup, hosted roles, consent, cooldown, expiry, cancellation and pause');
+    }
+
+    {
+      const host = 'confirmation-recovery.example';
+      const address = 'retry-confirmation@example.net';
+      emailFaults.set(address, 'E_RATE_LIMIT_EXCEEDED');
+      let release;
+      holdBatch = new Promise(resolve => { release = resolve; });
+      const before = completedBatches;
+      const beforeMail = (await capturedMail()).length;
+      let job;
+      try {
+        await json(host, path, 'POST', { channel: 'email', address }, 201);
+        await until(() => batches.length > before);
+        [job] = batches.at(-1);
+        confirmationFaults.set(job.deliveryId, 1);
+      } finally {
+        release();
+        holdBatch = undefined;
+      }
+      await until(() => completedBatches > before);
+      assert.deepEqual(actions.at(-1).retry, { delaySeconds: 5 });
+      assert.equal((await capturedMail()).length, beforeMail);
+      assert.equal((await json(host, path)).destinations[0].latestSubmission.status, 'retrying');
+      await until(() => completedBatches > before + 1, 9000);
+      assert.equal((await capturedMail()).length, beforeMail + 1, 'a real broker retry submits the confirmation');
+      assert.equal(confirmationReports.filter(report => report.deliveryId === job.deliveryId).length, 1);
+      await redeliver(producer, job);
+      assert.equal((await capturedMail()).length, beforeMail + 1, 'known acceptance closes confirmation while marking is pending');
+      assert.equal(confirmationReports.filter(report => report.deliveryId === job.deliveryId).length, 1);
+      await until(() => confirmationReports.filter(report => report.deliveryId === job.deliveryId).length === 2, 9000);
+      const captured = (await capturedMail()).find(message => message.to.includes(address));
+      const link = await confirmationLink(captured, address);
+      assert.equal((await json(host, path)).destinations[0].confirmed, false);
+      const recoveryPayload = JSON.stringify(confirmationReports.filter(report => report.deliveryId === job.deliveryId));
+      assert.doesNotMatch(recoveryPayload + errors.join('\n'), /retry-confirmation@example\.net|sensitive provider response/);
+      assert.ok(!(recoveryPayload + errors.join('\n')).includes(link.hash.slice(1)));
+      assert.equal(emailCalls.filter(to => to === address).length, 2);
+      const rejected = 'permanent-confirmation@example.net';
+      const rejectedBatch = completedBatches;
+      emailFaults.set(rejected, 'E_RECIPIENT_SUPPRESSED');
+      await json(host, path, 'POST', { channel: 'email', address: rejected }, 201);
+      await until(() => completedBatches > rejectedBatch);
+      assert.equal(actions.at(-1).ack, true);
+      assert.equal(emailCalls.filter(to => to === rejected).length, 1);
+      assert.equal((await capturedMail()).length, beforeMail + 1);
+      assert.equal((await json(host, path)).destinations.find(destination => destination.address === rejected).latestSubmission.reason, 'provider_rejected');
+      console.log('PASS confirmation transport recovery: provider backoff, one acceptance through mark failure, and safe recovery');
     }
 
     const host = 'personal.example';

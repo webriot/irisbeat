@@ -32,7 +32,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     const deliveryPath = join(source, 'wrangler.delivery.jsonc');
     experimental_patchConfig(monitoringPath, { queues: { producers: [{ queue: queueName }] } }, false);
     experimental_patchConfig(deliveryPath, {
-      queues: { consumers: [{ queue: queueName }], producers: [{ queue: dlqName }, { queue: queueName }] },
+      queues: { consumers: [{ queue: queueName }], producers: [{ queue: dlqName }] },
       services: [{ service: monitoringName }],
     }, false);
     const producerConfig = unstable_readConfig({ config: monitoringPath });
@@ -47,11 +47,9 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     }
     const [queueProducer] = producerConfig.queues.producers;
     const [queueConsumer] = consumerConfig.queues.consumers;
-    const [dlqProducer, outcomeProducer] = consumerConfig.queues.producers;
+    const [dlqProducer] = consumerConfig.queues.producers;
     const [deliveryService] = consumerConfig.services;
     const [recovery] = consumerConfig.durable_objects.bindings;
-    assert.equal(outcomeProducer.binding, 'NOTIFICATION_OUTCOMES');
-    assert.equal(outcomeProducer.queue, queueConsumer.queue);
     assert.equal(queueConsumer.dead_letter_queue, undefined, 'source jobs must not be transferred with their full bodies');
     assert.ok(consumerConfig.migrations.some(migration => migration.new_sqlite_classes?.includes(recovery.class_name)));
     const delivery = (await build({
@@ -86,9 +84,11 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     let outcome = 503;
     const alerts = [], targets = [];
     const secret = randomBytes(32).toString('hex');
-    mf = new Miniflare(convertV4MiniflareOptions({ workers: [
+    mf = new Miniflare(convertV4MiniflareOptions({ unsafeLocalExplorer: true, workers: [
       { name: monitoringName, modules: true, script, compatibilityDate: '2026-11-13',
-        bindings: { INSTALLATION_SECRET: secret }, durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } },
+        bindings: { INSTALLATION_SECRET: secret, NOTIFICATION_PUBLIC_ORIGIN: 'https://personal.example' },
+        serviceBindings: { NOTIFICATION_EMAIL: { name: deliveryName, entrypoint: 'NotificationEmailCapability' } },
+        durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } },
         queueProducers: { [queueProducer.binding]: queueProducer.queue },
         outboundService: request => {
           const host = new URL(request.url).hostname;
@@ -97,13 +97,12 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
         },
       },
       { name: deliveryName, modules: true, script: delivery, compatibilityDate: '2026-11-18',
+        email: { send_email: [{ name: 'EMAIL' }] }, bindings: { EMAIL_FROM: 'alerts@sender.example' },
         durableObjects: { [recovery.name]: { className: recovery.class_name, useSQLite: true } },
         queueConsumers: { [queueConsumer.queue]: {
           maxBatchTimeout: 0.1, maxRetries: queueConsumer.max_retries,
         } },
-        queueProducers: {
-          [dlqProducer.binding]: dlqProducer.queue, [outcomeProducer.binding]: outcomeProducer.queue,
-        },
+        queueProducers: { [dlqProducer.binding]: dlqProducer.queue },
         serviceBindings: { [deliveryService.binding]: { name: deliveryService.service, entrypoint: deliveryService.entrypoint } },
         outboundService: async request => {
           assert.equal(request.url, 'https://webhook.example/controlled');
@@ -188,7 +187,30 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     await request(paths[0], 'DELETE');
     assert.ok((await status()).incidents.some(incident => incident.monitorId === monitors[0].id), 'deletion retains operator Incidents');
     assert.ok(!(await status('/api/status')).incidents.some(incident => incident.monitorId === monitors[0].id));
-    console.log('PASS exact-source personal workerd smoke: named producer and consumer dry runs, matched Queue and service binding, secret guards, named anonymous ledger/source, HTTP/TCP/Heartbeat, Maintenance/history, opening/recovery webhooks, publication and retained Incidents; no live deployment');
+    const inbox = 'ops@example.net';
+    assert.equal((await request('/api/operator/destinations', 'POST', { channel: 'email', address: inbox })).status, 201);
+    const deadline = Date.now() + 5000;
+    const capture = '/cdn-cgi/local/explorer/api/local/email/sending?worker=' + deliveryName;
+    const capturedMail = async suffix => {
+      const response = await mf.dispatchFetch(new URL(capture + suffix, await mf.ready));
+      assert.equal(response.status, 200);
+      return (await response.json()).result;
+    };
+    let mail;
+    while (!(mail = (await capturedMail('')).find(message => message.to.includes(inbox)))) {
+      assert.ok(Date.now() < deadline, 'timed out waiting for packaged confirmation transport');
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    const confirmation = await capturedMail('&email_id=' + encodeURIComponent(mail.messageId));
+    const link = new URL(confirmation.text.match(/https:\/\/[^\s]+/)[0]);
+    assert.equal(link.pathname, '/notifications/confirm');
+    const accepted = await mf.dispatchFetch('https://personal.example/notifications/confirm', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'x-acceptance-time': String(now) },
+      body: new URLSearchParams({ token: link.hash.slice(1) }),
+    });
+    assert.equal(accepted.status, 200);
+    assert.ok((await status()).destinations.find(destination => destination.address === inbox)?.confirmed);
+    console.log('PASS exact-source personal workerd smoke: named producer and consumer dry runs, matched Queue and service binding, secret guards, named anonymous ledger/source, HTTP/TCP/Heartbeat, Maintenance/history, opening/recovery webhooks, email confirmation, publication and retained Incidents; no live deployment');
   } finally {
     if (mf) await mf.dispose();
     rmSync(temporary, { recursive: true, force: true });
