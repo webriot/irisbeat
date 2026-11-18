@@ -25,6 +25,50 @@ async function create(extra = {}) {
 async function tick(offset: number) { await worker.scheduled(createScheduledController({ scheduledTime: start + offset, cron: '* * * * *' }), env); }
 const maintenance = (id: string, endsAt?: number) => mutate('/api/operator/monitors/' + id + '/maintenance', endsAt === undefined ? 'DELETE' : 'PUT', endsAt === undefined ? undefined : { endsAt });
 afterEach(async () => { vi.restoreAllMocks(); network.resetHandlers(); await reset(); });
+it('queues one expiration for a selected private Monitor after restart and delayed dispatch', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+  const monitor = await create({ kind: 'heartbeat', url: undefined, published: false });
+  const notifications = await captureNotifications();
+  await mutate('/api/operator/webhook', 'PUT', { url: 'https://alerts.example/hook' });
+  await maintenance(monitor.id, start + 25_000);
+  await selectWebhooks(mutate);
+  expect(await notifications.jobs()).toEqual([]);
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  clock.mockReturnValue(start + 60_000);
+  await tick(60_000);
+  expect(await notifications.jobs()).toMatchObject([{
+    monitorId: monitor.id,
+    event: { kind: 'maintenance.ended', reason: 'expired', at: start + 25_000, startedAt: start, endsAt: start + 25_000 },
+  }]);
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  await tick(60_000);
+  await maintenance(monitor.id);
+  expect(await notifications.jobs()).toHaveLength(1);
+  expect((await operator()).monitor?.maintenance).toBeNull();
+  expect((await status()).monitors).toEqual([]);
+});
+
+it('preserves a committed Maintenance start when Queue handoff fails without replaying it', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+  const monitor = await create({ kind: 'heartbeat', url: undefined });
+  await mutate('/api/operator/webhook', 'PUT', { url: 'https://alerts.example/private-token' });
+  await selectWebhooks(mutate);
+  await captureNotifications(true);
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const endsAt = start + 25_000;
+  expect((await maintenance(monitor.id, endsAt)).status).toBe(200);
+  expect(log).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/^\{"event":"notification_enqueue_failed","eventId":"[a-f0-9-]+"\}$/));
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  clock.mockReturnValue(start + 10_000);
+  const notifications = await captureNotifications();
+  const unchanged = await maintenance(monitor.id, endsAt);
+  expect((await unchanged.json<Status>()).monitor?.maintenance).toEqual({ startedAt: start, endsAt });
+  expect(await notifications.jobs()).toEqual([]);
+  clock.mockReturnValue(start + 60_000);
+  await tick(60_000);
+  expect((await notifications.jobs()).map(({ event }) => event.kind)).toEqual(['maintenance.ended']);
+});
+
 it('authenticates and validates immediate per-Monitor windows, replaces, persists and ends them', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
   const monitor = await create();

@@ -80,12 +80,13 @@ destinations through `destinationIds`. Replacing a webhook address clears its ol
 selections. The editor snapshot includes saved addresses and selections. Public
 and hosted-reader snapshots omit both.
 
-HTTP, TCP and Heartbeat enqueue an Incident opening or recovery only for the
-destinations selected when the event commits, including for private Monitors.
+HTTP, TCP and Heartbeat enqueue Incident openings and recoveries and Maintenance
+starts, end-time changes and endings for destinations selected when the event
+commits, including for private Monitors.
 A separate delivery Worker rechecks eligibility before sending a bounded,
 Slack-compatible webhook POST with the original event time. Discord webhook
 paths normalize to `/slack`. Queue handoff errors record
-`notification_enqueue_failed` and preserve the Incident. The delivery Worker logs
+`notification_enqueue_failed` and preserve the committed change. The delivery Worker logs
 sanitized `webhook_submission_failed` events. See [installation](docs/install.md)
 and [hosted integration](docs/hosted-contract.md#incident-notifications).
 

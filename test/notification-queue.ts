@@ -10,7 +10,7 @@ export async function captureNotifications(unavailable = false) {
   return {
     jobs: async () => (await exports.default.fetch(queue)).json<NotificationJob[]>(),
     async summaries() {
-      return (await this.jobs()).map(({ event }) =>
+      return (await this.jobs()).filter(({ event }) => event.kind.startsWith("incident.")).map(({ event }) =>
         event.monitorName.replace(/\s+/g, " ") + ": Incident " + event.kind.split(".")[1]);
     },
   };
