@@ -53,11 +53,32 @@ function renderWebhook({ event }: NotificationJob) {
     .replace(/[\p{Cc}\p{Bidi_Control}]/gu, "")
     .replaceAll("`", "ˋ").replaceAll("@", "@\u200b")
     .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-  const summary = event.kind === "incident.opened" ? "Incident opened" : "Incident recovered";
-  const at = new Date(event.at).toISOString();
-  const opened = event.kind === "incident.recovered"
-    ? "\nOpened " + new Date(event.openedAt).toISOString() : "";
-  return JSON.stringify({ text: "`" + name + "` · " + summary + "\n" + at + opened });
+  const iso = (at: number) => new Date(at).toISOString();
+  let summary: string;
+  let details = "";
+  switch (event.kind) {
+    case "incident.opened":
+      summary = "Incident opened";
+      break;
+    case "incident.recovered":
+      summary = "Incident recovered";
+      details = "\nOpened " + iso(event.openedAt);
+      break;
+    case "maintenance.started":
+      summary = "Maintenance started";
+      details = "\nScheduled end " + iso(event.endsAt);
+      break;
+    case "maintenance.updated":
+      summary = "Maintenance end time changed";
+      details = "\nPrevious end " + iso(event.previousEndsAt) + "\nScheduled end " + iso(event.endsAt);
+      break;
+    case "maintenance.ended":
+      summary = event.reason === "early" ? "Maintenance ended early" : "Maintenance expired";
+      details = "\nStarted " + iso(event.startedAt);
+      if (event.reason === "early") details += "\nScheduled end " + iso(event.endsAt);
+      break;
+  }
+  return JSON.stringify({ text: "`" + name + "` · " + summary + "\n" + iso(event.at) + details });
 }
 
 export default {

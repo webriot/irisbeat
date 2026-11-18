@@ -96,8 +96,8 @@ NODE
 
 Open that file locally and save the `INSTALLATION_SECRET` value in your password
 manager; you need it to sign in and configure producers. Keep it out of terminal
-recordings, source control and shell command arguments. Deploy the monitoring
-Worker and secret together. After that succeeds, deploy the consumer so its
+recordings, source control and shell command arguments. For a fresh installation,
+deploy the monitoring Worker and secret together. After that succeeds, deploy the consumer so its
 service binding can resolve the monitoring Worker.
 
 ```sh
@@ -145,8 +145,9 @@ start unselected on every Monitor. Removing a webhook or replacing its address
 clears its selections. Slack-compatible messages include the Monitor
 name, the transition and its original UTC time. Webhook-only installations need
 no email configuration.
-Declare/replace/end per-Monitor Maintenance in its ledger. Checks continue; detection
-and alerts are suppressed, Incidents retained. History shows 90 UTC calendar days;
+Declare, replace or end per-Monitor Maintenance in its ledger. Checks continue,
+Incident detection and alerts are suppressed, and Incidents are retained. Selected
+webhooks receive Maintenance notices. History shows 90 UTC calendar days;
 Maintenance is excluded from availability. Delete stops checking but retains
 operator Incidents. Detailed bounds and semantics are in README and the API handoffs.
 
@@ -161,6 +162,21 @@ history, and deploy the reviewed new source. Back up operational configuration v
 authenticated API in private storage. This is not a database/Incident backup or
 restore tool. Code rollback does not roll back Durable Object data; review migration
 compatibility before rollback. Never delete/recreate a production namespace to upgrade.
+
+### Upgrade and roll back notification Workers
+
+On an existing Queue installation, keep the Worker names, Queue and service
+binding. Deploy the Maintenance-aware delivery Worker first, then deploy the
+monitoring Worker that produces Maintenance jobs. The new consumer handles
+Incident jobs from the previous producer, so existing Monitor selections can
+stay in place. The previous consumer renders Maintenance jobs as Incident
+recoveries.
+
+To roll back, restore the previous monitoring Worker first so it stops
+producing Maintenance jobs. Keep the Maintenance-aware consumer running until
+all queued and in-flight Maintenance jobs have been handled. Restore the
+previous consumer only after that drain is confirmed. Keep the Maintenance-aware
+consumer in place if any Maintenance jobs could still be delivered or replayed.
 
 ## Optional email confirmation
 

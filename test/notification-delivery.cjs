@@ -42,8 +42,13 @@ async function main(runFixture, emailEnabled = true) {
       },
       contexts: env => [env.testContext],
     });
+    const systemNow = Date.now;
+    let wallTime;
+    Date.now = () => wallTime ?? systemNow();
     export default {
       fetch(request, env) {
+        const wall = request.headers.get('x-test-wall-time');
+        wallTime = wall === null ? undefined : Number(wall);
         const url = new URL(request.url);
         const app = url.hostname === 'personal.example' ? personal : hosted;
         if (url.pathname === '/test-clock') {
@@ -148,8 +153,13 @@ async function main(runFixture, emailEnabled = true) {
   let at = Date.now();
   const path = '/api/operator/destinations';
   const monitors = '/api/operator/monitors';
+  let wallTime;
   const request = (host, endpoint, method = 'GET', value, headers = {}) => mf.dispatchFetch('https://' + host + endpoint, {
-    method, headers: { authorization: 'Bearer test-installation-secret', 'content-type': 'application/json', ...headers },
+    method, headers: {
+      authorization: 'Bearer test-installation-secret', 'content-type': 'application/json',
+      ...(wallTime === undefined ? {} : { 'x-test-wall-time': String(wallTime) }),
+      ...headers,
+    },
     ...(value === undefined ? {} : { body: JSON.stringify(value) }),
   });
   async function json(host, endpoint, method, value, expected = 200, headers) {
@@ -171,12 +181,12 @@ async function main(runFixture, emailEnabled = true) {
     }
     return result;
   }
-  async function holdTransition(host, change) {
+  async function holdTransition(host, change, produce = () => tick(host)) {
     const priorBatches = batches.length;
     let release;
     holdBatch = new Promise(resolve => { release = resolve; });
     try {
-      await tick(host);
+      await produce();
       await until(() => batches.length > priorBatches);
       await change();
     } finally {
@@ -567,8 +577,119 @@ async function main(runFixture, emailEnabled = true) {
         assert.equal(webhook.status, 201);
         assert.ok(!('emailConfigured' in await webhook.json()));
       }, false);
+      await setClock(consentHost, 0);
       console.log('PASS email confirmation: optional setup, hosted roles, consent, cooldown, expiry, cancellation and pause');
     }
+
+    const host = 'personal.example';
+    providerStatus = 204;
+    const { monitors: withMaintenance } = await json(host, monitors, 'POST', {
+      name: 'Private `@here <!everyone>` [link](https://event.example)', url: 'https://internal.example:8443/target-secret',
+      published: false,
+    }, 201);
+    const monitor = withMaintenance.at(-1);
+    const monitorPath = monitors + '/' + monitor.id;
+    const maintenance = monitorPath + '/maintenance';
+    const ids = (await json(host, path)).destinations.filter(destination => destination.channel === 'webhook').map(destination => destination.id);
+    await json(host, monitorPath, 'PATCH', { destinationIds: ids });
+    const beforeMaintenance = submissions.length;
+    const endsAt = at + 25_000;
+    const started = (await json(host, maintenance, 'PUT', { endsAt })).monitors.find(item => item.id === monitor.id);
+    await until(() => submissions.length === beforeMaintenance + 2 && completedBatches === batches.length);
+    for (const { payload } of submissions.slice(beforeMaintenance)) {
+      assert.match(payload.text, /Maintenance started/);
+      assert.ok(payload.text.includes(new Date(started.maintenance.startedAt).toISOString()));
+      assert.ok(payload.text.includes('Scheduled end ' + new Date(endsAt).toISOString()));
+      assert.doesNotMatch(payload.text, /@here|<!everyone>|internal\.example|8443|target-secret|hooks\.example|\/token/);
+      assert.equal(payload.text.split('`').length, 3, 'only the renderer delimits inline code');
+    }
+    await json(host, maintenance, 'PUT', { endsAt });
+    const revisedEnd = endsAt + 60_000;
+    await json(host, maintenance, 'PUT', { endsAt: revisedEnd });
+    await until(() => submissions.length === beforeMaintenance + 4 && completedBatches === batches.length);
+    assert.match(submissions.at(-1).payload.text, /Maintenance end time changed/);
+    assert.ok(submissions.at(-1).payload.text.includes('Previous end ' + new Date(endsAt).toISOString()));
+    assert.ok(submissions.at(-1).payload.text.includes('Scheduled end ' + new Date(revisedEnd).toISOString()));
+    await holdTransition(host, async () => {
+      await json(host, monitorPath, 'PATCH', { destinationIds: [ids[1]] });
+      await json(host, monitorPath, 'PATCH', { destinationIds: ids });
+      await json(host, maintenance, 'DELETE');
+    }, () => json(host, maintenance, 'DELETE'));
+    assert.equal(submissions.length, beforeMaintenance + 5, 'only the still-selected destination submits the early end');
+    assert.match(submissions.at(-1).payload.text, /Maintenance ended early/);
+    const [ended] = batches.at(-1);
+    assert.ok(submissions.at(-1).payload.text.includes(new Date(ended.event.at).toISOString()));
+    await json(host, maintenance, 'PUT', { endsAt });
+    await until(() => submissions.length === beforeMaintenance + 7 && completedBatches === batches.length);
+    at = endsAt + 10_000;
+    healthy = true;
+    await tick(host);
+    await until(() => submissions.length === beforeMaintenance + 9 && completedBatches === batches.length);
+    assert.match(submissions.at(-1).payload.text, /Maintenance expired/);
+    assert.ok(submissions.at(-1).payload.text.includes(new Date(endsAt).toISOString()));
+    assert.deepEqual(batches.flat().filter(job => job.monitorId === monitor.id).map(job => job.event.kind), [
+      'maintenance.started', 'maintenance.started', 'maintenance.updated', 'maintenance.updated', 'maintenance.ended',
+      'maintenance.ended', 'maintenance.started', 'maintenance.started', 'maintenance.ended', 'maintenance.ended',
+    ]);
+    wallTime = Date.now();
+    const { monitors: withWatchdog } = await json(host, monitors, 'POST', {
+      name: 'Delayed Watchdog', kind: 'heartbeat', published: false,
+    }, 201);
+    const watchdog = withWatchdog.at(-1);
+    const watchdogPath = monitors + '/' + watchdog.id;
+    await json(host, watchdogPath, 'PATCH', { destinationIds: [ids[0]] });
+    const silenceAt = wallTime + 180_000;
+    const watchdogEnd = wallTime + 185_000;
+    const watchdogBatches = completedBatches;
+    await json(host, watchdogPath + '/maintenance', 'PUT', { endsAt: watchdogEnd });
+    await until(() => completedBatches > watchdogBatches);
+    const beforeExpiry = submissions.length;
+    wallTime += 190_000;
+    at = silenceAt;
+    await tick(host);
+    const delayed = await json(host, '/api/operator');
+    assert.deepEqual(delayed.monitors.find(item => item.id === watchdog.id).lastResult, {
+      at: silenceAt, outcome: 'maintenance',
+    });
+    assert.equal(delayed.monitors.find(item => item.id === watchdog.id).maintenance, null);
+    assert.ok(!delayed.incidents.some(incident => incident.monitorId === watchdog.id));
+    at = silenceAt;
+    await tick(host);
+    await until(() => completedBatches > watchdogBatches + 1 && completedBatches === batches.length);
+    assert.deepEqual(batches.flat().filter(job => job.monitorId === watchdog.id).map(job => [job.event.kind, job.event.at]), [
+      ['maintenance.started', silenceAt - 180_000], ['maintenance.ended', watchdogEnd],
+    ]);
+    assert.equal(submissions.length, beforeExpiry + 1);
+    assert.match(submissions.at(-1).payload.text, /Maintenance expired/);
+    assert.ok(submissions.at(-1).payload.text.includes(new Date(watchdogEnd).toISOString()));
+    at = watchdogEnd;
+    await tick(host);
+    await until(() => submissions.length === beforeExpiry + 2 && completedBatches === batches.length);
+    assert.match(submissions.at(-1).payload.text, /Incident opened/);
+    assert.equal((await json(host, '/api/operator')).incidents.find(incident => incident.monitorId === watchdog.id).openedAt, watchdogEnd);
+
+    const activeHost = 'active-maintenance.example';
+    const { destinations: activeDestinations } = await json(activeHost, path, 'POST', { url: 'https://hooks.example/active' }, 201);
+    const { monitors: [activeWatchdog] } = await json(activeHost, monitors, 'POST', {
+      name: 'Active Maintenance Watchdog', kind: 'heartbeat', published: false,
+    }, 201);
+    const activePath = monitors + '/' + activeWatchdog.id;
+    await json(activeHost, activePath, 'PATCH', { destinationIds: [activeDestinations[0].id] });
+    const activeSilence = wallTime + 180_000;
+    wallTime = activeSilence + 5_000;
+    const activeEnd = activeSilence + 65_000;
+    await json(activeHost, activePath + '/maintenance', 'PUT', { endsAt: activeEnd });
+    await until(() => submissions.at(-1)?.url === 'https://hooks.example/active' && completedBatches === batches.length);
+    at = activeSilence;
+    wallTime = activeSilence + 10_000;
+    await tick(activeHost);
+    const active = await json(activeHost, '/api/operator');
+    assert.deepEqual(active.monitors[0].lastResult, { at: activeSilence, outcome: 'maintenance' });
+    assert.equal(active.monitors[0].maintenance.endsAt, activeEnd);
+    assert.deepEqual(active.incidents, []);
+    assert.deepEqual(batches.flat().filter(job => job.monitorId === activeWatchdog.id).map(job => job.event.kind), ['maintenance.started']);
+    console.log('PASS delayed Watchdog silence: Maintenance exclusion, one expiry and normal detection at the window end');
+    console.log('PASS Maintenance Queue delivery: private fan-out, safe content, no-op, update, early end, selection cancellation and natural expiry');
   } finally {
     await mf.dispose();
   }

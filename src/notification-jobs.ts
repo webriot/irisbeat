@@ -31,19 +31,33 @@ export type NotificationSelection = {
   generation: string;
 };
 
+type EventIdentity = {
+  id: string;
+  at: number;
+  monitorName: string;
+};
+
+export type MaintenanceNotificationEvent = EventIdentity & {
+  startedAt: number;
+  endsAt: number;
+} & (
+  | { kind: "maintenance.started" }
+  | { kind: "maintenance.updated"; previousEndsAt: number }
+  | { kind: "maintenance.ended"; reason: "early" | "expired" }
+);
+
+export type NotificationEvent = MaintenanceNotificationEvent | (EventIdentity & {
+  kind: "incident.opened" | "incident.recovered";
+  incidentId: string;
+  openedAt: number;
+});
+
 export type NotificationJob = NotificationSelection & {
   contextId: string;
   monitorId: string;
   pauseGeneration: number;
   deliveryId: string;
-  event: {
-    id: string;
-    kind: "incident.opened" | "incident.recovered";
-    at: number;
-    incidentId: string;
-    openedAt: number;
-    monitorName: string;
-  };
+  event: NotificationEvent;
 };
 
 
