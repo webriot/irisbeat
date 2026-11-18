@@ -179,11 +179,11 @@ previous consumer only after that drain is confirmed. Keep the Maintenance-aware
 consumer in place if any Maintenance jobs could still be delivered or replayed.
 
 From a Maintenance-aware Queue deployment, deploy the email-alert monitoring
-Worker before its consumer so the trusted `resolveAlert` RPC is available. Open
-Operator once as an editor with email configured if upgrading from the
-confirmation-only build. The editor snapshot provisions withdrawal credentials
-for previously confirmed inboxes and preserves their selections. The consumer
-requires those credentials before sending an alert.
+Worker before its consumer so the trusted `resolveAlert` RPC is available. When
+upgrading from the confirmation-only build, existing inboxes retain consent and
+Monitor selections. The engine provisions withdrawal credentials from
+`NOTIFICATION_PUBLIC_ORIGIN` for self-hosted alerts and from the trusted
+[context origin](hosted-contract.md#trusted-adapter) for hosted alerts.
 
 ## Optional email confirmation
 

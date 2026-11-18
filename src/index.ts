@@ -16,7 +16,7 @@ export interface EngineEnv {
   NOTIFICATION_QUEUE?: Pick<Queue<NotificationQueueJob>, "sendBatch">;
 }
 type PausePolicy = { paused: boolean; policyRevision: number } | { paused?: undefined; policyRevision?: undefined };
-export type ScheduledContext = { id: string } & PausePolicy;
+export type ScheduledContext = { id: string; notificationOrigin?: string } & PausePolicy;
 function validPolicy(value: { paused?: unknown; policyRevision?: unknown }) {
   return value.paused === undefined ? value.policyRevision === undefined
     : typeof value.paused === "boolean" && typeof value.policyRevision === "number" &&
@@ -25,7 +25,6 @@ function validPolicy(value: { paused?: unknown; policyRevision?: unknown }) {
 export type ResolvedContext = ScheduledContext & {
   permission: "editor" | "reader" | null;
   monitorLimit: number;
-  notificationOrigin?: string;
 };
 export interface HostedAdapter<E extends EngineEnv = EngineEnv> {
   contractVersion: string;
@@ -821,7 +820,15 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const destination = state.destinations?.find(candidate => candidate.id === job.destinationId);
     if (destination?.channel === "webhook") return { channel: "webhook", url: destination.url };
     if (destination?.channel !== "email" || !destination.confirmed) return null;
-    const withdrawal = state.emailWithdrawals?.[destination.id];
+    let withdrawal = state.emailWithdrawals?.[destination.id];
+    if (!withdrawal && this.ctx.id.equals(this.env.MONITORING.idFromName("personal"))) {
+      const origin = notificationOrigin(this.env.NOTIFICATION_PUBLIC_ORIGIN);
+      if (origin) {
+        withdrawal = { token: crypto.randomUUID(), origin };
+        (state.emailWithdrawals ??= {})[destination.id] = withdrawal;
+        this.ctx.storage.kv.put("context", state);
+      }
+    }
     if (!withdrawal) return null;
     return {
       channel: "email", address: destination.address,
@@ -915,19 +922,20 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     }
   }
 
-  status(operator = false, secrets = operator, emailOrigin?: string) {
-    const state = this.read();
-    if (secrets && emailOrigin) {
-      // The confirmation-only build discarded the origin after consent.
-      const missing = state.destinations?.filter(destination =>
-        destination.channel === "email" && destination.confirmed && !state.emailWithdrawals?.[destination.id]);
-      if (missing?.length) {
-        const withdrawals = state.emailWithdrawals ??= {};
-        for (const { id } of missing) withdrawals[id] = { token: crypto.randomUUID(), origin: emailOrigin };
-        this.ctx.storage.kv.put("context", state);
-      }
-    }
-    return this.project(state, operator, secrets, Date.now());
+  provisionEmailWithdrawals(origin: string) {
+    // Confirmation-only builds discarded the invitation origin after consent.
+    const state = this.ctx.storage.kv.get<StoredContext | LegacyContext>("context");
+    if (!state || !("monitors" in state)) return;
+    const missing = state.destinations?.filter(destination =>
+      destination.channel === "email" && destination.confirmed && !state.emailWithdrawals?.[destination.id]);
+    if (!missing?.length) return;
+    const withdrawals = state.emailWithdrawals ??= {};
+    for (const { id } of missing) withdrawals[id] = { token: crypto.randomUUID(), origin };
+    this.ctx.storage.kv.put("context", state);
+  }
+
+  status(operator = false, secrets = operator) {
+    return this.project(this.read(), operator, secrets, Date.now());
   }
 
   private project(state: StoredContext, operator: boolean, secrets: boolean, at: number) {
@@ -1014,12 +1022,15 @@ function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E
       const context = typeof value === "string" ? { id: value } : value;
       if (!context || typeof context.id !== "string" || !context.id ||
           !validPolicy(context)) throw new Error("Invalid hosted context");
+      const origin = notificationOrigin(context.notificationOrigin);
       const prior = unique.get(context.id);
-      if (prior && (prior.paused !== context.paused || prior.policyRevision !== context.policyRevision)) throw new Error("Conflicting hosted context");
-      unique.set(context.id, context);
+      if (prior && (prior.paused !== context.paused || prior.policyRevision !== context.policyRevision ||
+          prior.notificationOrigin !== origin)) throw new Error("Conflicting hosted context");
+      unique.set(context.id, { ...context, notificationOrigin: origin });
     }
     await Promise.all([...unique.values()].map(async (policy) => {
       const context = env.MONITORING.getByName(policy.id);
+      if (policy.notificationOrigin) await context.provisionEmailWithdrawals(policy.notificationOrigin);
       if (policy.paused !== undefined) await context.setPaused(policy.paused, policy.policyRevision);
       await context.check(controller.scheduledTime);
     }));
@@ -1092,16 +1103,25 @@ function confirmationOrigin<E extends EngineEnv>(c: Context<HttpEnv<E>>) {
   return origin;
 }
 
-async function configuredConfirmationOrigin<E extends EngineEnv>(c: Context<HttpEnv<E>>) {
-  const resolved = c.get("resolved");
-  const configured = resolved ? resolved.notificationOrigin : c.env.NOTIFICATION_PUBLIC_ORIGIN;
-  const capability = c.env.NOTIFICATION_EMAIL;
-  if (!configured || !capability || !c.env.NOTIFICATION_QUEUE) return;
+function notificationOrigin(configured: string | undefined) {
+  if (!configured) return;
   try {
     const url = new URL(configured);
     if (url.username || url.password || url.href !== url.origin + "/" ||
         (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)))) return;
-    if (await capability.isConfigured()) return url.origin;
+    return url.origin;
+  } catch {
+    return;
+  }
+}
+
+async function configuredConfirmationOrigin<E extends EngineEnv>(c: Context<HttpEnv<E>>) {
+  const resolved = c.get("resolved");
+  const origin = notificationOrigin(resolved ? resolved.notificationOrigin : c.env.NOTIFICATION_PUBLIC_ORIGIN);
+  const capability = c.env.NOTIFICATION_EMAIL;
+  if (!origin || !capability || !c.env.NOTIFICATION_QUEUE) return;
+  try {
+    if (await capability.isConfigured()) return origin;
   } catch {
     console.error(JSON.stringify({ event: "notification_email_check_failed" }));
   }
@@ -1160,6 +1180,8 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     const context = c.env.MONITORING.getByName(resolved?.id ?? "personal");
     c.set("resolved", resolved ?? undefined);
     c.set("context", context);
+    const origin = notificationOrigin(resolved?.notificationOrigin);
+    if (origin) await context.provisionEmailWithdrawals(origin);
     if (resolved?.paused !== undefined) await context.setPaused(resolved.paused, resolved.policyRevision);
     await next();
   });
@@ -1270,9 +1292,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     app.get(path, async (c: Context<HttpEnv<E>>) => {
       if (c.req.method !== "GET")
         return methodNotAllowed(path === "/api/operator/monitors" || path === destinationsPath ? "GET, POST" : "GET, PUT");
-      const editor = c.get("permission") === "editor";
-      const origin = editor ? await confirmationOrigin(c) : undefined;
-      return operatorResponse(c, await c.get("context").status(true, editor, origin));
+      return operatorResponse(c, await c.get("context").status(true, c.get("permission") === "editor"));
     });
   }
   app.post(rotationPath, async (c: Context<HttpEnv<E>>) => {

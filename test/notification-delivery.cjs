@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 const assert = require('node:assert/strict');
 const { createRequire } = require('node:module');
+const { execFileSync } = require('node:child_process');
+const { mkdtempSync, rmSync } = require('node:fs');
+const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const localRequire = createRequire(join(process.cwd(), 'node_modules/@cloudflare/vitest-plugin/package.json'));
 const { build } = localRequire('esbuild');
@@ -9,15 +12,16 @@ const { Log, LogLevel, Miniflare, convertV4MiniflareOptions } = localRequire('mi
 async function bundle(contents) {
   return (await build({
     stdin: { contents, resolveDir: process.cwd(), loader: 'ts' },
+    nodePaths: [join(process.cwd(), 'node_modules')],
     bundle: true, write: false, format: 'esm', platform: 'neutral',
     external: ['cloudflare:workers', 'cloudflare:sockets'],
   })).outputFiles[0].text;
 }
 
-async function main(runFixture, emailEnabled = true) {
+async function deliveryBundles(source = './src') {
   const monitoring = await bundle(`
-    import personal, { createHostedWorker, MonitoringContext as EngineContext } from './src/index.ts';
-    export { NotificationDelivery } from './src/index.ts';
+    import personal, { createHostedWorker, MonitoringContext as EngineContext } from ${JSON.stringify(source + '/index.ts')};
+    export { NotificationDelivery } from ${JSON.stringify(source + '/index.ts')};
     const realNow = Date.now;
     let testTime;
     Date.now = () => testTime ?? realNow();
@@ -57,15 +61,17 @@ async function main(runFixture, emailEnabled = true) {
         }
         if (url.pathname === '/test-tick') {
           const revision = url.searchParams.get('test-policy-revision');
-          const testContext = revision === null ? url.hostname : { id: url.hostname, ...policy(revision) };
+          const testContext = url.hostname === 'legacy-tenant.example'
+            ? { id: url.hostname, notificationOrigin: 'https://legacy-tenant.example' }
+            : revision === null ? url.hostname : { id: url.hostname, ...policy(revision) };
           return app.scheduled({ scheduledTime: Number(url.searchParams.get('at')) }, { ...env, testContext }).then(() => new Response(null, { status: 204 }));
         }
         return app.fetch(request, env);
       },
     };`);
   const consumer = await bundle(`
-    import delivery from './src/notification-delivery.ts';
-    export { NotificationEmailCapability } from './src/notification-delivery.ts';
+    import delivery from ${JSON.stringify(source + '/notification-delivery.ts')};
+    export { NotificationEmailCapability } from ${JSON.stringify(source + '/notification-delivery.ts')};
     export default {
       async queue(batch, env, ctx) {
         await env.GATE.fetch('https://test.example/batch', { method: 'POST', body: JSON.stringify(batch.messages.map(message => message.body)) });
@@ -73,7 +79,11 @@ async function main(runFixture, emailEnabled = true) {
         await env.GATE.fetch('https://test.example/done', { method: 'POST' });
       },
     };`);
+  return { monitoring, consumer };
+}
 
+async function main(runFixture, emailEnabled = true, upgrade) {
+  const current = await deliveryBundles();
   const batches = [], submissions = [], errors = [];
   const sender = 'alerts@sender.example';
   const capturedTokens = new Set();
@@ -82,7 +92,8 @@ async function main(runFixture, emailEnabled = true) {
   let holdBatch, holdProvider, providerStartedAt;
   let completedBatches = 0;
   let providerStatus = 204;
-  const mf = new Miniflare(convertV4MiniflareOptions({
+  const options = ({ monitoring, consumer }) => convertV4MiniflareOptions({
+    ...(upgrade ? { durableObjectsPersist: upgrade.persist } : {}),
     unsafeLocalExplorer: emailEnabled,
     log: new Log(LogLevel.NONE),
     handleStructuredLogs: log => { if (log.level === 'error') errors.push(log.message); },
@@ -129,7 +140,8 @@ async function main(runFixture, emailEnabled = true) {
         },
       },
     ],
-  }));
+  });
+  const mf = new Miniflare(options(upgrade?.old ?? current));
   const captureEndpoint = '/cdn-cgi/local/explorer/api/local/email/sending?worker=delivery';
   async function capturedMail(query = '') {
     const response = await mf.dispatchFetch(new URL(captureEndpoint + query, await mf.ready));
@@ -202,6 +214,70 @@ async function main(runFixture, emailEnabled = true) {
   }
 
   try {
+    if (upgrade) {
+      const hosts = ['personal.example', 'legacy-tenant.example'];
+      const address = 'legacy-alert@example.net';
+      const selected = [];
+      const recipient = (link, origin = link.origin) => mf.dispatchFetch(origin + link.pathname, {
+        method: 'POST', body: new URLSearchParams({ token: link.hash.slice(1) }),
+      });
+      for (const host of hosts) {
+        const { destinations: [destination] } = await json(host, path, 'POST', { channel: 'email', address }, 201);
+        const message = await until(async () => {
+          if (completedBatches !== batches.length) return;
+          return (await capturedMail()).find(capture => capture.to.includes(address) &&
+            !selected.some(item => item.messageId === capture.messageId));
+        });
+        const link = await confirmationLink(message, address);
+        assert.equal(link.host, host);
+        assert.equal((await recipient(link)).status, 200);
+        const { monitor } = await json(host, monitors, 'POST', {
+          name: 'Existing Monitor', url: 'https://internal.example:8443/target-secret', failureThreshold: 1,
+        }, 201);
+        const snapshot = await json(host, monitors + '/' + monitor.id, 'PATCH', { destinationIds: [destination.id] });
+        assert.equal(snapshot.destinations[0].confirmed, true);
+        assert.deepEqual(snapshot.monitor.destinationIds, [destination.id]);
+        selected.push({ destination, monitor, messageId: message.messageId });
+      }
+      await mf.setOptions(options(current));
+
+      const withdrawals = [];
+      for (const [index, host] of hosts.entries()) {
+        const { destination, monitor } = selected[index];
+        const before = completedBatches;
+        const openedAt = at;
+        await tick(host);
+        await until(() => completedBatches > before);
+        assert.ok(batches.at(-1).some(job => job.destinationId === destination.id && job.monitorId === monitor.id &&
+          job.event.kind === 'incident.opened'), 'the first Incident reached the native Queue consumer');
+        const openings = (await capturedMail()).filter(message => message.to.includes(address) &&
+          message.subject === 'Irisbeat: Incident opened');
+        assert.equal(openings.length, index + 1, host + ' sends its first alert before any Operator request');
+        const mail = await capturedMail('&email_id=' + encodeURIComponent(openings.find(message =>
+          !withdrawals.some(item => item.messageId === message.messageId)).messageId));
+        const href = mail.text.match(/https:\/\/[^\s]+/)?.[0];
+        assert.ok(href && mail.html.includes('href="' + href + '"'));
+        const link = new URL(href);
+        assert.equal(link.origin + link.pathname, 'https://' + host + '/notifications/unsubscribe');
+        assert.match(link.hash, /^#[a-f0-9-]{36}$/);
+        withdrawals.push({ link, messageId: mail.messageId });
+        const status = await json(host, '/api/status', 'GET', undefined, 200, { authorization: '' });
+        assert.equal(status.incidents[0].openedAt, openedAt);
+      }
+
+      const [personal, hosted] = withdrawals;
+      assert.equal((await recipient(hosted.link, personal.link.origin)).status, 400);
+      assert.equal((await recipient(hosted.link)).status, 200);
+      assert.equal((await recipient(hosted.link)).status, 400);
+      const personalStatus = await json(hosts[0], '/api/operator');
+      assert.equal(personalStatus.destinations[0].confirmed, true);
+      assert.deepEqual(personalStatus.monitor.destinationIds, [selected[0].destination.id]);
+      const hostedStatus = await json(hosts[1], '/api/operator');
+      assert.deepEqual(hostedStatus.destinations, []);
+      assert.deepEqual(hostedStatus.monitor.destinationIds, []);
+      console.log('PASS confirmation-only Worker upgrade: first Incident email without Operator traffic and context-scoped withdrawal');
+      return;
+    }
     if (runFixture) {
       await runFixture((url, init) => mf.dispatchFetch(url, init), async address => {
         const message = await until(async () => (await capturedMail()).find(message => message.to.includes(address) &&
@@ -872,5 +948,19 @@ async function main(runFixture, emailEnabled = true) {
     await mf.dispose();
   }
 }
+async function testUpgrade() {
+  const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-email-upgrade-'));
+  const base = '2f1fba80b7fa6bed019298c41844c5201b28a600'; // #82, the confirmation-only integration revision.
+  try {
+    const archive = execFileSync('git', ['archive', base, 'src']);
+    execFileSync('tar', ['-x', '-C', temporary], { input: archive });
+    const old = await deliveryBundles(join(temporary, 'src'));
+    await main(undefined, true, { old, persist: join(temporary, 'state') });
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+}
+
 exports.withDelivery = main;
-if (require.main === module) main().catch(error => { console.error(error); process.exitCode = 1; });
+if (require.main === module) (process.argv.includes('--upgrade') ? testUpgrade() : main())
+  .catch(error => { console.error(error); process.exitCode = 1; });

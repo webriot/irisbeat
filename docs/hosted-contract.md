@@ -37,10 +37,12 @@ The adapter supplies just:
   nonnegative safe integer. Invalid resolved contexts fail closed with 500.
   An optional `notificationOrigin` is a trusted canonical HTTPS origin for the
   context's recipient-facing pages. Leave it unset for a context without email.
-- `contexts(env)`: return stable context names or `{ id, paused?, policyRevision? }` descriptors for
-  this scheduled invocation. Identical duplicates are removed; conflicting pause
-  state/revision metadata for the same ID rejects the invocation before dispatch. The consumer owns context discovery and
-  batching; large fleets need bounded enumeration by the consumer.
+- `contexts(env)`: return stable context names or `{ id, paused?, policyRevision?, notificationOrigin? }`
+  descriptors for this scheduled invocation. For contexts with email, supply the
+  same trusted origin as in `resolve`. Identical duplicates are removed. Conflicting
+  pause metadata or origins for the same ID reject the invocation before dispatch.
+  The consumer owns context discovery and batching. Large fleets need bounded
+  enumeration by the consumer.
 
 The adapter must authenticate the actor and validate the actual tenant host using
 its trusted configuration. Never use a caller's tenant/role/allowance headers or
@@ -168,12 +170,14 @@ A paused context can save pending inboxes. Resume requires an explicit resend
 and never releases a confirmation queued before pause.
 
 Alert mail includes the Monitor name, original event time and safe Incident or
-Maintenance details in HTML and plain text. The unsubscribe link remains valid
-for that confirmed destination at its consent origin until removal or replacement.
+Maintenance details in HTML and plain text. The unsubscribe link remains valid at
+the origin where it was issued until the destination is removed or replaced.
 The recipient can withdraw while monitoring is paused. The explicit POST removes
 only that context's destination and its selections and invalidates queued alerts
-that have yet to be submitted. Cloudflare owns SMTP processing after provider
-acceptance.
+that have yet to be submitted. On upgrade from the confirmation-only build, the
+engine uses the trusted context origin to create missing withdrawal credentials
+before scheduled dispatch while preserving consent and Monitor selections.
+Cloudflare owns SMTP processing after provider acceptance.
 
 The Queue uses `NotificationQueueJob` for both regular Monitor jobs and jobs
 with `kind: "email.confirmation"`. The latter resolve the inbox and its link
