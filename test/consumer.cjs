@@ -66,6 +66,32 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     if (overlapAction) await overlapAction();
     return new Response(null, { status: outcome });
   } };
+  const withoutQueue = new Miniflare(convertV4MiniflareOptions({
+    ...workerOptions,
+    durableObjects: { MONITORING: { className: 'MonitoringContextWithoutQueue', useSQLite: true } },
+  }));
+  try {
+    const requestWithoutQueue = (path, method = 'GET', body, at = 0) =>
+      withoutQueue.dispatchFetch('https://a.example' + path, {
+        method, headers: { authorization: 'Bearer editor', 'content-type': 'application/json', 'x-test-at': String(at) },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      });
+    assert.equal((await requestWithoutQueue('/api/operator/webhook', 'PUT', { url: 'https://webhook.example/legacy' })).status, 200);
+    const created = await requestWithoutQueue('/api/operator/monitors', 'POST', {
+      name: 'Unselected without Queue', url: 'https://target.example/', failureThreshold: 1,
+    });
+    assert.equal(created.status, 201);
+    const { monitor } = await created.json();
+    assert.deepEqual(monitor.destinationIds, []);
+    assert.equal((await requestWithoutQueue('/test-tick?at=60000', 'GET', undefined, 60_000)).status, 200);
+    const status = await (await requestWithoutQueue('/api/operator', 'GET', undefined, 60_000)).json();
+    const incident = status.incidents.find(incident => incident.monitorId === monitor.id);
+    assert.equal(incident?.openedAt, 60_000, 'the unselected Monitor opening commits without a Queue');
+    assert.equal(incident.closedAt, null);
+    assert.deepEqual(deliveries, [], 'without a Queue, the unchanged override must never send');
+    console.log('PASS installed consumer without a Queue: unselected Monitor commits an Incident without invoking the legacy override');
+  } finally { await withoutQueue.dispose(); }
+
   const mf = new Miniflare(convertV4MiniflareOptions(workerOptions));
   let nextPolicyRevision = 0;
   const request = (host, path, method = 'GET', body, token = 'editor') => {

@@ -20,7 +20,7 @@ TypeScript-aware Workers bundler (including Wrangler/esbuild) is required; it is
 not a Node.js runtime library. Hono is an installed runtime dependency. For consumer
 TypeScript checks, enable `"jsx": "react-jsx"` and `"jsxImportSource": "hono/jsx"`;
 the packaged page source also declares its JSX runtime for bundlers. Import `createHostedWorker`, `MonitoringContext`,
-`HostedAdapter`, `EngineEnv`, `Status` and `IncidentTransition` from `irisbeat`.
+`HostedAdapter`, `EngineEnv` and `Status` from `irisbeat`.
 Pin the artifact version **and literal `contractVersion: '1'`**; unsupported
 versions throw during factory construction, before requests or scheduling run.
 `private: true` prevents accidental registry publication; versioned GitHub release tarballs are the supported distribution path.
@@ -109,15 +109,17 @@ enqueue logs `notification_enqueue_failed` and leaves the Incident committed.
 Queue acceptance starts durable delivery. This slice makes one bounded provider
 submission per message and logs `webhook_submission_failed` on failure.
 
-Binding `NOTIFICATION_QUEUE` switches the entire monitoring Worker to delivery
-through explicit Monitor selections. It suppresses every `onIncidentTransition`
-override, including for unselected Monitors and when Queue submission fails.
-Set up the consumer before enabling notifications and select destinations on
-each Monitor that should send. Existing hosted Workers without the Queue binding
-retain the legacy `protected async onIncidentTransition(event: IncidentTransition):
-Promise<void>` override for migration. The event contains the opaque Durable
-Object ID, Incident, transition and observation time. Hook exceptions log
-`transition_delivery_failed`.
+Hosted and self-hosted Incident notifications require explicit Monitor selections
+and the Queue and delivery Worker above. Monitoring and Incident recording
+continue without `NOTIFICATION_QUEUE`. If a selected destination cannot be
+enqueued because the binding is missing, the engine records the same enqueue
+failure as a rejected submission.
+
+The engine no longer invokes `onIncidentTransition` in any configuration. The
+protected method and exported `IncidentTransition` type remain deprecated for
+source compatibility with existing hosted subclasses. To resume sending after
+upgrade, configure the Queue and delivery Worker and select destinations on each
+Monitor that should send.
 
 ## Pause and resume
 
@@ -199,14 +201,13 @@ not resume. Checks wholly after resume follow existing due-time rules.
 
 Any pending HTTP/TCP attempt touched by pause is discarded even if resumed before
 completion. Its original due-time anchor and in-flight guard remain in force.
-Pause cancels queued jobs from previous pause generations. Target requests,
-webhooks and hosted hooks already submitted remain in flight. Resume starts with
-an empty notification backlog. Maintenance #8 suppresses Incident transitions and
-their delivery before the engine reaches Queue handoff or the hosted hook. Editors use `PUT`/`DELETE /api/operator/monitors/:id/maintenance`; readers
-cannot mutate windows. See [Maintenance handoff](maintenance-api.md) for status
+Pause cancels queued jobs from previous pause generations. Target requests and
+webhooks already submitted remain in flight. Resume starts with an empty
+notification backlog. Maintenance #8 suppresses Incident transitions before the
+engine reaches Queue handoff. Editors use `PUT`/`DELETE /api/operator/monitors/:id/maintenance`.
+See [Maintenance handoff](maintenance-api.md) for status
 fields, observation retention, and the #11 precedence seam. Installed-consumer
 coverage verifies Queue suppression for all three check kinds.
-The hook observes committed detector transitions, not every raw observation.
 [History #9](history-api.md) adds the same filtered per-Monitor series to personal and hosted status, including readers; it does not change credentials, permissions, allowances or delivery. The release candidate must be
 regenerated after integration changes, before #12 publishes anything.
 

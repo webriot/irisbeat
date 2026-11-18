@@ -37,6 +37,7 @@ export type Incident = {
   openedAt: number;
   closedAt: number | null;
 };
+/** @deprecated Retained for source compatibility with legacy hosted overrides. */
 export type IncidentTransition = {
   contextId: string;
   incident: Incident;
@@ -551,7 +552,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (current.paused) return;
     const pauseGeneration = current.pauseGeneration ?? 0;
     let transition: "opened" | "recovered" | undefined;
-    let transitionedIncident: Incident | undefined;
+    let transitionedIncident: Pick<Incident, "id" | "openedAt"> | undefined;
     this.ctx.storage.transactionSync(() => {
       monitor.lastResult = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" };
       if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
@@ -581,7 +582,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         transition = "opened";
         monitor.state = "down";
         const incidentId = crypto.randomUUID();
-        transitionedIncident = { id: incidentId, monitorId: monitor.id, monitorName: monitor.name, openedAt: at, closedAt: null };
+        transitionedIncident = { id: incidentId, openedAt: at };
         this.ctx.storage.sql.exec(
           "INSERT INTO incidents (id, monitorId, openedAt, monitorName) VALUES (?, ?, ?, ?)",
           incidentId,
@@ -596,7 +597,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
           open.id,
         );
         transition = "recovered";
-        transitionedIncident = { ...open, closedAt: at };
+        transitionedIncident = open;
         monitor.state = "up";
       } else if (!open && success) {
         monitor.state = "up";
@@ -615,18 +616,6 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         openedAt: transitionedIncident.openedAt,
         monitorName: monitor.name,
       });
-    }
-    // Queue-enabled deployments use Monitor selections as their only delivery path.
-    if (this.env.NOTIFICATION_QUEUE) return;
-    const deliveryState = this.read();
-    // Calendar receipt windows already determine exclusion; later Maintenance cannot erase old hooks.
-    const maintenanceBlocksHook = !(monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") && deliveryState.monitors.some(candidate => candidate.id === monitor.id && candidate.maintenance);
-    if (!deliveryState.paused && (deliveryState.pauseGeneration ?? 0) === pauseGeneration && !maintenanceBlocksHook) {
-      try {
-        await this.onIncidentTransition({ contextId: this.ctx.id.toString(), incident: transitionedIncident, transition, at });
-      } catch {
-        console.error(JSON.stringify({ event: "transition_delivery_failed" }));
-      }
     }
   }
 
@@ -647,6 +636,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     }
   }
 
+  /** @deprecated Retained for source compatibility. The engine no longer calls this method. */
   protected async onIncidentTransition(_event: IncidentTransition): Promise<void> {}
 
   resolveWebhook(job: NotificationJob) {

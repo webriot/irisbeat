@@ -194,7 +194,7 @@ Git archive includes test fixtures in Corresponding Source; npm's explicit files
 allowlist excludes them from the engine package. `private: true` intentionally
 prevents accidental registry publication; consumers install the versioned tarball.
 See [hosted contract 1](hosted-contract.md) for exact version/integrity pinning,
-trusted identity, permissions, allowance, hook and policyRevision requirements.
+trusted identity, permissions, allowance, notification Queue and policyRevision requirements.
 
 ## Candidate runtime acceptance (before publication, pending)
 
