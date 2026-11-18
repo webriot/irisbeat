@@ -119,12 +119,12 @@ async function main() {
       await new Promise(resolve => setTimeout(resolve, 25));
     }
   }
-  async function holdTransition(host, change) {
+  async function holdTransition(host, change, produce = () => tick(host)) {
     const priorBatches = batches.length;
     let release;
     holdBatch = new Promise(resolve => { release = resolve; });
     try {
-      await tick(host);
+      await produce();
       await until(() => batches.length > priorBatches);
       await change();
     } finally {
@@ -250,6 +250,56 @@ async function main() {
       }
     }
     await deletePersonalMonitor();
+    const host = 'personal.example';
+    providerStatus = 204;
+    const { monitor } = await json(host, monitors, 'POST', {
+      name: 'Private `@here <!everyone>` [link](https://event.example)', url: 'https://internal.example:8443/target-secret',
+      published: false,
+    }, 201);
+    const monitorPath = monitors + '/' + monitor.id;
+    const maintenance = monitorPath + '/maintenance';
+    const ids = (await json(host, path)).destinations.map(destination => destination.id);
+    await json(host, monitorPath, 'PATCH', { destinationIds: ids });
+    const beforeMaintenance = submissions.length;
+    const endsAt = at + 25_000;
+    const { monitor: started } = await json(host, maintenance, 'PUT', { endsAt });
+    await until(() => submissions.length === beforeMaintenance + 2 && completedBatches === batches.length);
+    for (const { payload } of submissions.slice(beforeMaintenance)) {
+      assert.match(payload.text, /Maintenance started/);
+      assert.ok(payload.text.includes(new Date(started.maintenance.startedAt).toISOString()));
+      assert.ok(payload.text.includes('Scheduled end ' + new Date(endsAt).toISOString()));
+      assert.doesNotMatch(payload.text, /@here|<!everyone>|internal\.example|8443|target-secret|hooks\.example|\/token/);
+      assert.equal(payload.text.split('`').length, 3, 'only the renderer delimits inline code');
+    }
+    await json(host, maintenance, 'PUT', { endsAt });
+    const revisedEnd = endsAt + 60_000;
+    await json(host, maintenance, 'PUT', { endsAt: revisedEnd });
+    await until(() => submissions.length === beforeMaintenance + 4 && completedBatches === batches.length);
+    assert.match(submissions.at(-1).payload.text, /Maintenance end time changed/);
+    assert.ok(submissions.at(-1).payload.text.includes('Previous end ' + new Date(endsAt).toISOString()));
+    assert.ok(submissions.at(-1).payload.text.includes('Scheduled end ' + new Date(revisedEnd).toISOString()));
+    await holdTransition(host, async () => {
+      await json(host, monitorPath, 'PATCH', { destinationIds: [ids[1]] });
+      await json(host, monitorPath, 'PATCH', { destinationIds: ids });
+      await json(host, maintenance, 'DELETE');
+    }, () => json(host, maintenance, 'DELETE'));
+    assert.equal(submissions.length, beforeMaintenance + 5, 'only the still-selected destination submits the early end');
+    assert.match(submissions.at(-1).payload.text, /Maintenance ended early/);
+    const [ended] = batches.at(-1);
+    assert.ok(submissions.at(-1).payload.text.includes(new Date(ended.event.at).toISOString()));
+    await json(host, maintenance, 'PUT', { endsAt });
+    await until(() => submissions.length === beforeMaintenance + 7 && completedBatches === batches.length);
+    at = endsAt + 10_000;
+    healthy = true;
+    await tick(host);
+    await until(() => submissions.length === beforeMaintenance + 9 && completedBatches === batches.length);
+    assert.match(submissions.at(-1).payload.text, /Maintenance expired/);
+    assert.ok(submissions.at(-1).payload.text.includes(new Date(endsAt).toISOString()));
+    assert.deepEqual(batches.flat().filter(job => job.monitorId === monitor.id).map(job => job.event.kind), [
+      'maintenance.started', 'maintenance.started', 'maintenance.updated', 'maintenance.updated', 'maintenance.ended',
+      'maintenance.ended', 'maintenance.started', 'maintenance.started', 'maintenance.ended', 'maintenance.ended',
+    ]);
+    console.log('PASS Maintenance Queue delivery: private fan-out, safe content, no-op, update, early end, selection cancellation and natural expiry');
     console.log('PASS real Queue delivery: opt-in, fan-out, safe content, redirects, deadline, tenant isolation and cancellation across selection, deletion and pause');
   } finally {
     await mf.dispose();

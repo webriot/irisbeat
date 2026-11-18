@@ -105,18 +105,20 @@ their current selection. Use one selection field per request.
 A new Monitor starts with zero selections. The previous webhook setting upgrades
 to an unselected destination and its compatibility endpoint manages that entry.
 
-HTTP, TCP and Heartbeat share post-commit Incident enqueueing. A job carries stable
+HTTP, TCP and Heartbeat share post-commit Incident and Maintenance enqueueing. A job carries stable
 event and delivery IDs, original event time and safe rendering data. Address
 changes replace the destination identity and clear prior selections. A failed
-enqueue logs `notification_enqueue_failed` and leaves the Incident committed.
+enqueue logs `notification_enqueue_failed` and leaves the change committed.
 Queue acceptance starts durable delivery. This slice makes one bounded provider
 submission per message and logs `webhook_submission_failed` on failure.
 
-Hosted and self-hosted Incident notifications require explicit Monitor selections
+Hosted and self-hosted notifications require explicit Monitor selections
 and the Queue and delivery Worker above. Monitoring and Incident recording
 continue without `NOTIFICATION_QUEUE`. If a selected destination cannot be
 enqueued because the binding is missing, the engine records the same enqueue
 failure as a rejected submission.
+See [Maintenance notifications](maintenance-api.md#maintenance-notifications)
+for the event vocabulary and timestamps.
 
 The engine no longer invokes `onIncidentTransition` in any configuration. The
 protected method and exported `IncidentTransition` type remain deprecated for

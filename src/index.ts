@@ -44,7 +44,7 @@ export type IncidentTransition = {
   transition: "opened" | "recovered";
   at: number;
 };
-export type { NotificationDestination, NotificationJob } from "./notification-jobs";
+export type { MaintenanceNotificationEvent, NotificationDestination, NotificationEvent, NotificationJob } from "./notification-jobs";
 export type { MaintenanceWindow } from "./monitor-configuration";
 const DAY = 86_400_000;
 const historyStart = (at: number) => Math.floor(at / DAY) * DAY - 89 * DAY;
@@ -242,19 +242,35 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     }
   }
 
-  private read(at = Date.now()): StoredContext {
+  private read(at = Date.now(), expiry: { pending?: Promise<void>[]; suppress?: boolean } = {}): StoredContext {
     const stored = this.ctx.storage.kv.get<StoredContext | LegacyContext>("context");
     if (!stored) return { pageName: "Irisbeat", monitors: [] };
     if ("monitors" in stored) {
       stored.monitors = stored.monitors.map(monitor => { monitor.kind ??= "http"; return { ...timingDefaults, scheduleMode: "interval", ...monitor, createdAt: monitor.createdAt ?? 0, lastSeen: monitor.lastSeen ?? null, recoveryReceiptAt: monitor.recoveryReceiptAt ?? null }; });
       let changed = this.migrateWebhook(stored);
+      const expired: { monitor: Monitor; window: MaintenanceWindow }[] = [];
       for (const monitor of stored.monitors) {
-        if (monitor.maintenance && at >= monitor.maintenance.endsAt) {
+        const window = monitor.maintenance;
+        if (window && at >= window.endsAt) {
           this.endMaintenance(monitor);
           changed = true;
+          if (!stored.paused && !expiry.suppress && monitor.notificationSelections?.length) expired.push({ monitor, window });
         }
       }
       if (changed) this.ctx.storage.kv.put("context", stored);
+      for (const { monitor, window } of expired) {
+        const send = this.enqueueNotifications(monitor, stored.pauseGeneration ?? 0, {
+          id: crypto.randomUUID(),
+          kind: "maintenance.ended",
+          reason: "expired",
+          at: window.endsAt,
+          monitorName: monitor.name,
+          ...window,
+        });
+        // Synchronous readers still tie the post-commit handoff to their runtime lifetime.
+        if (expiry.pending) expiry.pending.push(send);
+        else this.ctx.waitUntil(send);
+      }
       return stored;
     }
     const { monitor: legacyMonitor, ...context } = stored;
@@ -292,7 +308,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
     }
     // Compare and persist policy together, without awaiting external I/O or another RPC.
-    const state = this.read();
+    const state = this.read(Date.now(), { suppress: paused });
     const before = this.subscriptionSnapshot(state);
     state.policyRevision = policyRevision;
     if (!!state.paused === paused) {
@@ -399,7 +415,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     monitor.recoveryReceiptAt = null;
   }
 
-  maintenance(id: string, value: unknown, end = false) {
+  async maintenance(id: string, value: unknown, end = false) {
     const at = Date.now();
     const state = this.read(at);
     const before = this.subscriptionSnapshot(state);
@@ -409,20 +425,38 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         Object.keys(value).length !== 1 || !("endsAt" in value) ||
         typeof value.endsAt !== "number" || !Number.isSafeInteger(value.endsAt) ||
         value.endsAt <= at || value.endsAt > 8_640_000_000_000_000)) return undefined;
-    if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
-      // Retain actual overlap, not the replaced window's cancelled future portion.
-      this.ctx.storage.sql.exec("UPDATE calendar_maintenance SET endsAt = MIN(endsAt, ?) WHERE monitorId = ? AND endsAt > ?", at, id, at);
-      if (!end) this.ctx.storage.sql.exec("INSERT INTO calendar_maintenance (monitorId, startedAt, endsAt) VALUES (?, ?, ?)", id, at, (value as { endsAt: number }).endsAt);
-    }
-    if (end) {
-      if (monitor.maintenance) this.endMaintenance(monitor);
-    } else {
-      monitor.maintenance = { startedAt: at, endsAt: (value as { endsAt: number }).endsAt };
+    const previous = monitor.maintenance;
+    const next = end ? null : { startedAt: at, endsAt: (value as { endsAt: number }).endsAt };
+    if (previous?.endsAt === next?.endsAt) return this.status(true);
+    this.ctx.storage.transactionSync(() => {
+      if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
+        // Retain elapsed overlap when an operator cuts a window short or replaces it.
+        this.ctx.storage.sql.exec("UPDATE calendar_maintenance SET endsAt = MIN(endsAt, ?) WHERE monitorId = ? AND endsAt > ?", at, id, at);
+        if (next) this.ctx.storage.sql.exec("INSERT INTO calendar_maintenance (monitorId, startedAt, endsAt) VALUES (?, ?, ?)", id, next.startedAt, next.endsAt);
+      }
+      if (next) monitor.maintenance = next;
+      else this.endMaintenance(monitor);
+      this.ctx.storage.kv.put("context", state);
+    });
+    if (next) {
       const attempt = this.checking.get(id);
       if (attempt) attempt.maintenance = true;
     }
-    this.ctx.storage.kv.put("context", state);
     this.notify(before);
+    if (!state.paused && monitor.notificationSelections?.length) {
+      const event = { id: crypto.randomUUID(), at, monitorName: monitor.name };
+      if (next) {
+        await this.enqueueNotifications(monitor, state.pauseGeneration ?? 0, {
+          ...event, ...next, ...(previous
+            ? { kind: "maintenance.updated", previousEndsAt: previous.endsAt }
+            : { kind: "maintenance.started" }),
+        });
+      } else if (previous) {
+        await this.enqueueNotifications(monitor, state.pauseGeneration ?? 0, {
+          ...event, ...previous, kind: "maintenance.ended", reason: "early",
+        });
+      }
+    }
     return this.status(true);
   }
 
@@ -453,7 +487,9 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   private checking = new Map<string, { maintenance: boolean; paused: boolean }>();
 
   async check(at: number) {
-    await Promise.all(this.read().monitors.map(monitor => this.checkMonitor(monitor.id, at)));
+    const pending: Promise<void>[] = [];
+    const { monitors } = this.read(Math.max(at, Date.now()), { pending });
+    await Promise.all([...pending, ...monitors.map(monitor => this.checkMonitor(monitor.id, at))]);
   }
 
   private async checkMonitor(id: string, at: number) {
