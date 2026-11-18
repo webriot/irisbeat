@@ -32,7 +32,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     const deliveryPath = join(source, 'wrangler.delivery.jsonc');
     experimental_patchConfig(monitoringPath, { queues: { producers: [{ queue: queueName }] } }, false);
     experimental_patchConfig(deliveryPath, {
-      queues: { consumers: [{ queue: queueName, dead_letter_queue: dlqName }], producers: [{ queue: dlqName }] },
+      queues: { consumers: [{ queue: queueName }], producers: [{ queue: dlqName }] },
       services: [{ service: monitoringName }],
     }, false);
     const producerConfig = unstable_readConfig({ config: monitoringPath });
@@ -49,7 +49,10 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     const [queueConsumer] = consumerConfig.queues.consumers;
     const [dlqProducer] = consumerConfig.queues.producers;
     const [deliveryService] = consumerConfig.services;
-    const delivery = (await build({ entryPoints: [join(source, 'src/notification-delivery.ts')], bundle: true, write: false, format: 'esm', platform: 'neutral' })).outputFiles[0].text;
+    const [recovery] = consumerConfig.durable_objects.bindings;
+    assert.equal(queueConsumer.dead_letter_queue, undefined, 'source jobs must not be transferred with their full bodies');
+    assert.ok(consumerConfig.migrations.some(migration => migration.new_sqlite_classes?.includes(recovery.class_name)));
+    const delivery = (await build({ entryPoints: [join(source, 'src/notification-delivery.ts')], bundle: true, write: false, format: 'esm', platform: 'neutral', external: ['cloudflare:workers'] })).outputFiles[0].text;
     const script = (await build({ stdin: { contents: `
       import worker from './src/index.ts';
       export { MonitoringContext, NotificationDelivery } from './src/index.ts';
@@ -89,8 +92,9 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
         },
       },
       { name: deliveryName, modules: true, script: delivery, compatibilityDate: '2026-11-18',
+        durableObjects: { [recovery.name]: { className: recovery.class_name, useSQLite: true } },
         queueConsumers: { [queueConsumer.queue]: {
-          maxBatchTimeout: 0.1, maxRetries: queueConsumer.max_retries, deadLetterQueue: queueConsumer.dead_letter_queue,
+          maxBatchTimeout: 0.1, maxRetries: queueConsumer.max_retries,
         } },
         queueProducers: { [dlqProducer.binding]: dlqProducer.queue },
         serviceBindings: { [deliveryService.binding]: { name: deliveryService.service, entrypoint: deliveryService.entrypoint } },

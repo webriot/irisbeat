@@ -9,10 +9,13 @@
     "consumers": [{
       "queue": "irisbeat-notifications",
       "max_retries": 10,
-      "dead_letter_queue": "irisbeat-notifications-dead-letter",
     }],
     "producers": [{ "binding": "NOTIFICATION_DLQ", "queue": "irisbeat-notifications-dead-letter" }],
   },
+  "durable_objects": {
+    "bindings": [{ "name": "NOTIFICATION_RECOVERY", "class_name": "NotificationRecovery" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["NotificationRecovery"] }],
   "services": [
     { "binding": "NOTIFICATION_DELIVERY", "service": "irisbeat", "entrypoint": "NotificationDelivery" },
   ],

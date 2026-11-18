@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { deliverNotification } from "./notification-delivery-policy";
 import type { NotificationJob } from "./notification-jobs";
-import type { DeadLetter, NotificationDeliveryIdentity, SubmissionReport } from "./notification-outcomes";
+import type { NotificationRecovery, ResultBindings } from "./notification-recovery";
+export { NotificationRecovery } from "./notification-recovery";
 import { submitWebhook } from "./webhook-transport";
 
-interface DeliveryEnv {
-  NOTIFICATION_DELIVERY: {
+interface DeliveryEnv extends ResultBindings {
+  NOTIFICATION_DELIVERY: ResultBindings["NOTIFICATION_DELIVERY"] & {
     resolveWebhook(job: NotificationJob): Promise<string | null>;
-    reportSubmission(job: NotificationDeliveryIdentity, report: SubmissionReport): Promise<void>;
   };
-  NOTIFICATION_DLQ: Pick<Queue<DeadLetter>, "send">;
+  NOTIFICATION_RECOVERY: DurableObjectNamespace<NotificationRecovery>;
 }
 
 export default {

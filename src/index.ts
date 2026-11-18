@@ -95,6 +95,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       deliveryId TEXT PRIMARY KEY, expiresAt INTEGER NOT NULL
     )`);
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS notification_completions_expiry ON notification_completions (expiresAt)");
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS notification_retries (
+      deliveryId TEXT PRIMARY KEY, attempt INTEGER NOT NULL, at INTEGER NOT NULL, expiresAt INTEGER NOT NULL
+    )`);
+    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS notification_retries_expiry ON notification_retries (expiresAt)");
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS incidents (
       id TEXT PRIMARY KEY, monitorId TEXT NOT NULL, openedAt INTEGER NOT NULL, closedAt INTEGER
     )`);
@@ -672,16 +676,33 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const now = Date.now();
     let changed = false;
     this.ctx.storage.transactionSync(() => {
-      if (!accepted && this.notificationCompleted(job.deliveryId)) return;
+      const sql = this.ctx.storage.sql;
+      if (!accepted) {
+        if (this.notificationCompleted(job.deliveryId)) return;
+        const [retry] = sql.exec<{ attempt: number; at: number }>(
+          "SELECT attempt, at FROM notification_retries WHERE deliveryId = ? AND expiresAt > ?",
+          job.deliveryId, now,
+        ).toArray();
+        // The latest Settings result may already be for a different event.
+        const latest = retry ?? (current?.deliveryId === job.deliveryId
+          ? { attempt: current.attempt, at: current.result.at } : undefined);
+        if (latest) {
+          const order = report.attempt - latest.attempt || report.result.at - latest.at;
+          if (order < 0 || (order === 0 && !terminal)) return;
+        }
+      }
+      sql.exec("DELETE FROM notification_retries WHERE expiresAt <= ?", now);
       if (terminal) {
         // Retain completed identities through the maximum source Queue retention window.
-        this.ctx.storage.sql.exec("DELETE FROM notification_completions WHERE expiresAt <= ?", now);
-        this.ctx.storage.sql.exec("INSERT OR IGNORE INTO notification_completions VALUES (?, ?)", job.deliveryId, now + 14 * DAY);
+        sql.exec("DELETE FROM notification_completions WHERE expiresAt <= ?", now);
+        sql.exec("INSERT OR IGNORE INTO notification_completions VALUES (?, ?)", job.deliveryId, now + 14 * DAY);
+        sql.exec("DELETE FROM notification_retries WHERE deliveryId = ?", job.deliveryId);
+      } else {
+        sql.exec("INSERT OR REPLACE INTO notification_retries VALUES (?, ?, ?, ?)",
+          job.deliveryId, report.attempt, report.result.at, now + 14 * DAY);
       }
       if (current?.deliveryId === job.deliveryId) {
         if (current.result.status === "accepted") return;
-        if (!terminal && (report.attempt < current.attempt ||
-          (report.attempt === current.attempt && report.result.at <= current.result.at))) return;
       } else if (current) {
         const order = report.eventAt - current.eventAt || report.queuedAt - current.queuedAt;
         if (order < 0 || (order === 0 && job.deliveryId < current.deliveryId)) return;

@@ -73,11 +73,13 @@ variable values above. Keep deployment-specific configuration out of version con
 | --- | --- | --- |
 | `wrangler.jsonc` | `queues.producers[0].queue` | `IRISBEAT_QUEUE_NAME` |
 | `wrangler.delivery.jsonc` | `queues.consumers[0].queue` | `IRISBEAT_QUEUE_NAME` |
-| `wrangler.delivery.jsonc` | `queues.consumers[0].dead_letter_queue` and `queues.producers[0].queue` | `IRISBEAT_DLQ_NAME` |
+| `wrangler.delivery.jsonc` | `queues.producers[0].queue` | `IRISBEAT_DLQ_NAME` |
 | `wrangler.delivery.jsonc` | `services[0].service` | `IRISBEAT_WORKER_NAME` |
 
 Keep the binding names, `NotificationDelivery` entrypoint and migrations from
-the reviewed configs. Each install needs its own Queue because Cloudflare
+the reviewed configs. Leave the source Queue's native dead-letter routing unset
+so only the delivery Worker's sanitized diagnostics reach the dead-letter Queue.
+Each install needs its own Queue because Cloudflare
 allows one active consumer per Queue.
 See [Cloudflare's Queue setup instructions](https://developers.cloudflare.com/queues/get-started/#connect-the-consumer-worker-to-your-queue).
 

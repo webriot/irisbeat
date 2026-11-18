@@ -17,7 +17,16 @@ async function bundle(contents) {
 async function main() {
   const monitoring = await bundle(`
     import personal, { createHostedWorker, MonitoringContext as EngineContext } from './src/index.ts';
-    export { NotificationDelivery } from './src/index.ts';
+    import { NotificationDelivery as EngineDelivery } from './src/index.ts';
+    export class NotificationDelivery extends EngineDelivery {
+      async reportSubmission(job, report) {
+        const response = await this.env.GATE.fetch('https://test.example/report', {
+          method: 'POST', body: JSON.stringify({ job, report }),
+        });
+        if (!response.ok) throw new Error('Injected result RPC failure');
+        return super.reportSubmission(job, report);
+      }
+    }
     export class MonitoringContext extends EngineContext {
       restartForTest() { this.ctx.abort('Local Queue restart drill'); }
     }
@@ -56,7 +65,17 @@ async function main() {
       },
     };`);
   const consumer = await bundle(`
-    import delivery from './src/notification-delivery.ts';
+    import delivery, { NotificationRecovery as Recovery } from './src/notification-delivery.ts';
+    export class NotificationRecovery extends Recovery {
+      constructor(ctx, env) { super(ctx, faultDLQ(env)); }
+    }
+    function faultDLQ(env) {
+      return { ...env, NOTIFICATION_DLQ: { async send(letter) {
+        const response = await env.GATE.fetch('https://test.example/dlq-write', { method: 'POST', body: JSON.stringify(letter) });
+        if (!response.ok) throw new Error('Injected DLQ write failure');
+        await env.NOTIFICATION_DLQ.send(letter);
+      } } };
+    }
     export default {
       async queue(batch, env, ctx) {
         if (batch.queue === 'dead-letters') {
@@ -74,7 +93,7 @@ async function main() {
           retry(options) {
             actions.push({ id: message.body.deliveryId, retry: options });
             // Controlled messages drive exact attempts without waiting for long retry delays.
-            if (overrides[index]) message.ack();
+            if (overrides[index] && batch.queue !== 'final-notifications') message.ack();
             else message.retry(options);
           },
         })) }, env, ctx);
@@ -89,6 +108,48 @@ async function main() {
   let healthy = false;
   let holdBatch, holdProvider, heldEventTime, providerStartedAt;
   let completedBatches = 0;
+  const reportFaults = new Map();
+  const dlqFaults = new Set();
+  const reportAttempts = [], dlqAttempts = [];
+  const gate = async request => {
+    const path = new URL(request.url).pathname;
+    if (path === '/report') {
+      const { job } = await request.json();
+      reportAttempts.push(job.deliveryId);
+      const remaining = reportFaults.get(job.deliveryId) ?? 0;
+      if (remaining) {
+        reportFaults.set(job.deliveryId, remaining - 1);
+        return new Response(null, { status: 503 });
+      }
+      return new Response(null, { status: 204 });
+    }
+    if (path === '/dlq-write') {
+      const { deliveryId } = await request.json();
+      dlqAttempts.push(deliveryId);
+      return new Response(null, { status: dlqFaults.has(deliveryId) ? 503 : 204 });
+    }
+    if (path === '/batch') {
+      const messages = await request.json();
+      batches.push(messages.map(message => message.body));
+      await holdBatch;
+      return Response.json(messages.map(message => {
+        const control = controls.get(message.body.deliveryId);
+        if (Array.isArray(control)) {
+          const next = control.shift();
+          if (!control.length) controls.delete(message.body.deliveryId);
+          return next;
+        }
+        controls.delete(message.body.deliveryId);
+        return control;
+      }));
+    }
+    if (path === '/dead-letters') deadLetters.push(...await request.json());
+    if (path === '/done') {
+      actions.push(...await request.json());
+      completedBatches++;
+    }
+    return new Response(null, { status: 204 });
+  };
   let providerStatus = 204;
   const options = {
     handleStructuredLogs: log => { if (log.level === 'error') errors.push(log.message); },
@@ -96,7 +157,8 @@ async function main() {
       { name: 'monitoring', modules: true, script: monitoring, compatibilityDate: '2026-11-13',
         bindings: { INSTALLATION_SECRET: 'test-installation-secret' },
         durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } },
-        queueProducers: { NOTIFICATION_QUEUE: 'notifications' },
+        queueProducers: { NOTIFICATION_QUEUE: 'notifications', FINAL_QUEUE: 'final-notifications' },
+        serviceBindings: { GATE: gate },
         outboundService: request => {
           assert.equal(request.url, 'https://internal.example:8443/target-secret');
           targetRequests++;
@@ -104,32 +166,16 @@ async function main() {
         },
       },
       { name: 'delivery', modules: true, script: consumer, compatibilityDate: '2026-11-18',
+        durableObjects: { NOTIFICATION_RECOVERY: { className: 'NotificationRecovery', useSQLite: true } },
         queueConsumers: {
           notifications: { maxBatchTimeout: 0.1, maxRetries: 10, deadLetterQueue: 'dead-letters' },
+          'final-notifications': { maxBatchTimeout: 0.1, maxRetries: 0, deadLetterQueue: 'dead-letters' },
           'dead-letters': { maxBatchTimeout: 0.1 },
         },
         queueProducers: { NOTIFICATION_DLQ: 'dead-letters' },
         serviceBindings: {
           NOTIFICATION_DELIVERY: { name: 'monitoring', entrypoint: 'NotificationDelivery' },
-          GATE: async request => {
-            const path = new URL(request.url).pathname;
-            if (path === '/batch') {
-              const messages = await request.json();
-              batches.push(messages.map(message => message.body));
-              await holdBatch;
-              return Response.json(messages.map(message => {
-                const control = controls.get(message.body.deliveryId);
-                controls.delete(message.body.deliveryId);
-                return control;
-              }));
-            }
-            if (path === '/dead-letters') deadLetters.push(...await request.json());
-            if (path === '/done') {
-              actions.push(...await request.json());
-              completedBatches++;
-            }
-            return new Response(null, { status: 204 });
-          },
+          GATE: gate,
         },
         outboundService: async request => {
           const submission = { url: request.url };
@@ -139,8 +185,9 @@ async function main() {
           const status = providerStatuses.get(request.url) ?? providerStatus;
           if (holdProvider && (!heldEventTime || submission.payload.text.includes(heldEventTime))) {
             providerStartedAt = performance.now();
+            const fail = !!heldEventTime;
             await holdProvider;
-            if (heldEventTime) return new Response('sensitive provider response', { status: 403 });
+            if (fail) return new Response('sensitive provider response', { status: 403 });
           }
           return new Response(status === 204 ? null : 'sensitive provider response', {
             status, headers: { Location: 'https://redirect.example/secret' },
@@ -169,7 +216,7 @@ async function main() {
   }
   async function until(condition, timeout = 5000) {
     const deadline = Date.now() + timeout;
-    while (!condition()) {
+    while (!await condition()) {
       assert.ok(Date.now() < deadline, 'timed out waiting for the Queue consumer');
       await new Promise(resolve => setTimeout(resolve, 25));
     }
@@ -511,6 +558,75 @@ async function main() {
     assert.equal(queuedAction().ack, true);
     assert.equal(submissions.length, beforePending + 1, 'the queued job submits after the MonitoringContext restarts');
 
+    holdProvider = heldEventTime = undefined;
+    const reported = job(firstOrigin, 'accepted-report-outage', 7000);
+    reportFaults.set(reported.deliveryId, 1);
+    providerStatuses.set(first.url, 403);
+    await sendBatch([job(firstOrigin, 'before-accepted-report-outage', 6500)]);
+    assert.equal((await json(host, path)).destinations[0].latestSubmission.status, 'failed');
+    providerStatuses.set(first.url, 204);
+    const beforeAccepted = submissions.length;
+    await sendBatch([reported]);
+    assert.equal((await json(host, path)).destinations[0].latestSubmission.status, 'failed');
+    await sendBatch([reported]);
+    assert.equal(submissions.length, beforeAccepted + 1, 'a duplicate cannot resubmit a known acceptance during a result RPC outage');
+    await until(async () => (await json(host, path)).destinations[0].latestSubmission.status === 'accepted', 9000);
+    assert.equal(reportAttempts.filter(id => id === reported.deliveryId).length, 2);
+
+    const stale = job(firstOrigin, 'older-attempt', 8000);
+    const newerRetry = job(firstOrigin, 'newer-retry-event', 9000);
+    const beforeRace = submissions.length;
+    let releaseOldFailure;
+    holdProvider = new Promise(resolve => { releaseOldFailure = resolve; });
+    heldEventTime = 'Held old attempt';
+    // Pause only the older copy of this delivery while the newer attempt returns 429.
+    providerStatuses.set(first.url, 429);
+    let racingAttempts;
+    try {
+      controls.set(stale.deliveryId, [{ attempts: 1 }, { attempts: 2 }]);
+      racingAttempts = sendBatch([{ ...stale, event: { ...stale.event, monitorName: heldEventTime } }, stale]);
+      await until(() => submissions.length === beforeRace + 2);
+      const deadline = Date.now() + 5000;
+      while ((await json(host, path)).destinations[0].latestSubmission.status !== 'retrying') {
+        assert.ok(Date.now() < deadline, 'the newer attempt must record Retry while the older one is held');
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+    } finally {
+      releaseOldFailure();
+      holdProvider = heldEventTime = undefined;
+    }
+    await racingAttempts;
+    assert.equal((await json(host, path)).destinations[0].latestSubmission.status, 'retrying',
+      'the late 403 cannot replace the newer attempt result');
+    await sendBatch([newerRetry], [{ attempts: 1 }]);
+    providerStatuses.set(first.url, 204);
+    await sendBatch([stale], [{ attempts: 3 }]);
+    assert.equal(submissions.length, beforeRace + 4, 'the late 403 cannot close a newer retry');
+
+    const finalProducer = await mf.getQueueProducer('FINAL_QUEUE', 'monitoring');
+    const final = job(firstOrigin, 'final-dlq-outage', 10_000);
+    const beforeFinal = submissions.length;
+    const beforeLetters = deadLetters.length;
+    const beforeFinalBatch = completedBatches;
+    controls.set(final.deliveryId, { attempts: 11 });
+    dlqFaults.add(final.deliveryId);
+    reportFaults.set(final.deliveryId, 1);
+    await finalProducer.send(final);
+    await until(() => completedBatches > beforeFinalBatch);
+    assert.equal(submissions.length, beforeFinal, 'the final delivery cannot submit again');
+    assert.ok(dlqAttempts.includes(final.deliveryId), 'the final delivery exercised the failing DLQ producer');
+    assert.ok(reportAttempts.includes(final.deliveryId), 'the result RPC ran independently of the failing DLQ producer');
+    assert.deepEqual(actions.at(-1), { id: final.deliveryId, ack: true }, 'only diagnostic recovery remains after final delivery');
+    await until(async () => (await json(host, path)).destinations[0].latestSubmission.reason === 'attempts_exhausted', 9000);
+    assert.equal(reportAttempts.filter(id => id === final.deliveryId).length, 2);
+    assert.equal(deadLetters.length, beforeLetters, 'terminal feedback recovers while the DLQ is still unavailable');
+    dlqFaults.delete(final.deliveryId);
+    await until(() => deadLetters.length > beforeLetters, 20_000);
+    assert.deepEqual(Object.keys(deadLetters.at(-1)).sort(), ['attempts', 'contextId', 'deliveryId', 'destinationId', 'queuedAt', 'reason']);
+    assert.equal(deadLetters.at(-1).deliveryId, final.deliveryId);
+    assert.equal(deadLetters.at(-1).attempts, 11);
+    assert.doesNotMatch(JSON.stringify(deadLetters.at(-1)) + errors.join('\n'), /Retry Monitor|target-secret|sensitive provider response|https:\/\//);
+
     const beforeRestart = submissions.length;
     options.workers[0].script += '\n// Restart monitoring after acceptance';
     options.workers[1].script += '\n// Restart delivery after acceptance';
@@ -521,8 +637,8 @@ async function main() {
     await until(() => actions.length === beforeReplay + 3);
     assert.ok(actions.slice(beforeReplay).every(action => action.ack));
     assert.equal(submissions.length, beforeRestart, 'completed identities survive restart, including out-of-order completion');
-    assert.equal((await json(host, path)).destinations[0].latestSubmission.status, 'accepted');
-    console.log('PASS real Queue delivery: independent ack/retry, 5–1280s backoff, deadline, ten attempts, one-hour age, DLQ, cancellation, out-of-order results and restart-safe completion');
+    assert.equal((await json(host, path)).destinations[0].latestSubmission.reason, 'attempts_exhausted');
+    console.log('PASS real Queue delivery: independent ack/retry, deadline and limits, cancellation, submission ordering, durable result recovery and safe DLQ recovery');
   } finally {
     await mf.dispose();
   }
