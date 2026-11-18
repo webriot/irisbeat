@@ -27,8 +27,9 @@ issues; this document describes integration points.
 Expiry is lazy at the next request/receipt/evaluation, with the exact end timestamp
 excluded from the window. It requires no cron execution or alarm to become visible.
 Expiry/early end reset outbound counts and Heartbeat recovery count/spacing without
-changing due times, last-seen, last result, availability, or Incidents. No missing
-execution becomes a result. Heartbeat receipts during Maintenance refresh last-seen
+changing due times, last-seen, last result, availability, or Incidents. Delayed
+Watchdog silence observations use their scheduled timestamp to determine whether
+they fall inside a naturally expired window. Missing executions create no results. Heartbeat receipts during Maintenance refresh last-seen
 and record Maintenance, including closely spaced receipts; they never recover an
 Incident. Subsequent recovery requires the Monitor's normal post-window rule.
 

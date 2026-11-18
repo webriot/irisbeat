@@ -254,11 +254,20 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         if (window && at >= window.endsAt) {
           this.endMaintenance(monitor);
           changed = true;
-          if (!stored.paused && !expiry.suppress && monitor.notificationSelections?.length) expired.push({ monitor, window });
+          expired.push({ monitor, window });
         }
       }
-      if (changed) this.ctx.storage.kv.put("context", stored);
+      if (changed) this.ctx.storage.transactionSync(() => {
+        for (const { monitor, window } of expired) {
+          if (monitor.kind !== "heartbeat" || monitor.scheduleMode === "calendar") continue;
+          // Watchdog silence uses scheduled time, even when a wall-clock read expires the window first.
+          this.ctx.storage.sql.exec("DELETE FROM calendar_maintenance WHERE monitorId = ? AND endsAt <= ?", monitor.id, historyStart(at));
+          this.ctx.storage.sql.exec("INSERT INTO calendar_maintenance (monitorId, startedAt, endsAt) VALUES (?, ?, ?)", monitor.id, window.startedAt, window.endsAt);
+        }
+        this.ctx.storage.kv.put("context", stored);
+      });
       for (const { monitor, window } of expired) {
+        if (stored.paused || expiry.suppress || !monitor.notificationSelections?.length) continue;
         const send = this.enqueueNotifications(monitor, stored.pauseGeneration ?? 0, {
           id: crypto.randomUUID(),
           kind: "maintenance.ended",
@@ -503,7 +512,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
       if (at >= (attempt.lastSeen ?? attempt.createdAt) + attempt.silenceSeconds * 1000) {
         attempt.recoveryReceiptAt = null;
-        await this.record(state, attempt, at, false, 1, attempt.recoveryThreshold);
+        const window = attempt.maintenance;
+        const maintenance = (window && window.startedAt <= at && at < window.endsAt) ||
+          this.ctx.storage.sql.exec("SELECT 1 FROM calendar_maintenance WHERE monitorId = ? AND startedAt <= ? AND endsAt > ? LIMIT 1", id, at, at).toArray().length > 0;
+        await this.record(state, attempt, at, false, 1, attempt.recoveryThreshold, maintenance);
       }
       return;
     }

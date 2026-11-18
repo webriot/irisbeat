@@ -118,7 +118,9 @@ continue without `NOTIFICATION_QUEUE`. If a selected destination cannot be
 enqueued because the binding is missing, the engine records the same enqueue
 failure as a rejected submission.
 See [Maintenance notifications](maintenance-api.md#maintenance-notifications)
-for the event vocabulary and timestamps.
+for the event vocabulary and timestamps. Installations with an existing Queue
+and Monitor selections must follow the [delivery-first upgrade and producer-first
+rollback order](install.md#upgrade-and-roll-back-notification-workers).
 
 The engine no longer invokes `onIncidentTransition` in any configuration. The
 protected method and exported `IncidentTransition` type remain deprecated for

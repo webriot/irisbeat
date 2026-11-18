@@ -30,8 +30,13 @@ async function main() {
       },
       contexts: () => ['tenant.example'],
     });
+    const systemNow = Date.now;
+    let wallTime;
+    Date.now = () => wallTime ?? systemNow();
     export default {
       fetch(request, env) {
+        const wall = request.headers.get('x-test-wall-time');
+        wallTime = wall === null ? undefined : Number(wall);
         const url = new URL(request.url);
         const app = url.hostname === 'personal.example' ? personal : hosted;
         if (url.pathname === '/test-tick')
@@ -99,8 +104,12 @@ async function main() {
   let at = Date.now();
   const path = '/api/operator/destinations';
   const monitors = '/api/operator/monitors';
+  let wallTime;
   const request = (host, endpoint, method = 'GET', value) => mf.dispatchFetch('https://' + host + endpoint, {
-    method, headers: { authorization: 'Bearer test-installation-secret', 'content-type': 'application/json' },
+    method, headers: {
+      authorization: 'Bearer test-installation-secret', 'content-type': 'application/json',
+      ...(wallTime === undefined ? {} : { 'x-test-wall-time': String(wallTime) }),
+    },
     ...(value === undefined ? {} : { body: JSON.stringify(value) }),
   });
   async function json(host, endpoint, method, value, expected = 200) {
@@ -299,6 +308,43 @@ async function main() {
       'maintenance.started', 'maintenance.started', 'maintenance.updated', 'maintenance.updated', 'maintenance.ended',
       'maintenance.ended', 'maintenance.started', 'maintenance.started', 'maintenance.ended', 'maintenance.ended',
     ]);
+    wallTime = Date.now();
+    const { monitors: withWatchdog } = await json(host, monitors, 'POST', {
+      name: 'Delayed Watchdog', kind: 'heartbeat', published: false,
+    }, 201);
+    const watchdog = withWatchdog.at(-1);
+    const watchdogPath = monitors + '/' + watchdog.id;
+    await json(host, watchdogPath, 'PATCH', { destinationIds: [ids[0]] });
+    const silenceAt = wallTime + 180_000;
+    const watchdogEnd = wallTime + 185_000;
+    const watchdogBatches = completedBatches;
+    await json(host, watchdogPath + '/maintenance', 'PUT', { endsAt: watchdogEnd });
+    await until(() => completedBatches > watchdogBatches);
+    const beforeExpiry = submissions.length;
+    wallTime += 190_000;
+    at = silenceAt;
+    await tick(host);
+    const delayed = await json(host, '/api/operator');
+    assert.deepEqual(delayed.monitors.find(item => item.id === watchdog.id).lastResult, {
+      at: silenceAt, outcome: 'maintenance',
+    });
+    assert.equal(delayed.monitors.find(item => item.id === watchdog.id).maintenance, null);
+    assert.ok(!delayed.incidents.some(incident => incident.monitorId === watchdog.id));
+    at = silenceAt;
+    await tick(host);
+    await until(() => completedBatches > watchdogBatches + 1 && completedBatches === batches.length);
+    assert.deepEqual(batches.flat().filter(job => job.monitorId === watchdog.id).map(job => [job.event.kind, job.event.at]), [
+      ['maintenance.started', silenceAt - 180_000], ['maintenance.ended', watchdogEnd],
+    ]);
+    assert.equal(submissions.length, beforeExpiry + 1);
+    assert.match(submissions.at(-1).payload.text, /Maintenance expired/);
+    assert.ok(submissions.at(-1).payload.text.includes(new Date(watchdogEnd).toISOString()));
+    at = watchdogEnd;
+    await tick(host);
+    await until(() => submissions.length === beforeExpiry + 2 && completedBatches === batches.length);
+    assert.match(submissions.at(-1).payload.text, /Incident opened/);
+    assert.equal((await json(host, '/api/operator')).incidents.find(incident => incident.monitorId === watchdog.id).openedAt, watchdogEnd);
+    console.log('PASS delayed Watchdog silence: Maintenance exclusion, one expiry and normal detection at the window end');
     console.log('PASS Maintenance Queue delivery: private fan-out, safe content, no-op, update, early end, selection cancellation and natural expiry');
     console.log('PASS real Queue delivery: opt-in, fan-out, safe content, redirects, deadline, tenant isolation and cancellation across selection, deletion and pause');
   } finally {
