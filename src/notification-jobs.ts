@@ -71,3 +71,7 @@ export type ConfirmationJob = {
 };
 
 export type NotificationQueueJob = NotificationJob | ConfirmationJob;
+
+export type AlertDestination =
+  | { channel: "webhook"; url: string }
+  | { channel: "email"; address: string; unsubscribeUrl: string };

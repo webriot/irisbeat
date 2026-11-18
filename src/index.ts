@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { confirmationPage, confirmationScript, operatorPage, operatorScript, statusPage, styleSheet, themeScript } from "./ui";
+import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, statusPage, styleSheet, themeScript } from "./ui";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
 import { MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
 import { connect } from "cloudflare:sockets";
-import { parseEmailAddress, type ConfirmationJob, type NewNotificationDestination, type NotificationDestination, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
+import { parseEmailAddress, type AlertDestination, type ConfirmationJob, type NewNotificationDestination, type NotificationDestination, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 
 export const CONTRACT_VERSION = "1" as const;
@@ -69,7 +69,6 @@ export type AvailabilityHistory = { days: HistoryDay[]; percentage: number | nul
 type DailyCounts = { day: number; successes: number; failures: number; maintenance: number };
 export type Status = ReturnType<MonitoringContext["status"]>;
 const CONFIRMATION_COOLDOWN = 5 * 60_000;
-const CONFIRMATION_PATH = "/notifications/confirm";
 type ConfirmationInvitation = { id: string; token: string; origin: string; expiresAt: number; submitted?: boolean };
 type StoredContext = {
   pageName: string;
@@ -78,6 +77,7 @@ type StoredContext = {
   legacyDestinationId?: string;
   destinations?: NotificationDestination[];
   emailConfirmations?: Record<string, ConfirmationInvitation>;
+  emailWithdrawals?: Record<string, { token: string; origin: string }>;
   confirmationCooldowns?: Record<string, number>;
   paused?: boolean;
   policyRevision?: number;
@@ -433,6 +433,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     }
     if (existing) {
       if (state.emailConfirmations) delete state.emailConfirmations[existing.id];
+      if (state.emailWithdrawals) delete state.emailWithdrawals[existing.id];
       for (const monitor of state.monitors) {
         monitor.notificationSelections = monitor.notificationSelections?.filter(selection => selection.destinationId !== existing.id);
       }
@@ -493,7 +494,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (!current) return null;
     return {
       address: current.address,
-      url: new URL(CONFIRMATION_PATH + "#" + current.invitation.token, current.invitation.origin).href,
+      url: new URL(recipientAction.confirm.path + "#" + current.invitation.token, current.invitation.origin).href,
     };
   }
 
@@ -516,9 +517,22 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (destination?.channel !== "email") return false;
     const before = this.subscriptionSnapshot(state);
     destination.confirmed = true;
+    (state.emailWithdrawals ??= {})[destination.id] = { token: crypto.randomUUID(), origin };
     delete state.emailConfirmations?.[destination.id];
     this.ctx.storage.kv.put("context", state);
     this.notify(before);
+    return true;
+  }
+
+  async unsubscribeEmail(token: string, origin: string) {
+    const state = this.read();
+    const destination = state.destinations?.find(candidate => {
+      const withdrawal = state.emailWithdrawals?.[candidate.id];
+      return candidate.channel === "email" && candidate.confirmed &&
+        withdrawal?.token === token && withdrawal.origin === origin;
+    });
+    if (!destination) return false;
+    await this.configureDestination(destination.id, null);
     return true;
   }
 
@@ -798,13 +812,25 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   /** @deprecated Retained for source compatibility. The engine no longer calls this method. */
   protected async onIncidentTransition(_event: IncidentTransition): Promise<void> {}
 
-  resolveWebhook(job: NotificationJob) {
+  resolveAlert(job: NotificationJob): AlertDestination | null {
     if (job.contextId !== this.ctx.id.toString()) return null;
     const state = this.read();
     if (state.paused || (state.pauseGeneration ?? 0) !== job.pauseGeneration) return null;
     const selected = state.monitors.find(monitor => monitor.id === job.monitorId)?.notificationSelections;
     if (!selected?.some(selection => selection.destinationId === job.destinationId && selection.generation === job.generation)) return null;
     const destination = state.destinations?.find(candidate => candidate.id === job.destinationId);
+    if (destination?.channel === "webhook") return { channel: "webhook", url: destination.url };
+    if (destination?.channel !== "email" || !destination.confirmed) return null;
+    const withdrawal = state.emailWithdrawals?.[destination.id];
+    if (!withdrawal) return null;
+    return {
+      channel: "email", address: destination.address,
+      unsubscribeUrl: new URL(recipientAction.unsubscribe.path + "#" + withdrawal.token, withdrawal.origin).href,
+    };
+  }
+
+  resolveWebhook(job: NotificationJob) {
+    const destination = this.resolveAlert(job);
     return destination?.channel === "webhook" ? destination.url : null;
   }
 
@@ -889,8 +915,19 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     }
   }
 
-  status(operator = false, secrets = operator) {
-    return this.project(this.read(), operator, secrets, Date.now());
+  status(operator = false, secrets = operator, emailOrigin?: string) {
+    const state = this.read();
+    if (secrets && emailOrigin) {
+      // The confirmation-only build discarded the origin after consent.
+      const missing = state.destinations?.filter(destination =>
+        destination.channel === "email" && destination.confirmed && !state.emailWithdrawals?.[destination.id]);
+      if (missing?.length) {
+        const withdrawals = state.emailWithdrawals ??= {};
+        for (const { id } of missing) withdrawals[id] = { token: crypto.randomUUID(), origin: emailOrigin };
+        this.ctx.storage.kv.put("context", state);
+      }
+    }
+    return this.project(state, operator, secrets, Date.now());
   }
 
   private project(state: StoredContext, operator: boolean, secrets: boolean, at: number) {
@@ -999,6 +1036,11 @@ function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E
 export default createWorker();
 
 export class NotificationDelivery extends WorkerEntrypoint<EngineEnv> {
+  async resolveAlert(job: NotificationJob) {
+    if (!/^[a-f0-9]{64}$/.test(job.contextId)) return null;
+    return this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId)).resolveAlert(job);
+  }
+
   async resolveConfirmation(job: ConfirmationJob) {
     if (!/^[a-f0-9]{64}$/.test(job.contextId)) return null;
     return this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId)).resolveConfirmation(job);
@@ -1157,18 +1199,24 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   app.get("/api/operator/events", getOnly, subscribe);
   app.get("/api/status", getOnly, async (c: Context<HttpEnv<E>>) => Response.json(await c.get("context").status()));
 
-  app.get(CONFIRMATION_PATH, getOnly, c => c.html(confirmationPage()));
-  app.get(CONFIRMATION_PATH + ".js", getOnly, () => new Response(confirmationScript, { headers: { "Content-Type": "text/javascript; charset=utf-8" } }));
-  app.post(CONFIRMATION_PATH, async c => {
-    if (c.req.header("Content-Type")?.split(";")[0] !== "application/x-www-form-urlencoded") return new Response(null, { status: 415 });
-    const body = await readBoundedBody(c.req.raw);
-    if (body === null) return new Response(null, { status: 413 });
-    const tokens = new URLSearchParams(body).getAll("token");
-    const [token] = tokens;
-    const confirmed = tokens.length === 1 && /^[a-f0-9-]{36}$/.test(token) &&
-      await c.get("context").confirmEmail(token, new URL(c.req.url).origin);
-    return c.html(confirmationPage(confirmed), confirmed ? 200 : 400);
-  });
+  for (const action of ["confirm", "unsubscribe"] as const) {
+    const { path } = recipientAction[action];
+    app.get(path, getOnly, c => c.html(recipientPage(action)));
+    app.get(path + ".js", getOnly, () => new Response(recipientScript, { headers: { "Content-Type": "text/javascript; charset=utf-8" } }));
+    app.post(path, async c => {
+      if (c.req.header("Content-Type")?.split(";")[0] !== "application/x-www-form-urlencoded") return new Response(null, { status: 415 });
+      const body = await readBoundedBody(c.req.raw);
+      if (body === null) return new Response(null, { status: 413 });
+      const tokens = new URLSearchParams(body).getAll("token");
+      const [token] = tokens;
+      const context = c.get("context");
+      const origin = new URL(c.req.url).origin;
+      const accepted = tokens.length === 1 && /^[a-f0-9-]{36}$/.test(token) && (action === "confirm"
+        ? await context.confirmEmail(token, origin)
+        : await context.unsubscribeEmail(token, origin));
+      return c.html(recipientPage(action, accepted), accepted ? 200 : 400);
+    });
+  }
 
   const monitorPath = "/api/operator/monitors/:id";
   const maintenancePath = monitorPath + "/maintenance";
@@ -1219,9 +1267,13 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   // IDs are opaque: read the original path rather than Hono's decoded params.
   const monitorId = (c: Context<HttpEnv<E>>) => c.req.path.split("/")[4];
   for (const path of ["/api/operator", "/api/operator/webhook", "/api/operator/monitors", destinationsPath]) {
-    app.get(path, async (c: Context<HttpEnv<E>>) => c.req.method === "GET"
-      ? operatorResponse(c, await c.get("context").status(true, c.get("permission") === "editor"))
-      : methodNotAllowed(path === "/api/operator/monitors" || path === destinationsPath ? "GET, POST" : "GET, PUT"));
+    app.get(path, async (c: Context<HttpEnv<E>>) => {
+      if (c.req.method !== "GET")
+        return methodNotAllowed(path === "/api/operator/monitors" || path === destinationsPath ? "GET, POST" : "GET, PUT");
+      const editor = c.get("permission") === "editor";
+      const origin = editor ? await confirmationOrigin(c) : undefined;
+      return operatorResponse(c, await c.get("context").status(true, editor, origin));
+    });
   }
   app.post(rotationPath, async (c: Context<HttpEnv<E>>) => {
     const result = await c.get("context").rotateHeartbeatSecret(monitorId(c));

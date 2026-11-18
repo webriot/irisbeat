@@ -178,6 +178,13 @@ all queued and in-flight Maintenance jobs have been handled. Restore the
 previous consumer only after that drain is confirmed. Keep the Maintenance-aware
 consumer in place if any Maintenance jobs could still be delivered or replayed.
 
+From a Maintenance-aware Queue deployment, deploy the email-alert monitoring
+Worker before its consumer so the trusted `resolveAlert` RPC is available. Open
+Operator once as an editor with email configured if upgrading from the
+confirmation-only build. The editor snapshot provisions withdrawal credentials
+for previously confirmed inboxes and preserves their selections. The consumer
+requires those credentials before sending an alert.
+
 ## Optional email confirmation
 
 - In Cloudflare, onboard a sending domain and choose a sender address on that domain.
@@ -187,12 +194,12 @@ consumer in place if any Maintenance jobs could still be delivered or replayed.
   separately for each monitoring context.
   [Cloudflare pricing](https://developers.cloudflare.com/email-service/platform/pricing/) and
   [send binding restrictions](https://developers.cloudflare.com/email-service/configuration/send-bindings/).
-- Before enabling confirmation mail, turn off **Enable email preview** for the
+- Before enabling email, turn off **Enable email preview** for the
   sending domain in Cloudflare under **Compute > Email Service > Email Sending >
-  [sending domain] > Settings**. Keep it off while sending confirmation mail.
+  [sending domain] > Settings**. Keep it off while sending Irisbeat mail.
   Cloudflare turns it on for new sending domains and retains previews for about
   seven days. Previews include the HTML, plain text and raw message, which expose
-  the live confirmation link. This prerequisite applies to self-hosted and hosted
+  live confirmation and unsubscribe links. This prerequisite applies to self-hosted and hosted
   deployments. [Domain settings](https://developers.cloudflare.com/email-service/configuration/domains/#email-preview)
   and [Activity log message previews](https://developers.cloudflare.com/email-service/observability/logs/#message-preview).
 - In your private delivery Worker configuration, add `send_email: [{ "name": "EMAIL" }]`
@@ -209,9 +216,15 @@ consumer in place if any Maintenance jobs could still be delivered or replayed.
   Resending replaces the previous link. The five-minute cooldown applies within
   the installation even if the inbox is removed and re-added.
 
+Each Incident and Maintenance email includes an unsubscribe link. The recipient
+opens the link and chooses **Unsubscribe**. This removes the inbox and its Monitor
+selections from the context and cancels unsubmitted alerts. Cloudflare owns any
+SMTP processing after acceptance.
+
 Cloudflare still processes recipient metadata for transport. Keep addresses and
-confirmation links out of Irisbeat logs and Queue diagnostics. The delivery Worker
-logs sanitized `email_confirmation_submission_failed` events for failed submissions.
+recipient links out of Irisbeat logs and Queue diagnostics. The delivery Worker
+logs sanitized `email_confirmation_submission_failed` and
+`email_alert_submission_failed` events for failed submissions.
 
 `npm run test:delivery` and the rendered Settings acceptance test read HTML, plain
 text and synthetic sender and recipient metadata through the simulated

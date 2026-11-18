@@ -30,24 +30,35 @@ export function statusPage(status: Status) {
   return "<!doctype html>" + <Document title={status.pageName}><div id="public-status">{raw(statusLedger.render(status))}</div></Document>;
 }
 
-export function confirmationPage(confirmed?: boolean) {
-  const title = confirmed === undefined ? "Confirm email notifications"
-    : confirmed ? "Email confirmed" : "Confirmation link is invalid or expired";
+export const recipientAction = {
+  confirm: {
+    path: "/notifications/confirm", title: "Confirm email notifications", button: "Confirm email",
+    success: "Email confirmed", invalid: "Confirmation link is invalid or expired",
+  },
+  unsubscribe: {
+    path: "/notifications/unsubscribe", title: "Unsubscribe from email notifications", button: "Unsubscribe",
+    success: "Email unsubscribed", invalid: "Unsubscribe link is invalid",
+  },
+};
+
+export function recipientPage(action: keyof typeof recipientAction, accepted?: boolean) {
+  const page = recipientAction[action];
+  const title = accepted === undefined ? page.title : accepted ? page.success : page.invalid;
   return "<!doctype html>" + <html lang="en"><head>
     <meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>{title}</title><link rel="stylesheet" href="/app.css" />
   </head><body><main>
     <h1>{title}</h1>
-    {confirmed === undefined && <>
-      <form method="post" action="/notifications/confirm">
-        <input type="hidden" name="token" /><button disabled>Confirm email</button>
+    {accepted === undefined && <>
+      <form method="post" action={page.path} data-invalid={page.invalid}>
+        <input type="hidden" name="token" /><button disabled>{page.button}</button>
       </form>
-      <script src="/notifications/confirm.js" defer></script>
+      <script src={page.path + ".js"} defer></script>
     </>}
   </main></body></html>;
 }
 
-export const confirmationScript = `
+export const recipientScript = `
 const form = document.querySelector('form');
 const token = location.hash.slice(1);
 const button = form.querySelector('button');
@@ -55,7 +66,7 @@ if (/^[a-f0-9-]{36}$/.test(token)) {
   form.elements.token.value = token;
   button.disabled = false;
 } else {
-  document.querySelector('h1').textContent = 'Confirmation link is invalid or expired';
+  document.querySelector('h1').textContent = form.dataset.invalid;
   form.hidden = true;
 }
 `;

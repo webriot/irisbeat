@@ -204,8 +204,16 @@ async function main(runFixture, emailEnabled = true) {
   try {
     if (runFixture) {
       await runFixture((url, init) => mf.dispatchFetch(url, init), async address => {
-        const message = await until(async () => (await capturedMail()).find(message => message.to.includes(address)));
+        const message = await until(async () => (await capturedMail()).find(message => message.to.includes(address) &&
+          message.subject === 'Confirm Irisbeat email notifications'));
         return (await confirmationLink(message, address)).href;
+      }, async address => {
+        const message = await until(async () => (await capturedMail()).find(message => message.to.includes(address) &&
+          message.subject === 'Irisbeat: Maintenance started'));
+        const mail = await capturedMail('&email_id=' + encodeURIComponent(message.messageId));
+        const link = mail.text.match(/https:\/\/[^\s]+/)?.[0];
+        assert.ok(link);
+        return link;
       });
       return;
     }
@@ -694,6 +702,172 @@ async function main(runFixture, emailEnabled = true) {
     assert.deepEqual(batches.flat().filter(job => job.monitorId === activeWatchdog.id).map(job => job.event.kind), ['maintenance.started']);
     console.log('PASS delayed Watchdog silence: Maintenance exclusion, one expiry and normal detection at the window end');
     console.log('PASS Maintenance Queue delivery: private fan-out, safe content, no-op, update, early end, selection cancellation and natural expiry');
+
+    const alertHost = 'email-alerts.example';
+    const address = 'alert-recipient@example.net';
+    const seenInvitations = new Set();
+    const addInbox = async (host, address) => (await json(host, path, 'POST', { channel: 'email', address }, 201))
+      .destinations.find(destination => destination.address === address);
+    const confirmInbox = async (host, address) => {
+      const destination = await addInbox(host, address);
+      const message = await until(async () => (await capturedMail()).find(message => message.to.includes(address) &&
+        message.subject === 'Confirm Irisbeat email notifications' &&
+        !seenInvitations.has(message.messageId)));
+      seenInvitations.add(message.messageId);
+      const link = await confirmationLink(message, address);
+      assert.equal(link.host, host);
+      const result = await mf.dispatchFetch(link.origin + link.pathname, {
+        method: 'POST', body: new URLSearchParams({ token: link.hash.slice(1) }),
+      });
+      assert.equal(result.status, 200);
+      return destination;
+    };
+    const destination = await confirmInbox(alertHost, address);
+    const name = '<img src=x onerror="bad()">& @everyone';
+    const { monitor: emailMonitor } = await json(alertHost, monitors, 'POST', {
+      name, url: 'https://internal.example:8443/target-secret', published: false, failureThreshold: 1, recoveryThreshold: 1,
+    }, 201);
+    const emailMonitorPath = monitors + '/' + emailMonitor.id;
+    const alertMail = async (inbox = address) => (await capturedMail()).filter(message => message.to.includes(inbox) &&
+      message.subject !== 'Confirm Irisbeat email notifications');
+    await json(alertHost, emailMonitorPath, 'PATCH', { destinationIds: [destination.id] });
+    at = wallTime + 60_000;
+    healthy = false;
+    const openedAt = at;
+    await tick(alertHost);
+    const openedMessage = await until(async () => (await alertMail())[0]);
+    const openMail = await capturedMail('&email_id=' + encodeURIComponent(openedMessage.messageId));
+    assert.deepEqual(openMail.to, [address]);
+    assert.equal(openMail.from, sender);
+    assert.match(openMail.subject, /Incident opened/);
+    assert.ok(openMail.text.includes(name));
+    assert.ok(openMail.text.includes(new Date(openedAt).toISOString()));
+    assert.match(openMail.html, /&lt;img src=x onerror=&quot;bad\(\)&quot;&gt;&amp;/);
+    assert.doesNotMatch(openMail.html, /<img/);
+    assert.doesNotMatch(openMail.text + openMail.html, /internal\.example|8443|target-secret/);
+    const href = openMail.text.match(/https:\/\/[^\s]+/)?.[0];
+    assert.ok(href);
+    const withdraw = new URL(href);
+    assert.equal(withdraw.origin + withdraw.pathname, 'https://' + alertHost + '/notifications/unsubscribe');
+    assert.ok(withdraw.hash.length > 1);
+    assert.ok(openMail.html.includes('href="' + href + '"'));
+
+    const secondAddress = 'second-alert@example.net';
+    const second = await confirmInbox(alertHost, secondAddress);
+    await json(alertHost, emailMonitorPath, 'PATCH', { destinationIds: [destination.id, second.id] });
+    assert.equal((await alertMail(secondAddress)).length, 0, 'confirmation and selection do not replay the open Incident');
+    healthy = true;
+    const recoveredAt = at;
+    await tick(alertHost);
+    const recovery = async inbox => {
+      const message = await until(async () => (await alertMail(inbox)).find(mail => mail.subject === 'Irisbeat: Incident recovered'));
+      return capturedMail('&email_id=' + encodeURIComponent(message.messageId));
+    };
+    for (const inbox of [address, secondAddress]) {
+      const mail = await recovery(inbox);
+      assert.deepEqual(mail.to, [inbox]);
+      assert.ok(mail.text.includes(new Date(recoveredAt).toISOString()));
+      assert.ok(mail.text.includes('Opened ' + new Date(openedAt).toISOString()));
+    }
+
+    const otherHost = 'other-alerts.example';
+    const other = await confirmInbox(otherHost, address);
+    const { monitor: publicEmailMonitor } = await json(otherHost, monitors, 'POST', {
+      name: 'Public email Monitor', url: 'https://internal.example:8443/target-secret', failureThreshold: 1,
+    }, 201);
+    await json(otherHost, monitors + '/' + publicEmailMonitor.id, 'PATCH', { destinationIds: [other.id] });
+    const { monitors: withSpareMonitor } = await json(alertHost, monitors, 'POST', { name: 'Spare email Monitor', kind: 'heartbeat' }, 201);
+    const spareMonitor = withSpareMonitor.at(-1);
+    await json(alertHost, monitors + '/' + spareMonitor.id, 'PATCH', { destinationIds: [destination.id] });
+    const recipient = (method, origin = withdraw.origin) => mf.dispatchFetch(origin + withdraw.pathname, {
+      method, ...(method === 'POST' ? { body: new URLSearchParams({ token: withdraw.hash.slice(1) }) } : {}),
+    });
+    const snapshot = await json(alertHost, '/api/operator');
+    const landing = await recipient('GET');
+    assert.equal(landing.status, 200);
+    assert.equal(landing.headers.get('Referrer-Policy'), 'no-referrer');
+    assert.doesNotMatch(await landing.text(), /alert-recipient@example\.net/);
+    assert.equal((await recipient('POST', 'https://' + otherHost)).status, 400);
+    assert.deepEqual((await json(alertHost, '/api/operator')).destinations, snapshot.destinations,
+      'a link fetch or wrong context cannot unsubscribe');
+
+    const emailMaintenance = emailMonitorPath + '/maintenance';
+    const expectedEnd = wallTime + 600_000;
+    const updatedEnd = expectedEnd + 60_000;
+    const beforeWithdrawal = (await alertMail()).length;
+    await holdTransition(alertHost, async () => {
+      assert.equal((await recipient('POST')).status, 200);
+      assert.equal((await recipient('POST')).status, 400);
+    }, () => json(alertHost, emailMaintenance, 'PUT', { endsAt: expectedEnd }));
+    assert.equal((await alertMail()).length, beforeWithdrawal, 'withdrawal cancels queued Maintenance for the original inbox');
+    const unsubscribed = await json(alertHost, '/api/operator');
+    assert.deepEqual(unsubscribed.destinations.map(destination => destination.id), [second.id]);
+    assert.deepEqual(unsubscribed.monitors.find(item => item.id === emailMonitor.id).destinationIds, [second.id]);
+    assert.deepEqual(unsubscribed.monitors.find(item => item.id === spareMonitor.id).destinationIds, []);
+
+    const maintenanceMail = async (subject, detail) => {
+      const message = await until(async () => (await alertMail(secondAddress)).find(mail => mail.subject === 'Irisbeat: ' + subject));
+      const mail = await capturedMail('&email_id=' + encodeURIComponent(message.messageId));
+      assert.deepEqual(mail.to, [secondAddress]);
+      assert.ok(mail.text.includes(detail));
+      assert.ok(mail.html.includes(detail));
+      const link = mail.text.match(/https:\/\/[^\s]+/)?.[0];
+      assert.ok(link);
+      assert.match(link, /^https:\/\/email-alerts\.example\/notifications\/unsubscribe#[a-f0-9-]{36}$/);
+      assert.ok(mail.html.includes('href="' + link + '"'));
+      return link;
+    };
+    const secondWithdrawal = await maintenanceMail('Maintenance started', 'Scheduled end ' + new Date(expectedEnd).toISOString());
+    assert.notEqual(secondWithdrawal, href);
+    await json(alertHost, emailMaintenance, 'PUT', { endsAt: updatedEnd });
+    await maintenanceMail('Maintenance end time changed', 'Previous end ' + new Date(expectedEnd).toISOString());
+    await json(alertHost, emailMaintenance, 'DELETE');
+    await maintenanceMail('Maintenance ended early', 'Scheduled end ' + new Date(updatedEnd).toISOString());
+    await json(alertHost, emailMaintenance, 'PUT', { endsAt: expectedEnd });
+    at = expectedEnd;
+    await tick(alertHost);
+    await maintenanceMail('Maintenance expired', new Date(expectedEnd).toISOString());
+
+    const beforeOther = new Set((await alertMail()).map(message => message.messageId));
+    healthy = false;
+    await tick(otherHost);
+    const publicMessage = await until(async () => (await alertMail()).find(mail => !beforeOther.has(mail.messageId)));
+    const publicMail = await capturedMail('&email_id=' + encodeURIComponent(publicMessage.messageId));
+    assert.match(publicMail.text, /Incident opened\nPublic email Monitor/);
+    assert.match(publicMail.text, /https:\/\/other-alerts\.example\/notifications\/unsubscribe#/);
+    assert.ok((await json(otherHost, '/api/status')).incidents.length);
+
+    const beforeStale = (await alertMail(secondAddress)).length;
+    await holdTransition(alertHost, async () => {
+      await json(alertHost, emailMonitorPath, 'PATCH', { destinationIds: [] });
+      await json(alertHost, emailMonitorPath, 'PATCH', { destinationIds: [second.id] });
+    }, () => json(alertHost, emailMaintenance, 'PUT', { endsAt: updatedEnd }));
+    assert.equal((await alertMail(secondAddress)).length, beforeStale, 'reselection cannot revive a queued alert');
+    const stale = batches.at(-1)[0];
+    const replacementAddress = 'replacement-alert@example.net';
+    await holdTransition(alertHost, async () => {
+      const replacement = await json(alertHost, path + '/' + second.id, 'PUT', { channel: 'email', address: replacementAddress });
+      const pending = replacement.destinations.find(destination => destination.address === replacementAddress);
+      assert.equal(pending.confirmed, false);
+      assert.deepEqual(replacement.monitors.find(item => item.id === emailMonitor.id).destinationIds, []);
+      assert.equal((await request(alertHost, emailMonitorPath, 'PATCH', { destinationIds: [pending.id] })).status, 400);
+      const oldLink = new URL(secondWithdrawal);
+      assert.equal((await mf.dispatchFetch(oldLink.origin + oldLink.pathname, {
+        method: 'POST', body: new URLSearchParams({ token: oldLink.hash.slice(1) }),
+      })).status, 400);
+    }, () => json(alertHost, emailMaintenance, 'DELETE'));
+    await redeliver(producer, stale);
+    await until(() => completedBatches === batches.length);
+    assert.equal((await alertMail(secondAddress)).length, beforeStale);
+    assert.equal((await alertMail(replacementAddress)).length, 0);
+    wallTime += 300_000;
+    const readded = await confirmInbox(alertHost, address);
+    assert.notEqual(readded.id, destination.id);
+    assert.equal((await recipient('POST')).status, 400, 'the old link cannot remove the same inbox after it confirms again');
+    assert.deepEqual((await json(alertHost, '/api/operator')).monitors.find(item => item.id === emailMonitor.id).destinationIds, []);
+    assert.ok(!JSON.stringify(batches).includes(withdraw.hash.slice(1)));
+    assert.ok(errors.every(error => !error.includes(address) && !error.includes(withdraw.hash.slice(1))));
+    console.log('PASS email alerts: native capture, Incidents and Maintenance, context-scoped withdrawal, replacement and stale selections');
   } finally {
     await mf.dispose();
   }

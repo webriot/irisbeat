@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { html } from "hono/html";
-import { parseEmailAddress, type ConfirmationJob, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
+import { describeNotification, notificationName } from "./notification-content";
+import { submitAlertEmail, submitEmail } from "./email-transport";
+import { parseEmailAddress, type AlertDestination, type ConfirmationJob, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
 
 interface DeliveryEnv {
   EMAIL?: SendEmail;
@@ -9,7 +11,7 @@ interface DeliveryEnv {
   NOTIFICATION_DELIVERY: {
     resolveConfirmation(job: ConfirmationJob): Promise<{ address: string; url: string } | null>;
     markConfirmationSubmitted(job: ConfirmationJob): Promise<void>;
-    resolveWebhook(job: NotificationJob): Promise<string | null>;
+    resolveAlert(job: NotificationJob): Promise<AlertDestination | null>;
   };
 }
 
@@ -20,65 +22,29 @@ export class NotificationEmailCapability extends WorkerEntrypoint<DeliveryEnv> {
 }
 
 async function sendConfirmation(job: ConfirmationJob, env: DeliveryEnv) {
-  const from = parseEmailAddress(env.EMAIL_FROM);
-  if (!env.EMAIL || !from) throw new Error("Email binding unavailable");
   const destination = await env.NOTIFICATION_DELIVERY.resolveConfirmation(job);
   if (!destination) return;
   const { address, url } = destination;
   const subject = "Confirm Irisbeat email notifications";
   const intro = "Confirm this inbox to receive Irisbeat notifications. This link expires in 24 hours.";
   const email = {
-    to: address, from, subject,
+    to: address, subject,
     text: intro + "\n\n" + url,
     html: html`<p>${intro}</p><p><a href="${url}">Confirm email</a></p>`.toString(),
   };
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await Promise.race([
-      env.EMAIL.send(email),
-      new Promise<never>((_, reject) => {
-        timeout = setTimeout(() => reject(new Error("Email submission timed out")), 10_000);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timeout);
-  }
+  const outcome = await submitEmail(env, email);
+  if (outcome.status !== "accepted") throw new Error("Email confirmation submission failed");
   await env.NOTIFICATION_DELIVERY.markConfirmationSubmitted(job);
 }
 
 function renderWebhook({ event }: NotificationJob) {
   // Inline code isolates Markdown. Slack decodes its reserved entities and the zero-width
   // separator prevents Discord from expanding broadcast mentions.
-  const name = event.monitorName.replace(/\s+/g, " ")
-    .replace(/[\p{Cc}\p{Bidi_Control}]/gu, "")
+  const name = notificationName(event)
     .replaceAll("`", "ˋ").replaceAll("@", "@\u200b")
     .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-  const iso = (at: number) => new Date(at).toISOString();
-  let summary: string;
-  let details = "";
-  switch (event.kind) {
-    case "incident.opened":
-      summary = "Incident opened";
-      break;
-    case "incident.recovered":
-      summary = "Incident recovered";
-      details = "\nOpened " + iso(event.openedAt);
-      break;
-    case "maintenance.started":
-      summary = "Maintenance started";
-      details = "\nScheduled end " + iso(event.endsAt);
-      break;
-    case "maintenance.updated":
-      summary = "Maintenance end time changed";
-      details = "\nPrevious end " + iso(event.previousEndsAt) + "\nScheduled end " + iso(event.endsAt);
-      break;
-    case "maintenance.ended":
-      summary = event.reason === "early" ? "Maintenance ended early" : "Maintenance expired";
-      details = "\nStarted " + iso(event.startedAt);
-      if (event.reason === "early") details += "\nScheduled end " + iso(event.endsAt);
-      break;
-  }
-  return JSON.stringify({ text: "`" + name + "` · " + summary + "\n" + iso(event.at) + details });
+  const { summary, lines } = describeNotification(event);
+  return JSON.stringify({ text: ["`" + name + "` · " + summary, ...lines].join("\n") });
 }
 
 export default {
@@ -93,14 +59,21 @@ export default {
         message.ack();
         return;
       }
+      const destination = await env.NOTIFICATION_DELIVERY.resolveAlert(message.body).catch(() => {
+        console.error(JSON.stringify({ event: "notification_eligibility_failed" }));
+        return null;
+      });
       try {
-        const body = renderWebhook(message.body);
-        const url = await env.NOTIFICATION_DELIVERY.resolveWebhook(message.body);
-        if (url) {
-          const response = await fetch(url, {
+        if (destination?.channel === "email") {
+          const outcome = await submitAlertEmail(destination, message.body, env);
+          if (outcome.status !== "accepted") console.error(JSON.stringify({
+            event: "email_alert_submission_failed", reason: outcome.reason,
+          }));
+        } else if (destination?.channel === "webhook") {
+          const response = await fetch(destination.url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body,
+            body: renderWebhook(message.body),
             redirect: "manual",
             signal: AbortSignal.timeout(10_000),
           });
@@ -108,7 +81,9 @@ export default {
           if (!response.ok) throw new Error("Webhook rejected");
         }
       } catch {
-        console.error(JSON.stringify({ event: "webhook_submission_failed" }));
+        console.error(JSON.stringify({
+          event: destination?.channel === "email" ? "email_alert_submission_failed" : "webhook_submission_failed",
+        }));
       }
       message.ack();
     }));

@@ -5,8 +5,8 @@ import { monitorAction } from './actions';
 
 test.use({ trace: 'off', screenshot: 'off', video: 'off' });
 
-test('Settings sends a captured email and only the recipient POST enables selection', async ({ page, browser }) => {
-  await withDelivery(async (dispatch, confirmationLinkFor) => {
+test('Recipients confirm and withdraw a selected inbox from captured mail', async ({ page, browser }) => {
+  await withDelivery(async (dispatch, confirmationLinkFor, unsubscribeLinkFor) => {
     const origin = 'https://personal.example';
     async function connect(tab: typeof page) {
       await tab.addInitScript(() => {
@@ -64,6 +64,32 @@ test('Settings sends a captured email and only the recipient POST enables select
       await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
       await expect(choice).toBeVisible();
       await expect(choice).not.toBeChecked();
+      await choice.check();
+      await page.getByRole('button', { name: 'Save Monitor' }).click();
+      await monitorAction(page, 'Edit Email Monitor');
+      await expect(choice).toBeChecked();
+
+      const headers = { Authorization: 'Bearer test-installation-secret', 'Content-Type': 'application/json' };
+      const snapshot = await (await dispatch(origin + '/api/operator', { headers })).json();
+      const maintenance = await dispatch(origin + '/api/operator/monitors/' + snapshot.monitor.id + '/maintenance', {
+        method: 'PUT', headers, body: JSON.stringify({ endsAt: Date.now() + 300_000 }),
+      });
+      expect(maintenance.status).toBe(200);
+      const unsubscribeLink = await unsubscribeLinkFor(address);
+      try {
+        await recipient.goto(unsubscribeLink);
+      } catch {
+        throw new Error('Could not open the captured unsubscribe link');
+      }
+      await expect(recipient.getByRole('heading', { name: 'Unsubscribe from email notifications' })).toBeVisible();
+      await expect(choice).toBeChecked();
+      await recipient.getByRole('button', { name: 'Unsubscribe', exact: true }).focus();
+      await recipient.keyboard.press('Enter');
+      await expect(recipient.getByRole('heading', { name: 'Email unsubscribed' })).toBeVisible();
+      await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+      await expect(choice).toHaveCount(0);
+      await page.getByRole('button', { name: 'Settings', exact: true }).click();
+      await expect(page.getByText(address, { exact: true })).toHaveCount(0);
     } finally {
       await recipient.close();
     }

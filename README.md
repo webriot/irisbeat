@@ -50,6 +50,7 @@ Local cron dispatch can be triggered at `/__scheduled?cron=*+*+*+*+*`. Deployed 
 | `PUT /api/operator/destinations/:id` or `DELETE /api/operator/destinations/:id` | Replace or remove a destination and clear prior selections |
 | `POST /api/operator/destinations/:id/confirmation` | Request a new confirmation for a pending inbox, subject to a five-minute cooldown |
 | `GET /notifications/confirm` and `POST /notifications/confirm` | Display the recipient consent form and explicitly accept a single-use confirmation |
+| `GET /notifications/unsubscribe` and `POST /notifications/unsubscribe` | Display the withdrawal form and remove the inbox and its selections from that context with an explicit recipient POST |
 | `PUT /api/operator/webhook` | Manage the compatibility destination with `{ url }`; empty string removes it |
 | `POST /heartbeat/:id` | Refresh an active Heartbeat with the installation Bearer secret; ignore the body; 204 on success, 404 for unknown/deleted/wrong-kind IDs |
 | Worker `scheduled` | Dispatch due HTTP/TCP attempts and evaluate Heartbeat silence independently, including private Monitors |
@@ -92,11 +93,13 @@ HTTP, TCP and Heartbeat enqueue Incident openings and recoveries and Maintenance
 starts, end-time changes and endings for destinations selected when the event
 commits, including for private Monitors.
 A separate delivery Worker rechecks eligibility before sending a bounded,
-Slack-compatible webhook POST with the original event time. Discord webhook
-paths normalize to `/slack`. Queue handoff errors record
-`notification_enqueue_failed` and preserve the committed change. The delivery Worker logs
-sanitized `webhook_submission_failed` events. See [installation](docs/install.md)
-and [hosted integration](docs/hosted-contract.md#incident-notifications).
+Slack-compatible webhook POST or submitting HTML and plain-text email through
+Cloudflare Email Sending. Both include the original event time. Discord webhook
+paths normalize to `/slack`. Each alert email links to an account-free withdrawal
+form. Withdrawal removes the inbox and its Monitor selections in that context
+and cancels queued alerts that have yet to be submitted. Queue handoff errors
+record `notification_enqueue_failed` and preserve the committed change.
+See [installation](docs/install.md) and [hosted integration](docs/hosted-contract.md#incident-notifications).
 
 ## Runtime verification
 

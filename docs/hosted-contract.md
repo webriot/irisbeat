@@ -90,7 +90,7 @@ Use one Queue for the monitoring Worker's `NOTIFICATION_QUEUE` producer and
 the isolated delivery Worker's consumer trigger. Use `irisbeat/notification-delivery`
 as the delivery Worker entrypoint. Export `NotificationDelivery` from the hosted
 monitoring Worker and bind the delivery Worker's `NOTIFICATION_DELIVERY` service
-to that named entrypoint. It resolves a webhook only while the original context,
+to that named entrypoint. It resolves a destination only while the original context,
 Monitor, destination and selection remain eligible. Keep the Queue and service
 binding under trusted deployment control. Delivery lookup is available through
 service RPC. Keep Workers Logs enabled on the delivery Worker and disable
@@ -111,7 +111,13 @@ event and delivery IDs, original event time and safe rendering data. Address
 changes replace the destination identity and clear prior selections. A failed
 enqueue logs `notification_enqueue_failed` and leaves the change committed.
 Queue acceptance starts durable delivery. This slice makes one bounded provider
-submission per message and logs `webhook_submission_failed` on failure.
+submission per message and logs `webhook_submission_failed` or
+`email_alert_submission_failed` on failure. The alert consumer uses
+`NotificationDelivery.resolveAlert` to resolve webhook and confirmed email
+destinations over trusted RPC. It checks the original selection and pause
+generation on each lookup. Deploy the monitoring Worker with that service
+entrypoint before deploying the email-alert consumer. The monitoring Worker
+continues to support the older consumer's `resolveWebhook` RPC.
 
 Hosted and self-hosted notifications require explicit Monitor selections
 and the Queue and delivery Worker above. Monitoring and Incident recording
@@ -131,11 +137,11 @@ Monitor that should send.
 
 ## Email consent
 
-Before enabling hosted confirmation mail, turn off **Enable email preview** in
-the Cloudflare sending domain's settings and keep it off while sending confirmation
+Before enabling hosted email, turn off **Enable email preview** in
+the Cloudflare sending domain's settings and keep it off while sending Irisbeat
 mail. When enabled, the Activity log stores the HTML, plain text and raw message
-with the live confirmation link for about seven days. Cloudflare still processes
-recipient metadata for transport. Keep addresses and confirmation links out of
+with live confirmation or unsubscribe links for about seven days. Cloudflare still processes
+recipient metadata for transport. Keep addresses and recipient links out of
 Irisbeat logs and Queue diagnostics.
 [Cloudflare domain settings](https://developers.cloudflare.com/email-service/configuration/domains/#email-preview)
 and [Activity log message previews](https://developers.cloudflare.com/email-service/observability/logs/#message-preview).
@@ -145,8 +151,8 @@ Follow the sender, Queue and service-binding configuration in
 For hosted delivery wrappers, re-export `NotificationEmailCapability` from
 `irisbeat/notification-delivery`. Set `ResolvedContext.notificationOrigin`
 from trusted configuration. Resolve unauthenticated requests to
-`/notifications/confirm` at that origin to the same context. Confirmation
-credentials remain in the link's fragment until the recipient submits the form
+`/notifications/confirm` and `/notifications/unsubscribe` at that origin to the same
+context. Recipient credentials remain in the link's fragment until the recipient submits the form
 and are excluded from status snapshots and Queue payloads.
 
 Editors use the same destination create and replace routes with
@@ -160,6 +166,14 @@ explicit POST, is single-use, and expires 24 hours after the invitation is
 created. It does not change Monitor selections or replay Monitor events.
 A paused context can save pending inboxes. Resume requires an explicit resend
 and never releases a confirmation queued before pause.
+
+Alert mail includes the Monitor name, original event time and safe Incident or
+Maintenance details in HTML and plain text. The unsubscribe link remains valid
+for that confirmed destination at its consent origin until removal or replacement.
+The recipient can withdraw while monitoring is paused. The explicit POST removes
+only that context's destination and its selections and invalidates queued alerts
+that have yet to be submitted. Cloudflare owns SMTP processing after provider
+acceptance.
 
 The Queue uses `NotificationQueueJob` for both regular Monitor jobs and jobs
 with `kind: "email.confirmation"`. The latter resolve the inbox and its link
