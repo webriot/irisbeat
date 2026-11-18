@@ -387,141 +387,158 @@ async function main(runFixture, emailEnabled = true) {
     assert.ok(submissions.at(-1).payload.text.includes(new Date(firstCheckAt).toISOString()), 'resume sends only the fresh Incident');
     console.log('PASS real Queue delivery: opt-in, fan-out, safe content, redirects, deadline, tenant isolation, paused configuration, and cancellation before and between attempts');
 
-    const inbox = 'ops+test@example.net';
-    const email = address => ({ channel: 'email', address });
-    const setClock = (host, at) => request(host, '/test-clock?at=' + at);
-    assert.equal((await request('no-email.example', path, 'POST', email(inbox))).status, 503);
-    const withoutEmail = await json('no-email.example', path, 'POST', { url: 'https://hooks.example/ordinary' }, 201);
-    assert.ok(!('emailConfigured' in withoutEmail));
-    assert.equal(withoutEmail.destinations.length, 1);
-    const denied = await mf.dispatchFetch('https://consentHost.example' + path, {
-      method: 'POST', headers: { authorization: 'Bearer reader', 'content-type': 'application/json' },
-      body: JSON.stringify(email(inbox)),
-    });
-    assert.equal(denied.status, 403);
-    const added = await json('personal.example', path, 'POST', email(inbox), 201);
-    assert.equal(added.emailConfigured, true);
-    const pending = added.destinations.find(destination => destination.channel === 'email');
-    assert.equal(pending.confirmed, false);
-    const { monitor } = await json('personal.example', monitors, 'POST', { name: 'Email opt-in', kind: 'heartbeat' }, 201);
-    const monitorPath = monitors + '/' + monitor.id;
-    assert.equal((await request('personal.example', monitorPath, 'PATCH', { destinationIds: [pending.id] })).status, 400);
-    assert.equal((await request('personal.example', monitorPath, 'PATCH', { destinationChanges: { [pending.id]: true } })).status, 400);
-    await until(() => mail.length === 1);
-    assert.equal(mail[0].to, inbox);
-    assert.equal(mail[0].from, 'alerts@sender.example');
-    const link = new URL(mail[0].text.match(/https:\/\/[^\s]+/)[0]);
-    assert.ok(mail[0].html.includes(link.href));
-    const token = link.hash.slice(1);
-    assert.ok(token);
-    assert.doesNotMatch(JSON.stringify(batches.at(-1)), /ops\+test|personal\.example/);
-    assert.ok(!JSON.stringify(batches.at(-1)).includes(token));
-    assert.ok(!JSON.stringify(added).includes(token));
-    const recipient = (host, method = 'GET', credential = token) => mf.dispatchFetch('https://' + host + link.pathname, {
-      method,
-      ...(method === 'POST' ? { body: new URLSearchParams({ token: credential }) } : {}),
-    });
-    assert.equal((await recipient('personal.example')).status, 200);
-    assert.equal((await json('personal.example', path)).destinations.find(destination => destination.id === pending.id).confirmed, false);
-    assert.equal((await recipient('tenant.example', 'POST')).status, 400);
-    assert.equal((await recipient('personal.example', 'POST')).status, 200);
-    assert.equal((await recipient('personal.example', 'POST')).status, 400);
-    assert.equal((await json('personal.example', path)).destinations.find(destination => destination.id === pending.id).confirmed, true);
-    assert.equal(mail.length, 1);
-    assert.deepEqual((await json('personal.example', '/api/operator')).monitor.destinationIds, []);
-    await json('personal.example', monitorPath, 'PATCH', { destinationIds: [pending.id] });
-    const replacement = await json('personal.example', path + '/' + pending.id, 'PUT', email('replacement@example.net'));
-    assert.deepEqual(replacement.monitor.destinationIds, []);
-    assert.equal(replacement.destinations.find(destination => destination.address === 'replacement@example.net').confirmed, false);
-    await until(() => completedBatches === batches.length && mail.length === 2);
+    {
+      const inbox = 'ops+test@example.net';
+      const email = address => ({ channel: 'email', address });
+      const setClock = (host, at) => request(host, '/test-clock?at=' + at);
+      assert.equal((await request('no-email.example', path, 'POST', email(inbox))).status, 503);
+      const withoutEmail = await json('no-email.example', path, 'POST', { url: 'https://hooks.example/ordinary' }, 201);
+      assert.ok(!('emailConfigured' in withoutEmail));
+      assert.equal(withoutEmail.destinations.length, 1);
+      const denied = await mf.dispatchFetch('https://tenant.example' + path, {
+        method: 'POST', headers: { authorization: 'Bearer reader', 'content-type': 'application/json' },
+        body: JSON.stringify(email(inbox)),
+      });
+      assert.equal(denied.status, 403);
+      const added = await json('personal.example', path, 'POST', email(inbox), 201);
+      assert.equal(added.emailConfigured, true);
+      const pending = added.destinations.find(destination => destination.channel === 'email');
+      assert.equal(pending.confirmed, false);
+      const { monitor } = await json('personal.example', monitors, 'POST', { name: 'Email opt-in', kind: 'heartbeat' }, 201);
+      const monitorPath = monitors + '/' + monitor.id;
+      assert.equal((await request('personal.example', monitorPath, 'PATCH', { destinationIds: [pending.id] })).status, 400);
+      assert.equal((await request('personal.example', monitorPath, 'PATCH', { destinationChanges: { [pending.id]: true } })).status, 400);
+      await until(() => mail.length === 1);
+      assert.equal(mail[0].to, inbox);
+      assert.equal(mail[0].from, 'alerts@sender.example');
+      const link = new URL(mail[0].text.match(/https:\/\/[^\s]+/)[0]);
+      assert.ok(mail[0].html.includes(link.href));
+      const token = link.hash.slice(1);
+      assert.ok(token);
+      assert.doesNotMatch(JSON.stringify(batches.at(-1)), /ops\+test|personal\.example/);
+      assert.ok(!JSON.stringify(batches.at(-1)).includes(token));
+      assert.ok(!JSON.stringify(added).includes(token));
+      const recipient = (host, method = 'GET', credential = token) => mf.dispatchFetch('https://' + host + link.pathname, {
+        method,
+        ...(method === 'POST' ? { body: new URLSearchParams({ token: credential }) } : {}),
+      });
+      assert.equal((await recipient('personal.example')).status, 200);
+      assert.equal((await json('personal.example', path)).destinations.find(destination => destination.id === pending.id).confirmed, false);
+      assert.equal((await recipient('tenant.example', 'POST')).status, 400);
+      assert.equal((await recipient('personal.example', 'POST')).status, 200);
+      assert.equal((await recipient('personal.example', 'POST')).status, 400);
+      assert.equal((await json('personal.example', path)).destinations.find(destination => destination.id === pending.id).confirmed, true);
+      assert.equal(mail.length, 1);
+      assert.deepEqual((await json('personal.example', '/api/operator')).monitor.destinationIds, []);
+      await json('personal.example', monitorPath, 'PATCH', { destinationIds: [pending.id] });
+      const replacement = await json('personal.example', path + '/' + pending.id, 'PUT', email('replacement@example.net'));
+      assert.deepEqual(replacement.monitor.destinationIds, []);
+      assert.equal(replacement.destinations.find(destination => destination.address === 'replacement@example.net').confirmed, false);
+      await until(() => completedBatches === batches.length && mail.length === 2);
 
-    const consentHost = 'consent-tenant.example';
-    const addTenant = async (address, search = '') => (await json(consentHost, path + search, 'POST', email(address), 201))
-      .destinations.find(destination => destination.address === address);
-    const tenantDestination = await addTenant(inbox);
-    const tenantPath = path + '/' + tenantDestination.id;
-    const resend = () => request(consentHost, tenantPath + '/confirmation', 'POST');
-    await until(() => mail.length === 3 && completedBatches === batches.length);
-    const tenantJob = batches.at(-1)[0];
-    const credential = message => new URL(message.text.match(/https:\/\/[^\s]+/)[0]).hash.slice(1);
-    const previous = credential(mail.at(-1));
-    const readerResponse = await mf.dispatchFetch('https://' + consentHost + '/api/operator', { headers: { authorization: 'Bearer reader' } });
-    assert.doesNotMatch(await readerResponse.text(), /example\.net|emailConfigured/);
-    assert.doesNotMatch(await (await request(consentHost, '/api/status')).text(), /example\.net/);
-    await setClock(consentHost, tenantJob.at + 299_999);
-    assert.equal((await resend()).status, 429);
-    assert.equal((await request(consentHost, path, 'POST', email(inbox.toUpperCase()))).status, 409);
-    await setClock(consentHost, tenantJob.at + 300_000);
-    assert.equal((await resend()).status, 200);
-    assert.equal((await recipient(consentHost, 'POST', previous)).status, 400);
-    await until(() => mail.length === 4 && completedBatches === batches.length);
-    const newJob = batches.at(-1)[0];
-    const next = credential(mail.at(-1));
-    assert.notEqual(next, previous);
-    const beforeReplay = completedBatches;
-    await producer.send(newJob);
-    await until(() => completedBatches > beforeReplay);
-    assert.equal(mail.length, 4, 'an already submitted confirmation job does not send again');
-    await setClock(consentHost, newJob.at + 86_400_000);
-    assert.equal((await recipient(consentHost, 'POST', next)).status, 400);
-
-    const beforeRemove = completedBatches;
-    let release;
-    holdBatch = new Promise(resolve => { release = resolve; });
-    try {
+      const consentHost = 'consent-tenant.example';
+      const addTenant = async (address, search = '') => (await json(consentHost, path + search, 'POST', email(address), 201))
+        .destinations.find(destination => destination.address === address);
+      const consentDestination = await addTenant(inbox);
+      const consentPath = path + '/' + consentDestination.id;
+      const resend = () => request(consentHost, consentPath + '/confirmation', 'POST');
+      await until(() => mail.length === 3 && completedBatches === batches.length);
+      const tenantJob = batches.at(-1)[0];
+      const credential = message => new URL(message.text.match(/https:\/\/[^\s]+/)[0]).hash.slice(1);
+      const previous = credential(mail.at(-1));
+      const readerResponse = await mf.dispatchFetch('https://' + consentHost + '/api/operator', { headers: { authorization: 'Bearer reader' } });
+      assert.doesNotMatch(await readerResponse.text(), /example\.net|emailConfigured/);
+      assert.doesNotMatch(await (await request(consentHost, '/api/status')).text(), /example\.net/);
+      await setClock(consentHost, tenantJob.at + 299_999);
+      assert.equal((await resend()).status, 429);
+      assert.equal((await request(consentHost, path, 'POST', email(inbox.toUpperCase()))).status, 409);
+      await setClock(consentHost, tenantJob.at + 300_000);
       assert.equal((await resend()).status, 200);
-      await until(() => batches.length > beforeRemove);
-      await json(consentHost, tenantPath, 'DELETE');
-      assert.equal((await request(consentHost, path, 'POST', email(inbox.toUpperCase()))).status, 429);
-    } finally {
-      release();
-      holdBatch = undefined;
+      assert.equal((await recipient(consentHost, 'POST', previous)).status, 400);
+      await until(() => mail.length === 4 && completedBatches === batches.length);
+      const newJob = batches.at(-1)[0];
+      const next = credential(mail.at(-1));
+      assert.notEqual(next, previous);
+      const beforeReplay = completedBatches;
+      await producer.send(newJob);
+      await until(() => completedBatches > beforeReplay);
+      assert.equal(mail.length, 4, 'an already submitted confirmation job does not send again');
+      await setClock(consentHost, newJob.at + 86_400_000);
+      assert.equal((await recipient(consentHost, 'POST', next)).status, 400);
+
+      const beforeRemove = completedBatches;
+      let release;
+      holdBatch = new Promise(resolve => { release = resolve; });
+      try {
+        assert.equal((await resend()).status, 200);
+        await until(() => batches.length > beforeRemove);
+        await json(consentHost, consentPath, 'DELETE');
+        assert.equal((await request(consentHost, path, 'POST', email(inbox.toUpperCase()))).status, 429);
+      } finally {
+        release();
+        holdBatch = undefined;
+      }
+      await until(() => completedBatches > beforeRemove);
+      assert.equal(mail.length, 4, 'removal prevents a queued confirmation from submitting');
+      assert.equal((await recipient(consentHost, 'POST', next)).status, 400);
+      await setClock(consentHost, newJob.at + 86_400_000 + 300_000);
+      const reAdded = await addTenant(inbox);
+      assert.notEqual(reAdded.id, consentDestination.id);
+      await until(() => mail.length === 5 && completedBatches === batches.length);
+      assert.equal((await recipient(consentHost, 'POST', credential(mail.at(-1)))).status, 200);
+
+      const pauseInbox = 'pause@example.net';
+      const priorBatch = batches.length;
+      const paused = await addTenant(pauseInbox, '?test-policy-revision=1');
+      assert.equal(paused.confirmed, false);
+      assert.equal((await request(consentHost, path + '/' + paused.id + '/confirmation', 'POST')).status, 409);
+      assert.equal((await json(consentHost, '/api/operator?test-policy-revision=2')).paused, false);
+      assert.equal(batches.length, priorBatch);
+      await json(consentHost, path + '/' + paused.id + '/confirmation', 'POST');
+      await until(() => mail.length === 6 && completedBatches === batches.length);
+      assert.equal(mail.at(-1).to, pauseInbox);
+
+      const heldInbox = 'held@example.net';
+      const beforePause = completedBatches;
+      holdBatch = new Promise(resolve => { release = resolve; });
+      try {
+        await addTenant(heldInbox);
+        await until(() => batches.length > beforePause);
+        assert.equal((await json(consentHost, '/api/operator?test-policy-revision=3')).paused, true);
+        assert.equal((await json(consentHost, '/api/operator?test-policy-revision=4')).paused, false);
+      } finally {
+        release();
+        holdBatch = undefined;
+      }
+      await until(() => completedBatches > beforePause);
+      assert.equal(mail.length, 6, 'pause and resume invalidate a queued confirmation');
+
+      const resendInbox = 'resend-race@example.net';
+      const beforeResend = completedBatches;
+      holdBatch = new Promise(resolve => { release = resolve; });
+      try {
+        const destination = await addTenant(resendInbox);
+        await until(() => batches.length > beforeResend);
+        await setClock(consentHost, batches.at(-1)[0].at + 300_000);
+        await json(consentHost, path + '/' + destination.id + '/confirmation', 'POST');
+      } finally {
+        release();
+        holdBatch = undefined;
+      }
+      await until(() => completedBatches === beforeResend + 2);
+      assert.equal(mail.filter(message => message.to === resendInbox).length, 1, 'resend invalidates the older queued confirmation');
+      assert.ok(!errors.some(error => error.includes(next) || error.includes(inbox)));
+
+      await main(async dispatch => {
+        const headers = { authorization: 'Bearer test-installation-secret', 'content-type': 'application/json' };
+        const endpoint = 'https://personal.example' + path;
+        assert.equal((await dispatch(endpoint, { method: 'POST', headers, body: JSON.stringify(email(inbox)) })).status, 503);
+        const webhook = await dispatch(endpoint, { method: 'POST', headers, body: JSON.stringify({ url: 'https://hooks.example/still-available' }) });
+        assert.equal(webhook.status, 201);
+        assert.ok(!('emailConfigured' in await webhook.json()));
+      }, false);
+      console.log('PASS email confirmation: optional setup, hosted roles, consent, cooldown, expiry, cancellation and pause');
     }
-    await until(() => completedBatches > beforeRemove);
-    assert.equal(mail.length, 4, 'removal prevents a queued confirmation from submitting');
-    assert.equal((await recipient(consentHost, 'POST', next)).status, 400);
-    await setClock(consentHost, newJob.at + 86_400_000 + 300_000);
-    const reAdded = await addTenant(inbox);
-    assert.notEqual(reAdded.id, tenantDestination.id);
-    await until(() => mail.length === 5 && completedBatches === batches.length);
-    assert.equal((await recipient(consentHost, 'POST', credential(mail.at(-1)))).status, 200);
-
-    const pauseInbox = 'pause@example.net';
-    const priorBatch = batches.length;
-    const paused = await addTenant(pauseInbox, '?test-policy-revision=1');
-    assert.equal(paused.confirmed, false);
-    assert.equal((await request(consentHost, path + '/' + paused.id + '/confirmation', 'POST')).status, 409);
-    assert.equal((await json(consentHost, '/api/operator?test-policy-revision=2')).paused, false);
-    assert.equal(batches.length, priorBatch);
-    await json(consentHost, path + '/' + paused.id + '/confirmation', 'POST');
-    await until(() => mail.length === 6 && completedBatches === batches.length);
-    assert.equal(mail.at(-1).to, pauseInbox);
-
-    const heldInbox = 'held@example.net';
-    const beforePause = completedBatches;
-    holdBatch = new Promise(resolve => { release = resolve; });
-    try {
-      await addTenant(heldInbox);
-      await until(() => batches.length > beforePause);
-      assert.equal((await json(consentHost, '/api/operator?test-policy-revision=3')).paused, true);
-      assert.equal((await json(consentHost, '/api/operator?test-policy-revision=4')).paused, false);
-    } finally {
-      release();
-      holdBatch = undefined;
-    }
-    await until(() => completedBatches > beforePause);
-    assert.equal(mail.length, 6, 'pause and resume invalidate a queued confirmation');
-    assert.ok(!errors.some(error => error.includes(next) || error.includes(inbox)));
-
-    await main(async dispatch => {
-      const headers = { authorization: 'Bearer test-installation-secret', 'content-type': 'application/json' };
-      const endpoint = 'https://personal.example' + path;
-      assert.equal((await dispatch(endpoint, { method: 'POST', headers, body: JSON.stringify(email(inbox)) })).status, 503);
-      const webhook = await dispatch(endpoint, { method: 'POST', headers, body: JSON.stringify({ url: 'https://hooks.example/still-available' }) });
-      assert.equal(webhook.status, 201);
-      assert.ok(!('emailConfigured' in await webhook.json()));
-    }, false);
-    console.log('PASS email confirmation: optional setup, hosted roles, consent, cooldown, expiry, cancellation and pause');
   } finally {
     await mf.dispose();
   }
