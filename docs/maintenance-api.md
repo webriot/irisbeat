@@ -54,10 +54,9 @@ Retain adapter context resolution, operator metadata, allowance enforcement and
 heartbeat credential rotation. Suppression returns from shared `record` before
 Incident mutation or post-commit delivery; both Queue submission and
 `onIncidentTransition` remain downstream of it. Installed-consumer tests cover
-both delivery paths for HTTP, TCP and Heartbeat. There are no Maintenance
-transition alert events. A webhook submitted before declaration cannot be recalled;
-a hosted hook still waiting behind that delivery is suppressed if Maintenance is
-active when it would start.
+Queue handoff for HTTP, TCP and Heartbeat. There are no Maintenance transition
+alert events. A webhook submitted before declaration cannot be recalled. The
+legacy hosted hook applies only to installations without a Queue binding.
 
 #11 makes pause override Maintenance for checking/recording/display and retains
 unexpired windows for resume. See the [hosted pause contract](hosted-contract.md#pause-and-resume). Do not infer subscriptions or hosted identity from

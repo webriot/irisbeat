@@ -616,7 +616,8 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         monitorName: monitor.name,
       });
     }
-    // Recheck policy after yielding for Queue acceptance before starting the hosted hook.
+    // Queue-enabled deployments use Monitor selections as their only delivery path.
+    if (this.env.NOTIFICATION_QUEUE) return;
     const deliveryState = this.read();
     // Calendar receipt windows already determine exclusion; later Maintenance cannot erase old hooks.
     const maintenanceBlocksHook = !(monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") && deliveryState.monitors.some(candidate => candidate.id === monitor.id && candidate.maintenance);

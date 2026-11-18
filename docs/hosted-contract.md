@@ -91,7 +91,8 @@ monitoring Worker and bind the delivery Worker's `NOTIFICATION_DELIVERY` service
 to that named entrypoint. It resolves a webhook only while the original context,
 Monitor, destination and selection remain eligible. Keep the Queue and service
 binding under trusted deployment control. Delivery lookup is available through
-service RPC.
+service RPC. Keep Workers Logs enabled on the delivery Worker and disable
+automatic traces because fetch spans can include credential-bearing webhook URLs.
 
 Editors manage webhook destinations with `POST /api/operator/destinations` and
 `PUT` or `DELETE /api/operator/destinations/:id`. Provide an HTTPS `{ url }` for
@@ -108,12 +109,15 @@ enqueue logs `notification_enqueue_failed` and leaves the Incident committed.
 Queue acceptance starts durable delivery. This slice makes one bounded provider
 submission per message and logs `webhook_submission_failed` on failure.
 
-The existing `onIncidentTransition` hook remains available while hosted consumers
-migrate to engine-owned destinations. Override
-`protected async onIncidentTransition(event: IncidentTransition): Promise<void>`
-on the hosted `MonitoringContext` subclass. The event contains the opaque Durable
+Binding `NOTIFICATION_QUEUE` switches the entire monitoring Worker to delivery
+through explicit Monitor selections. It suppresses every `onIncidentTransition`
+override, including for unselected Monitors and when Queue submission fails.
+Set up the consumer before enabling notifications and select destinations on
+each Monitor that should send. Existing hosted Workers without the Queue binding
+retain the legacy `protected async onIncidentTransition(event: IncidentTransition):
+Promise<void>` override for migration. The event contains the opaque Durable
 Object ID, Incident, transition and observation time. Hook exceptions log
-`transition_delivery_failed`. Configure a destination in one path during migration.
+`transition_delivery_failed`.
 
 ## Pause and resume
 
@@ -201,7 +205,7 @@ an empty notification backlog. Maintenance #8 suppresses Incident transitions an
 their delivery before the engine reaches Queue handoff or the hosted hook. Editors use `PUT`/`DELETE /api/operator/monitors/:id/maintenance`; readers
 cannot mutate windows. See [Maintenance handoff](maintenance-api.md) for status
 fields, observation retention, and the #11 precedence seam. Installed-consumer
-coverage verifies suppression of both delivery paths for all three check kinds.
+coverage verifies Queue suppression for all three check kinds.
 The hook observes committed detector transitions, not every raw observation.
 [History #9](history-api.md) adds the same filtered per-Monitor series to personal and hosted status, including readers; it does not change credentials, permissions, allowances or delivery. The release candidate must be
 regenerated after integration changes, before #12 publishes anything.

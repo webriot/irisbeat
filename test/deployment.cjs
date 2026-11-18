@@ -6,6 +6,7 @@ const { mkdtempSync, rmSync, readFileSync, symlinkSync, mkdirSync } = require('n
 const { join } = require('node:path');
 const { createHash, randomBytes } = require('node:crypto');
 const { version } = require('../package.json');
+const { experimental_patchConfig, unstable_readConfig } = require('wrangler');
 const project = process.cwd();
 const localRequire = createRequire(join(project, 'node_modules/@cloudflare/vitest-plugin/package.json'));
 const { build } = localRequire('esbuild');
@@ -23,8 +24,29 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     // Share the lockfile-installed toolchain rather than copying dependencies on a constrained machine.
     assert.equal(readFileSync(join(source, 'package-lock.json'), 'utf8'), readFileSync('package-lock.json', 'utf8'));
     symlinkSync(join(project, 'node_modules'), join(source, 'node_modules'), 'dir');
-    execFileSync(join(project, 'node_modules/.bin/wrangler'), ['deploy', '--dry-run', '--outdir', join(temporary, 'build')], { cwd: source, stdio: 'pipe' });
-    execFileSync(join(project, 'node_modules/.bin/wrangler'), ['deploy', '--dry-run', '--config', 'wrangler.delivery.jsonc', '--outdir', join(temporary, 'delivery-build')], { cwd: source, stdio: 'pipe' });
+    const monitoringName = 'irisbeat-smoke';
+    const deliveryName = monitoringName + '-delivery';
+    const queueName = monitoringName + '-notifications';
+    const monitoringPath = join(source, 'wrangler.jsonc');
+    const deliveryPath = join(source, 'wrangler.delivery.jsonc');
+    experimental_patchConfig(monitoringPath, { queues: { producers: [{ queue: queueName }] } }, false);
+    experimental_patchConfig(deliveryPath, {
+      queues: { consumers: [{ queue: queueName }] },
+      services: [{ service: monitoringName }],
+    }, false);
+    const producerConfig = unstable_readConfig({ config: monitoringPath });
+    const consumerConfig = unstable_readConfig({ config: deliveryPath });
+    assert.equal(consumerConfig.observability.enabled, true, 'delivery keeps Workers Logs');
+    assert.equal(consumerConfig.observability.traces.enabled, false, 'delivery omits credential-bearing fetch spans');
+    for (const [name, config] of [[monitoringName, producerConfig], [deliveryName, consumerConfig]]) {
+      execFileSync(join(project, 'node_modules/.bin/wrangler'), [
+        'deploy', '--dry-run', '--config', config.configPath, '--name', name,
+        '--outdir', join(temporary, name + '-build'),
+      ], { cwd: source, stdio: 'pipe' });
+    }
+    const [queueProducer] = producerConfig.queues.producers;
+    const [queueConsumer] = consumerConfig.queues.consumers;
+    const [deliveryService] = consumerConfig.services;
     const delivery = (await build({ entryPoints: [join(source, 'src/notification-delivery.ts')], bundle: true, write: false, format: 'esm', platform: 'neutral' })).outputFiles[0].text;
     const script = (await build({ stdin: { contents: `
       import worker from './src/index.ts';
@@ -55,18 +77,18 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     const alerts = [], targets = [];
     const secret = randomBytes(32).toString('hex');
     mf = new Miniflare(convertV4MiniflareOptions({ workers: [
-      { name: 'monitoring', modules: true, script, compatibilityDate: '2026-11-13',
+      { name: monitoringName, modules: true, script, compatibilityDate: '2026-11-13',
         bindings: { INSTALLATION_SECRET: secret }, durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } },
-        queueProducers: { NOTIFICATION_QUEUE: 'notifications' },
+        queueProducers: { [queueProducer.binding]: queueProducer.queue },
         outboundService: request => {
           const host = new URL(request.url).hostname;
           assert.ok(['http-target.example', 'tcp-target.example'].includes(host), 'all targets are substituted');
           targets.push(host); return new Response(null, { status: outcome });
         },
       },
-      { name: 'delivery', modules: true, script: delivery, compatibilityDate: '2026-11-18',
-        queueConsumers: { notifications: { maxBatchTimeout: 0.1, maxRetries: 0 } },
-        serviceBindings: { NOTIFICATION_DELIVERY: { name: 'monitoring', entrypoint: 'NotificationDelivery' } },
+      { name: deliveryName, modules: true, script: delivery, compatibilityDate: '2026-11-18',
+        queueConsumers: { [queueConsumer.queue]: { maxBatchTimeout: 0.1, maxRetries: queueConsumer.max_retries } },
+        serviceBindings: { [deliveryService.binding]: { name: deliveryService.service, entrypoint: deliveryService.entrypoint } },
         outboundService: async request => {
           assert.equal(request.url, 'https://webhook.example/controlled');
           alerts.push(await request.json()); return new Response(null, { status: 204 });
@@ -145,7 +167,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     await request(paths[0], 'DELETE');
     assert.ok((await status()).incidents.some(incident => incident.monitorId === monitors[0].id), 'deletion retains operator Incidents');
     assert.ok(!(await status('/api/status')).incidents.some(incident => incident.monitorId === monitors[0].id));
-    console.log('PASS exact-source personal workerd smoke: dry-run entrypoint, secret guards, named anonymous ledger/source, HTTP/TCP/Heartbeat, Maintenance/history, opening/recovery webhooks, publication and retained Incidents; no live deployment');
+    console.log('PASS exact-source personal workerd smoke: named producer and consumer dry runs, matched Queue and service binding, secret guards, named anonymous ledger/source, HTTP/TCP/Heartbeat, Maintenance/history, opening/recovery webhooks, publication and retained Incidents; no live deployment');
   } finally {
     if (mf) await mf.dispose();
     rmSync(temporary, { recursive: true, force: true });

@@ -13,6 +13,7 @@
   ],
   "observability": {
     "enabled": true,
-    "traces": { "enabled": true },
+    // Automatic fetch spans include webhook URLs, which can contain credentials.
+    "traces": { "enabled": false },
   },
 }

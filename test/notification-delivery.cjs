@@ -20,7 +20,14 @@ async function main() {
     export { MonitoringContext, NotificationDelivery } from './src/index.ts';
     const hosted = createHostedWorker({
       contractVersion: '1',
-      resolve: request => ({ id: new URL(request.url).hostname, permission: 'editor', monitorLimit: 10 }),
+      resolve(request) {
+        const url = new URL(request.url);
+        const revision = url.searchParams.get('test-policy-revision');
+        return {
+          id: url.hostname, permission: 'editor', monitorLimit: 10,
+          ...(revision === null ? {} : { paused: revision === '1', policyRevision: Number(revision) }),
+        };
+      },
       contexts: () => ['tenant.example'],
     });
     export default {
@@ -42,44 +49,53 @@ async function main() {
       },
     };`);
 
-  const batches = [], submissions = [];
+  const batches = [], submissions = [], errors = [];
   let healthy = false;
-  let holdBatch;
+  let holdBatch, holdProvider, providerStartedAt;
   let completedBatches = 0;
   let providerStatus = 204;
-  const mf = new Miniflare(convertV4MiniflareOptions({ workers: [
-    { name: 'monitoring', modules: true, script: monitoring, compatibilityDate: '2026-11-13',
-      bindings: { INSTALLATION_SECRET: 'test-installation-secret' },
-      durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } },
-      queueProducers: { NOTIFICATION_QUEUE: 'notifications' },
-      outboundService: request => {
-        assert.equal(request.url, 'https://internal.example:8443/target-secret');
-        return new Response(null, { status: healthy ? 204 : 503 });
-      },
-    },
-    { name: 'delivery', modules: true, script: consumer, compatibilityDate: '2026-11-18',
-      queueConsumers: { notifications: { maxBatchTimeout: 0.1, maxRetries: 0 } },
-      serviceBindings: {
-        NOTIFICATION_DELIVERY: { name: 'monitoring', entrypoint: 'NotificationDelivery' },
-        GATE: async request => {
-          if (new URL(request.url).pathname === '/batch') {
-            batches.push(await request.json());
-            await holdBatch;
-          } else {
-            completedBatches++;
-          }
-          return new Response(null, { status: 204 });
+  const mf = new Miniflare(convertV4MiniflareOptions({
+    handleStructuredLogs: log => { if (log.level === 'error') errors.push(log.message); },
+    workers: [
+      { name: 'monitoring', modules: true, script: monitoring, compatibilityDate: '2026-11-13',
+        bindings: { INSTALLATION_SECRET: 'test-installation-secret' },
+        durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } },
+        queueProducers: { NOTIFICATION_QUEUE: 'notifications' },
+        outboundService: request => {
+          assert.equal(request.url, 'https://internal.example:8443/target-secret');
+          return new Response(null, { status: healthy ? 204 : 503 });
         },
       },
-      outboundService: async request => {
-        assert.ok(['hooks.example', 'discord.com'].includes(new URL(request.url).hostname), 'redirects stay unfollowed');
-        submissions.push({ url: request.url, payload: await request.json() });
-        return new Response(providerStatus === 204 ? null : 'sensitive provider response', {
-          status: providerStatus, headers: { Location: 'https://redirect.example/secret' },
-        });
+      { name: 'delivery', modules: true, script: consumer, compatibilityDate: '2026-11-18',
+        queueConsumers: { notifications: { maxBatchTimeout: 0.1, maxRetries: 0 } },
+        serviceBindings: {
+          NOTIFICATION_DELIVERY: { name: 'monitoring', entrypoint: 'NotificationDelivery' },
+          GATE: async request => {
+            if (new URL(request.url).pathname === '/batch') {
+              batches.push(await request.json());
+              await holdBatch;
+            } else {
+              completedBatches++;
+            }
+            return new Response(null, { status: 204 });
+          },
+        },
+        outboundService: async request => {
+          const submission = { url: request.url };
+          submissions.push(submission);
+          if (new URL(request.url).hostname === 'redirect.example') return new Response(null, { status: 204 });
+          submission.payload = await request.json();
+          if (holdProvider) {
+            providerStartedAt = performance.now();
+            await holdProvider;
+          }
+          return new Response(providerStatus === 204 ? null : 'sensitive provider response', {
+            status: providerStatus, headers: { Location: 'https://redirect.example/secret' },
+          });
+        },
       },
-    },
-  ] }));
+    ],
+  }));
   let at = Date.now();
   const path = '/api/operator/destinations';
   const monitors = '/api/operator/monitors';
@@ -96,14 +112,31 @@ async function main() {
     assert.equal((await request(host, '/test-tick?at=' + at)).status, 204);
     at += 60_000;
   }
-  async function until(condition) {
-    const deadline = Date.now() + 5000;
+  async function until(condition, timeout = 5000) {
+    const deadline = Date.now() + timeout;
     while (!condition()) {
       assert.ok(Date.now() < deadline, 'timed out waiting for the Queue consumer');
       await new Promise(resolve => setTimeout(resolve, 25));
     }
   }
+  async function holdTransition(host, change) {
+    const priorBatches = batches.length;
+    let release;
+    holdBatch = new Promise(resolve => { release = resolve; });
+    try {
+      await tick(host);
+      await until(() => batches.length > priorBatches);
+      await change();
+    } finally {
+      release();
+      holdBatch = undefined;
+    }
+    await until(() => completedBatches > priorBatches);
+  }
+
   try {
+    const producer = await mf.getQueueProducer('NOTIFICATION_QUEUE', 'monitoring');
+    let deletePersonalMonitor;
     for (const host of ['personal.example', 'tenant.example']) {
       healthy = false;
       providerStatus = 204;
@@ -140,34 +173,29 @@ async function main() {
       }
       assert.doesNotMatch(JSON.stringify(batches), /internal\.example|8443|target-secret|hooks\.example|\/token/);
 
-      async function holdTransition(change) {
-        const priorBatches = batches.length;
-        let release;
-        holdBatch = new Promise(resolve => { release = resolve; });
-        try {
-          await tick(host);
-          await until(() => batches.length > priorBatches);
-          await change();
-        } finally {
-          release();
-          holdBatch = undefined;
-        }
-        await until(() => completedBatches > priorBatches);
+      if (host === 'tenant.example') {
+        // Replay only the context ID of a job that just delivered while its selection is still active.
+        const wrongContext = batches[0][0].contextId;
+        assert.notEqual(recoveryJobs[0].contextId, wrongContext);
+        const beforeReplay = completedBatches;
+        await producer.send({ ...recoveryJobs[0], contextId: wrongContext });
+        await until(() => completedBatches > beforeReplay);
+        assert.equal(submissions.length, before + 2, 'changing only context ID rejects an otherwise eligible job');
       }
 
       // A no-op selection retains eligibility, while deselecting and reselecting does not.
       healthy = false;
-      providerStatus = 302;
-      await holdTransition(async () => {
+      providerStatus = 307;
+      await holdTransition(host, async () => {
         const committed = (await json(host, '/api/operator')).incidents;
         assert.equal(committed.filter(incident => incident.closedAt === null).length, 1);
         await json(host, monitorPath, 'PATCH', { destinationIds: [ids[1]] });
         await json(host, monitorPath, 'PATCH', { destinationIds: ids });
       });
-      assert.deepEqual(submissions.slice(before + 2).map(item => item.url), [discord + '/slack']);
+      assert.deepEqual(submissions.slice(before + 2).map(item => item.url), [discord + '/slack'], 'a 307 never triggers a second outbound request');
 
       healthy = true;
-      await holdTransition(async () => {
+      await holdTransition(host, async () => {
         await json(host, path + '/' + ids[0], 'PUT', { url: 'https://hooks.example/replaced' });
         await json(host, path + '/' + ids[1], 'DELETE');
         const { destinations: addedAgain } = await json(host, path, 'POST', { url: discord }, 201);
@@ -176,23 +204,53 @@ async function main() {
       assert.equal(submissions.length, before + 3, 'replacement and re-addition cancel already queued jobs');
 
       if (host === 'personal.example') {
+        deletePersonalMonitor = async () => {
+          const beforeDeletion = submissions.length;
+          healthy = false;
+          await holdTransition(host, async () => {
+            await json(host, monitorPath, 'DELETE');
+          });
+          assert.equal(submissions.length, beforeDeletion, 'deleting the Monitor cancels already queued jobs');
+        };
+      } else {
+        const [destination] = (await json(host, '/api/operator')).destinations;
+        await json(host, monitorPath, 'PATCH', { destinationIds: [destination.id] });
         healthy = false;
-        await holdTransition(async () => {
-          await json(host, monitorPath, 'DELETE');
+        providerStatus = 204;
+        await holdTransition(host, async () => {
+          assert.equal((await json(host, '/api/operator?test-policy-revision=1')).paused, true);
+          healthy = true;
+          await tick(host);
+          assert.ok((await json(host, '/api/operator')).incidents.some(incident => incident.closedAt === null),
+            'paused dispatch leaves the opening Incident unresolved');
+          assert.equal((await json(host, '/api/operator?test-policy-revision=2')).paused, false);
         });
-        assert.equal(submissions.length, before + 3, 'deleting the Monitor cancels already queued jobs');
+        assert.equal(submissions.length, before + 3, 'jobs held across a trusted pause and resume cannot submit');
+        await tick(host);
+        await until(() => submissions.length === before + 4 && completedBatches === batches.length);
+        assert.match(submissions.at(-1).payload.text, /Incident recovered/, 'a fresh post-resume job delivers');
+
+        healthy = false;
+        let releaseProvider;
+        holdProvider = new Promise(resolve => { releaseProvider = resolve; });
+        try {
+          const beforeDeadline = completedBatches;
+          const beforeErrors = errors.length;
+          await tick(host);
+          await until(() => submissions.length === before + 5);
+          // The simulated provider stays unanswered while the real delivery deadline runs.
+          await until(() => completedBatches > beforeDeadline && errors.length > beforeErrors, 13_000);
+          assert.ok(performance.now() - providerStartedAt >= 9500, 'the held provider reaches the configured deadline');
+          assert.deepEqual(errors.slice(beforeErrors), [JSON.stringify({ event: 'webhook_submission_failed' })]);
+          assert.equal(submissions.length, before + 5, 'the held submission is attempted once');
+        } finally {
+          releaseProvider();
+          holdProvider = undefined;
+        }
       }
     }
-    const personalJob = batches[0][0];
-    const tenantJob = batches.find(batch => batch[0].contextId !== personalJob.contextId)[0];
-    assert.notEqual(personalJob.contextId, tenantJob.contextId);
-    const priorSubmissions = submissions.length;
-    const priorBatches = completedBatches;
-    const producer = await mf.getQueueProducer('NOTIFICATION_QUEUE', 'monitoring');
-    await producer.send({ ...personalJob, contextId: tenantJob.contextId });
-    await until(() => completedBatches > priorBatches);
-    assert.equal(submissions.length, priorSubmissions, 'jobs cannot resolve a destination with another context ID');
-    console.log('PASS Incident fan-out, private Monitors, opt-in, trusted two-Worker Queue delivery, safe content, cancellation and no redirects');
+    await deletePersonalMonitor();
+    console.log('PASS real Queue delivery: opt-in, fan-out, safe content, redirects, deadline, tenant isolation and cancellation across selection, deletion and pause');
   } finally {
     await mf.dispose();
   }
