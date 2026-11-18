@@ -246,15 +246,14 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (!stored) return { pageName: "Irisbeat", monitors: [] };
     if ("monitors" in stored) {
       stored.monitors = stored.monitors.map(monitor => { monitor.kind ??= "http"; return { ...timingDefaults, scheduleMode: "interval", ...monitor, createdAt: monitor.createdAt ?? 0, lastSeen: monitor.lastSeen ?? null, recoveryReceiptAt: monitor.recoveryReceiptAt ?? null }; });
-      const changed = this.migrateWebhook(stored);
-      let maintenanceChanged = false;
+      let changed = this.migrateWebhook(stored);
       for (const monitor of stored.monitors) {
         if (monitor.maintenance && at >= monitor.maintenance.endsAt) {
           this.endMaintenance(monitor);
-          maintenanceChanged = true;
+          changed = true;
         }
       }
-      if (changed || maintenanceChanged) this.ctx.storage.kv.put("context", stored);
+      if (changed) this.ctx.storage.kv.put("context", stored);
       return stored;
     }
     const { monitor: legacyMonitor, ...context } = stored;
@@ -606,43 +605,43 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       this.ctx.storage.kv.put("context", current);
     });
     this.notify(before);
-    if (maintenance) return;
-    if (transition && transitionedIncident) {
-      const selections = monitor.notificationSelections ?? [];
-      if (selections.length) {
-        const event: NotificationJob["event"] = {
-          id: transitionedIncident.id + ":" + transition,
-          kind: transition === "opened" ? "incident.opened" : "incident.recovered",
-          at,
-          incidentId: transitionedIncident.id,
-          openedAt: transitionedIncident.openedAt,
-          monitorName: monitor.name,
-        };
-        const contextId = this.ctx.id.toString();
-        const jobs: NotificationJob[] = selections.map(selection => ({
-          ...selection, contextId, monitorId: monitor.id, pauseGeneration,
-          deliveryId: event.id + ":" + selection.destinationId, event,
-        }));
-        // The storage output gate holds the Queue handoff until the transition is durable.
-        for (let i = 0; i < jobs.length; i += 100) {
-          try {
-            if (!this.env.NOTIFICATION_QUEUE) throw new Error("Queue binding unavailable");
-            await this.env.NOTIFICATION_QUEUE.sendBatch(jobs.slice(i, i + 100).map(body => ({ body })));
-          } catch {
-            console.error(JSON.stringify({ event: "notification_enqueue_failed", eventId: event.id }));
-          }
-        }
-      }
+    if (!transition || !transitionedIncident) return;
+    if (monitor.notificationSelections?.length) {
+      await this.enqueueNotifications(monitor, pauseGeneration, {
+        id: transitionedIncident.id + ":" + transition,
+        kind: transition === "opened" ? "incident.opened" : "incident.recovered",
+        at,
+        incidentId: transitionedIncident.id,
+        openedAt: transitionedIncident.openedAt,
+        monitorName: monitor.name,
+      });
     }
     // Recheck policy after yielding for Queue acceptance before starting the hosted hook.
     const deliveryState = this.read();
     // Calendar receipt windows already determine exclusion; later Maintenance cannot erase old hooks.
     const maintenanceBlocksHook = !(monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") && deliveryState.monitors.some(candidate => candidate.id === monitor.id && candidate.maintenance);
-    if (transition && transitionedIncident && !deliveryState.paused && (deliveryState.pauseGeneration ?? 0) === pauseGeneration && !maintenanceBlocksHook) {
+    if (!deliveryState.paused && (deliveryState.pauseGeneration ?? 0) === pauseGeneration && !maintenanceBlocksHook) {
       try {
         await this.onIncidentTransition({ contextId: this.ctx.id.toString(), incident: transitionedIncident, transition, at });
       } catch {
         console.error(JSON.stringify({ event: "transition_delivery_failed" }));
+      }
+    }
+  }
+
+  private async enqueueNotifications(monitor: Monitor, pauseGeneration: number, event: NotificationJob["event"]) {
+    const contextId = this.ctx.id.toString();
+    const jobs: NotificationJob[] = (monitor.notificationSelections ?? []).map(selection => ({
+      ...selection, contextId, monitorId: monitor.id, pauseGeneration,
+      deliveryId: event.id + ":" + selection.destinationId, event,
+    }));
+    // The storage output gate holds the Queue handoff until the transition is durable.
+    for (let i = 0; i < jobs.length; i += 100) {
+      try {
+        if (!this.env.NOTIFICATION_QUEUE) throw new Error("Queue binding unavailable");
+        await this.env.NOTIFICATION_QUEUE.sendBatch(jobs.slice(i, i + 100).map(body => ({ body })));
+      } catch {
+        console.error(JSON.stringify({ event: "notification_enqueue_failed", eventId: event.id }));
       }
     }
   }
