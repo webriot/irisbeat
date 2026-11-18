@@ -54,7 +54,10 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     assert.equal(outcomeProducer.queue, queueConsumer.queue);
     assert.equal(queueConsumer.dead_letter_queue, undefined, 'source jobs must not be transferred with their full bodies');
     assert.ok(consumerConfig.migrations.some(migration => migration.new_sqlite_classes?.includes(recovery.class_name)));
-    const delivery = (await build({ entryPoints: [join(source, 'src/notification-delivery.ts')], bundle: true, write: false, format: 'esm', platform: 'neutral', external: ['cloudflare:workers'] })).outputFiles[0].text;
+    const delivery = (await build({
+      entryPoints: [join(source, 'src/notification-delivery.ts')],
+      bundle: true, write: false, format: 'esm', platform: 'neutral', external: ['cloudflare:workers'],
+    })).outputFiles[0].text;
     const script = (await build({ stdin: { contents: `
       import worker from './src/index.ts';
       export { MonitoringContext, NotificationDelivery } from './src/index.ts';
@@ -155,19 +158,24 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     assert.deepEqual(alerts.map(row => row.text.split('\n')[0]).sort(), ['`HTTP` · Incident opened', '`Producer` · Incident opened', '`TCP` · Incident opened']);
     const paths = monitors.map(monitor => '/api/operator/monitors/' + monitor.id);
     for (const path of paths) assert.equal((await request(path + '/maintenance', 'PUT', { endsAt: start + 600_000 })).status, 200);
+    await waitForAlerts(6);
+    assert.ok(alerts.slice(3).every(row => row.text.split('\n')[0].endsWith(' · Maintenance started')));
     outcome = 204;
     await tick(240_000); await request(heartbeat, 'POST');
-    assert.equal(alerts.length, 3);
+    assert.equal(alerts.length, 6);
     const maintained = await status();
     assert.ok(maintained.monitors.every(monitor => monitor.state === 'maintenance'));
     assert.ok(maintained.incidents.every(incident => incident.closedAt === null));
     assert.ok(maintained.monitors.every(monitor => monitor.history.days.at(-1).maintenance > 0));
     for (const path of paths) await request(path + '/maintenance', 'DELETE');
+    await waitForAlerts(9);
+    assert.ok(alerts.slice(6).every(row => row.text.split('\n')[0].endsWith(' · Maintenance ended early')));
     await tick(300_000); await request(heartbeat, 'POST');
-    assert.equal(alerts.length, 3, 'one healthy observation cannot recover');
+    assert.equal(alerts.length, 9, 'one healthy observation cannot recover');
     await tick(360_000); await request(heartbeat, 'POST');
     const recovered = await status();
-    await waitForAlerts(6);
+    await waitForAlerts(12);
+    assert.ok(alerts.slice(9).every(row => row.text.split('\n')[0].endsWith(' · Incident recovered')));
     assert.ok(recovered.incidents.every(incident => incident.closedAt !== null));
     for (const monitor of recovered.monitors) {
       assert.equal(monitor.history.days.length, 90);

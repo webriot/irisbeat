@@ -102,8 +102,8 @@ NODE
 
 Open that file locally and save the `INSTALLATION_SECRET` value in your password
 manager; you need it to sign in and configure producers. Keep it out of terminal
-recordings, source control and shell command arguments. Deploy the monitoring
-Worker and secret together. After that succeeds, deploy the consumer so its
+recordings, source control and shell command arguments. For a fresh installation,
+deploy the monitoring Worker and secret together. After that succeeds, deploy the consumer so its
 service binding can resolve the monitoring Worker.
 
 ```sh
@@ -151,8 +151,9 @@ start unselected on every Monitor. Removing a webhook or replacing its address
 clears its selections. Slack-compatible messages include the Monitor
 name, the transition and its original UTC time. Webhook-only installations need
 no email configuration.
-Declare/replace/end per-Monitor Maintenance in its ledger. Checks continue; detection
-and alerts are suppressed, Incidents retained. History shows 90 UTC calendar days;
+Declare, replace or end per-Monitor Maintenance in its ledger. Checks continue,
+Incident detection and alerts are suppressed, and Incidents are retained. Selected
+webhooks receive Maintenance notices. History shows 90 UTC calendar days;
 Maintenance is excluded from availability. Delete stops checking but retains
 operator Incidents. Detailed bounds and semantics are in README and the API handoffs.
 
@@ -166,14 +167,70 @@ which has no automatic replay. Keep both Queues in the same jurisdiction.
 Monitor Workers Logs for sanitized `notification_enqueue_failed`,
 `notification_submission_failed`, `notification_submission_report_failed`,
 `notification_dead_letter_failed`, `notification_outcome_persistence_failed`
-and `notification_outcome_enqueue_failed` events. The Incident remains committed if Queue
-handoff fails.
+and `notification_outcome_enqueue_failed` events. The Incident or Maintenance
+change remains committed if Queue handoff fails.
 
 For upgrades, retain the same Worker, `MONITORING` binding, class and migration
 history, and deploy the reviewed new source. Back up operational configuration via
 authenticated API in private storage. This is not a database/Incident backup or
 restore tool. Code rollback does not roll back Durable Object data; review migration
 compatibility before rollback. Never delete/recreate a production namespace to upgrade.
+
+### Upgrade and roll back notification Workers
+
+On an existing Queue installation, keep the Worker names, source Queue and
+service binding. Configure the dead-letter Queue, outcome producer and Recovery
+migration above before upgrading the delivery Worker. Deploy the delivery
+Worker first, then deploy the monitoring Worker. The updated consumer handles
+Incident jobs from the previous producer, so existing Monitor selections can
+stay in place. Its Recovery object can retain Settings reports until the
+upgraded monitoring Worker can accept them.
+
+To roll back, restore the previous monitoring Worker first. Before restoring
+a delivery Worker that cannot handle Maintenance events or outcome messages,
+drain queued and in-flight messages of those types and let pending result
+and diagnostic writes settle. Keep the updated delivery Worker in place if
+unsupported messages can still reach the source Queue.
+
+## Optional email confirmation
+
+- In Cloudflare, onboard a sending domain and choose a sender address on that domain.
+  Workers Paid is required for arbitrary recipients. Account-verified recipients can
+  receive mail on the Free plan using a routing domain. Cloudflare verifies account
+  destinations for transport eligibility. Irisbeat requires the recipient to confirm
+  separately for each monitoring context.
+  [Cloudflare pricing](https://developers.cloudflare.com/email-service/platform/pricing/) and
+  [send binding restrictions](https://developers.cloudflare.com/email-service/configuration/send-bindings/).
+- Before enabling confirmation mail, turn off **Enable email preview** for the
+  sending domain in Cloudflare under **Compute > Email Service > Email Sending >
+  [sending domain] > Settings**. Keep it off while sending confirmation mail.
+  Cloudflare turns it on for new sending domains and retains previews for about
+  seven days. Previews include the HTML, plain text and raw message, which expose
+  the live confirmation link. This prerequisite applies to self-hosted and hosted
+  deployments. [Domain settings](https://developers.cloudflare.com/email-service/configuration/domains/#email-preview)
+  and [Activity log message previews](https://developers.cloudflare.com/email-service/observability/logs/#message-preview).
+- In your private delivery Worker configuration, add `send_email: [{ "name": "EMAIL" }]`
+  and set the `EMAIL_FROM` variable to the sender address. Deploy the delivery Worker
+  with the existing Queue consumer and `NOTIFICATION_DELIVERY` service binding.
+- In your private monitoring Worker configuration, set `NOTIFICATION_PUBLIC_ORIGIN`
+  to the installation's public HTTPS origin without a path. Add a service binding
+  named `NOTIFICATION_EMAIL` pointing to the delivery Worker's
+  `NotificationEmailCapability` entrypoint. The Workers can first be deployed with
+  webhooks, then the monitoring Worker can be redeployed with the optional reverse binding.
+- Open Operator Settings and choose **Add email**. The recipient opens the message
+  and clicks **Confirm email** on the confirmation page. The inbox can then be
+  selected on individual Monitors. Pending inboxes offer **Resend confirmation**.
+  Resending replaces the previous link. The five-minute cooldown applies within
+  the installation even if the inbox is removed and re-added.
+
+Cloudflare still processes recipient metadata for transport. Keep addresses and
+confirmation links out of Irisbeat logs and Queue diagnostics. The delivery Worker
+logs sanitized `email_confirmation_submission_failed` events for failed submissions.
+
+`npm run test:delivery` and the rendered Settings acceptance test read HTML, plain
+text and synthetic sender and recipient metadata through the simulated
+`send_email` binding. The tests use local capture without contacting Email Service.
+[Cloudflare local simulation](https://developers.cloudflare.com/email-service/observability/local-development/sending/#local-simulation).
 
 ## Prepare and verify a release (no publication)
 

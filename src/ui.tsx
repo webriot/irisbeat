@@ -30,6 +30,36 @@ export function statusPage(status: Status) {
   return "<!doctype html>" + <Document title={status.pageName}><div id="public-status">{raw(statusLedger.render(status))}</div></Document>;
 }
 
+export function confirmationPage(confirmed?: boolean) {
+  const title = confirmed === undefined ? "Confirm email notifications"
+    : confirmed ? "Email confirmed" : "Confirmation link is invalid or expired";
+  return "<!doctype html>" + <html lang="en"><head>
+    <meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>{title}</title><link rel="stylesheet" href="/app.css" />
+  </head><body><main>
+    <h1>{title}</h1>
+    {confirmed === undefined && <>
+      <form method="post" action="/notifications/confirm">
+        <input type="hidden" name="token" /><button disabled>Confirm email</button>
+      </form>
+      <script src="/notifications/confirm.js" defer></script>
+    </>}
+  </main></body></html>;
+}
+
+export const confirmationScript = `
+const form = document.querySelector('form');
+const token = location.hash.slice(1);
+const button = form.querySelector('button');
+if (/^[a-f0-9-]{36}$/.test(token)) {
+  form.elements.token.value = token;
+  button.disabled = false;
+} else {
+  document.querySelector('h1').textContent = 'Confirmation link is invalid or expired';
+  form.hidden = true;
+}
+`;
+
 function DurationControl({ field, label, min, max, value }: { field: string; label: string; min: number; max: number; value: number }) {
   return <fieldset class="duration"><label for={field}>{label}</label><div class="duration-value"><input id={field} name={field} type="number" min={min} max={max} step="any" value={value} data-duration="" required /><select id={field + "-unit"} aria-label={label + " unit"}><option value="seconds">Seconds</option><option value="minutes">Minutes</option><option value="hours">Hours</option><option value="days">Days</option></select></div></fieldset>;
 }
@@ -86,10 +116,10 @@ function Operator({ hosted }: { hosted: boolean }) {
           <form id="page-configuration"><label for="pageName">Page name</label><input id="pageName" name="pageName" required maxlength={120} /><button>Save page</button></form>
         </section>
         <section aria-labelledby="destinations-heading">
-          <div class="operator-heading"><h2 id="destinations-heading">Notification destinations</h2><button id="add-webhook" type="button">Add webhook</button></div>
+          <div class="operator-heading"><h2 id="destinations-heading">Notification destinations</h2><div class="destination-actions"><button id="add-email" type="button" hidden>Add email</button><button id="add-webhook" type="button">Add webhook</button></div></div>
           <form id="webhook" hidden aria-labelledby="webhook-heading">
             <h3 id="webhook-heading">Add webhook</h3>
-            <label for="webhookUrl">HTTPS webhook URL</label><input id="webhookUrl" name="url" type="url" required maxlength={2048} autocomplete="off" />
+            <label for="webhookUrl" id="destination-address-label">HTTPS webhook URL</label><input id="webhookUrl" name="url" type="url" required maxlength={2048} autocomplete="off" />
             <p id="webhook-impact" hidden></p>
             <p id="destination-missing" role="status" hidden>This destination was removed or replaced. Copy your draft or cancel.</p>
             <button id="save-webhook">Save webhook</button><button id="cancel-webhook" type="button">Cancel</button>
@@ -556,14 +586,17 @@ let savedPageName = '';
 let destinations = [];
 let destinationUses = new Map();
 let replacingDestination = null;
+let destinationChannel = 'webhook';
+let emailConfigured = false;
 const destinationsPath = '/api/operator/destinations';
 const destinationRows = byId('destination-rows');
 const addWebhook = byId('add-webhook');
+const addEmail = byId('add-email');
 const webhookUrl = byId('webhookUrl');
 function updateWebhook() {
   const missing = replacingDestination !== null && !destinations.some(destination => destination.id === replacingDestination);
   byId('destination-missing').hidden = !missing;
-  byId('save-webhook').disabled = missing;
+  byId('save-webhook').disabled = missing || (destinationChannel === 'email' && !emailConfigured);
   const count = destinationUses.get(replacingDestination) || 0;
   const impact = byId('webhook-impact');
   impact.hidden = !count || webhook.hidden;
@@ -571,17 +604,23 @@ function updateWebhook() {
 }
 function closeWebhook(focus = false) {
   const id = replacingDestination;
+  const add = destinationChannel === 'email' && emailConfigured ? addEmail : addWebhook;
   replacingDestination = null;
   webhook.reset(); webhook.hidden = true; updateWebhook();
-  if (focus) (document.getElementById('replace-' + id) || addWebhook).focus();
+  if (focus) (document.getElementById('replace-' + id) || add).focus();
 }
-function openWebhook(destination) {
+function openDestination(channel, destination) {
   const id = destination?.id ?? null;
-  if (!webhook.hidden && replacingDestination === id) { webhookUrl.focus(); return; }
+  if (!webhook.hidden && replacingDestination === id && destinationChannel === channel) { webhookUrl.focus(); return; }
   replacingDestination = id;
-  webhookUrl.value = destination?.url ?? '';
-  byId('webhook-heading').textContent = destination ? 'Replace webhook' : 'Add webhook';
-  byId('save-webhook').textContent = destination ? 'Replace webhook' : 'Save webhook';
+  destinationChannel = channel;
+  const email = channel === 'email';
+  webhookUrl.type = email ? 'email' : 'url';
+  webhookUrl.maxLength = email ? 254 : 2048;
+  webhookUrl.value = (email ? destination?.address : destination?.url) ?? '';
+  byId('destination-address-label').textContent = email ? 'Email address' : 'HTTPS webhook URL';
+  byId('webhook-heading').textContent = (destination ? 'Replace ' : 'Add ') + channel;
+  byId('save-webhook').textContent = destination ? 'Replace ' + channel : email ? 'Save email' : 'Save webhook';
   webhook.hidden = false; updateWebhook(); webhookUrl.focus();
 }
 function renderSubmission(result) {
@@ -617,26 +656,37 @@ function renderDestinations(next, monitors) {
   const focusedRow = destinationRows.contains(focused);
   reconcileNodes(destinationRows, destinations.map(destination => {
     const row = document.createElement('li'); row.dataset.key = destination.id;
-    const address = document.createElement('span'); address.className = 'destination-address'; address.textContent = destination.url;
+    const email = destination.channel === 'email';
+    const value = email ? destination.address : destination.url;
+    const details = document.createElement('div'); details.className = 'destination-details';
+    const address = document.createElement('div'); address.className = 'destination-address'; address.textContent = value;
+    details.append(address);
+    if (email) {
+      const consent = document.createElement('div');
+      consent.textContent = destination.confirmed ? 'Confirmed' : 'Pending confirmation';
+      details.append(consent);
+    }
     const actions = document.createElement('div'); actions.className = 'destination-actions';
-    for (const label of ['Replace', 'Remove']) {
+    const labels = email ? (emailConfigured ? (destination.confirmed ? ['Replace', 'Remove'] : ['Resend confirmation', 'Replace', 'Remove']) : ['Remove'])
+      : ['Replace', 'Remove'];
+    for (const label of labels) {
       const button = document.createElement('button'); button.type = 'button'; button.textContent = label;
-      button.setAttribute('aria-label', label + ' ' + destination.url);
+      button.setAttribute('aria-label', label + ' ' + value);
       if (label === 'Replace') {
         button.id = 'replace-' + destination.id;
-        button.onclick = () => openWebhook(destination);
+        button.onclick = () => openDestination(destination.channel, destination);
+      } else if (label === 'Resend confirmation') {
+        button.onclick = () => run(destinationsPath + '/' + encodeURIComponent(destination.id) + '/confirmation', 'POST');
       } else {
         button.className = 'danger';
         button.onclick = () => {
-          if (confirm('Remove ' + destination.url + '? Monitors will lose this selection.')) {
+          if (confirm('Remove ' + value + '? Monitors will lose this selection.')) {
             run(destinationsPath + '/' + encodeURIComponent(destination.id), 'DELETE', undefined, () => queueMicrotask(() => addWebhook.focus()));
           }
         };
       }
       actions.append(button);
     }
-    const details = document.createElement('div'); details.className = 'destination-details';
-    details.append(address);
     if (destination.latestSubmission) details.append(renderSubmission(destination.latestSubmission));
     row.append(details, actions); return row;
   }));
@@ -677,6 +727,7 @@ function clearSession() {
   byId('maintenance-dialog').close();
   document.querySelectorAll('button, input, select').forEach(control => { control.disabled = false; });
   monitorIds.clear(); selectedHistoryDays.clear(); byId('stale').hidden = true; byId('sync-announcement').textContent = ''; snapshotPending(false);
+  emailConfigured = false; addEmail.hidden = true;
   savedPageName = ''; monitorEditor.close(); monitorEditor.refreshDestinations([]); renderDestinations([], []); byId('heartbeat-path').textContent = ''; maintenanceForm.reset(); maintenanceForm.removeAttribute('data-monitor-id'); byId('maintenance-heading').textContent = 'Maintenance'; maintenanceForm.hidden = true; pageForm.reset(); closeWebhook(); editor.hidden = true; login.hidden = false;
   showSettings(false); byId('operator-navigation').hidden = true;
 
@@ -701,6 +752,8 @@ function render(data, savedField) {
     savedPageName = data.pageName;
   }
   monitorIds = new Set(data.monitors.map(monitor => monitor.id));
+  emailConfigured = canEdit && data.emailConfigured === true;
+  addEmail.hidden = !emailConfigured;
   renderDestinations(canEdit ? data.destinations ?? [] : [], canEdit ? data.monitors : []);
   monitorEditor.refreshDestinations(destinations, data.monitors.find(monitor => monitor.id === monitorEditor.id)?.destinationIds);
   updateDeleted();
@@ -786,7 +839,8 @@ const session = createOperatorSession(liveSnapshots, {
     };
   },
   saved(path, method) {
-    message.textContent = method === 'DELETE' ? (path.endsWith('/maintenance') ? 'Maintenance ended' : 'Deleted') : 'Saved';
+    message.textContent = method === 'DELETE' ? (path.endsWith('/maintenance') ? 'Maintenance ended' : 'Deleted')
+      : path.endsWith('/confirmation') ? 'Confirmation requested' : 'Saved';
   },
   previewed: data => monitorEditor.previewed(data),
   previewFailed: error => monitorEditor.previewFailed(error),
@@ -823,15 +877,17 @@ byId('maintenance-end').addEventListener('input', event => event.target.setCusto
 byId('cancel-maintenance').addEventListener('click', closeMaintenance);
 byId('maintenance-dialog').addEventListener('cancel', event => { event.preventDefault(); closeMaintenance(); });
 byId('end-maintenance').addEventListener('click', () => { if (monitorIds.has(maintenanceForm.dataset.monitorId)) run('/api/operator/monitors/' + encodeURIComponent(maintenanceForm.dataset.monitorId) + '/maintenance', 'DELETE', undefined, closeMaintenance); });
-addWebhook.addEventListener('click', () => openWebhook());
+addWebhook.addEventListener('click', () => openDestination('webhook'));
+addEmail.addEventListener('click', () => openDestination('email'));
 byId('cancel-webhook').addEventListener('click', () => closeWebhook(true));
 webhook.addEventListener('submit', async event => {
   event.preventDefault();
   if (byId('save-webhook').disabled) return;
   const id = replacingDestination;
-  const url = webhookUrl.value;
-  await run(id ? destinationsPath + '/' + encodeURIComponent(id) : destinationsPath, id ? 'PUT' : 'POST', { url }, () => {
-    closeWebhook(); queueMicrotask(() => addWebhook.focus());
+  const value = destinationChannel === 'email' ? { channel: 'email', address: webhookUrl.value } : { url: webhookUrl.value };
+  await run(id ? destinationsPath + '/' + encodeURIComponent(id) : destinationsPath, id ? 'PUT' : 'POST', value, () => {
+    const add = destinationChannel === 'email' ? addEmail : addWebhook;
+    closeWebhook(); queueMicrotask(() => add.focus());
   });
 });
 pageForm.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator', 'PUT', { pageName: byId('pageName').value }); });

@@ -7,7 +7,8 @@ issues; this document describes integration points.
 ## Controls and status
 
 - `PUT /api/operator/monitors/:id/maintenance` accepts `{ "endsAt": <epoch milliseconds> }`.
-  Starts immediately using server time; replaces the one existing window. End time
+  Starts immediately using server time; a changed end time replaces the one
+  existing window. Saving the existing end time leaves its window intact. End time
   must be a safe integer in the future within the JavaScript Date range.
 - `DELETE /api/operator/monitors/:id/maintenance` ends early. Repeating it after
   expiry/end is harmless and does not reset subsequent detector progress.
@@ -26,8 +27,9 @@ issues; this document describes integration points.
 Expiry is lazy at the next request/receipt/evaluation, with the exact end timestamp
 excluded from the window. It requires no cron execution or alarm to become visible.
 Expiry/early end reset outbound counts and Heartbeat recovery count/spacing without
-changing due times, last-seen, last result, availability, or Incidents. No missing
-execution becomes a result. Heartbeat receipts during Maintenance refresh last-seen
+changing due times, last-seen, last result, availability, or Incidents. Delayed
+Watchdog silence observations use their scheduled timestamp to determine whether
+they fall inside a naturally expired window. Missing executions create no results. Heartbeat receipts during Maintenance refresh last-seen
 and record Maintenance, including closely spaced receipts; they never recover an
 Incident. Subsequent recovery requires the Monitor's normal post-window rule.
 
@@ -49,18 +51,37 @@ this change does not synthesize them. Existing Incident history is unchanged.
 
 ## Hosted #10 and pause #11
 
-`maintenance(id, value, end?)` is a synchronous DO operation. The route uses hosted editor authorization and hides reader controls.
+`maintenance(id, value, end?)` commits before awaiting Queue acceptance. The route uses hosted editor authorization and hides reader controls.
 Retain adapter context resolution, operator metadata, allowance enforcement and
 heartbeat credential rotation. Suppression returns from shared `record` before
-Incident mutation or Queue handoff. Installed-consumer tests cover Queue handoff
-for HTTP, TCP and Heartbeat. There are no Maintenance transition alert events.
+Incident mutation or Incident Queue handoff. Installed-consumer tests cover Queue
+handoff for HTTP, TCP and Heartbeat.
 A webhook submitted before declaration cannot be recalled. See the
 [hosted notification contract](hosted-contract.md#incident-notifications) for
 Queue setup and upgrade behavior.
 
 #11 makes pause override Maintenance for checking/recording/display and retains
 unexpired windows for resume. See the [hosted pause contract](hosted-contract.md#pause-and-resume). Do not infer subscriptions or hosted identity from
-Maintenance. This ticket adds no pause flag or commercial policy.
+Maintenance.
+
+## Maintenance notifications
+
+[Issue #74](https://github.com/Webriot/irisbeat/issues/74) uses the same Queue
+handoff and trusted destination eligibility as Incident notifications. The
+channel-independent `MaintenanceNotificationEvent` is part of `NotificationEvent`.
+It carries the Monitor name, original event time (`at`), and the window's
+`startedAt` and scheduled `endsAt`, all timestamps in epoch milliseconds.
+
+| Event kind | Additional detail |
+| --- | --- |
+| `maintenance.started` | `at` is the declaration time |
+| `maintenance.updated` | `previousEndsAt` records the replaced end time |
+| `maintenance.ended` | `reason` is `early` or `expired`. For expiry, `at` is the scheduled end even when evaluated later |
+
+Expiry clears the persisted window once. Scheduled evaluation can clear it and
+enqueue its end without status traffic or subscriptions. A paused context
+suppresses Maintenance notifications, and the trusted delivery lookup applies
+the same selection and pause checks used for Incident jobs.
 
 ## In-flight attempts
 

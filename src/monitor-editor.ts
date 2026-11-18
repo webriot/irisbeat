@@ -149,7 +149,7 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
       if (selected) savedSelections = new Set(selected);
       const fieldset = controls.get('destination-selection');
       const choices = controls.get('destination-choices');
-      const available = editingId ? destinations : [];
+      const available = editingId ? destinations.filter(destination => destination.channel === 'webhook' || destination.confirmed) : [];
       const availableIds = new Set(available.map(destination => destination.id));
       for (const id of selectionChanges.keys()) if (!availableIds.has(id)) selectionChanges.delete(id);
       const focused = document.activeElement;
@@ -159,7 +159,7 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
         label.setAttribute('data-key', destination.id);
         const input = document.createElement('input');
         input.type = 'checkbox'; input.name = 'destinationId'; input.value = destination.id;
-        const address = document.createElement('span'); address.textContent = destination.url;
+        const address = document.createElement('span'); address.textContent = destination.channel === 'email' ? destination.address : destination.url;
         label.append(input, address);
         return label;
       }));
