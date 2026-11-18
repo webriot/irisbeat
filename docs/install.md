@@ -164,6 +164,10 @@ means the provider accepted the request. Temporary failures retry independently
 with exponential delays, up to ten attempts and one hour from Queue acceptance.
 Permanent failures stop immediately. Exhausted jobs go to the dead-letter Queue,
 which has no automatic replay. Keep both Queues in the same jurisdiction.
+If the Recovery object and the bookkeeping-only handoff to the source Queue
+both reject writes on the final broker delivery, the broker can discard the job.
+Settings can retain its previous result and the dead-letter Queue can receive
+no diagnostic for that job.
 Monitor Workers Logs for sanitized `notification_enqueue_failed`,
 `notification_submission_failed`, `notification_submission_report_failed`,
 `notification_dead_letter_failed`, `notification_recovery_unavailable`
