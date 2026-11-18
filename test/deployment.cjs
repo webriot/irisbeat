@@ -47,7 +47,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     }
     const [queueProducer] = producerConfig.queues.producers;
     const [queueConsumer] = consumerConfig.queues.consumers;
-    const [dlqProducer] = consumerConfig.queues.producers;
+    const deliveryProducers = Object.fromEntries(consumerConfig.queues.producers.map(({ binding, queue }) => [binding, queue]));
     const [deliveryService] = consumerConfig.services;
     const [recovery] = consumerConfig.durable_objects.bindings;
     assert.equal(queueConsumer.dead_letter_queue, undefined, 'source jobs must not be transferred with their full bodies');
@@ -102,7 +102,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
         queueConsumers: { [queueConsumer.queue]: {
           maxBatchTimeout: 0.1, maxRetries: queueConsumer.max_retries,
         } },
-        queueProducers: { [dlqProducer.binding]: dlqProducer.queue },
+        queueProducers: deliveryProducers,
         serviceBindings: { [deliveryService.binding]: { name: deliveryService.service, entrypoint: deliveryService.entrypoint } },
         outboundService: async request => {
           assert.equal(request.url, 'https://webhook.example/controlled');

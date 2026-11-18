@@ -20,6 +20,7 @@ export type SubmissionResult = SubmissionOutcome & { at: number };
 
 export type SubmissionReport = {
   eventAt: number;
+  eventOrder?: number;
   queuedAt: number;
   attempt: number;
   confirmation?: true;

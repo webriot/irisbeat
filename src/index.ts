@@ -4,7 +4,7 @@ import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
 import { MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
 import { connect } from "cloudflare:sockets";
-import { parseEmailAddress, type ConfirmationIdentity, type ConfirmationJob, type NewNotificationDestination, type NotificationDestination, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
+import { parseEmailAddress, type ConfirmationIdentity, type ConfirmationJob, type NewNotificationDestination, type NotificationDestination, type NotificationEligibility, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
 import type { NotificationDeliveryIdentity, SubmissionReport } from "./notification-outcomes";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 
@@ -83,6 +83,7 @@ type StoredContext = {
   paused?: boolean;
   policyRevision?: number;
   pauseGeneration?: number;
+  notificationOrder?: number;
 };
 type LegacyContext = { webhookUrl?: string | null; monitor: (Monitor & { pageName: string }) | null };
 
@@ -272,13 +273,13 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if ("monitors" in stored) {
       stored.monitors = stored.monitors.map(monitor => { monitor.kind ??= "http"; return { ...timingDefaults, scheduleMode: "interval", ...monitor, createdAt: monitor.createdAt ?? 0, lastSeen: monitor.lastSeen ?? null, recoveryReceiptAt: monitor.recoveryReceiptAt ?? null }; });
       let changed = this.migrateWebhook(stored);
-      const expired: { monitor: Monitor; window: MaintenanceWindow }[] = [];
+      const expired: { monitor: Monitor; window: MaintenanceWindow; order: number }[] = [];
       for (const monitor of stored.monitors) {
         const window = monitor.maintenance;
         if (window && at >= window.endsAt) {
           this.endMaintenance(monitor);
           changed = true;
-          expired.push({ monitor, window });
+          expired.push({ monitor, window, order: this.nextNotificationOrder(stored) });
         }
       }
       if (changed) this.ctx.storage.transactionSync(() => {
@@ -290,13 +291,14 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         }
         this.ctx.storage.kv.put("context", stored);
       });
-      for (const { monitor, window } of expired) {
+      for (const { monitor, window, order } of expired) {
         if (stored.paused || expiry.suppress || !monitor.notificationSelections?.length) continue;
         const send = this.enqueueNotifications(monitor, stored.pauseGeneration ?? 0, {
           id: crypto.randomUUID(),
           kind: "maintenance.ended",
           reason: "expired",
           at: window.endsAt,
+          order,
           monitorName: monitor.name,
           ...window,
         });
@@ -475,6 +477,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     (state.emailConfirmations ??= {})[destination.id] = { id, origin, token: crypto.randomUUID(), expiresAt: at + DAY };
     return {
       kind: "email.confirmation", destinationId: destination.id, deliveryId: id, at,
+      order: this.nextNotificationOrder(state),
       contextId: this.ctx.id.toString(), pauseGeneration: state.pauseGeneration ?? 0,
     } satisfies ConfirmationJob;
   }
@@ -557,6 +560,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const previous = monitor.maintenance;
     const next = end ? null : { startedAt: at, endsAt: (value as { endsAt: number }).endsAt };
     if (previous?.endsAt === next?.endsAt) return this.status(true);
+    const order = this.nextNotificationOrder(state);
     this.ctx.storage.transactionSync(() => {
       if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
         // Retain elapsed overlap when an operator cuts a window short or replaces it.
@@ -573,7 +577,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     }
     this.notify(before);
     if (!state.paused && monitor.notificationSelections?.length) {
-      const event = { id: crypto.randomUUID(), at, monitorName: monitor.name };
+      const event = { id: crypto.randomUUID(), at, order, monitorName: monitor.name };
       if (next) {
         await this.enqueueNotifications(monitor, state.pauseGeneration ?? 0, {
           ...event, ...next, ...(previous
@@ -721,6 +725,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const pauseGeneration = current.pauseGeneration ?? 0;
     let transition: "opened" | "recovered" | undefined;
     let transitionedIncident: Pick<Incident, "id" | "openedAt"> | undefined;
+    let order: number | undefined;
     this.ctx.storage.transactionSync(() => {
       monitor.lastResult = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" };
       if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
@@ -771,6 +776,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         monitor.state = "up";
       }
       if (resetProgress) { monitor.failures = 0; monitor.successes = 0; }
+      if (transition) order = this.nextNotificationOrder(current);
       this.ctx.storage.kv.put("context", current);
     });
     this.notify(before);
@@ -780,11 +786,17 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         id: transitionedIncident.id + ":" + transition,
         kind: transition === "opened" ? "incident.opened" : "incident.recovered",
         at,
+        order,
         incidentId: transitionedIncident.id,
         openedAt: transitionedIncident.openedAt,
         monitorName: monitor.name,
       });
     }
+  }
+
+  private nextNotificationOrder(state: StoredContext) {
+    state.notificationOrder = (state.notificationOrder ?? 0) + 1;
+    return state.notificationOrder;
   }
 
   private async enqueueNotifications(monitor: Monitor, pauseGeneration: number, event: NotificationJob["event"]) {
@@ -807,7 +819,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   /** @deprecated Retained for source compatibility. The engine no longer calls this method. */
   protected async onIncidentTransition(_event: IncidentTransition): Promise<void> {}
 
-  resolveWebhook(job: NotificationJob) {
+  resolveWebhook(job: NotificationEligibility) {
     if (job.contextId !== this.ctx.id.toString()) return null;
     const state = this.read();
     if (state.paused || (state.pauseGeneration ?? 0) !== job.pauseGeneration) return null;
@@ -866,10 +878,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       if (current?.deliveryId === job.deliveryId) {
         if (current.result.status === "accepted") return;
       } else if (current) {
-        const order = report.eventAt - current.eventAt || report.queuedAt - current.queuedAt;
+        const order = report.eventAt - current.eventAt ||
+          (report.eventOrder ?? 0) - (current.eventOrder ?? 0) || report.queuedAt - current.queuedAt;
         if (order < 0 || (order === 0 && job.deliveryId < current.deliveryId)) return;
       }
-      destination.submission = { ...report, deliveryId: job.deliveryId };
+      const eventOrder = report.eventOrder ?? (current?.deliveryId === job.deliveryId ? current.eventOrder : undefined);
+      destination.submission = { ...report, eventOrder, deliveryId: job.deliveryId };
       this.ctx.storage.kv.put("context", state);
       changed = true;
     });
@@ -1079,7 +1093,7 @@ export class NotificationDelivery extends WorkerEntrypoint<EngineEnv> {
     await this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId)).markConfirmationSubmitted(job);
   }
 
-  async resolveWebhook(job: NotificationJob) {
+  async resolveWebhook(job: NotificationEligibility) {
     if (!/^[a-f0-9]{64}$/.test(job.contextId)) return null;
     const context = this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId));
     return context.resolveWebhook(job);

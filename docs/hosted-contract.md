@@ -87,7 +87,8 @@ installation secret and ignores bodies.
 ## Incident notifications
 
 Use one Queue for the monitoring Worker's `NOTIFICATION_QUEUE` producer and
-the isolated delivery Worker's consumer trigger. Configure a second Queue in the same jurisdiction for the delivery
+the isolated delivery Worker's consumer trigger and `NOTIFICATION_HANDOFF`
+producer. Configure a second Queue in the same jurisdiction for the delivery
 Worker's `NOTIFICATION_DLQ` producer. Keep native dead-letter routing unset
 because it forwards the original job body. Use `irisbeat/notification-delivery`
 as the delivery Worker entrypoint and bind its exported SQLite Durable Object
@@ -127,19 +128,26 @@ bookkeeping and does not submit to a provider.
 
 The Recovery object records terminal outcomes before the source is acknowledged.
 Result reporting, confirmation marking and sanitized dead-letter writes then
-recover independently through the object's alarm, for up to 14 days. Final broker
-delivery retries transient Recovery RPC failures within the same invocation.
-If Recovery stays unavailable for that entire delivery, the broker can discard
-the exhausted source. A durable provider reservation can also consume a slot if
-the Worker crashes before making the request.
+recover independently through the object's alarm, for up to 14 days. If Recovery
+is unavailable on the final broker delivery, the consumer submits a delayed,
+bookkeeping-only message to the source Queue and acknowledges the original
+after that write succeeds. The handoff retains the original eligibility evidence
+and timestamps, omits Monitor names and addresses, and cannot submit to a provider.
+If Recovery and the Queue write both fail on the final delivery, the broker
+can discard the exhausted source. A durable provider reservation can consume a
+slot if the Worker crashes before making the request.
 
 Editor snapshots expose the optional `destinations[].latestSubmission` with
 `status`, `at` (Unix milliseconds) and a safe `reason` for failures.
 A recorded acceptance closes submission while Settings or confirmation marking
 is pending. An acceptance from a request already submitted is preserved even if
-a newer attempt started. A crash before recording the provider outcome, or a
-transport timeout with unknown provider outcome, can still lead to duplicates.
-Acceptance records provider submission.
+a newer attempt started. Exhaustion and its dead-letter diagnostic wait for
+outstanding requests for that delivery identity to settle. A crash before
+recording the provider outcome, or a transport timeout with unknown provider outcome, can still lead to duplicates.
+Acceptance records provider submission. At equal event times, Settings uses the
+order recorded with the monitoring commit. Ordered events take precedence over
+legacy jobs at the same event time. Legacy jobs still use broker time and
+delivery identity when compared with one another.
 
 Confirmation eligibility uses the original invitation and pause generation.
 The Recovery object stores only opaque identities, timestamps, the pause

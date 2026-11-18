@@ -42,11 +42,13 @@ async function main(runFixture, emailEnabled = true) {
       }
     }
     const realNow = Date.now;
-    let testTime;
+    const realUuid = crypto.randomUUID.bind(crypto);
+    let testTime, testUuid;
     Date.now = () => testTime ?? realNow();
+    crypto.randomUUID = () => testUuid ?? realUuid();
     export class MonitoringContext extends EngineContext {
       restartForTest() { this.ctx.abort('Local Queue restart drill'); }
-      setTestTime(at) { testTime = at; }
+      setTestTime(at, uuid) { testTime = at; testUuid = uuid; }
     }
     function policy(revision) {
       return { paused: Number(revision) % 2 === 1, policyRevision: Number(revision) };
@@ -77,7 +79,8 @@ async function main(runFixture, emailEnabled = true) {
         const app = url.hostname === 'personal.example' ? personal : hosted;
         if (url.pathname === '/test-clock') {
           const id = url.hostname === 'personal.example' ? 'personal' : url.hostname;
-          return env.MONITORING.getByName(id).setTestTime(Number(url.searchParams.get('at')) || undefined).then(() => new Response(null, { status: 204 }));
+          const at = Number(url.searchParams.get('at')) || undefined;
+          return env.MONITORING.getByName(id).setTestTime(at, url.searchParams.get('uuid')).then(() => new Response(null, { status: 204 }));
         }
         if (url.pathname === '/test-restart') {
           const id = env.MONITORING.idFromString(url.searchParams.get('context'));
@@ -266,7 +269,7 @@ async function main(runFixture, emailEnabled = true) {
           'final-notifications': { maxBatchTimeout: 0.1, maxRetries: 0 },
           'dead-letters': { maxBatchTimeout: 0.1 },
         },
-        queueProducers: { NOTIFICATION_DLQ: 'dead-letters' },
+        queueProducers: { NOTIFICATION_DLQ: 'dead-letters', NOTIFICATION_HANDOFF: 'notifications' },
         serviceBindings: {
           NOTIFICATION_DELIVERY: { name: 'monitoring', entrypoint: 'NotificationDelivery' },
           GATE: gate,
@@ -410,7 +413,7 @@ async function main(runFixture, emailEnabled = true) {
       }
       for (const job of recoveryJobs) {
         assert.deepEqual(Object.keys(job).sort(), ['contextId', 'deliveryId', 'destinationId', 'event', 'generation', 'monitorId', 'pauseGeneration']);
-        assert.deepEqual(Object.keys(job.event).sort(), ['at', 'id', 'incidentId', 'kind', 'monitorName', 'openedAt']);
+        assert.deepEqual(Object.keys(job.event).sort(), ['at', 'id', 'incidentId', 'kind', 'monitorName', 'openedAt', 'order']);
       }
       assert.doesNotMatch(JSON.stringify(batches), /internal\.example|target-secret|hooks\.example|\/token/);
 
@@ -829,18 +832,24 @@ async function main(runFixture, emailEnabled = true) {
       const unavailable = job(firstOrigin, 'final-persistence-outage', 11_000);
       const beforeFallback = completedBatches;
       const beforeFallbackResult = (await json(host, path)).destinations[0].latestSubmission;
-      controls.set(unavailable.deliveryId, { attempts: 11 });
-      recoveryFaults.set(unavailable.deliveryId, 2);
+      const originalBrokerTime = Date.now() - 60_000;
+      controls.set(unavailable.deliveryId, { attempts: 11, timestamp: originalBrokerTime });
+      recoveryFaults.set(unavailable.deliveryId, 3);
       reportFaults.set(unavailable.deliveryId, 1);
       await finalProducer.send(unavailable);
       await until(() => completedBatches > beforeFallback);
       assert.ok(actions.some(action => action.id === unavailable.deliveryId && action.ack),
         'the broker’s final delivery hands off the outcome before acknowledging the source');
-      await until(() => deadLetters.some(letter => letter.deliveryId === unavailable.deliveryId), 15_000);
+      await until(() => deadLetters.some(letter => letter.deliveryId === unavailable.deliveryId), 25_000);
       const diagnostic = deadLetters.find(letter => letter.deliveryId === unavailable.deliveryId);
       assert.deepEqual(Object.keys(diagnostic).sort(), ['attempts', 'contextId', 'deliveryId', 'destinationId', 'queuedAt', 'reason']);
       assert.equal(diagnostic.attempts, 0);
-      assert.equal(recoveryCalls.filter(id => id === unavailable.deliveryId).length, 3, 'the last broker delivery survives two transient Recovery RPC failures');
+      assert.equal(diagnostic.queuedAt, originalBrokerTime);
+      const handoff = batches.flat().find(job => job.deliveryId === unavailable.deliveryId && job.terminal);
+      assert.ok(handoff, 'terminal bookkeeping has its own broker delivery');
+      assert.deepEqual(handoff.event, { at: unavailable.event.at, order: unavailable.event.order });
+      assert.doesNotMatch(JSON.stringify(handoff), /Retry Monitor|target-secret|https:\/\//);
+      assert.equal(recoveryCalls.filter(id => id === unavailable.deliveryId).length, 4, 'the last broker delivery survives three Recovery RPC failures');
       assert.equal(diagnostic.reason, 'attempts_exhausted');
       await until(async () => {
         const result = (await json(host, path)).destinations[0].latestSubmission;
@@ -922,6 +931,111 @@ async function main(runFixture, emailEnabled = true) {
 
       console.log('PASS real Queue delivery: independent ack/retry, deadline and limits, cancellation, submission ordering, durable result recovery and safe DLQ recovery');
     }
+    {
+      const host = 'concurrent-exhaustion.example';
+      const url = 'https://hooks.example/concurrent-exhaustion';
+      const { monitor } = await json(host, monitors, 'POST', {
+        name: 'Concurrent Monitor', url: target, failureThreshold: 1,
+      }, 201);
+      const { destinations: [destination] } = await json(host, path, 'POST', { url }, 201);
+      await json(host, monitors + '/' + monitor.id, 'PATCH', { destinationIds: [destination.id] });
+      const beforeIncident = completedBatches;
+      healthy = false;
+      await tick(host);
+      await until(() => completedBatches > beforeIncident);
+      const [origin] = batches.at(-1);
+
+      for (const status of [204, 429]) {
+        const job = { ...origin, deliveryId: 'concurrent-' + status, event: { ...origin.event, at: origin.event.at + status } };
+        const beforeAttempts = submissions.length;
+        const beforeBatch = completedBatches;
+        let release;
+        holdProvider = new Promise(resolve => { release = resolve; });
+        heldEventTime = 'First pending attempt';
+        heldProviderStatus = status;
+        providerStatuses.set(url, 429);
+        const held = { ...job, event: { ...job.event, monitorName: heldEventTime } };
+        try {
+          await producer.send(held);
+          await until(() => submissions.length === beforeAttempts + 1);
+          controls.set(job.deliveryId, Array.from({ length: 9 }, () => ({ attempts: 1 })));
+          await producer.sendBatch(Array.from({ length: 9 }, () => ({ body: job })));
+          await until(() => submissions.length === beforeAttempts + 10);
+          // Allow the last temporary response to reach Recovery while the first request is held.
+          await new Promise(resolve => setTimeout(resolve, 300));
+          assert.notEqual((await json(host, path)).destinations[0].latestSubmission.reason, 'attempts_exhausted');
+          assert.ok(!dlqAttempts.includes(job.deliveryId), 'exhaustion cannot be published while a provider can still accept');
+        } finally {
+          release();
+          holdProvider = heldEventTime = undefined;
+        }
+        await until(() => completedBatches >= beforeBatch + 2);
+        heldProviderStatus = 403;
+        if (status === 204) {
+          assert.equal((await json(host, path)).destinations[0].latestSubmission.status, 'accepted');
+          assert.ok(!dlqAttempts.includes(job.deliveryId), 'a known acceptance prevents exhaustion');
+        } else {
+          await until(() => deadLetters.some(letter => letter.deliveryId === job.deliveryId));
+          assert.equal((await json(host, path)).destinations[0].latestSubmission.reason, 'attempts_exhausted');
+          assert.equal(deadLetters.filter(letter => letter.deliveryId === job.deliveryId).length, 1);
+        }
+        assert.equal(submissions.length, beforeAttempts + 10);
+      }
+      console.log('PASS concurrent exhaustion: ten same-ordinal submissions, held acceptance wins, all-temporary submissions dead-letter once');
+    }
+
+    {
+      const host = 'causal-order.example';
+      const url = 'https://hooks.example/causal-order';
+      const { monitor } = await json(host, monitors, 'POST', {
+        name: 'Causal Monitor', url: target,
+      }, 201);
+      const { destinations: [destination] } = await json(host, path, 'POST', { url }, 201);
+      const monitorPath = monitors + '/' + monitor.id;
+      await json(host, monitorPath, 'PATCH', { destinationIds: [destination.id] });
+      const maintenance = monitorPath + '/maintenance';
+      const eventAt = Date.now();
+      async function commitMaintenance(endsAt, uuid, reportOutage = false) {
+        assert.equal((await request(host, '/test-clock?at=' + eventAt + '&uuid=' + uuid)).status, 204);
+        const before = completedBatches;
+        let release;
+        holdBatch = new Promise(resolve => { release = resolve; });
+        try {
+          await json(host, maintenance, 'PUT', { endsAt });
+          const [created] = await until(() => batches.length > before && batches.at(-1));
+          assert.equal(created.event.at, eventAt);
+          controls.set(created.deliveryId, { timestamp: eventAt });
+          if (reportOutage) reportFaults.set(created.deliveryId, 1);
+          return created;
+        } finally {
+          release();
+          holdBatch = undefined;
+          await until(() => completedBatches > before);
+        }
+      }
+      providerStatuses.set(url, 403);
+      const older = await commitMaintenance(eventAt + 60_000, 'ffffffff-0000-4000-8000-000000000000');
+      assert.equal((await json(host, path)).destinations[0].latestSubmission.reason, 'provider_rejected');
+
+      providerStatuses.set(url, 204);
+      const newer = await commitMaintenance(eventAt + 120_000, '00000000-0000-4000-8000-000000000000', true);
+      assert.ok(newer.deliveryId < older.deliveryId, 'the legacy UUID tie-break would favor the older job');
+      assert.equal((await json(host, path)).destinations[0].latestSubmission.status, 'failed', 'the first report RPC failed');
+      await until(async () => (await json(host, path)).destinations[0].latestSubmission.status === 'accepted', 9000);
+      assert.equal(reportAttempts.filter(id => id === newer.deliveryId).length, 2);
+
+      const { order: _order, ...legacyEvent } = older.event;
+      const legacy = { ...older, deliveryId: 'legacy-' + older.deliveryId, event: legacyEvent };
+      providerStatuses.set(url, 403);
+      await redeliver(producer, legacy);
+      assert.equal((await json(host, path)).destinations[0].latestSubmission.status, 'accepted',
+        'an unordered legacy job cannot replace an ordered result at the same event time');
+
+      assert.equal(newer.event.at, older.event.at);
+      assert.equal((await request(host, '/test-clock?at=0')).status, 204);
+      console.log('PASS committed Maintenance ordering: equal event and broker times, report recovery and a legacy Queue copy');
+    }
+
     console.log('PASS real Queue delivery: opt-in, fan-out, safe content, redirects, deadline, tenant isolation, paused configuration, and cancellation before and between attempts');
 
     {

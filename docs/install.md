@@ -73,7 +73,8 @@ variable values above. Keep deployment-specific configuration out of version con
 | --- | --- | --- |
 | `wrangler.jsonc` | `queues.producers[0].queue` | `IRISBEAT_QUEUE_NAME` |
 | `wrangler.delivery.jsonc` | `queues.consumers[0].queue` | `IRISBEAT_QUEUE_NAME` |
-| `wrangler.delivery.jsonc` | `queues.producers[0].queue` | `IRISBEAT_DLQ_NAME` |
+| `wrangler.delivery.jsonc` | `queues.producers[0].queue` (`NOTIFICATION_DLQ`) | `IRISBEAT_DLQ_NAME` |
+| `wrangler.delivery.jsonc` | `queues.producers[1].queue` (`NOTIFICATION_HANDOFF`) | `IRISBEAT_QUEUE_NAME` |
 | `wrangler.delivery.jsonc` | `services[0].service` | `IRISBEAT_WORKER_NAME` |
 
 Keep the binding names, `NotificationDelivery` entrypoint and migrations from
@@ -165,8 +166,8 @@ Permanent failures stop immediately. Exhausted jobs go to the dead-letter Queue,
 which has no automatic replay. Keep both Queues in the same jurisdiction.
 Monitor Workers Logs for sanitized `notification_enqueue_failed`,
 `notification_submission_failed`, `notification_submission_report_failed`,
-`notification_dead_letter_failed`, `notification_outcome_persistence_failed`
-and `notification_outcome_enqueue_failed` events. The Incident or Maintenance
+`notification_dead_letter_failed`, `notification_recovery_unavailable`
+and `notification_handoff_unavailable` events. The Incident or Maintenance
 change remains committed if Queue handoff fails.
 
 For upgrades, retain the same Worker, `MONITORING` binding, class and migration
@@ -178,15 +179,15 @@ compatibility before rollback. Never delete/recreate a production namespace to u
 ### Upgrade and roll back notification Workers
 
 On an existing Queue installation, keep the Worker names, source Queue and
-service binding. Configure the dead-letter Queue and Recovery
-migration above before upgrading the delivery Worker. Deploy the delivery
+service binding. Configure the handoff producer on the existing source Queue,
+the dead-letter Queue and the Recovery migration before upgrading the delivery Worker. Deploy the delivery
 Worker first, then deploy the monitoring Worker. The updated consumer handles
 Incident jobs from the previous producer, so existing Monitor selections can
 stay in place. Its Recovery object can retain Settings reports until the
 upgraded monitoring Worker can accept them.
 
 To roll back, restore the previous monitoring Worker first. Before restoring
-a delivery Worker that cannot handle Maintenance events or outcome messages,
+a delivery Worker that cannot handle Maintenance events or bookkeeping messages,
 drain queued and in-flight messages of those types and let pending result
 and diagnostic writes settle. Keep the updated delivery Worker in place if
 unsupported messages can still reach the source Queue.

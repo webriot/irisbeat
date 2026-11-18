@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { DurableObject } from "cloudflare:workers";
 import { submitConfirmation } from "./email-confirmation-transport";
-import { parseEmailAddress, type ConfirmationIdentity, type ConfirmationJob, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
+import { parseEmailAddress, type ConfirmationIdentity, type ConfirmationJob, type NotificationEligibility, type NotificationQueueJob, type TerminalNotificationJob } from "./notification-jobs";
 import type {
   DeadLetter, ExhaustionReason, NotificationDeliveryIdentity, SubmissionOutcome, SubmissionReport, TransportOutcome,
 } from "./notification-outcomes";
@@ -13,7 +13,7 @@ export type DeliveryBindings = {
   NOTIFICATION_DELIVERY: {
     resolveConfirmation(job: ConfirmationJob): Promise<{ address: string; url: string } | null>;
     markConfirmationSubmitted(job: ConfirmationIdentity): Promise<void>;
-    resolveWebhook(job: NotificationJob): Promise<string | null>;
+    resolveWebhook(job: NotificationEligibility): Promise<string | null>;
     reportSubmission(job: NotificationDeliveryIdentity, report: SubmissionReport): Promise<void>;
   };
   NOTIFICATION_DLQ: Pick<Queue<DeadLetter>, "send">;
@@ -31,19 +31,19 @@ const RETENTION = 14 * 24 * 60 * 60 * 1000;
 
 export class NotificationRecovery extends DurableObject<DeliveryBindings> {
   private readonly inFlight = new Set<string>();
-  private submitting = 0;
+  private readonly submitting = new Set<Promise<TransportOutcome>>();
 
   private closed(now: number) {
     const { kv } = this.ctx.storage;
     return (kv.get<number>("accepted") ?? 0) > now || (kv.get<number>("terminal") ?? 0) > now;
   }
 
-  async deliver(job: NotificationQueueJob, brokerAttempt: number, timestamp: number): Promise<number | null> {
+  async deliver(job: NotificationQueueJob | TerminalNotificationJob, brokerAttempt: number, timestamp: number): Promise<number | null> {
     const storage = this.ctx.storage;
     const { kv } = storage;
     const identity = { contextId: job.contextId, destinationId: job.destinationId, deliveryId: job.deliveryId };
     const confirmation = "kind" in job ? { ...identity, pauseGeneration: job.pauseGeneration } : undefined;
-    const eventAt = "kind" in job ? job.at : job.event.at;
+    const { at: eventAt, order: eventOrder } = "kind" in job ? job : job.event;
     const superseded = () => this.closed(Date.now()) || brokerAttempt < (kv.get<number>("broker-attempt") ?? 0);
     if (superseded()) return null;
     const knownQueuedAt = kv.get<number>("queued-at");
@@ -55,15 +55,18 @@ export class NotificationRecovery extends DurableObject<DeliveryBindings> {
     }
 
     let submit: (() => Promise<TransportOutcome>) | undefined;
+    let eligible = false;
     let eligibilityAvailable = true;
     try {
       if ("kind" in job) {
         const from = parseEmailAddress(this.env.EMAIL_FROM);
         const destination = await this.env.NOTIFICATION_DELIVERY.resolveConfirmation(job);
+        eligible = !!destination;
         if (destination) submit = () => submitConfirmation(this.env.EMAIL, from, destination);
       } else {
         const url = await this.env.NOTIFICATION_DELIVERY.resolveWebhook(job);
-        if (url) submit = () => submitWebhook(url, job);
+        eligible = !!url;
+        if (url && !("terminal" in job)) submit = () => submitWebhook(url, job);
       }
     } catch {
       eligibilityAvailable = false;
@@ -78,28 +81,35 @@ export class NotificationRecovery extends DurableObject<DeliveryBindings> {
     let submissions = kv.get<number>("submissions") ?? Math.min(previous, MAX_SUBMISSIONS);
     const attempt = previous + 1;
     const record = (result: SubmissionOutcome, exhaustion?: ExhaustionReason) => this.stage(
-      identity, { eventAt, queuedAt, attempt, result: { ...result, at }, ...(confirmation && { confirmation: true }) },
-      exhaustion && { ...identity, queuedAt, attempts: submissions, reason: exhaustion },
+      identity, {
+        eventAt, eventOrder, queuedAt,
+        attempt: exhaustion ? Math.max(attempt, kv.get<number>("attempt") ?? 0) : attempt,
+        result: { ...result, at: exhaustion ? Date.now() : at }, ...(confirmation && { confirmation: true }),
+      },
+      exhaustion && { ...identity, queuedAt, attempts: kv.get<number>("submissions") ?? submissions, reason: exhaustion },
       result.status === "accepted" ? confirmation : undefined,
     );
-    const exhaust = (reason: ExhaustionReason) => record({ status: "failed", reason }, reason);
+    const exhaust = async (reason: ExhaustionReason) => {
+      if (brokerAttempt >= LAST_BROKER_DELIVERY) kv.put("broker-attempt", LAST_BROKER_DELIVERY);
+      // Keep this delivery outstanding until every admitted provider call can record acceptance.
+      while (this.submitting.size) await Promise.all(this.submitting);
+      await record({ status: "failed", reason }, reason);
+    };
     const retry = async (reason: Extract<SubmissionOutcome, { status: "retrying" }>["reason"], count: number) => {
-      const remaining = expiresAt - Date.now();
+      const now = Date.now();
+      if (this.closed(now)) return null;
+      const remaining = expiresAt - now;
       if (remaining <= 0) await exhaust("expired");
-      else if (submissions >= MAX_SUBMISSIONS || brokerAttempt >= LAST_BROKER_DELIVERY) await exhaust("attempts_exhausted");
+      else if ((kv.get<number>("submissions") ?? submissions) >= MAX_SUBMISSIONS || brokerAttempt >= LAST_BROKER_DELIVERY) await exhaust("attempts_exhausted");
       else {
         await record({ status: "retrying", reason });
-        return Math.min(5 * 2 ** (count - 1), Math.ceil(remaining / 1000));
+        return this.closed(Date.now()) ? null : Math.min(5 * 2 ** (count - 1), Math.ceil(remaining / 1000));
       }
       return null;
     };
     if (kv.get("submissions") === undefined) kv.put("submissions", submissions);
-    if (!submit && eligibilityAvailable) {
+    if (!eligible && eligibilityAvailable) {
       await record({ status: "canceled" });
-      return null;
-    }
-    // Let an already submitted request settle before a duplicate at the limit reports failure.
-    if ((submissions >= MAX_SUBMISSIONS || brokerAttempt >= LAST_BROKER_DELIVERY || at >= expiresAt) && this.submitting) {
       return null;
     }
     if (at >= expiresAt) await exhaust("expired");
@@ -110,15 +120,10 @@ export class NotificationRecovery extends DurableObject<DeliveryBindings> {
       kv.put("broker-attempt", brokerAttempt);
       kv.put("attempt", attempt);
       kv.put("submissions", ++submissions);
-      this.submitting++;
-      let outcome: TransportOutcome;
-      try {
-        outcome = await submit();
-      } catch {
-        outcome = { status: "temporary", reason: "network" };
-      } finally {
-        this.submitting--;
-      }
+      const submitted = submit().catch((): TransportOutcome => ({ status: "temporary", reason: "network" }));
+      this.submitting.add(submitted);
+      const outcome = await submitted;
+      this.submitting.delete(submitted);
       if (outcome.status === "temporary") return retry(outcome.reason, submissions);
       if (outcome.status === "permanent") {
         console.error(JSON.stringify({ event: "notification_submission_failed", reason: outcome.reason }));
@@ -129,6 +134,9 @@ export class NotificationRecovery extends DurableObject<DeliveryBindings> {
   }
 
   async record(identity: NotificationDeliveryIdentity, report: SubmissionReport, letter?: DeadLetter) {
+    if (letter) {
+      while (this.submitting.size) await Promise.all(this.submitting);
+    }
     await this.stage(identity, report, letter);
   }
 
