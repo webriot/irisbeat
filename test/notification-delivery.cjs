@@ -18,24 +18,32 @@ async function main() {
   const monitoring = await bundle(`
     import personal, { createHostedWorker } from './src/index.ts';
     export { MonitoringContext, NotificationDelivery } from './src/index.ts';
+    function policy(revision) {
+      return { paused: Number(revision) % 2 === 1, policyRevision: Number(revision) };
+    }
     const hosted = createHostedWorker({
       contractVersion: '1',
       resolve(request) {
         const url = new URL(request.url);
         const revision = url.searchParams.get('test-policy-revision');
+        const token = request.headers.get('authorization');
         return {
-          id: url.hostname, permission: 'editor', monitorLimit: 10,
-          ...(revision === null ? {} : { paused: revision === '1', policyRevision: Number(revision) }),
+          id: url.hostname, monitorLimit: 10,
+          permission: token === 'Bearer test-installation-secret' ? 'editor' : token === 'Bearer reader' ? 'reader' : null,
+          ...(revision === null ? {} : policy(revision)),
         };
       },
-      contexts: () => ['tenant.example'],
+      contexts: env => [env.testContext],
     });
     export default {
       fetch(request, env) {
         const url = new URL(request.url);
         const app = url.hostname === 'personal.example' ? personal : hosted;
-        if (url.pathname === '/test-tick')
-          return app.scheduled({ scheduledTime: Number(url.searchParams.get('at')) }, env).then(() => new Response(null, { status: 204 }));
+        if (url.pathname === '/test-tick') {
+          const revision = url.searchParams.get('test-policy-revision');
+          const testContext = revision === null ? url.hostname : { id: url.hostname, ...policy(revision) };
+          return app.scheduled({ scheduledTime: Number(url.searchParams.get('at')) }, { ...env, testContext }).then(() => new Response(null, { status: 204 }));
+        }
         return app.fetch(request, env);
       },
     };`);
@@ -50,6 +58,7 @@ async function main() {
     };`);
 
   const batches = [], submissions = [], errors = [];
+  let targetRequests = 0;
   let healthy = false;
   let holdBatch, holdProvider, providerStartedAt;
   let completedBatches = 0;
@@ -63,6 +72,7 @@ async function main() {
         queueProducers: { NOTIFICATION_QUEUE: 'notifications' },
         outboundService: request => {
           assert.equal(request.url, 'https://internal.example:8443/target-secret');
+          targetRequests++;
           return new Response(null, { status: healthy ? 204 : 503 });
         },
       },
@@ -99,17 +109,18 @@ async function main() {
   let at = Date.now();
   const path = '/api/operator/destinations';
   const monitors = '/api/operator/monitors';
-  const request = (host, endpoint, method = 'GET', value) => mf.dispatchFetch('https://' + host + endpoint, {
-    method, headers: { authorization: 'Bearer test-installation-secret', 'content-type': 'application/json' },
+  const request = (host, endpoint, method = 'GET', value, headers = {}) => mf.dispatchFetch('https://' + host + endpoint, {
+    method, headers: { authorization: 'Bearer test-installation-secret', 'content-type': 'application/json', ...headers },
     ...(value === undefined ? {} : { body: JSON.stringify(value) }),
   });
-  async function json(host, endpoint, method, value, expected = 200) {
-    const response = await request(host, endpoint, method, value);
+  async function json(host, endpoint, method, value, expected = 200, headers) {
+    const response = await request(host, endpoint, method, value, headers);
     assert.equal(response.status, expected, endpoint);
     return response.json();
   }
-  async function tick(host) {
-    assert.equal((await request(host, '/test-tick?at=' + at)).status, 204);
+  async function tick(host, policyRevision) {
+    const revision = policyRevision === undefined ? '' : '&test-policy-revision=' + policyRevision;
+    assert.equal((await request(host, '/test-tick?at=' + at + revision)).status, 204);
     at += 60_000;
   }
   async function until(condition, timeout = 5000) {
@@ -132,6 +143,11 @@ async function main() {
       holdBatch = undefined;
     }
     await until(() => completedBatches > priorBatches);
+  }
+  async function redeliver(producer, job) {
+    const before = completedBatches;
+    await producer.send(job);
+    await until(() => completedBatches > before);
   }
 
   try {
@@ -213,7 +229,7 @@ async function main() {
           assert.equal(submissions.length, beforeDeletion, 'deleting the Monitor cancels already queued jobs');
         };
       } else {
-        const [destination] = (await json(host, '/api/operator')).destinations;
+        const [destination, secondDestination] = (await json(host, '/api/operator')).destinations;
         await json(host, monitorPath, 'PATCH', { destinationIds: [destination.id] });
         healthy = false;
         providerStatus = 204;
@@ -231,18 +247,52 @@ async function main() {
         assert.match(submissions.at(-1).payload.text, /Incident recovered/, 'a fresh post-resume job delivers');
 
         healthy = false;
+        providerStatus = 307;
+        await json(host, monitorPath, 'PATCH', { destinationIds: [destination.id, secondDestination.id] });
+        const beforeAttempt = completedBatches;
+        const beforeSubmitted = submissions.length;
+        let finishAttempt;
+        holdProvider = new Promise(resolve => { finishAttempt = resolve; });
+        try {
+          await tick(host);
+          await until(() => submissions.length === beforeSubmitted + 2);
+          await tick(host, 3);
+          assert.equal((await json(host, '/api/operator?test-policy-revision=2')).paused, true, 'a stale resume cannot override a scheduled pause');
+          assert.equal(completedBatches, beforeAttempt, 'pause cannot recall a submission already in flight');
+        } finally {
+          finishAttempt();
+          holdProvider = undefined;
+        }
+        await until(() => completedBatches > beforeAttempt);
+        const [pausedJob, resumedJob] = batches.at(-1);
+        const priorSubmissions = submissions.length;
+        const priorErrors = errors.length;
+        await redeliver(producer, pausedJob);
+        assert.equal(submissions.length, priorSubmissions, 'an attempted job cannot submit again while paused');
+        assert.equal((await json(host, '/api/operator?test-policy-revision=4')).paused, false);
+        await redeliver(producer, resumedJob);
+        assert.equal(submissions.length, priorSubmissions, 'pause and resume between attempts permanently invalidate the job');
+        assert.equal(errors.length, priorErrors, 'canceled jobs do not record transport failures');
+
+        healthy = true;
+        providerStatus = 204;
+        await json(host, monitorPath, 'PATCH', { destinationIds: [destination.id] });
+        await tick(host);
+        await until(() => submissions.length === priorSubmissions + 1 && completedBatches === batches.length);
+
+        healthy = false;
         let releaseProvider;
         holdProvider = new Promise(resolve => { releaseProvider = resolve; });
         try {
           const beforeDeadline = completedBatches;
           const beforeErrors = errors.length;
           await tick(host);
-          await until(() => submissions.length === before + 5);
+          await until(() => submissions.length === priorSubmissions + 2);
           // The simulated provider stays unanswered while the real delivery deadline runs.
           await until(() => completedBatches > beforeDeadline && errors.length > beforeErrors, 13_000);
           assert.ok(performance.now() - providerStartedAt >= 9500, 'the held provider reaches the configured deadline');
           assert.deepEqual(errors.slice(beforeErrors), [JSON.stringify({ event: 'webhook_submission_failed' })]);
-          assert.equal(submissions.length, before + 5, 'the held submission is attempted once');
+          assert.equal(submissions.length, priorSubmissions + 2, 'the held submission is attempted once');
         } finally {
           releaseProvider();
           holdProvider = undefined;
@@ -250,7 +300,66 @@ async function main() {
       }
     }
     await deletePersonalMonitor();
-    console.log('PASS real Queue delivery: opt-in, fan-out, safe content, redirects, deadline, tenant isolation and cancellation across selection, deletion and pause');
+
+    const tenant = 'tenant.example';
+    const peer = 'peer.example';
+    const target = 'https://internal.example:8443/target-secret';
+    const tenantWebhook = 'https://hooks.example/paused-secret';
+    const peerWebhook = 'https://hooks.example/peer-secret';
+    const reader = { authorization: 'Bearer reader' };
+    const spoofedResume = { 'x-paused': 'false', 'x-policy-revision': '10000', 'x-context-id': peer };
+    assert.equal((await json(tenant, '/api/status?test-policy-revision=5')).paused, true);
+    const beforeConfig = (await json(tenant, '/api/operator')).incidents;
+    const created = await json(tenant, monitors, 'POST', { name: 'Created while paused', url: target, failureThreshold: 1 }, 201);
+    const newMonitor = created.monitors.find(monitor => monitor.name === 'Created while paused');
+    assert.equal(newMonitor.state, 'paused');
+    assert.deepEqual(newMonitor.destinationIds, []);
+    const configured = await json(tenant, path, 'POST', { url: tenantWebhook }, 201);
+    const tenantDestination = configured.destinations.find(destination => destination.url === tenantWebhook);
+    const newMonitorPath = monitors + '/' + newMonitor.id;
+    const edited = await json(tenant, newMonitorPath, 'PATCH', { name: 'Edited while paused', destinationIds: [tenantDestination.id] }, 200, spoofedResume);
+    assert.equal(edited.paused, true);
+    assert.deepEqual(edited.monitors.find(monitor => monitor.id === newMonitor.id).destinationIds, [tenantDestination.id]);
+    assert.equal((await json(tenant, '/api/operator', 'PUT', { pageName: 'Paused tenant' })).pageName, 'Paused tenant');
+    for (const [endpoint, method, value] of [[path, 'POST', { url: peerWebhook }], [newMonitorPath, 'PATCH', { destinationIds: [] }]]) {
+      assert.equal((await request(tenant, endpoint, method, value, reader)).status, 403);
+    }
+    const read = await json(tenant, '/api/operator', 'GET', undefined, 200, reader);
+    const publicStatus = await json(tenant, '/api/status', 'GET', undefined, 200, { authorization: '' });
+    for (const projection of [read, publicStatus]) {
+      assert.equal(projection.paused, true);
+      assert.equal(projection.pageName, 'Paused tenant');
+      assert.equal(projection.monitors.find(monitor => monitor.id === newMonitor.id).state, 'paused');
+      assert.doesNotMatch(JSON.stringify(projection), /destinations|destinationIds|hooks\.example/);
+    }
+    assert.doesNotMatch(JSON.stringify(publicStatus), /internal\.example|target-secret/);
+    assert.equal(publicStatus.monitors.length, 1, 'the paused private Monitor stays private');
+
+    const peerMonitor = await json(peer, monitors, 'POST', { name: 'Peer', url: target, failureThreshold: 1 }, 201);
+    const peerConfig = await json(peer, path, 'POST', { url: peerWebhook }, 201);
+    await json(peer, monitors + '/' + peerMonitor.monitor.id, 'PATCH', { destinationIds: [peerConfig.destinations[0].id] });
+    const beforePausedTick = { batches: batches.length, submissions: submissions.length, checks: targetRequests };
+    await tick(tenant);
+    assert.equal(targetRequests, beforePausedTick.checks, 'persisted pause suppresses scheduled checks even when discovery omits policy');
+    const paused = await json(tenant, '/api/operator');
+    assert.equal(paused.monitors.find(monitor => monitor.id === newMonitor.id).lastResult, null);
+    assert.deepEqual(paused.incidents, beforeConfig);
+
+    await tick(peer);
+    await until(() => completedBatches > beforePausedTick.batches);
+    assert.deepEqual(submissions.slice(beforePausedTick.submissions).map(item => item.url), [peerWebhook]);
+    assert.deepEqual(batches.slice(beforePausedTick.batches).flat().map(job => job.event.monitorName), ['Peer']);
+    assert.equal((await json(peer, '/api/status')).paused, false);
+    assert.equal((await json(tenant, '/api/status')).paused, true);
+
+    assert.equal((await json(tenant, '/api/operator?test-policy-revision=6')).paused, false);
+    const firstCheckAt = at;
+    await tick(tenant);
+    await until(() => submissions.length === beforePausedTick.submissions + 2 && completedBatches === batches.length);
+    assert.equal(submissions.at(-1).url, tenantWebhook);
+    assert.match(submissions.at(-1).payload.text, /Edited while paused/);
+    assert.ok(submissions.at(-1).payload.text.includes(new Date(firstCheckAt).toISOString()), 'resume sends only the fresh Incident');
+    console.log('PASS real Queue delivery: opt-in, fan-out, safe content, redirects, deadline, tenant isolation, paused configuration, and cancellation before and between attempts');
   } finally {
     await mf.dispose();
   }
