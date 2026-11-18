@@ -7,6 +7,9 @@
   "triggers": {
     "crons": ["* * * * *"],
   },
+  "queues": {
+    "producers": [{ "binding": "NOTIFICATION_QUEUE", "queue": "irisbeat-notifications" }],
+  },
   "durable_objects": {
     "bindings": [
       {

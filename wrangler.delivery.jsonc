@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "irisbeat-delivery",
+  "main": "src/notification-delivery.ts",
+  "compatibility_date": "2026-11-18",
+  "workers_dev": false,
+  "preview_urls": false,
+  "queues": {
+    "consumers": [{ "queue": "irisbeat-notifications", "max_retries": 0 }],
+  },
+  "services": [
+    { "binding": "NOTIFICATION_DELIVERY", "service": "irisbeat", "entrypoint": "NotificationDelivery" },
+  ],
+  "observability": {
+    "enabled": true,
+    "traces": { "enabled": true },
+  },
+}

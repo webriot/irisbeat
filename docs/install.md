@@ -106,9 +106,18 @@ still apply (including prohibited ports/addresses).
 POST `/heartbeat/<id>` with `Authorization: Bearer <installation secret>` from a
 producer. Bodies are ignored. Never place the secret in a query string.
 
-Save one HTTPS webhook destination in Operator alerts. It becomes live immediately;
-there is no test-send or replay. Use only a destination controlled for this install.
-The payload is `{ "text": "<Monitor>: Incident opened" }` or `Incident recovered`.
+Webhook notifications require a [Cloudflare Queue](https://developers.cloudflare.com/queues/configuration/configure-queues/)
+and a separate delivery Worker. Bind the same Queue as the producer in
+`wrangler.jsonc` and as the consumer in `wrangler.delivery.jsonc`. The delivery
+Worker uses the `NOTIFICATION_DELIVERY` service binding to Irisbeat's named
+`NotificationDelivery` entrypoint. `npm run build:delivery` dry-runs the bundle
+and `npm run test:delivery` exercises both Workers locally.
+
+Save HTTPS destinations and explicitly select them on each Monitor that should send
+Incident notifications. Upgraded context-wide webhooks retain their address and
+start unselected on every Monitor. Slack-compatible messages include the Monitor
+name, the transition and its original UTC time. Webhook-only installations need
+no email configuration.
 Declare/replace/end per-Monitor Maintenance in its ledger. Checks continue; detection
 and alerts are suppressed, Incidents retained. History shows 90 UTC calendar days;
 Maintenance is excluded from availability. Delete stops checking but retains
@@ -116,9 +125,9 @@ operator Incidents. Detailed bounds and semantics are in README and the API hand
 
 Cron runs each minute; [new trigger propagation](https://developers.cloudflare.com/workers/configuration/cron-triggers/) can take up to 15 minutes.
 Do not expect a live `/__scheduled` endpoint: it is a Wrangler-local test route.
-Monitor Workers Logs for sanitized `webhook_delivery_failed` events and cron
-errors; check actual public/operator responses. Alerts are best effort, without
-retry or durable outbox. No deployment creates sample Monitors or sends messages.
+Monitor Workers Logs for sanitized `notification_enqueue_failed` and
+`webhook_submission_failed` events and cron errors. The Incident remains committed
+if Queue handoff fails. This slice has one provider submission per message.
 
 For upgrades, retain the same Worker, `MONITORING` binding, class and migration
 history, and deploy the reviewed new source. Back up operational configuration via
