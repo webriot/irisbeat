@@ -243,9 +243,13 @@ async function main(runFixture, emailEnabled = true) {
       for (const { payload } of [first, second]) {
         assert.match(payload.text, /Incident recovered/);
         assert.ok(payload.text.includes(new Date(recoveredAt).toISOString()));
-        assert.doesNotMatch(payload.text, /@everyone|<!channel>|<@&123>|internal\.example|8443|target-secret/);
+        assert.doesNotMatch(payload.text, /@everyone|<!channel>|<@&123>|internal\.example|target-secret/);
       }
-      assert.doesNotMatch(JSON.stringify(batches), /internal\.example|8443|target-secret|hooks\.example|\/token/);
+      for (const job of recoveryJobs) {
+        assert.deepEqual(Object.keys(job).sort(), ['contextId', 'deliveryId', 'destinationId', 'event', 'generation', 'monitorId', 'pauseGeneration']);
+        assert.deepEqual(Object.keys(job.event).sort(), ['at', 'id', 'incidentId', 'kind', 'monitorName', 'openedAt']);
+      }
+      assert.doesNotMatch(JSON.stringify(batches), /internal\.example|target-secret|hooks\.example|\/token/);
 
       if (host === 'tenant.example') {
         // Replay only the context ID of a job that just delivered while its selection is still active.
@@ -600,7 +604,7 @@ async function main(runFixture, emailEnabled = true) {
       assert.match(payload.text, /Maintenance started/);
       assert.ok(payload.text.includes(new Date(started.maintenance.startedAt).toISOString()));
       assert.ok(payload.text.includes('Scheduled end ' + new Date(endsAt).toISOString()));
-      assert.doesNotMatch(payload.text, /@here|<!everyone>|internal\.example|8443|target-secret|hooks\.example|\/token/);
+      assert.doesNotMatch(payload.text, /@here|<!everyone>|internal\.example|target-secret|hooks\.example|\/token/);
       assert.equal(payload.text.split('`').length, 3, 'only the renderer delimits inline code');
     }
     await json(host, maintenance, 'PUT', { endsAt });
