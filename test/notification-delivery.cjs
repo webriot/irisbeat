@@ -16,8 +16,11 @@ async function bundle(contents) {
 
 async function main() {
   const monitoring = await bundle(`
-    import personal, { createHostedWorker } from './src/index.ts';
-    export { MonitoringContext, NotificationDelivery } from './src/index.ts';
+    import personal, { createHostedWorker, MonitoringContext as EngineContext } from './src/index.ts';
+    export { NotificationDelivery } from './src/index.ts';
+    export class MonitoringContext extends EngineContext {
+      restartForTest() { this.ctx.abort('Local Queue restart drill'); }
+    }
     const hosted = createHostedWorker({
       contractVersion: '1',
       resolve(request) {
@@ -31,9 +34,14 @@ async function main() {
       contexts: () => ['tenant.example'],
     });
     export default {
-      fetch(request, env) {
+      async fetch(request, env) {
         const url = new URL(request.url);
         const app = url.hostname === 'personal.example' ? personal : hosted;
+        if (url.pathname === '/test-restart') {
+          const id = env.MONITORING.idFromString(url.searchParams.get('context'));
+          await env.MONITORING.get(id).restartForTest().catch(() => {});
+          return new Response(null, { status: 204 });
+        }
         if (url.pathname === '/test-tick')
           return app.scheduled({ scheduledTime: Number(url.searchParams.get('at')) }, env).then(() => new Response(null, { status: 204 }));
         return app.fetch(request, env);
@@ -43,18 +51,37 @@ async function main() {
     import delivery from './src/notification-delivery.ts';
     export default {
       async queue(batch, env, ctx) {
-        await env.GATE.fetch('https://test.example/batch', { method: 'POST', body: JSON.stringify(batch.messages.map(message => message.body)) });
-        await delivery.queue(batch, env, ctx);
-        await env.GATE.fetch('https://test.example/done', { method: 'POST' });
+        if (batch.queue === 'dead-letters') {
+          await env.GATE.fetch('https://test.example/dead-letters', { method: 'POST', body: JSON.stringify(batch.messages.map(message => message.body)) });
+          return;
+        }
+        const messages = batch.messages.map(({ id, body, attempts, timestamp }) => ({ id, body, attempts, timestamp }));
+        const overrides = await (await env.GATE.fetch('https://test.example/batch', { method: 'POST', body: JSON.stringify(messages) })).json();
+        const actions = [];
+        await delivery.queue({ ...batch, messages: batch.messages.map((message, index) => ({
+          ...messages[index],
+          ...(overrides[index]?.attempts === undefined ? {} : { attempts: overrides[index].attempts }),
+          ...(overrides[index]?.timestamp === undefined ? {} : { timestamp: new Date(overrides[index].timestamp) }),
+          ack() { message.ack(); actions.push({ id: message.body.deliveryId, ack: true }); },
+          retry(options) {
+            actions.push({ id: message.body.deliveryId, retry: options });
+            // Controlled messages drive exact attempts without waiting for long retry delays.
+            if (overrides[index]) message.ack();
+            else message.retry(options);
+          },
+        })) }, env, ctx);
+        await env.GATE.fetch('https://test.example/done', { method: 'POST', body: JSON.stringify(actions) });
       },
     };`);
 
-  const batches = [], submissions = [], errors = [];
+  const batches = [], submissions = [], errors = [], actions = [], deadLetters = [];
+  const controls = new Map();
+  const providerStatuses = new Map();
   let healthy = false;
-  let holdBatch, holdProvider, providerStartedAt;
+  let holdBatch, holdProvider, heldEventTime, providerStartedAt;
   let completedBatches = 0;
   let providerStatus = 204;
-  const mf = new Miniflare(convertV4MiniflareOptions({
+  const options = {
     handleStructuredLogs: log => { if (log.level === 'error') errors.push(log.message); },
     workers: [
       { name: 'monitoring', modules: true, script: monitoring, compatibilityDate: '2026-11-13',
@@ -67,14 +94,28 @@ async function main() {
         },
       },
       { name: 'delivery', modules: true, script: consumer, compatibilityDate: '2026-11-18',
-        queueConsumers: { notifications: { maxBatchTimeout: 0.1, maxRetries: 0 } },
+        queueConsumers: {
+          notifications: { maxBatchTimeout: 0.1, maxRetries: 10, deadLetterQueue: 'dead-letters' },
+          'dead-letters': { maxBatchTimeout: 0.1 },
+        },
+        queueProducers: { NOTIFICATION_DLQ: 'dead-letters' },
         serviceBindings: {
           NOTIFICATION_DELIVERY: { name: 'monitoring', entrypoint: 'NotificationDelivery' },
           GATE: async request => {
-            if (new URL(request.url).pathname === '/batch') {
-              batches.push(await request.json());
+            const path = new URL(request.url).pathname;
+            if (path === '/batch') {
+              const messages = await request.json();
+              batches.push(messages.map(message => message.body));
               await holdBatch;
-            } else {
+              return Response.json(messages.map(message => {
+                const control = controls.get(message.body.deliveryId);
+                controls.delete(message.body.deliveryId);
+                return control;
+              }));
+            }
+            if (path === '/dead-letters') deadLetters.push(...await request.json());
+            if (path === '/done') {
+              actions.push(...await request.json());
               completedBatches++;
             }
             return new Response(null, { status: 204 });
@@ -85,17 +126,20 @@ async function main() {
           submissions.push(submission);
           if (new URL(request.url).hostname === 'redirect.example') return new Response(null, { status: 204 });
           submission.payload = await request.json();
-          if (holdProvider) {
+          const status = providerStatuses.get(request.url) ?? providerStatus;
+          if (holdProvider && (!heldEventTime || submission.payload.text.includes(heldEventTime))) {
             providerStartedAt = performance.now();
             await holdProvider;
+            if (heldEventTime) return new Response('sensitive provider response', { status: 403 });
           }
-          return new Response(providerStatus === 204 ? null : 'sensitive provider response', {
-            status: providerStatus, headers: { Location: 'https://redirect.example/secret' },
+          return new Response(status === 204 ? null : 'sensitive provider response', {
+            status, headers: { Location: 'https://redirect.example/secret' },
           });
         },
       },
     ],
-  }));
+  };
+  const mf = new Miniflare(convertV4MiniflareOptions(options));
   let at = Date.now();
   const path = '/api/operator/destinations';
   const monitors = '/api/operator/monitors';
@@ -160,6 +204,8 @@ async function main() {
       await tick(host);
       await until(() => submissions.length === before + 2 && completedBatches === batches.length);
       const recoveryJobs = batches.at(-1);
+      const accepted = (await json(host, path)).destinations.map(destination => destination.latestSubmission?.status);
+      assert.deepEqual(accepted, ['accepted', 'accepted'], 'Settings data reports provider acceptance for each destination');
       assert.equal(recoveryJobs.length, 2);
       assert.equal(new Set(recoveryJobs.map(job => job.event.id)).size, 1);
       assert.equal(new Set(recoveryJobs.map(job => job.deliveryId)).size, 2);
@@ -235,14 +281,23 @@ async function main() {
         holdProvider = new Promise(resolve => { releaseProvider = resolve; });
         try {
           const beforeDeadline = completedBatches;
-          const beforeErrors = errors.length;
           await tick(host);
           await until(() => submissions.length === before + 5);
           // The simulated provider stays unanswered while the real delivery deadline runs.
-          await until(() => completedBatches > beforeDeadline && errors.length > beforeErrors, 13_000);
+          await until(() => completedBatches > beforeDeadline, 13_000);
           assert.ok(performance.now() - providerStartedAt >= 9500, 'the held provider reaches the configured deadline');
-          assert.deepEqual(errors.slice(beforeErrors), [JSON.stringify({ event: 'webhook_submission_failed' })]);
-          assert.equal(submissions.length, before + 5, 'the held submission is attempted once');
+          const [retrying] = (await json(host, path)).destinations;
+          assert.deepEqual(retrying.latestSubmission, {
+            status: 'retrying', reason: 'network', at: retrying.latestSubmission.at,
+          });
+          assert.deepEqual(actions.at(-1).retry, { delaySeconds: 5 });
+          await json(host, monitorPath, 'PATCH', { destinationIds: [] });
+          await json(host, monitorPath, 'PATCH', { destinationIds: [destination.id] });
+          const pending = completedBatches;
+          await until(() => completedBatches > pending, 7000);
+          assert.deepEqual(actions.at(-1), { id: actions.at(-2).id, ack: true });
+          assert.equal(submissions.length, before + 5, 're-selection cancels a pending retry');
+          assert.equal((await json(host, path)).destinations[0].latestSubmission.status, 'canceled');
         } finally {
           releaseProvider();
           holdProvider = undefined;
@@ -250,7 +305,108 @@ async function main() {
       }
     }
     await deletePersonalMonitor();
-    console.log('PASS real Queue delivery: opt-in, fan-out, safe content, redirects, deadline, tenant isolation and cancellation across selection, deletion and pause');
+
+    const host = 'tenant.example';
+    const snapshot = await json(host, '/api/operator');
+    const monitorPath = monitors + '/' + snapshot.monitor.id;
+    const [first, second] = snapshot.destinations;
+    await json(host, monitorPath, 'PATCH', { destinationIds: [first.id, second.id] });
+    healthy = true;
+    const baseline = completedBatches;
+    await tick(host);
+    await until(() => completedBatches > baseline);
+    const origins = batches.at(-1);
+    const [firstOrigin, secondOrigin] = [first, second].map(destination =>
+      origins.find(job => job.destinationId === destination.id));
+    const job = (origin, name, offset = 0) => ({
+      ...origin, deliveryId: name + ':' + origin.destinationId,
+      event: { ...origin.event, id: name, at: origin.event.at + offset },
+    });
+    async function sendBatch(jobs, overrides = []) {
+      const before = actions.length;
+      overrides.forEach((override, i) => controls.set(jobs[i].deliveryId, override));
+      await producer.sendBatch(jobs.map(body => ({ body })));
+      await until(() => actions.length >= before + jobs.length);
+      return actions.slice(before);
+    }
+    const retryJob = job(firstOrigin, 'retry', 1000);
+    const successfulJob = job(secondOrigin, 'success', 1000);
+    providerStatuses.set(first.url, 429);
+    providerStatuses.set(second.url, 204);
+    const independent = await sendBatch([retryJob, successfulJob], [{ attempts: 1 }]);
+    assert.deepEqual(independent.find(action => action.id === successfulJob.deliveryId), { id: successfulJob.deliveryId, ack: true });
+    assert.deepEqual(independent.find(action => action.id === retryJob.deliveryId).retry, { delaySeconds: 5 });
+    assert.deepEqual((await json(host, path)).destinations.map(destination => destination.latestSubmission.status), ['retrying', 'accepted']);
+    for (const [index, delaySeconds] of [10, 20, 40, 80, 160, 320, 640, 1280].entries()) {
+      const [attempt] = await sendBatch([retryJob], [{ attempts: index + 2 }]);
+      assert.deepEqual(attempt.retry, { delaySeconds });
+    }
+    const beforeExhaustion = submissions.length;
+    assert.deepEqual(await sendBatch([retryJob], [{ attempts: 10 }]), [{ id: retryJob.deliveryId, ack: true }]);
+    assert.equal(submissions.length, beforeExhaustion + 1, 'attempt ten may submit');
+    await until(() => deadLetters.length === 1);
+    assert.equal(deadLetters[0].reason, 'attempts_exhausted');
+    assert.equal(deadLetters[0].attempts, 10);
+    const tooLate = job(firstOrigin, 'expired', 2000);
+    const overLimit = job(firstOrigin, 'over-limit', 1500);
+    assert.ok((await sendBatch([tooLate], [{ timestamp: Date.now() - 3_600_000 }]))[0].ack);
+    assert.ok((await sendBatch([overLimit], [{ attempts: 11 }]))[0].ack);
+    assert.equal(submissions.length, beforeExhaustion + 1, 'expired jobs and attempt eleven never call the provider');
+    await until(() => deadLetters.length === 3);
+    assert.deepEqual(deadLetters.map(letter => letter.reason), ['attempts_exhausted', 'expired', 'attempts_exhausted']);
+    assert.deepEqual(Object.keys(deadLetters[0]).sort(), ['attempts', 'contextId', 'deliveryId', 'destinationId', 'queuedAt', 'reason']);
+    assert.doesNotMatch(JSON.stringify(deadLetters), /token|target-secret|sensitive provider response|Website/);
+    assert.match(JSON.stringify((await json(host, path)).destinations[0].latestSubmission), /"status":"failed","reason":"expired"/);
+
+    const permanent = job(firstOrigin, 'permanent', 3000);
+    providerStatuses.set(first.url, 403);
+    assert.ok((await sendBatch([permanent]))[0].ack);
+    assert.match(JSON.stringify((await json(host, path)).destinations[0].latestSubmission), /"status":"failed","reason":"provider_rejected"/);
+    assert.equal(deadLetters.length, 3, 'permanent failures stop on their first attempt');
+    assert.doesNotMatch(errors.join('\n'), /token|target-secret|sensitive provider response|Website/);
+
+    const older = job(firstOrigin, 'older', 4000);
+    const newer = job(firstOrigin, 'newer', 5000);
+    providerStatuses.set(first.url, 204);
+    let releaseSlow;
+    holdProvider = new Promise(resolve => { releaseSlow = resolve; });
+    heldEventTime = new Date(older.event.at).toISOString();
+    const prior = submissions.length;
+    let pendingOlder;
+    try {
+      pendingOlder = sendBatch([older, newer]);
+      await until(() => submissions.length === prior + 2);
+      const deadline = Date.now() + 5000;
+      while ((await json(host, path)).destinations[0].latestSubmission.status !== 'accepted') {
+        assert.ok(Date.now() < deadline, 'a newer result can complete while the older provider request is held');
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+    } finally {
+      releaseSlow();
+    }
+    await pendingOlder;
+    assert.equal((await json(host, path)).destinations[0].latestSubmission.status, 'accepted');
+
+    const pendingJob = job(firstOrigin, 'queued-before-restart', 6000);
+    await producer.send(pendingJob, { delaySeconds: 1 });
+    assert.equal((await request(host, '/test-restart?context=' + pendingJob.contextId)).status, 204);
+    const queuedAction = () => actions.find(action => action.id === pendingJob.deliveryId);
+    assert.equal(queuedAction(), undefined, 'the job is still queued when the MonitoringContext restarts');
+    await until(() => queuedAction());
+    assert.equal(queuedAction().ack, true);
+
+    const beforeRestart = submissions.length;
+    options.workers[0].script += '\n// Restart monitoring after acceptance';
+    options.workers[1].script += '\n// Restart delivery after acceptance';
+    await mf.setOptions(convertV4MiniflareOptions(options));
+    const restartedProducer = await mf.getQueueProducer('NOTIFICATION_QUEUE', 'monitoring');
+    const beforeReplay = actions.length;
+    await restartedProducer.sendBatch([older, newer, successfulJob].map(body => ({ body })));
+    await until(() => actions.length === beforeReplay + 3);
+    assert.ok(actions.slice(beforeReplay).every(action => action.ack));
+    assert.equal(submissions.length, beforeRestart, 'completed identities survive restart, including out-of-order completion');
+    assert.equal((await json(host, path)).destinations[0].latestSubmission.status, 'accepted');
+    console.log('PASS real Queue delivery: independent ack/retry, 5–1280s backoff, deadline, ten attempts, one-hour age, DLQ, cancellation, out-of-order results and restart-safe completion');
   } finally {
     await mf.dispose();
   }

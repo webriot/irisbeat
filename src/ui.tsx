@@ -483,6 +483,8 @@ form button + button { margin-left: 8px; }
 #destination-rows { list-style: none; padding: 0; margin: 12px 0 28px; }
 #destination-rows li { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 16px; border-top: 1px solid var(--line); padding: 12px 0; }
 .destination-address, #destination-choices label { overflow-wrap: anywhere; }
+.destination-details { min-width: 0; display: grid; gap: 4px; }
+.destination-submission { font-size: .875rem; }
 .destination-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 #destination-selection { margin-top: 12px; }
 #destination-selection legend { font-weight: 550; }
@@ -582,6 +584,29 @@ function openWebhook(destination) {
   byId('save-webhook').textContent = destination ? 'Replace webhook' : 'Save webhook';
   webhook.hidden = false; updateWebhook(); webhookUrl.focus();
 }
+function renderSubmission(result) {
+  const reasons = {
+    network: 'Provider connection failed',
+    rate_limited: 'Provider rate limit',
+    provider_unavailable: 'Provider unavailable',
+    provider_rejected: 'Provider rejected the submission',
+    eligibility_unavailable: 'Eligibility check unavailable',
+    expired: 'Job expired',
+    attempts_exhausted: 'Retry limit reached',
+  };
+  const submission = document.createElement('div'); submission.className = 'destination-submission';
+  const label = document.createElement('span');
+  const status = result.status === 'accepted' ? 'Submission accepted'
+    : result.status === 'canceled' ? 'Submission canceled'
+      : result.status === 'retrying' ? 'Submission failed · Retrying' : 'Submission failed';
+  label.textContent = [status, reasons[result.reason]].filter(Boolean).join(' · ');
+  const time = document.createElement('time');
+  const at = new Date(result.at);
+  time.dateTime = at.toISOString();
+  time.textContent = at.toLocaleString();
+  submission.append(label, ' · ', time);
+  return submission;
+}
 function renderDestinations(next, monitors) {
   destinations = next;
   destinationUses = new Map();
@@ -610,7 +635,10 @@ function renderDestinations(next, monitors) {
       }
       actions.append(button);
     }
-    row.append(address, actions); return row;
+    const details = document.createElement('div'); details.className = 'destination-details';
+    details.append(address);
+    if (destination.latestSubmission) details.append(renderSubmission(destination.latestSubmission));
+    row.append(details, actions); return row;
   }));
   byId('no-destinations').hidden = destinations.length !== 0;
   updateWebhook();

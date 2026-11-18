@@ -1,47 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { deliverNotification } from "./notification-delivery-policy";
 import type { NotificationJob } from "./notification-jobs";
+import type { DeadLetter, NotificationDeliveryIdentity, SubmissionReport } from "./notification-outcomes";
+import { submitWebhook } from "./webhook-transport";
 
 interface DeliveryEnv {
   NOTIFICATION_DELIVERY: {
     resolveWebhook(job: NotificationJob): Promise<string | null>;
+    reportSubmission(job: NotificationDeliveryIdentity, report: SubmissionReport): Promise<void>;
   };
-}
-
-function renderWebhook({ event }: NotificationJob) {
-  // Inline code isolates Markdown. Slack decodes its reserved entities and the zero-width
-  // separator prevents Discord from expanding broadcast mentions.
-  const name = event.monitorName.replace(/\s+/g, " ")
-    .replace(/[\p{Cc}\p{Bidi_Control}]/gu, "")
-    .replaceAll("`", "ˋ").replaceAll("@", "@\u200b")
-    .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-  const summary = event.kind === "incident.opened" ? "Incident opened" : "Incident recovered";
-  const at = new Date(event.at).toISOString();
-  const opened = event.kind === "incident.recovered"
-    ? "\nOpened " + new Date(event.openedAt).toISOString() : "";
-  return JSON.stringify({ text: "`" + name + "` · " + summary + "\n" + at + opened });
+  NOTIFICATION_DLQ: Pick<Queue<DeadLetter>, "send">;
 }
 
 export default {
   async queue(batch, env) {
-    await Promise.all(batch.messages.map(async message => {
-      try {
-        const body = renderWebhook(message.body);
-        const url = await env.NOTIFICATION_DELIVERY.resolveWebhook(message.body);
-        if (url) {
-          const response = await fetch(url, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body,
-            redirect: "manual",
-            signal: AbortSignal.timeout(10_000),
-          });
-          await response.body?.cancel();
-          if (!response.ok) throw new Error("Webhook rejected");
-        }
-      } catch {
-        console.error(JSON.stringify({ event: "webhook_submission_failed" }));
-      }
-      message.ack();
-    }));
+    await Promise.all(batch.messages.map(message =>
+      deliverNotification(message, message.body.event.at, env, job => env.NOTIFICATION_DELIVERY.resolveWebhook(job), submitWebhook)));
   },
 } satisfies ExportedHandler<DeliveryEnv, NotificationJob>;

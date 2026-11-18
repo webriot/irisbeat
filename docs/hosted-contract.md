@@ -85,13 +85,15 @@ installation secret and ignores bodies.
 ## Incident notifications
 
 Use one Queue for the monitoring Worker's `NOTIFICATION_QUEUE` producer and
-the isolated delivery Worker's consumer trigger. Use `irisbeat/notification-delivery`
+the isolated delivery Worker's consumer trigger. Configure a second Queue in
+the same jurisdiction as both the consumer's `dead_letter_queue` and the
+delivery Worker's `NOTIFICATION_DLQ` producer. Use `irisbeat/notification-delivery`
 as the delivery Worker entrypoint. Export `NotificationDelivery` from the hosted
 monitoring Worker and bind the delivery Worker's `NOTIFICATION_DELIVERY` service
 to that named entrypoint. It resolves a webhook only while the original context,
 Monitor, destination and selection remain eligible. Keep the Queue and service
-binding under trusted deployment control. Delivery lookup is available through
-service RPC. Keep Workers Logs enabled on the delivery Worker and disable
+binding under trusted deployment control. The same service RPC records submission
+results. Keep Workers Logs enabled on the delivery Worker and disable
 automatic traces because fetch spans can include credential-bearing webhook URLs.
 
 Editors manage webhook destinations with `POST /api/operator/destinations` and
@@ -109,8 +111,18 @@ HTTP, TCP and Heartbeat share post-commit Incident enqueueing. A job carries sta
 event and delivery IDs, original event time and safe rendering data. Address
 changes replace the destination identity and clear prior selections. A failed
 enqueue logs `notification_enqueue_failed` and leaves the Incident committed.
-Queue acceptance starts durable delivery. This slice makes one bounded provider
-submission per message and logs `webhook_submission_failed` on failure.
+Queue acceptance starts durable delivery. Each attempt rechecks eligibility and
+completed delivery identities. Provider acceptance and permanent rejection end
+retries. Temporary submission failures back off exponentially, up to ten
+attempts and one hour from Queue acceptance. Exhaustion publishes a sanitized
+dead-letter record and acknowledges the source message. The Queue's native
+dead-letter routing handles exhausted consumer failures. Keep job bodies free
+of addresses and credentials. The dead-letter Queue has no automatic replay.
+
+Editor snapshots expose the optional `destinations[].latestSubmission` with
+`status`, `at` (Unix milliseconds) and a safe `reason` for failures.
+Acceptance records provider submission. A crash between provider acceptance and
+recording the result can still cause duplicate notifications.
 
 Hosted and self-hosted Incident notifications require explicit Monitor selections
 and the Queue and delivery Worker above. Monitoring and Incident recording

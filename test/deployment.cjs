@@ -27,11 +27,12 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     const monitoringName = 'irisbeat-smoke';
     const deliveryName = monitoringName + '-delivery';
     const queueName = monitoringName + '-notifications';
+    const dlqName = queueName + '-dead-letter';
     const monitoringPath = join(source, 'wrangler.jsonc');
     const deliveryPath = join(source, 'wrangler.delivery.jsonc');
     experimental_patchConfig(monitoringPath, { queues: { producers: [{ queue: queueName }] } }, false);
     experimental_patchConfig(deliveryPath, {
-      queues: { consumers: [{ queue: queueName }] },
+      queues: { consumers: [{ queue: queueName, dead_letter_queue: dlqName }], producers: [{ queue: dlqName }] },
       services: [{ service: monitoringName }],
     }, false);
     const producerConfig = unstable_readConfig({ config: monitoringPath });
@@ -46,6 +47,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     }
     const [queueProducer] = producerConfig.queues.producers;
     const [queueConsumer] = consumerConfig.queues.consumers;
+    const [dlqProducer] = consumerConfig.queues.producers;
     const [deliveryService] = consumerConfig.services;
     const delivery = (await build({ entryPoints: [join(source, 'src/notification-delivery.ts')], bundle: true, write: false, format: 'esm', platform: 'neutral' })).outputFiles[0].text;
     const script = (await build({ stdin: { contents: `
@@ -87,7 +89,10 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
         },
       },
       { name: deliveryName, modules: true, script: delivery, compatibilityDate: '2026-11-18',
-        queueConsumers: { [queueConsumer.queue]: { maxBatchTimeout: 0.1, maxRetries: queueConsumer.max_retries } },
+        queueConsumers: { [queueConsumer.queue]: {
+          maxBatchTimeout: 0.1, maxRetries: queueConsumer.max_retries, deadLetterQueue: queueConsumer.dead_letter_queue,
+        } },
+        queueProducers: { [dlqProducer.binding]: dlqProducer.queue },
         serviceBindings: { [deliveryService.binding]: { name: deliveryService.service, entrypoint: deliveryService.entrypoint } },
         outboundService: async request => {
           assert.equal(request.url, 'https://webhook.example/controlled');

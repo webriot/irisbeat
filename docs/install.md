@@ -53,7 +53,7 @@ npx wrangler whoami
 
 Select the intended account using `CLOUDFLARE_ACCOUNT_ID` in the shell, outside
 this repository, if more than one account is available. Choose names unique in
-that account for this installation's two Workers and Queue. For a fresh or
+that account for this installation's two Workers and two Queues. For a fresh or
 disposable install, verify that the names are unused before provisioning. Do not
 use a temporary claim account.
 
@@ -61,7 +61,9 @@ use a temporary claim account.
 IRISBEAT_WORKER_NAME="irisbeat-my-install"
 IRISBEAT_DELIVERY_WORKER_NAME="${IRISBEAT_WORKER_NAME}-delivery"
 IRISBEAT_QUEUE_NAME="${IRISBEAT_WORKER_NAME}-notifications"
+IRISBEAT_DLQ_NAME="${IRISBEAT_QUEUE_NAME}-dead-letter"
 npx wrangler queues create "$IRISBEAT_QUEUE_NAME"
+npx wrangler queues create "$IRISBEAT_DLQ_NAME"
 ```
 
 In your local extracted source, set the following Wrangler values to the shell
@@ -71,6 +73,7 @@ variable values above. Keep deployment-specific configuration out of version con
 | --- | --- | --- |
 | `wrangler.jsonc` | `queues.producers[0].queue` | `IRISBEAT_QUEUE_NAME` |
 | `wrangler.delivery.jsonc` | `queues.consumers[0].queue` | `IRISBEAT_QUEUE_NAME` |
+| `wrangler.delivery.jsonc` | `queues.consumers[0].dead_letter_queue` and `queues.producers[0].queue` | `IRISBEAT_DLQ_NAME` |
 | `wrangler.delivery.jsonc` | `services[0].service` | `IRISBEAT_WORKER_NAME` |
 
 Keep the binding names, `NotificationDelivery` entrypoint and migrations from
@@ -152,9 +155,15 @@ operator Incidents. Detailed bounds and semantics are in README and the API hand
 
 Cron runs each minute; [new trigger propagation](https://developers.cloudflare.com/workers/configuration/cron-triggers/) can take up to 15 minutes.
 Do not expect a live `/__scheduled` endpoint: it is a Wrangler-local test route.
-Monitor Workers Logs for sanitized `notification_enqueue_failed` and
-`webhook_submission_failed` events and cron errors. The Incident remains committed
-if Queue handoff fails. This slice has one provider submission per message.
+Settings shows the latest submission result per destination. “Submission accepted”
+means the provider accepted the request. Temporary failures retry independently
+with exponential delays, up to ten attempts and one hour from Queue acceptance.
+Permanent failures stop immediately. Exhausted jobs go to the dead-letter Queue,
+which has no automatic replay. Keep both Queues in the same jurisdiction.
+Monitor Workers Logs for sanitized `notification_enqueue_failed`,
+`notification_submission_failed`, `notification_submission_report_failed` and
+`notification_dead_letter_failed` events. The Incident remains committed if Queue
+handoff fails.
 
 For upgrades, retain the same Worker, `MONITORING` binding, class and migration
 history, and deploy the reviewed new source. Back up operational configuration via
@@ -238,9 +247,9 @@ channels or arbitrary public sites. Use default one-minute intervals, thresholds
    persists. Local suites cover exact timing/UTC boundaries; live evidence covers
    actual Cloudflare socket/cron/secret/resource behavior.
 6. Stop producers, remove the drill webhook in Settings, and delete only drill Monitors.
-   Verify both disposable Worker names, the Queue and the account. Delete the
+   Verify both disposable Worker names, both Queues and the account. Delete the
    delivery Worker first, then the monitoring Worker using
-   `npx wrangler delete <worker-name>`. Delete the disposable Queue with
+   `npx wrangler delete <worker-name>`. Delete both disposable Queues with
    `npx wrangler queues delete <queue-name>`. Worker deletion destroys its
    associated DO data. Confirm removal, then remove any separate controlled
    target service, cloned test build/repository connection and private local
@@ -284,7 +293,7 @@ After the reviewed code is on main and the tag, release and artifacts are public
    and confirm the public/operator Source link downloads the matching source archive.
 2. Use the Deploy to Cloudflare button to install into another unused Worker. Record
    the installed revision and verify the secret prompt and build/deploy configuration.
-   Give that installation its own Queue and deploy its delivery Worker using the
+   Give that installation its own Queues and deploy its delivery Worker using the
    exact-source binding steps above, then run runtime acceptance.
 3. Remove the disposable installation and controlled targets using the cleanup step
    above. Record sanitized evidence for both the candidate CLI and published button

@@ -85,8 +85,9 @@ destinations selected when the event commits, including for private Monitors.
 A separate delivery Worker rechecks eligibility before sending a bounded,
 Slack-compatible webhook POST with the original event time. Discord webhook
 paths normalize to `/slack`. Queue handoff errors record
-`notification_enqueue_failed` and preserve the Incident. The delivery Worker logs
-sanitized `webhook_submission_failed` events. See [installation](docs/install.md)
+`notification_enqueue_failed` and preserve the Incident. The delivery Worker
+retries temporary submission failures and sends exhausted jobs to a dead-letter
+Queue. Settings shows each destination's latest submission result. See [installation](docs/install.md)
 and [hosted integration](docs/hosted-contract.md#incident-notifications).
 
 ## Runtime verification

@@ -6,7 +6,12 @@
   "workers_dev": false,
   "preview_urls": false,
   "queues": {
-    "consumers": [{ "queue": "irisbeat-notifications", "max_retries": 0 }],
+    "consumers": [{
+      "queue": "irisbeat-notifications",
+      "max_retries": 10,
+      "dead_letter_queue": "irisbeat-notifications-dead-letter",
+    }],
+    "producers": [{ "binding": "NOTIFICATION_DLQ", "queue": "irisbeat-notifications-dead-letter" }],
   },
   "services": [
     { "binding": "NOTIFICATION_DELIVERY", "service": "irisbeat", "entrypoint": "NotificationDelivery" },

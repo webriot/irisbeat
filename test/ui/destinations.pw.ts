@@ -255,3 +255,27 @@ test('Settings preserves webhook and page drafts across independent saves, failu
   await expect(page.getByRole('button', { name: 'Replace ' + draft, exact: true })).toBeVisible();
   await expect(pageName).toHaveValue('Page draft');
 });
+
+test('Settings distinguishes provider acceptance, retries and terminal failure', async ({ page }) => {
+  const at = Date.UTC(2026, 10, 18, 9, 30);
+  await page.route('**/api/operator', route => route.fulfill({ json: {
+    pageName: 'Status', monitors: [], incidents: [],
+    destinations: [
+      { id: 'ok', channel: 'webhook', url: 'https://alerts.example/ok', latestSubmission: { status: 'accepted', at } },
+      { id: 'retry', channel: 'webhook', url: 'https://alerts.example/retry', latestSubmission: { status: 'retrying', reason: 'rate_limited', at } },
+      { id: 'failed', channel: 'webhook', url: 'https://alerts.example/failed', latestSubmission: { status: 'failed', reason: 'attempts_exhausted', at } },
+    ],
+  } }));
+  await page.setViewportSize({ width: 320, height: 900 });
+  await page.goto('/operator');
+  await page.getByLabel('Installation secret').fill('ui-test-secret');
+  await page.getByRole('button', { name: 'Sign in' }).click();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  const ledger = page.getByRole('list', { name: 'Notification destinations' });
+  const accepted = ledger.getByRole('listitem').filter({ hasText: 'https://alerts.example/ok' });
+  await expect(accepted.getByText('Submission accepted', { exact: true })).toBeVisible();
+  await expect(accepted.locator('time')).toHaveAttribute('datetime', new Date(at).toISOString());
+  await expect(ledger.getByText('Submission failed · Retrying · Provider rate limit', { exact: true })).toBeVisible();
+  await expect(ledger.getByText('Submission failed · Retry limit reached', { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});

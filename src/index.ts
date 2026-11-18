@@ -5,6 +5,7 @@ import { calendar } from "./calendar";
 import { MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
 import { connect } from "cloudflare:sockets";
 import type { NotificationDestination, NotificationJob } from "./notification-jobs";
+import type { NotificationDeliveryIdentity, SubmissionReport } from "./notification-outcomes";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 
 export const CONTRACT_VERSION = "1" as const;
@@ -63,7 +64,7 @@ type StoredContext = {
   monitors: Monitor[];
   webhookUrl?: string | null;
   legacyDestinationId?: string;
-  destinations?: NotificationDestination[];
+  destinations?: (NotificationDestination & { submission?: SubmissionReport & { deliveryId: string } })[];
   paused?: boolean;
   policyRevision?: number;
   pauseGeneration?: number;
@@ -90,6 +91,10 @@ function allowedSubscriptionOrigin(request: Request, requireOrigin: boolean) {
 export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableObject<E> {
   constructor(ctx: DurableObjectState, env: E) {
     super(ctx, env);
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS notification_completions (
+      deliveryId TEXT PRIMARY KEY, expiresAt INTEGER NOT NULL
+    )`);
+    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS notification_completions_expiry ON notification_completions (expiresAt)");
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS incidents (
       id TEXT PRIMARY KEY, monitorId TEXT NOT NULL, openedAt INTEGER NOT NULL, closedAt INTEGER
     )`);
@@ -645,7 +650,47 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (state.paused || (state.pauseGeneration ?? 0) !== job.pauseGeneration) return null;
     const selected = state.monitors.find(monitor => monitor.id === job.monitorId)?.notificationSelections;
     if (!selected?.some(selection => selection.destinationId === job.destinationId && selection.generation === job.generation)) return null;
+    if (this.notificationCompleted(job.deliveryId)) return null;
     return state.destinations?.find(destination => destination.channel === "webhook" && destination.id === job.destinationId)?.url ?? null;
+  }
+
+  protected notificationCompleted(deliveryId: string) {
+    return this.ctx.storage.sql.exec("SELECT 1 FROM notification_completions WHERE deliveryId = ? AND expiresAt > ?", deliveryId, Date.now())
+      .toArray().length > 0;
+  }
+
+  reportSubmission(job: NotificationDeliveryIdentity, report: SubmissionReport) {
+    if (job.contextId !== this.ctx.id.toString()) return;
+    const state = this.read();
+    const destination = state.destinations?.find(destination => destination.id === job.destinationId);
+    if (!destination) return;
+    const current = destination.submission;
+    const accepted = report.result.status === "accepted";
+    const terminal = report.result.status !== "retrying";
+    if (report.result.status === "canceled" &&
+      (current?.deliveryId !== job.deliveryId || current.result.status !== "retrying")) return;
+    const now = Date.now();
+    let changed = false;
+    this.ctx.storage.transactionSync(() => {
+      if (!accepted && this.notificationCompleted(job.deliveryId)) return;
+      if (terminal) {
+        // Retain completed identities through the maximum source Queue retention window.
+        this.ctx.storage.sql.exec("DELETE FROM notification_completions WHERE expiresAt <= ?", now);
+        this.ctx.storage.sql.exec("INSERT OR IGNORE INTO notification_completions VALUES (?, ?)", job.deliveryId, now + 14 * DAY);
+      }
+      if (current?.deliveryId === job.deliveryId) {
+        if (current.result.status === "accepted") return;
+        if (!terminal && (report.attempt < current.attempt ||
+          (report.attempt === current.attempt && report.result.at <= current.result.at))) return;
+      } else if (current) {
+        const order = report.eventAt - current.eventAt || report.queuedAt - current.queuedAt;
+        if (order < 0 || (order === 0 && job.deliveryId < current.deliveryId)) return;
+      }
+      destination.submission = { ...report, deliveryId: job.deliveryId };
+      this.ctx.storage.kv.put("context", state);
+      changed = true;
+    });
+    if (changed) this.broadcast("operator", true);
   }
 
   async heartbeat(id: string, at: number) {
@@ -753,7 +798,9 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     }));
     return {
       ...(secrets ? {
-        destinations: state.destinations ?? [],
+        destinations: (state.destinations ?? []).map(({ submission, ...destination }) => ({
+          ...destination, ...(submission ? { latestSubmission: submission.result } : {}),
+        })),
         webhookUrl: state.destinations?.find(destination => destination.id === state.legacyDestinationId)?.url ?? null,
       } : {}),
       paused: !!state.paused,
@@ -842,6 +889,12 @@ export class NotificationDelivery extends WorkerEntrypoint<EngineEnv> {
     if (!/^[a-f0-9]{64}$/.test(job.contextId)) return null;
     const context = this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId));
     return context.resolveWebhook(job);
+  }
+
+  async reportSubmission(job: NotificationDeliveryIdentity, report: SubmissionReport) {
+    if (!/^[a-f0-9]{64}$/.test(job.contextId)) return;
+    const context = this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId));
+    await context.reportSubmission(job, report);
   }
 }
 
