@@ -113,7 +113,7 @@ export function renderViewPartial(scope: ViewScope, data: Status, audience: View
       const html = operator
         ? (data.monitors.length || all ? String(<OperatorRows monitors={data.monitors} canEdit={audience === "editor"} floor={data.minCheckIntervalSeconds ?? 60} />) : "")
         : String(<PublicRows monitors={data.monitors} />);
-      return { html, ...(operator ? { monitors: data.monitors.map(({ history: _history, historyRetryToken: _token, ...monitor }) => monitor) } : {}) };
+      return { html, ...(operator ? { monitors: data.monitors.map(({ history: _history, historyRetryToken: _token, ...monitor }) => monitor), minCheckIntervalSeconds: data.minCheckIntervalSeconds } : {}) };
     }
   }
 }
