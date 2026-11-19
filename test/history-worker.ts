@@ -11,10 +11,12 @@ let queued: NotificationQueueJob[] = [];
 let queueUnavailable = false;
 let checkFloor: string | undefined;
 let useWallClock = false;
+let renderInterval: string | undefined;
 export class MonitoringContext extends EngineContext {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, {
       ...env,
+      ...(renderInterval === undefined ? {} : { STATUS_RENDER_INTERVAL_SECONDS: renderInterval }),
       get MIN_CHECK_INTERVAL_SECONDS() { return checkFloor; },
       get AVAILABILITY_DATASET() { return readDataset; },
       get AVAILABILITY_HISTORY() { return backend === 'unconfigured' ? undefined : analytics.bindings.AVAILABILITY_HISTORY; },
@@ -61,6 +63,8 @@ export default {
     if (url.pathname === '/__test-history') {
       if (!url.searchParams.has('mode')) return Response.json({ points: analytics.points, queries: analytics.queries });
       const mode = url.searchParams.get('mode')!;
+      renderInterval = url.searchParams.get('render-interval') ?? renderInterval;
+      if (mode === 'available') renderInterval = undefined;
       readDataset = url.searchParams.get('dataset') ?? undefined;
       backend = mode === 'unconfigured' || mode === 'direct' ? mode : 'managed';
       interruptObservation = mode === 'interrupt-observation';

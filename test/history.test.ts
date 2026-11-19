@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import worker, { type Status } from '../src/index';
+import worker, { type AvailabilityQuery, type Status } from '../src/index';
 import { env, exports } from 'cloudflare:workers';
 import { createScheduledController, evictDurableObject, reset, runDurableObjectAlarm } from 'cloudflare:test';
 import { afterEach, expect, expectTypeOf, it, vi } from 'vitest';
@@ -10,6 +10,7 @@ const authorization = 'Bearer test-installation-secret';
 const request = (path: string, init?: RequestInit) => exports.default.fetch('https://irisbeat.example' + path, init);
 const mutate = (path: string, method: string, body?: unknown) => request(path, { method, headers: { authorization, 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
 const status = async (operator = false): Promise<Status> => (await request(operator ? '/api/operator' : '/api/status', { headers: operator ? { authorization } : {} })).json();
+const queries = async () => (await (await request('/__test-history')).json<{ queries: AvailabilityQuery[] }>()).queries;
 async function create(extra = {}) {
   const response = await mutate('/api/operator/monitors', 'POST', { name: 'Website', url: 'https://target.example/', failureThreshold: 1, recoveryThreshold: 1, ...extra });
   expect(response.status).toBe(201);
@@ -330,6 +331,68 @@ it('queries only published Monitor IDs, reuses their aggregates, and shares no p
   expect(sqlCalls).toHaveLength(1);
 });
 
+it('shares one upstream SQL query across overlapping availability reads', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(today);
+  const monitor = await create();
+  const outbound = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await tick(today);
+  await request('/__test-history?mode=direct');
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  outbound.mockClear().mockImplementation(async () => {
+    await held;
+    return Response.json({ data: [{ monitorId: monitor.id, date: '2026-11-13', successes: 3, failures: 1, maintenance: 0 }] });
+  });
+
+  const reads = Promise.all([status(), status(true)]);
+  try {
+    await vi.waitFor(() => expect(outbound).toHaveBeenCalled());
+  } finally {
+    release();
+  }
+  const [published, operator] = await reads;
+  expect(outbound).toHaveBeenCalledTimes(1);
+  expect(published.monitor!.history?.percentage).toBe(75);
+  expect(operator.monitor!.history).toEqual(published.monitor!.history);
+});
+
+it('shares a sealed publication query and isolates the next cutoff for the same Monitor revision', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
+  await request('/__test-history?mode=direct&render-interval=1');
+  const monitor = await create({ kind: 'heartbeat', url: undefined, failureThreshold: undefined });
+  expect((await mutate('/heartbeat/' + monitor.id, 'POST')).status).toBe(204);
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const firstCutoff = today / 1000 + 1;
+  const secondCutoff = firstCutoff + 1;
+  const cutoffSql = (seconds: number) => `timestamp < toDateTime(${seconds}, 'UTC')`;
+  const outbound = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+    const sql = String(init?.body);
+    if (sql.includes(cutoffSql(firstCutoff))) {
+      await held;
+      return Response.json({ data: [] });
+    }
+    expect(sql).toContain(cutoffSql(secondCutoff));
+    return Response.json({ data: [{ monitorId: monitor.id, date: '2026-11-13', successes: 1, failures: 0, maintenance: 0 }] });
+  });
+
+  clock.mockReturnValue(today + 1_000);
+  const earlier = Promise.all([status(), status()]);
+  try {
+    await vi.waitFor(() => expect(outbound).toHaveBeenCalled());
+    await mutate('/api/operator', 'PUT', { pageName: 'Next publication' });
+    clock.mockReturnValue(today + 2_000);
+    expect((await status()).monitor!.history?.percentage).toBe(100);
+  } finally {
+    release();
+    await earlier;
+  }
+  expect(outbound.mock.calls.map(([, init]) => String(init?.body).match(/timestamp < toDateTime\(\d+, 'UTC'\)/)?.[0]))
+    .toEqual([cutoffSql(firstCutoff), cutoffSql(secondCutoff)]);
+  for (const result of await earlier) expect(result.monitor!.history?.percentage).toBe(100);
+  expect((await status()).monitor!.history?.percentage).toBe(100);
+});
+
 it('enqueues the Incident while the history reader is unavailable', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
   const monitor = await create();
@@ -472,21 +535,20 @@ it('keeps a successful first query when a newer observation commits while it is 
   expect((await status()).monitor).toMatchObject({ state: 'down', history: { percentage: 100, stale: true } });
 });
 
-it('returns the newer successful scoped series when an earlier query fails', async () => {
+it('keeps a newer successful series when the same SQL from a different authorized Monitor set fails', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
   const monitor = await create();
-  await create({ published: false });
+  await create({ published: false, kind: 'heartbeat', url: undefined, failureThreshold: undefined });
   vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
   await tick(today);
   const path = '/api/status/partials/monitor/' + monitor.id;
   const read = async () => (await request(path)).json<{ html: string }>();
-  const queries = async () => (await (await request('/__test-history')).json<{ queries: { monitorIds: string[] }[] }>()).queries;
   await request('/__test-history?mode=held-failure');
   const earlier = read();
   await vi.waitFor(async () => expect(await queries()).toHaveLength(1));
   clock.mockReturnValue(today + 1_000);
   await request('/__test-history?mode=ingested');
-  expect((await read()).html).toContain('100.00%');
+  expect((await status(true)).monitors.find(item => item.id === monitor.id)?.history?.percentage).toBe(100);
   await request('/__test-history?mode=release-failure');
   const { html } = await earlier;
   expect(html).toContain('100.00%');
@@ -494,6 +556,34 @@ it('returns the newer successful scoped series when an earlier query fails', asy
   clock.mockReturnValue(today + 16_000);
   expect((await read()).html).toContain('100.00%');
   expect((await queries()).map(query => query.monitorIds)).toEqual([[monitor.id], [monitor.id], [monitor.id]]);
+});
+
+it('serves cached history to overlapping failed reads and retries after the usual delay', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
+  await create();
+  const target = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await tick(today);
+  const cached = (await status()).monitor!.history!;
+  expect(cached.percentage).toBe(100);
+
+  clock.mockReturnValue(today + 60_000);
+  target.mockResolvedValue(new Response(null, { status: 503 }));
+  await tick(today + 60_000);
+  await request('/__test-history?mode=held-failure');
+  const reads = Promise.all([status(), status(true)]);
+  try {
+    await vi.waitFor(async () => expect(await queries()).toHaveLength(2));
+  } finally {
+    await request('/__test-history?mode=release-failure');
+  }
+  for (const result of await reads) expect(result.monitor!.history).toEqual({ ...cached, stale: true });
+
+  clock.mockReturnValue(today + 74_999);
+  expect((await status()).monitor!.history).toEqual({ ...cached, stale: true });
+  expect(await queries()).toHaveLength(2);
+  clock.mockReturnValue(today + 75_000);
+  expect((await status()).monitor!.history).toMatchObject({ percentage: 50 });
+  expect(await queries()).toHaveLength(3);
 });
 
 it('marks aggregates pending during ingestion and refreshes them without another observation', async () => {

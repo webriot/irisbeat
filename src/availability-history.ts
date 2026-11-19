@@ -136,6 +136,7 @@ function checkedRows(rows: unknown, query: AvailabilityQuery): AvailabilityRow[]
 
 export class Availability {
   private nextAttempt = new Map<string, number>();
+  private inFlight = new Map<string, { startedAt: number; rows: Promise<AvailabilityRow[]> }>();
 
   constructor(private env: AvailabilityEnv, private ctx: DurableObjectState) {
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS availability_outbox (
@@ -217,9 +218,21 @@ export class Availability {
     }
   }
 
+  private queryHistory(scope: string[], batch: HistoryFence[], start: number, startedAt: number, loggedBefore?: number) {
+    const revisions = batch.map(({ id, revision }) => [id, revision]).sort();
+    const key = JSON.stringify([scope, revisions, start, loggedBefore]);
+    let flight = this.inFlight.get(key);
+    if (!flight) {
+      const rows = this.query(batch.map(({ id }) => id), start, start + 90 * DAY, undefined, loggedBefore)
+        .finally(() => this.inFlight.delete(key));
+      flight = { startedAt, rows };
+      this.inFlight.set(key, flight);
+    }
+    return flight;
+  }
+
   async readPublished(fences: HistoryFence[], at: number, loggedBefore: number | undefined, now: number, fallback: Map<string, AvailabilityHistory | null>) {
     const start = historyStart(at);
-    const end = start + 90 * DAY;
     const configured = this.configured;
     const result = new Map<string, AvailabilityHistory | null>();
     for (const { id, revision } of fences) {
@@ -227,12 +240,13 @@ export class Availability {
       result.set(id, previous ? { ...previous, stale: true } : !revision && configured ? series([], start) : null);
     }
     if (!configured || loggedBefore === undefined) return result;
+    const scope = fences.map(({ id }) => id).sort();
     const observed = fences.filter(fence => fence.revision);
     const batches = [];
     for (let offset = 0; offset < observed.length; offset += batchSize) batches.push(observed.slice(offset, offset + batchSize));
     await Promise.all(batches.map(async batch => {
       try {
-        const rows = await this.query(batch.map(({ id }) => id), start, end, undefined, loggedBefore);
+        const rows = await this.queryHistory(scope, batch, start, now, loggedBefore).rows;
         const byMonitor = new Map(batch.map(({ id }) => [id, [] as AvailabilityRow[]]));
         for (const row of rows) byMonitor.get(row.monitorId)!.push(row);
         for (const { id, changedAt } of batch) {
@@ -303,11 +317,12 @@ export class Availability {
     }
     const batches = [];
     for (let offset = 0; offset < pending.length; offset += batchSize) batches.push(pending.slice(offset, offset + batchSize));
+    const scope = monitors.map(({ id }) => id).sort();
     await Promise.all(batches.map(async batch => {
+      const { rows, startedAt } = this.queryHistory(scope, batch.map(({ id, historyRevision }) => ({ id, revision: historyRevision! })), start, now);
       try {
-        const rows = await this.query(batch.map(monitor => monitor.id), start, start + 90 * DAY);
         const rowsByMonitor = new Map(batch.map(({ id }) => [id, [] as AvailabilityRow[]]));
-        for (const row of rows) rowsByMonitor.get(row.monitorId)!.push(row);
+        for (const row of await rows) rowsByMonitor.get(row.monitorId)!.push(row);
         const revisions = currentRevisions();
         for (const { id, historyRevision, historyChangedAt } of batch) {
           if (!revisions.has(id)) { result.set(id, null); continue; }
@@ -316,16 +331,16 @@ export class Availability {
           const previous = this.ctx.storage.kv.get<CachedSeries>(key);
           const pendingUntil = (historyChangedAt ?? -Infinity) + historyRetryWindow;
           const queued = this.ctx.storage.sql.exec("SELECT 1 FROM availability_outbox WHERE monitorId = ? LIMIT 1", id).toArray().length > 0;
-          const pending = queued || now < pendingUntil;
-          const freshUntil = queued ? now + availabilityRetryAfter
-            : pending ? Math.min(now + availabilityRetryAfter, pendingUntil) : now + freshFor;
+          const pending = queued || startedAt < pendingUntil;
+          const freshUntil = queued ? startedAt + availabilityRetryAfter
+            : pending ? Math.min(startedAt + availabilityRetryAfter, pendingUntil) : startedAt + freshFor;
           let latest: CachedSeries = {
-            start, revision, queriedAt: now, freshUntil,
+            start, revision, queriedAt: startedAt, freshUntil,
             rows: rowsByMonitor.get(id)!, pending,
           };
-          // A raced query is still a useful fallback if no newer query has succeeded.
+          // Shared rows keep the time of the query that produced them.
           if (previous && (previous.revision > revision ||
-              (previous.revision === revision && queriedAt(previous) >= now))) {
+              (previous.revision === revision && queriedAt(previous) >= startedAt))) {
             latest = previous;
           } else {
             this.ctx.storage.kv.put(key, latest);
@@ -340,8 +355,8 @@ export class Availability {
           const revision = revisions.get(id);
           const latest = this.ctx.storage.kv.get<CachedSeries>(cacheKey(id));
           result.set(id, revisions.has(id) ? this.cachedHistory(latest, revision, Date.now(), start, configured) : null);
-          if (historyRevision === revision && (!latest || latest.revision !== revision || queriedAt(latest) < now)) {
-            this.nextAttempt.set(id, Math.max(this.nextAttempt.get(id) ?? -Infinity, now + availabilityRetryAfter));
+          if (historyRevision === revision && (!latest || latest.revision !== revision || queriedAt(latest) < startedAt)) {
+            this.nextAttempt.set(id, Math.max(this.nextAttempt.get(id) ?? -Infinity, startedAt + availabilityRetryAfter));
           }
         }
         console.error(JSON.stringify({ event: "history_query_failed" }));
