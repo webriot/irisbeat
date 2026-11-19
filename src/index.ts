@@ -1931,7 +1931,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
       if (!scope.startsWith("monitor/")) return { scope, data: renderViewPartial(scope, data, audience, emailConfigured) };
       const id = scope.slice("monitor/".length);
       const monitor = data.monitors.find(monitor => monitor.id === id) ?? null;
-      const projection = { ...data, monitors: monitor ? [monitor] : [], monitor };
+      const projection = { ...data, monitors: monitor ? [monitor] : [] };
       return { scope, data: renderViewPartial(scope, projection, audience, emailConfigured) };
     });
     return batch ? c.json({ revision, permission: audience, partials })

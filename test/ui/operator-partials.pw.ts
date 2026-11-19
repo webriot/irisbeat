@@ -13,7 +13,8 @@ test('one section read applies a Monitor deletion and acknowledges its live hint
         headers: { Authorization: headers.Authorization }, data: { name, kind: 'heartbeat', published: false },
       });
       expect(created.status()).toBe(201);
-      ids.push((await created.json()).monitors.at(-1).id);
+      const monitors: { id: string; name: string }[] = (await created.json()).monitors;
+      ids.push(monitors.find(monitor => monitor.name === name)!.id);
     }
     let live!: WebSocketRoute;
     let acknowledgments = 0;
