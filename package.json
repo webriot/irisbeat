@@ -10,13 +10,16 @@
     "check": "npm run types && tsc --noEmit",
     "test": "vitest run",
     "build": "wrangler deploy --dry-run",
+    "build:delivery": "wrangler deploy --dry-run --config wrangler.delivery.jsonc",
+    "test:delivery": "node test/notification-delivery.cjs",
+    "test:delivery:upgrade": "node test/notification-delivery.cjs --upgrade",
     "pack:engine": "mkdir -p dist && npm pack --pack-destination dist",
     "test:consumer": "node test/consumer.cjs",
     "deploy": "wrangler deploy",
     "release:prepare": "node scripts/release.cjs",
     "test:release": "node test/release.cjs",
     "test:deployment": "node test/deployment.cjs",
-    "release:verify": "npm run check && npm test && npm run build && npm run test:release && npm run test:consumer -- --prepared && npm run test:deployment",
+    "release:verify": "npm run check && npm test && npm run test:delivery && npm run build && npm run build:delivery && npm run test:release && npm run test:consumer -- --prepared && npm run test:deployment",
     "test:ui": "tsc -p test/ui && playwright test"
   },
   "devDependencies": {
@@ -32,6 +35,10 @@
     "node": ">=22.12.0"
   },
   "exports": {
+    "./notification-delivery": {
+      "types": "./src/notification-delivery.ts",
+      "default": "./src/notification-delivery.ts"
+    },
     ".": {
       "types": "./src/index.ts",
       "default": "./src/index.ts"
@@ -45,6 +52,10 @@
     "docs/maintenance-api.md",
     "docs/history-api.md",
     "docs/install.md",
+    "docs/heartbeat-api.md",
+    "docs/monitor-api.md",
+    "wrangler.jsonc",
+    "wrangler.delivery.jsonc",
     "NOTICE"
   ],
   "cloudflare": {

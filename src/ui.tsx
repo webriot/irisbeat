@@ -30,6 +30,47 @@ export function statusPage(status: Status) {
   return "<!doctype html>" + <Document title={status.pageName}><div id="public-status">{raw(statusLedger.render(status))}</div></Document>;
 }
 
+export const recipientAction = {
+  confirm: {
+    path: "/notifications/confirm", title: "Confirm email notifications", button: "Confirm email",
+    success: "Email confirmed", invalid: "Confirmation link is invalid or expired",
+  },
+  unsubscribe: {
+    path: "/notifications/unsubscribe", title: "Unsubscribe from email notifications", button: "Unsubscribe",
+    success: "Email unsubscribed", invalid: "Unsubscribe link is invalid",
+  },
+};
+
+export function recipientPage(action: keyof typeof recipientAction, accepted?: boolean) {
+  const page = recipientAction[action];
+  const title = accepted === undefined ? page.title : accepted ? page.success : page.invalid;
+  return "<!doctype html>" + <html lang="en"><head>
+    <meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>{title}</title><link rel="stylesheet" href="/app.css" />
+  </head><body><main>
+    <h1>{title}</h1>
+    {accepted === undefined && <>
+      <form method="post" action={page.path} data-invalid={page.invalid}>
+        <input type="hidden" name="token" /><button disabled>{page.button}</button>
+      </form>
+      <script src={page.path + ".js"} defer></script>
+    </>}
+  </main></body></html>;
+}
+
+export const recipientScript = `
+const form = document.querySelector('form');
+const token = location.hash.slice(1);
+const button = form.querySelector('button');
+if (/^[a-f0-9-]{36}$/.test(token)) {
+  form.elements.token.value = token;
+  button.disabled = false;
+} else {
+  document.querySelector('h1').textContent = form.dataset.invalid;
+  form.hidden = true;
+}
+`;
+
 function DurationControl({ field, label, min, max, value }: { field: string; label: string; min: number; max: number; value: number }) {
   return <fieldset class="duration"><label for={field}>{label}</label><div class="duration-value"><input id={field} name={field} type="number" min={min} max={max} step="any" value={value} data-duration="" required /><select id={field + "-unit"} aria-label={label + " unit"}><option value="seconds">Seconds</option><option value="minutes">Minutes</option><option value="hours">Hours</option><option value="days">Days</option></select></div></fieldset>;
 }
@@ -74,6 +115,9 @@ function Operator({ hosted }: { hosted: boolean }) {
           <DurationControl field="silenceSeconds" label="Silence" min={60} max={86400} value={180} />
           <DurationControl field="recoverySpacingSeconds" label="Recovery spacing" min={60} max={86400} value={60} />
           <label class="checkbox" for="published"><input id="published" name="published" type="checkbox" checked />Published</label>
+          <fieldset id="destination-selection" hidden><legend tabindex={-1}>Notification destinations</legend>
+            <div id="destination-choices"></div><p id="no-destination-choices">No destinations</p>
+          </fieldset>
           <p id="monitor-deleted" role="status" hidden>This Monitor was deleted. Copy your draft or cancel.</p><button id="save-monitor">Save Monitor</button><button id="cancel-edit" type="button">Cancel</button>
         </form>
       <section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2><div id="incidents"></div></section>
@@ -82,11 +126,17 @@ function Operator({ hosted }: { hosted: boolean }) {
         <section aria-labelledby="page-settings"><h2 id="page-settings">Status page</h2>
           <form id="page-configuration"><label for="pageName">Page name</label><input id="pageName" name="pageName" required maxlength={120} /><button>Save page</button></form>
         </section>
-      <form id="webhook" aria-labelledby="webhook-heading">
-        <h2 id="webhook-heading">Operator alerts</h2>
-        <label for="webhookUrl">HTTPS webhook URL</label><input id="webhookUrl" name="url" type="url" maxlength={2048} autocomplete="off" />
-        <button>Save webhook</button>
-      </form>
+        <section aria-labelledby="destinations-heading">
+          <div class="operator-heading"><h2 id="destinations-heading">Notification destinations</h2><div class="destination-actions"><button id="add-email" type="button" hidden>Add email</button><button id="add-webhook" type="button">Add webhook</button></div></div>
+          <form id="webhook" hidden aria-label="Add webhook">
+            <label for="destination-address" id="destination-address-label">HTTPS webhook URL</label><input id="destination-address" name="address" type="url" required maxlength={2048} autocomplete="off" />
+            <p id="webhook-impact" hidden></p>
+            <p id="destination-missing" role="status" hidden>This destination was removed or replaced. Copy your draft or cancel.</p>
+            <button id="save-webhook">Save webhook</button><button id="cancel-webhook" type="button">Cancel</button>
+          </form>
+          <p id="no-destinations">No destinations</p>
+          <ul id="destination-rows" aria-label="Notification destinations"></ul>
+        </section>
       </section>
       <div class="actions"><span id="updates-mode" role="status">Polling</span><button id="logout" type="button">Sign out</button></div>
     </section>
@@ -469,7 +519,17 @@ button:hover, summary:hover { background: var(--secondary); }
 button:disabled { opacity: .5; cursor: wait; }
 form button { margin-top: 16px; }
 form button + button { margin-left: 8px; }
-#webhook { margin-bottom: 28px; }
+#webhook { margin: 12px 0; }
+#destination-rows { list-style: none; padding: 0; margin: 12px 0 28px; }
+#destination-rows li { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 16px; border-top: 1px solid var(--line); padding: 12px 0; }
+.destination-address, #destination-choices label { overflow-wrap: anywhere; }
+.destination-details { min-width: 0; display: grid; gap: 4px; }
+.destination-submission { font-size: .875rem; }
+.destination-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+#destination-selection { margin-top: 12px; }
+#destination-selection legend { font-weight: 550; }
+#destination-choices label { margin: 4px 0; }
+#destination-choices input { flex: none; }
 .ledger:empty { display: none; }
 form button[type="submit"], form button:not([type]), #new-monitor { background: var(--primary); border-color: var(--primary); color: var(--primary-foreground); }
 .text-button { border: 0; background: transparent; color: inherit; padding-left: 0; text-decoration: underline; text-underline-offset: 4px; }
@@ -532,7 +592,120 @@ const pageForm = byId('page-configuration');
 const webhook = byId('webhook');
 const maintenanceForm = byId('maintenance');
 const message = byId('message');
-let savedSettings = {};
+let savedPageName = '';
+let destinations = [];
+let destinationUses = new Map();
+let replacingDestination = null;
+let destinationChannel = 'webhook';
+let emailConfigured = false;
+const destinationsPath = '/api/operator/destinations';
+const destinationRows = byId('destination-rows');
+const addWebhook = byId('add-webhook');
+const addEmail = byId('add-email');
+const destinationAddress = byId('destination-address');
+function updateWebhook() {
+  const missing = replacingDestination !== null && !destinations.some(destination => destination.id === replacingDestination);
+  byId('destination-missing').hidden = !missing;
+  byId('save-webhook').disabled = missing || (destinationChannel === 'email' && !emailConfigured);
+  const count = destinationUses.get(replacingDestination) || 0;
+  const impact = byId('webhook-impact');
+  impact.hidden = !count || webhook.hidden;
+  impact.textContent = count && !webhook.hidden ? count + (count === 1 ? ' Monitor will' : ' Monitors will') + ' lose this selection if the address changes.' : '';
+}
+function closeWebhook(focus = false) {
+  const id = replacingDestination;
+  const add = destinationChannel === 'email' && emailConfigured ? addEmail : addWebhook;
+  replacingDestination = null;
+  webhook.reset(); webhook.hidden = true; updateWebhook();
+  if (focus) (document.getElementById('replace-' + id) || add).focus();
+}
+function openDestination(channel, destination) {
+  const id = destination?.id ?? null;
+  if (!webhook.hidden && replacingDestination === id && destinationChannel === channel) { destinationAddress.focus(); return; }
+  replacingDestination = id;
+  destinationChannel = channel;
+  const email = channel === 'email';
+  destinationAddress.type = email ? 'email' : 'url';
+  destinationAddress.maxLength = email ? 254 : 2048;
+  destinationAddress.value = (email ? destination?.address : destination?.url) ?? '';
+  byId('destination-address-label').textContent = email ? 'Email address' : 'HTTPS webhook URL';
+  webhook.setAttribute('aria-label', (destination ? 'Replace ' : 'Add ') + channel);
+  byId('save-webhook').textContent = destination ? 'Replace ' + channel : email ? 'Save email' : 'Save webhook';
+  webhook.hidden = false; updateWebhook(); destinationAddress.focus();
+}
+function renderSubmission(result) {
+  const reasons = {
+    network: 'Provider connection failed',
+    rate_limited: 'Provider rate limit',
+    provider_unavailable: 'Provider unavailable',
+    provider_rejected: 'Provider rejected the submission',
+    eligibility_unavailable: 'Eligibility check unavailable',
+    expired: 'Job expired',
+    attempts_exhausted: 'Retry limit reached',
+  };
+  const submission = document.createElement('div'); submission.className = 'destination-submission';
+  const label = document.createElement('span');
+  const status = result.status === 'accepted' ? 'Submission accepted'
+    : result.status === 'canceled' ? 'Submission canceled'
+      : result.status === 'retrying' ? 'Submission failed · Retrying' : 'Submission failed';
+  label.textContent = [status, reasons[result.reason]].filter(Boolean).join(' · ');
+  const time = document.createElement('time');
+  const at = new Date(result.at);
+  time.dateTime = at.toISOString();
+  time.textContent = at.toLocaleString();
+  submission.append(label, ' · ', time);
+  return submission;
+}
+function renderDestinations(next, monitors) {
+  destinations = next;
+  destinationUses = new Map();
+  for (const monitor of monitors) for (const id of monitor.destinationIds ?? []) {
+    destinationUses.set(id, (destinationUses.get(id) || 0) + 1);
+  }
+  const focused = document.activeElement;
+  const focusedRow = destinationRows.contains(focused);
+  reconcileNodes(destinationRows, destinations.map(destination => {
+    const row = document.createElement('li'); row.dataset.key = destination.id;
+    const email = destination.channel === 'email';
+    const value = email ? destination.address : destination.url;
+    const details = document.createElement('div'); details.className = 'destination-details';
+    const address = document.createElement('div'); address.className = 'destination-address'; address.textContent = value;
+    details.append(address);
+    if (email) {
+      const consent = document.createElement('div');
+      consent.textContent = destination.confirmed ? 'Confirmed' : 'Pending confirmation';
+      details.append(consent);
+    }
+    const actions = document.createElement('div'); actions.className = 'destination-actions';
+    const labels = email ? (emailConfigured ? (destination.confirmed ? ['Replace', 'Remove'] : ['Resend confirmation', 'Replace', 'Remove']) : ['Remove'])
+      : ['Replace', 'Remove'];
+    for (const label of labels) {
+      const button = document.createElement('button'); button.type = 'button'; button.textContent = label;
+      button.setAttribute('aria-label', label + ' ' + value);
+      if (label === 'Replace') {
+        button.id = 'replace-' + destination.id;
+        button.onclick = () => openDestination(destination.channel, destination);
+      } else if (label === 'Resend confirmation') {
+        button.onclick = () => run(destinationsPath + '/' + encodeURIComponent(destination.id) + '/confirmation', 'POST');
+      } else {
+        button.className = 'danger';
+        button.onclick = () => {
+          if (confirm('Remove ' + value + '? Monitors will lose this selection.')) {
+            run(destinationsPath + '/' + encodeURIComponent(destination.id), 'DELETE', undefined, () => queueMicrotask(() => addWebhook.focus()));
+          }
+        };
+      }
+      actions.append(button);
+    }
+    if (destination.latestSubmission) details.append(renderSubmission(destination.latestSubmission));
+    row.append(details, actions); return row;
+  }));
+  byId('no-destinations').hidden = destinations.length !== 0;
+  updateWebhook();
+  if (focusedRow && destinationRows.contains(focused) && document.activeElement !== focused) focused.focus();
+  else if (focusedRow && !focused.isConnected) addWebhook.focus();
+}
+
 let hosted = false;
 let monitorIds = new Set();
 function updateDeleted() {
@@ -564,7 +737,8 @@ function clearSession() {
   byId('maintenance-dialog').close();
   document.querySelectorAll('button, input, select').forEach(control => { control.disabled = false; });
   monitorIds.clear(); selectedHistoryDays.clear(); byId('stale').hidden = true; byId('sync-announcement').textContent = ''; snapshotPending(false);
-  savedSettings = {}; monitorEditor.close(); byId('heartbeat-path').textContent = ''; maintenanceForm.reset(); maintenanceForm.removeAttribute('data-monitor-id'); byId('maintenance-heading').textContent = 'Maintenance'; maintenanceForm.hidden = true; pageForm.reset(); webhook.reset(); editor.hidden = true; login.hidden = false;
+  emailConfigured = false; addEmail.hidden = true;
+  savedPageName = ''; monitorEditor.close(); monitorEditor.refreshDestinations([]); renderDestinations([], []); byId('heartbeat-path').textContent = ''; maintenanceForm.reset(); maintenanceForm.removeAttribute('data-monitor-id'); byId('maintenance-heading').textContent = 'Maintenance'; maintenanceForm.hidden = true; pageForm.reset(); closeWebhook(); editor.hidden = true; login.hidden = false;
   showSettings(false); byId('operator-navigation').hidden = true;
 
   byId('monitor-rows').replaceChildren(); byId('incidents').replaceChildren();
@@ -577,20 +751,22 @@ function render(data, savedField) {
   hosted = !!data.hosted;
   byId('paused').hidden = !data.paused;
   const canEdit = data.permission !== 'reader';
-  if (!canEdit) { monitorEditor.close(); closeMaintenance(); byId('webhookUrl').value = ''; savedSettings.webhookUrl = ''; }
-  if (!canEdit) showSettings(false);
+  const focused = document.activeElement;
+  if (!canEdit) {
+    monitorEditor.close(); closeMaintenance(); closeWebhook(); showSettings(false);
+  }
   byId('new-monitor').hidden = !canEdit || !byId('settings').hidden; byId('settings-button').hidden = !canEdit || !byId('settings').hidden;
-  for (const field of ['pageName', 'webhookUrl']) {
-    const input = byId(field);
-    if (initial || savedField === field || input.value === savedSettings[field]) {
-      const value = field === 'webhookUrl' && !canEdit ? '' : data[field] || '';
-      if (input.value !== value) input.value = value;
-      savedSettings[field] = value;
-    }
+  const pageName = byId('pageName');
+  if (initial || savedField === 'pageName' || pageName.value === savedPageName) {
+    if (pageName.value !== data.pageName) pageName.value = data.pageName;
+    savedPageName = data.pageName;
   }
   monitorIds = new Set(data.monitors.map(monitor => monitor.id));
+  emailConfigured = canEdit && data.emailConfigured === true;
+  addEmail.hidden = !emailConfigured;
+  renderDestinations(canEdit ? data.destinations ?? [] : [], canEdit ? data.monitors : []);
+  monitorEditor.refreshDestinations(destinations, data.monitors.find(monitor => monitor.id === monitorEditor.id)?.destinationIds);
   updateDeleted();
-  const focused = document.activeElement;
   if (monitorEditor.id && !monitorIds.has(monitorEditor.id) && form.parentElement !== byId('new-monitor-panel')) {
     byId('new-monitor-panel').append(form);
     if (form.contains(focused)) focused.focus();
@@ -638,7 +814,10 @@ function render(data, savedField) {
   incidentContent.innerHTML = statusLedger.incidents(data, true);
   reconcile(byId('incidents'), incidentContent);
   initializeDisplay();
-  if (focused !== document.body && !focused.isConnected) byId(byId('new-monitor').hidden ? 'operator-title' : 'new-monitor').focus();
+  if (focused !== document.body && (document.activeElement === document.body ||
+      (focused === document.activeElement && focused.closest('[hidden]')))) {
+    byId(byId('new-monitor').hidden ? 'operator-title' : 'new-monitor').focus();
+  }
 }
 
 const session = createOperatorSession(liveSnapshots, {
@@ -656,23 +835,28 @@ const session = createOperatorSession(liveSnapshots, {
     else { message.textContent = error; if (byId('maintenance-dialog').open) byId('maintenance-error').textContent = error; }
   },
   writing() {
+    const focused = document.activeElement;
     const disabled = [...document.querySelectorAll('button, input, select')].filter(control => !control.disabled && control.id !== 'logout');
     disabled.forEach(control => { control.disabled = true; });
     message.textContent = ''; byId('maintenance-error').textContent = '';
     return () => {
       disabled.forEach(control => { control.disabled = false; });
-      updateDeleted();
-      if (!editor.hidden && document.activeElement === document.body) byId(byId('new-monitor').hidden ? 'operator-title' : 'new-monitor').focus();
+      updateDeleted(); updateWebhook();
+      if (!editor.hidden && document.activeElement === document.body) {
+        if (focused?.matches('button, input, select') && !focused.disabled && !focused.closest('[hidden]')) focused.focus();
+        if (document.activeElement === document.body) byId(byId('new-monitor').hidden ? 'operator-title' : 'new-monitor').focus();
+      }
     };
   },
   saved(path, method) {
-    message.textContent = method === 'DELETE' ? (path.endsWith('/maintenance') ? 'Maintenance ended' : 'Deleted') : 'Saved';
+    message.textContent = method === 'DELETE' ? (path.endsWith('/maintenance') ? 'Maintenance ended' : 'Deleted')
+      : path.endsWith('/confirmation') ? 'Confirmation requested' : 'Saved';
   },
   previewed: data => monitorEditor.previewed(data),
   previewFailed: error => monitorEditor.previewFailed(error),
 });
 const run = session.run;
-const monitorEditor = createMonitorEditor(form, session, focusActions);
+const monitorEditor = createMonitorEditor(form, session, focusActions, reconcileNodes);
 login.addEventListener('submit', async event => {
   event.preventDefault();
   await session.signIn(byId('secret').value); byId('secret').value = '';
@@ -703,7 +887,19 @@ byId('maintenance-end').addEventListener('input', event => event.target.setCusto
 byId('cancel-maintenance').addEventListener('click', closeMaintenance);
 byId('maintenance-dialog').addEventListener('cancel', event => { event.preventDefault(); closeMaintenance(); });
 byId('end-maintenance').addEventListener('click', () => { if (monitorIds.has(maintenanceForm.dataset.monitorId)) run('/api/operator/monitors/' + encodeURIComponent(maintenanceForm.dataset.monitorId) + '/maintenance', 'DELETE', undefined, closeMaintenance); });
-webhook.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator/webhook', 'PUT', { url: byId('webhookUrl').value }); });
+addWebhook.addEventListener('click', () => openDestination('webhook'));
+addEmail.addEventListener('click', () => openDestination('email'));
+byId('cancel-webhook').addEventListener('click', () => closeWebhook(true));
+webhook.addEventListener('submit', async event => {
+  event.preventDefault();
+  if (byId('save-webhook').disabled) return;
+  const id = replacingDestination;
+  const value = destinationChannel === 'email' ? { channel: 'email', address: destinationAddress.value } : { url: destinationAddress.value };
+  await run(id ? destinationsPath + '/' + encodeURIComponent(id) : destinationsPath, id ? 'PUT' : 'POST', value, () => {
+    const add = destinationChannel === 'email' ? addEmail : addWebhook;
+    closeWebhook(); queueMicrotask(() => add.focus());
+  });
+});
 pageForm.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator', 'PUT', { pageName: byId('pageName').value }); });
 function showSettings(settings) {
   byId('settings').hidden = !settings; byId('workspace').hidden = settings;

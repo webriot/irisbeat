@@ -11,7 +11,10 @@ Run `npm ci`, `npm run check`, then `npm run test:consumer`. This produces
 `dist/irisbeat-0.2.2.tgz` and `dist/SHA256SUMS`. The test packs twice and compares
 SHA-256, resolves the exact local version in `test/consumer/package.json`, verifies
 lockfile SHA-512 integrity, installs with offline `npm ci`, typechecks the installed
-package and bundles its package import into a separate real workerd consumer.
+package and runs both package exports as separate Workers in local workerd,
+with real Queue delivery, trusted service RPC, and locally captured Email Sending.
+The package includes both Wrangler configurations as binding references. Hosted
+consumers supply their own Worker names, routes, account integration and Queue resources.
 The temporary consumer lockfile changes with the candidate artifact and is ignored.
 A released consumer must retain its exact version and integrity lock; release operations attach the final tarball/checksum and exact source to the release without silently replacing it.
 
@@ -20,25 +23,29 @@ TypeScript-aware Workers bundler (including Wrangler/esbuild) is required; it is
 not a Node.js runtime library. Hono is an installed runtime dependency. For consumer
 TypeScript checks, enable `"jsx": "react-jsx"` and `"jsxImportSource": "hono/jsx"`;
 the packaged page source also declares its JSX runtime for bundlers. Import `createHostedWorker`, `MonitoringContext`,
-`HostedAdapter`, `EngineEnv`, `Status` and `IncidentTransition` from `irisbeat`.
+`HostedAdapter`, `EngineEnv` and `Status` from `irisbeat`.
 Pin the artifact version **and literal `contractVersion: '1'`**; unsupported
 versions throw during factory construction, before requests or scheduling run.
 `private: true` prevents accidental registry publication; versioned GitHub release tarballs are the supported distribution path.
-No Accounts, Stripe, hostname provisioning or email transport is included.
+Hosted consumers own accounts, Stripe, hostname provisioning, and Email Service provisioning. The engine provides email consent and the delivery Worker submits confirmation and alert mail.
 
 ## Trusted adapter
 
 `createHostedWorker(adapter)` returns Worker `fetch` and `scheduled` handlers.
 The adapter supplies just:
 
-- `resolve(request, env)`: return `{ id, permission, monitorLimit, paused?, policyRevision? }` or `null` for
+- `resolve(request, env)`: return `{ id, permission, monitorLimit, paused?, policyRevision?, notificationOrigin? }` or `null` for
   an unrecognized host. `id` is the stable Durable Object name; `permission` is
   `editor`, `reader`, or `null` for an anonymous visitor. `monitorLimit` is a
   nonnegative safe integer. Invalid resolved contexts fail closed with 500.
-- `contexts(env)`: return stable context names or `{ id, paused?, policyRevision? }` descriptors for
-  this scheduled invocation. Identical duplicates are removed; conflicting pause
-  state/revision metadata for the same ID rejects the invocation before dispatch. The consumer owns context discovery and
-  batching; large fleets need bounded enumeration by the consumer.
+  An optional `notificationOrigin` is a trusted canonical HTTPS origin for the
+  context's recipient-facing pages. Leave it unset for a context without email.
+- `contexts(env)`: return stable context names or `{ id, paused?, policyRevision?, notificationOrigin? }`
+  descriptors for this scheduled invocation. For contexts with email, supply the
+  same trusted origin as in `resolve`. Identical duplicates are removed. Conflicting
+  pause metadata or origins for the same ID reject the invocation before dispatch.
+  The consumer owns context discovery and batching. Large fleets need bounded
+  enumeration by the consumer.
 
 The adapter must authenticate the actor and validate the actual tenant host using
 its trusted configuration. Never use a caller's tenant/role/allowance headers or
@@ -82,31 +89,140 @@ and commits synchronously before any delivery awaits. A receipt already committe
 before rotation is retained. Personal `/heartbeat/:id` continues using the
 installation secret and ignores bodies.
 
-## Transition delivery and siblings
+## Incident notifications
 
-Export a subclass of `MonitoringContext<YourEnv>` with
-`protected async onIncidentTransition(event: IncidentTransition): Promise<void>`.
-Bind the consumer's MONITORING namespace to that exported subclass, with the same
-SQLite migration as the public app. The default hook does nothing. Each committed
-opening/recovery invokes it independently of publication, alongside the unchanged
-webhook path; HTTP, TCP and Heartbeat use the same detector. The event contains the
-opaque Durable Object `contextId`, complete `incident`, `transition` and observation
-`at`. Map tenant names with `env.MONITORING.idFromName(name).toString()`; never
-infer identity from a Monitor name. Events omit targets and destination/heartbeat
-credentials. The consumer owns bounded delivery and any queue/outbox/recipient
-mapping. Hook exceptions log only `transition_delivery_failed`, never undo the
-Incident, and do not retry/reopen it. Webhooks retain their own ten-second bound.
-Both paths remain best effort: a crash after commit can lose delivery; concurrent
-transitions can arrive out of order. Use Incident ID plus transition for deduping.
+Use one Queue for the monitoring Worker's `NOTIFICATION_QUEUE` producer and
+the isolated delivery Worker's consumer trigger and `NOTIFICATION_HANDOFF`
+producer. Configure a second Queue in the same jurisdiction for the delivery
+Worker's `NOTIFICATION_DLQ` producer. Keep native dead-letter routing unset
+because it forwards the original job body. Use `irisbeat/notification-delivery`
+as the delivery Worker entrypoint and bind its exported SQLite Durable Object
+`NotificationRecovery` as `NOTIFICATION_RECOVERY`, with a SQLite class migration.
+Export `NotificationDelivery` from the hosted monitoring Worker and bind the
+delivery Worker's `NOTIFICATION_DELIVERY` service to that named entrypoint.
+It resolves a webhook or confirmed inbox only while the original context,
+Monitor, destination and selection remain eligible. Keep the Queue and service
+binding under trusted deployment control. The same service RPC records submission
+results. Keep Workers Logs enabled on the delivery Worker and disable
+automatic traces because fetch spans can include credential-bearing webhook URLs.
 
-`src/index.ts` adds small seams around existing handlers, DO creation, heartbeat
-authorization and post-commit delivery. The detector and webhook transport remain
-owned here. TCP integration retains the three-kind target union, atomic DO-side patch validation,
-first-Monitor identity pinned before reading legacy bodies and immutable kinds.
-Subsequent siblings should preserve the allowance argument on `create`,
-operator response metadata, secret-safe status views and this post-commit hook
-when merging their target union/atomic patch validation. Relevant paths are the
-existing collection API plus the two hosted heartbeat paths above.
+Editors manage webhook destinations with `POST /api/operator/destinations` and
+`PUT` or `DELETE /api/operator/destinations/:id`. Provide an HTTPS `{ url }` for
+creates and replacements. The authenticated editor snapshot exposes `destinations`
+and each Monitor's `destinationIds`. Use `PATCH /api/operator/monitors/:id`
+with `{ destinationIds: [...] }` to replace the list or `{ destinationChanges: { [id]: true | false } }`
+to change individual selections atomically. `true` requires a saved webhook or a confirmed inbox, `false` removes the selection if present, and omitted IDs retain
+their current selection. Use one selection field per request.
+A new Monitor starts with zero selections. The previous webhook setting upgrades
+to an unselected destination and its compatibility endpoint manages that entry.
+
+HTTP, TCP and Heartbeat share post-commit Incident and Maintenance enqueueing. A job carries stable
+event and delivery IDs, original event time and safe rendering data. Address
+changes replace the destination identity and clear prior selections. A failed
+enqueue logs `notification_enqueue_failed` and leaves the change committed.
+Queue acceptance starts durable delivery for webhooks, email confirmations and alert emails.
+The consumer calls the trusted `resolveAlert` RPC for webhook and email alerts.
+The monitoring Worker continues to support the earlier `resolveWebhook` RPC.
+The delivery Worker rechecks eligibility immediately before it reserves a
+submission in the delivery's SQLite Recovery object and calls the provider.
+Duplicate Queue copies share a ten-submission budget, even at the same broker
+ordinal. No provider call starts once the job is one hour old. Temporary
+failures back off exponentially. Eligibility and Recovery RPC errors can
+consume broker deliveries without spending the provider budget. Keep the broker
+configured for ten retries. Its final delivery is reserved for terminal
+bookkeeping and does not submit to a provider.
+
+The Recovery object records terminal outcomes before the source is acknowledged.
+Result reporting, confirmation marking and sanitized dead-letter writes then
+recover independently through the object's alarm, for up to 14 days. If Recovery
+is unavailable on the final broker delivery, the consumer submits a delayed,
+bookkeeping-only message to the source Queue and acknowledges the original
+after that write succeeds. The handoff retains the original eligibility evidence
+and timestamps, omits Monitor names and addresses, and cannot submit to a provider.
+If Recovery and the handoff write both fail on the final delivery, the broker
+can discard the exhausted source. Settings can retain its preceding result and
+the dead-letter Queue can receive no diagnostic for that job. A durable provider
+reservation can consume a slot if the Worker crashes before making the request.
+
+Editor snapshots expose the optional `destinations[].latestSubmission` with
+`status`, `at` (Unix milliseconds) and a safe `reason` for failures.
+A recorded acceptance closes submission while Settings or confirmation marking
+is pending. An acceptance from a request already submitted is preserved even if
+a newer attempt started. Exhaustion and its dead-letter diagnostic wait for
+outstanding requests for that delivery identity to settle. A crash before
+recording the provider outcome, or a transport timeout with unknown provider outcome, can still lead to duplicates.
+Acceptance records provider submission. At equal event times, Settings uses the
+order recorded with the monitoring commit. Ordered events take precedence over
+legacy jobs at the same event time. Legacy jobs still use broker time and
+delivery identity when compared with one another.
+
+Confirmation eligibility uses the original invitation and pause generation.
+The Recovery object stores only opaque identities, timestamps, the pause
+generation needed for confirmation marking, and sanitized outcome fields.
+Dead-letter diagnostics include the reserved provider attempt count and have
+no automatic replay.
+
+Hosted and self-hosted notifications require explicit Monitor selections
+and the Queue and delivery Worker above. Monitoring and Incident recording
+continue without `NOTIFICATION_QUEUE`. If a selected destination cannot be
+enqueued because the binding is missing, the engine records the same enqueue
+failure as a rejected submission.
+See [Maintenance notifications](maintenance-api.md#maintenance-notifications)
+for the event vocabulary and timestamps. Installations with an existing Queue
+and Monitor selections must follow the [version compatibility and rollout order](install.md#upgrade-and-roll-back-notification-workers).
+
+The engine no longer invokes `onIncidentTransition` in any configuration. The
+protected method and exported `IncidentTransition` type remain deprecated for
+source compatibility with existing hosted subclasses. To resume sending after
+upgrade, configure the Queue and delivery Worker and select destinations on each
+Monitor that should send.
+
+## Email consent
+
+Before enabling hosted email, turn off **Enable email preview** in
+the Cloudflare sending domain's settings and keep it off while sending Irisbeat
+mail. When enabled, the Activity log stores the HTML, plain text and raw message
+with live confirmation or unsubscribe links for about seven days. Cloudflare still processes
+recipient metadata for transport. Keep addresses and recipient links out of
+Irisbeat logs and Queue diagnostics.
+[Cloudflare domain settings](https://developers.cloudflare.com/email-service/configuration/domains/#email-preview)
+and [Activity log message previews](https://developers.cloudflare.com/email-service/observability/logs/#message-preview).
+
+Follow the sender, Queue and service-binding configuration in
+[optional email confirmation](install.md#optional-email-confirmation).
+For hosted delivery wrappers, re-export `NotificationEmailCapability` from
+`irisbeat/notification-delivery`. Set `ResolvedContext.notificationOrigin`
+from trusted configuration in both request and scheduled resolution. Resolve unauthenticated requests to
+`/notifications/confirm` and `/notifications/unsubscribe` at that origin to the same
+context. Recipient credentials remain in the link's fragment until the recipient submits the form
+and are excluded from status snapshots and Queue payloads.
+
+Editors use the same destination create and replace routes with
+`{ channel: "email", address }`. Editor snapshots report `emailConfigured: true`
+when email setup is available and expose email destinations as
+`{ id, channel: "email", address, confirmed }`. A pending destination can
+be resent via `POST /api/operator/destinations/:id/confirmation`.
+Removal and replacement clear the original invitation and selections. The
+five-minute cooldown is per inbox within the context. Confirmation requires an
+explicit POST, is single-use, and expires 24 hours after the invitation is
+created. It does not change Monitor selections or replay Monitor events.
+A paused context can save pending inboxes. Resume requires an explicit resend
+and never releases a confirmation queued before pause.
+
+Alert mail includes the Monitor name, original event time and safe Incident or
+Maintenance details in HTML and plain text. The unsubscribe link remains valid at
+the origin where it was issued until the destination is removed or replaced.
+The recipient can withdraw while monitoring is paused. The explicit POST removes
+only that context's destination and its selections and invalidates queued alerts
+that have yet to be submitted. On upgrade from the confirmation-only build, the
+engine uses the trusted context origin to create missing withdrawal credentials
+before scheduled dispatch while preserving consent and Monitor selections.
+Cloudflare owns SMTP processing after provider acceptance.
+
+The Queue uses `NotificationQueueJob` for both regular Monitor jobs and jobs
+with `kind: "email.confirmation"`. The latter resolve the inbox and its link
+through trusted `NotificationDelivery` RPC using the current invitation
+identity and pause generation.
 
 ## Pause and resume
 
@@ -188,18 +304,18 @@ not resume. Checks wholly after resume follow existing due-time rules.
 
 Any pending HTTP/TCP attempt touched by pause is discarded even if resumed before
 completion. Its original due-time anchor and in-flight guard remain in force.
-Already submitted target requests/webhooks/consumer hooks cannot be recalled;
-their transport remains bounded by the existing attempt/delivery contract. A hook
-waiting behind a submitted webhook is suppressed if pause intervenes, even after
-resume. No missed alert is replayed. Pause alone emits no transition event and
-never fabricates Incident recovery.
-Maintenance #8 returns from shared `record` before Incident mutation and both
-`deliverWebhook` and `onIncidentTransition`; the hosted hook must never bypass that
-guard. Editors use `PUT`/`DELETE /api/operator/monitors/:id/maintenance`; readers
-cannot mutate windows. See [Maintenance handoff](maintenance-api.md) for status
+Before each provider submission attempt, the delivery Worker checks eligibility
+through the trusted service binding. The monitoring context rejects jobs while
+paused and rejects jobs from an earlier pause generation, including when both
+pause and resume happened between attempts. Resume creates no notification
+backlog. Target requests and provider submissions already in flight cannot be
+recalled. A policy update can race with provider submission after the eligibility
+check, since they are separate operations. Maintenance #8 suppresses Incident
+transitions before the engine reaches Queue handoff. Editors use
+`PUT`/`DELETE /api/operator/monitors/:id/maintenance`.
+See [Maintenance handoff](maintenance-api.md) for status
 fields, observation retention, and the #11 precedence seam. Installed-consumer
-coverage verifies suppression of both delivery paths for all three check kinds.
-The hook observes committed detector transitions, not every raw observation.
+coverage verifies Queue suppression for all three check kinds.
 [History #9](history-api.md) adds the same filtered per-Monitor series to personal and hosted status, including readers; it does not change credentials, permissions, allowances or delivery. The release candidate must be
 regenerated after integration changes, before #12 publishes anything.
 

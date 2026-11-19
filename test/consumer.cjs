@@ -30,6 +30,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
   const lock = JSON.parse(readFileSync('test/consumer/package-lock.json', 'utf8'));
   assert.equal(lock.packages['node_modules/irisbeat'].version, '0.2.2');
   assert.equal(lock.packages['node_modules/irisbeat'].integrity, 'sha512-' + createHash('sha512').update(readFileSync(artifact)).digest('base64'));
+  await require('./notification-delivery.cjs').testInstalledDelivery();
   const script = (await build({ entryPoints: ['test/consumer/worker.ts'], bundle: true, write: false, format: 'esm', platform: 'neutral', external: ['cloudflare:workers'], plugins: [{
     name: 'substitute-external-tcp-target',
     setup(builder) {
@@ -40,13 +41,13 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       }; }` }));
     },
   }] })).outputFiles[0].text;
-  const deliveries = [], webhooks = [];
+  const deliveries = [], queued = [];
   const policyGates = new Map();
   let targetCount = 0;
   let outcome = 503;
-  let deliveryFails = false;
-  let releaseWebhook, webhookStarted;
-  let holdWebhook = false;
+  let queueFails = false;
+  let releaseQueue, enqueueStarted;
+  let holdQueue = false;
   let overlapAction;
   let now = 0;
   const workerOptions = { name: 'consumer', modules: true, script, compatibilityDate: '2026-11-13', durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } }, outboundService: async request => {
@@ -55,14 +56,43 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       gate.captured(); await gate.released;
       return new Response(null, { status: 204 });
     }
-    if (request.url.startsWith('https://delivery.example/')) { deliveries.push(await request.json()); return new Response(null, { status: deliveryFails ? 503 : 204 }); }
-    if (request.url.startsWith('https://webhook.example/')) { webhooks.push(await request.json());
-      if (holdWebhook) { await new Promise(resolve => { releaseWebhook = resolve; webhookStarted(); }); }
-      return new Response(null, { status: 204 }); }
+    if (request.url.startsWith('https://delivery.example/')) { deliveries.push(await request.json()); return new Response(null, { status: 204 }); }
+    if (request.url === 'https://queue.example/accepted') {
+      const jobs = await request.json();
+      queued.push(...jobs);
+      if (holdQueue && jobs.some(({ event }) => event.kind.startsWith('incident.'))) await new Promise(resolve => { releaseQueue = resolve; enqueueStarted(); });
+      return new Response(null, { status: queueFails ? 503 : 204 });
+    }
     targetCount++;
     if (overlapAction) await overlapAction();
     return new Response(null, { status: outcome });
   } };
+  const withoutQueue = new Miniflare(convertV4MiniflareOptions({
+    ...workerOptions,
+    durableObjects: { MONITORING: { className: 'MonitoringContextWithoutQueue', useSQLite: true } },
+  }));
+  try {
+    const requestWithoutQueue = (path, method = 'GET', body, at = 0) =>
+      withoutQueue.dispatchFetch('https://a.example' + path, {
+        method, headers: { authorization: 'Bearer editor', 'content-type': 'application/json', 'x-test-at': String(at) },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      });
+    assert.equal((await requestWithoutQueue('/api/operator/webhook', 'PUT', { url: 'https://webhook.example/legacy' })).status, 200);
+    const created = await requestWithoutQueue('/api/operator/monitors', 'POST', {
+      name: 'Unselected without Queue', url: 'https://target.example/', failureThreshold: 1,
+    });
+    assert.equal(created.status, 201);
+    const { monitor } = await created.json();
+    assert.deepEqual(monitor.destinationIds, []);
+    assert.equal((await requestWithoutQueue('/test-tick?at=60000', 'GET', undefined, 60_000)).status, 200);
+    const status = await (await requestWithoutQueue('/api/operator', 'GET', undefined, 60_000)).json();
+    const incident = status.incidents.find(incident => incident.monitorId === monitor.id);
+    assert.equal(incident?.openedAt, 60_000, 'the unselected Monitor opening commits without a Queue');
+    assert.equal(incident.closedAt, null);
+    assert.deepEqual(deliveries, [], 'without a Queue, the unchanged override must never send');
+    console.log('PASS installed consumer without a Queue: unselected Monitor commits an Incident without invoking the legacy override');
+  } finally { await withoutQueue.dispose(); }
+
   const mf = new Miniflare(convertV4MiniflareOptions(workerOptions));
   let nextPolicyRevision = 0;
   const request = (host, path, method = 'GET', body, token = 'editor') => {
@@ -72,6 +102,14 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     return mf.dispatchFetch('https://' + host + path, { method, headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', 'x-test-at': String(now) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
   };
   const tick = at => { now = at; return request('a.example', '/test-tick?at=' + at); };
+  const selectWebhook = async path => {
+    const { destinations } = await (await request('a.example', '/api/operator')).json();
+    assert.equal(destinations.length, 1);
+    assert.equal((await request('a.example', path, 'PATCH', { destinationIds: [destinations[0].id] })).status, 200);
+  };
+  const queuedLabels = () => queued.map(({ event }) => event.monitorName + ': ' + event.kind);
+  const incidentJobs = () => queued.filter(({ event }) => event.kind.startsWith('incident.'));
+  const incidentTransitionsFor = monitorId => incidentJobs().filter(job => job.monitorId === monitorId).map(job => job.event.kind);
   try {
     {
       const response = await mf.dispatchFetch('https://a.example/api/status/events', { headers: { Upgrade: 'websocket', Origin: 'https://a.example', 'x-test-at': String(now) } });
@@ -228,24 +266,32 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       now = 0;
       console.log('PASS installed policy revisions: malformed metadata, equal-revision conflicts/idempotence, persisted ordering, omission, higher same-state counts, duplicate descriptors and concurrent arrivals');
     }
-    deliveries.length = 0; webhooks.length = 0;
+    deliveries.length = 0; queued.length = 0;
+    const unselected = await (await request('ordering.example', '/api/operator/monitors', 'POST', {
+      name: 'Unselected', url: 'https://target.example/', failureThreshold: 1,
+    })).json();
+    await tick(60_000);
+    const unselectedStatus = await (await request('ordering.example', '/api/operator')).json();
+    assert.ok(unselectedStatus.incidents.some(incident => incident.monitorId === unselected.monitor.id));
+    assert.deepEqual(queued, [], 'zero selections produce no Queue jobs');
+    assert.deepEqual(deliveries, [], 'a Queue-enabled context never invokes the legacy override');
+    await request('ordering.example', '/api/operator/monitors/' + unselected.monitor.id, 'DELETE');
+    now = 0;
     assert.equal((await request('a.example', '/test-unsupported-version')).status, 409);
     new (require('node:vm').Script)(await (await request('a.example', '/operator.js')).text());
     await request('a.example', '/api/operator/monitors', 'POST', { name: 'Private API', url: 'https://target.example/', published: false });
     await request('a.example', '/api/operator/webhook', 'PUT', { url: 'https://webhook.example/private-token' });
+    const privateStatus = await (await request('a.example', '/api/operator')).json();
+    await selectWebhook('/api/operator/monitors/' + privateStatus.monitor.id);
     await request('b.example', '/api/operator/monitors', 'POST', { name: 'Other API', url: 'https://other.example/', failureThreshold: 100 });
     await tick(60_000); await tick(120_000); await tick(180_000);
-    assert.equal(deliveries.length, 1, 'consumer receives exactly one committed opening');
-    assert.equal(deliveries[0].transition, 'opened');
-    assert.equal(deliveries[0].incident.monitorName, 'Private API');
-    assert.equal(deliveries[0].at, 120_000);
-    assert.equal(deliveries[0].incident.closedAt, null);
+    assert.equal(queued.length, 1, 'one committed opening produces one selected job');
+    assert.equal(queued[0].event.at, 120_000);
     outcome = 204; await tick(240_000); await tick(300_000);
-    assert.equal(deliveries.length, 2);
-    assert.equal(deliveries[1].transition, 'recovered');
-    assert.equal(deliveries[1].incident.id, deliveries[0].incident.id);
-    assert.equal(deliveries[1].incident.closedAt, 300_000);
-    assert.deepEqual(webhooks, [{ text: 'Private API: Incident opened' }, { text: 'Private API: Incident recovered' }]);
+    assert.equal(queued[1].event.incidentId, queued[0].event.incidentId);
+    assert.equal(queued[1].event.at, 300_000);
+    assert.deepEqual(queuedLabels(), ['Private API: incident.opened', 'Private API: incident.recovered']);
+    assert.deepEqual(deliveries, [], 'selected jobs never invoke the legacy override');
     const a = await (await request('a.example', '/api/operator')).json();
     const b = await (await request('b.example', '/api/operator')).json();
     assert.equal(a.incidents.length, 1); assert.equal(b.incidents.length, 0);
@@ -255,21 +301,22 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     assert.equal((await (await request('a.example', '/api/status')).json()).monitors.length, 0, 'private history never leaks');
     const historyReader = await (await request('a.example', '/api/operator', 'GET', undefined, 'reader')).json();
     assert.deepEqual(historyReader.monitor.history, a.monitor.history, 'reader retains private history');
-    assert.equal(JSON.stringify(deliveries).includes('private-token'), false);
+    assert.equal(JSON.stringify(queued).includes('private-token'), false);
     const created = await request('a.example', '/api/operator/monitors', 'POST', { name: 'Producer', kind: 'heartbeat', silenceSeconds: 60, recoveryThreshold: 1 });
     assert.equal(created.status, 201);
     const heartbeat = (await created.json()).monitors.at(-1);
+    await selectWebhook('/api/operator/monitors/' + heartbeat.id);
     const rotationPath = '/api/operator/monitors/' + heartbeat.id + '/heartbeat-secret';
     const { secret } = await (await request('a.example', rotationPath, 'POST')).json();
     assert.equal((await request('b.example', '/heartbeat', 'POST', undefined, secret)).status, 401);
-    deliveryFails = true;
+    queueFails = true;
     await tick(360_000); await tick(370_000);
-    assert.equal(deliveries.length, 3, 'failed hook never repeats the opening');
+    assert.equal(queued.length, 3, 'failed enqueue never repeats the opening');
+    assert.deepEqual(deliveries, [], 'enqueue failure does not fall back to broadcast');
+    queueFails = false;
     assert.equal((await (await request('a.example', '/api/operator')).json()).monitors.at(-1).state, 'down');
     now = 375_000;
     assert.equal((await request('a.example', '/heartbeat', 'POST', 'ignored body', secret)).status, 204);
-    assert.equal(deliveries.length, 4);
-    assert.equal(deliveries[3].transition, 'recovered');
     assert.equal((await (await request('a.example', '/api/operator')).json()).monitors.at(-1).state, 'up');
     const replacement = await (await request('a.example', rotationPath, 'POST')).json();
     assert.equal((await request('a.example', '/heartbeat', 'POST', undefined, secret)).status, 401);
@@ -277,20 +324,21 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     const reader = await (await request('a.example', '/api/operator', 'GET', undefined, 'reader')).json();
     assert.equal(JSON.stringify(reader).includes('private-token'), false);
     assert.equal((await request('a.example', rotationPath, 'POST', undefined, 'reader')).status, 403);
-    assert.deepEqual(webhooks.slice(2), [{ text: 'Producer: Incident opened' }, { text: 'Producer: Incident recovered' }]);
+    assert.deepEqual(queuedLabels().slice(2), ['Producer: incident.opened', 'Producer: incident.recovered']);
     await request('a.example', '/api/operator/monitors/' + heartbeat.id, 'DELETE');
-    deliveryFails = false; outcome = 503;
+    outcome = 503;
     const tcpResponse = await request('b.example', '/api/operator/monitors', 'POST', { name: 'Private database', kind: 'tcp', hostname: 'db.example', port: 5432, failureThreshold: 1, recoveryThreshold: 1, published: false });
     assert.equal(tcpResponse.status, 201);
     const tcp = (await tcpResponse.json()).monitors.at(-1);
+    const tcpDestination = await (await request('b.example', '/api/operator/destinations', 'POST', { url: 'https://webhook.example/tenant-b' })).json();
+    assert.equal((await request('b.example', '/api/operator/monitors/' + tcp.id, 'PATCH', { destinationIds: [tcpDestination.destinations[0].id] })).status, 200);
     assert.equal((await request('b.example', '/api/operator/monitors', 'POST', { name: 'Over allowance', kind: 'heartbeat' })).status, 409);
     await tick(420_000);
     outcome = 204; await tick(480_000);
-    const tcpEvents = deliveries.filter(event => event.incident.monitorId === tcp.id);
-    assert.deepEqual(tcpEvents.map(event => event.transition), ['opened', 'recovered']);
-    assert.notEqual(tcpEvents[0].contextId, deliveries[0].contextId);
+    assert.deepEqual(incidentTransitionsFor(tcp.id), ['incident.opened', 'incident.recovered']);
+    assert.notEqual(queued.find(job => job.monitorId === tcp.id).contextId, queued[0].contextId);
     assert.equal((await (await request('b.example', '/api/status')).json()).monitors.some(monitor => monitor.id === tcp.id), false);
-    // Verify both delivery paths from the installed engine, with no tenant left checking in parallel.
+    // Verify the Queue path from the installed engine, with no tenant left checking in parallel.
     for (const host of ['a.example', 'b.example']) {
       const current = await (await request(host, '/api/operator')).json();
       for (const monitor of current.monitors) await request(host, '/api/operator/monitors/' + monitor.id, 'DELETE');
@@ -302,37 +350,38 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       const added = await (await request('a.example', '/api/operator/monitors', 'POST', { name: 'Maintenance ' + kind, kind, ...target })).json();
       const monitor = added.monitors.at(-1);
       const path = '/api/operator/monitors/' + monitor.id;
+      await selectWebhook(path);
       const credential = kind === 'heartbeat' ? (await (await request('a.example', path + '/heartbeat-secret', 'POST')).json()).secret : null;
       const receipt = () => request('a.example', '/heartbeat', 'POST', undefined, credential);
       if (credential) await receipt(); else await tick(base);
-      const before = [deliveries.length, webhooks.length];
+      const before = incidentJobs().length;
       assert.equal((await request('a.example', path + '/maintenance', 'PUT', { endsAt: base + 180_000 })).status, 200);
       outcome = 503;
       await tick(base + 60_000); await tick(base + 120_000);
       let state = await (await request('a.example', '/api/operator')).json();
       assert.equal(state.monitor.state, 'maintenance');
       assert.equal(state.monitor.lastResult.outcome, 'maintenance');
-      assert.deepEqual([deliveries.length, webhooks.length], before, kind + ' Maintenance failure suppresses both paths');
+      assert.equal(incidentJobs().length, before, kind + ' Maintenance failure suppresses Incident jobs');
       if (credential) { now = base + 130_000; await receipt(); }
       await tick(base + 180_000);
       if (credential) assert.equal((await (await request('a.example', '/api/operator')).json()).monitor.state, 'up', 'fresh receipt survives expiry');
       await tick(base + 240_000);
-      assert.deepEqual([deliveries.length, webhooks.length], before.map(n => n + 1), kind + ' opens only after Maintenance');
-      const opening = deliveries.at(-1);
-      assert.equal(opening.transition, 'opened');
+      assert.equal(incidentJobs().length, before + 1, kind + ' opens only after Maintenance');
+      const opening = incidentJobs().at(-1).event;
+      assert.equal(opening.kind, 'incident.opened');
       await request('a.example', path + '/maintenance', 'PUT', { endsAt: base + 600_000 });
       outcome = 204;
       for (const at of [base + 300_000, base + 360_000]) { now = at; if (credential) await receipt(); else await tick(at); }
       state = await (await request('a.example', '/api/operator')).json();
-      assert.equal(state.incidents.find(incident => incident.id === opening.incident.id).closedAt, null);
-      assert.deepEqual([deliveries.length, webhooks.length], before.map(n => n + 1), kind + ' Maintenance recovery suppresses both paths');
+      assert.equal(state.incidents.find(incident => incident.id === opening.incidentId).closedAt, null);
+      assert.equal(incidentJobs().length, before + 1, kind + ' Maintenance recovery suppresses Incident jobs');
       await request('a.example', path + '/maintenance', 'DELETE');
       now = base + 420_000; if (credential) await receipt(); else await tick(now);
-      assert.deepEqual([deliveries.length, webhooks.length], before.map(n => n + 1), 'first post-window success cannot recover');
+      assert.equal(incidentJobs().length, before + 1, 'first post-window success cannot recover');
       now = base + 480_000; if (credential) await receipt(); else await tick(now);
-      assert.deepEqual([deliveries.length, webhooks.length], before.map(n => n + 2), kind + ' recovers once after Maintenance');
-      assert.equal(deliveries.at(-1).incident.id, opening.incident.id);
-      assert.equal(deliveries.at(-1).transition, 'recovered');
+      assert.equal(incidentJobs().length, before + 2, kind + ' recovers once after Maintenance');
+      assert.equal(incidentJobs().at(-1).event.incidentId, opening.incidentId);
+      assert.equal(incidentJobs().at(-1).event.kind, 'incident.recovered');
       await request('a.example', path, 'DELETE');
     }
     for (const kind of ['http', 'tcp']) {
@@ -341,7 +390,8 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       const target = kind === 'http' ? { url: 'https://target.example/' } : { hostname: 'db.example', port: 5432 };
       const added = await (await request('a.example', '/api/operator/monitors', 'POST', { name: 'Overlap ' + kind, kind, ...target })).json();
       const path = '/api/operator/monitors/' + added.monitors.at(-1).id;
-      const before = [deliveries.length, webhooks.length];
+      await selectWebhook(path);
+      const before = incidentJobs().length;
       overlapAction = async () => {
         overlapAction = undefined;
         now = base + 1_000;
@@ -354,12 +404,12 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       await tick(base);
       let current = await (await request('a.example', '/api/operator')).json();
       assert.deepEqual(current.monitor.lastResult, { at: base, outcome: 'maintenance' });
-      assert.deepEqual([deliveries.length, webhooks.length], before, kind + ' completed window overlap suppresses both paths');
+      assert.equal(incidentJobs().length, before, kind + ' completed window overlap suppresses Incident jobs');
       await tick(base + 60_000);
-      assert.deepEqual([deliveries.length, webhooks.length], before, 'overlap does not seed failure counts');
+      assert.equal(incidentJobs().length, before, 'overlap does not seed failure counts');
       await tick(base + 120_000);
-      const incident = deliveries.at(-1).incident;
-      assert.deepEqual([deliveries.length, webhooks.length], before.map(n => n + 1));
+      const incidentId = incidentJobs().at(-1).event.incidentId;
+      assert.equal(incidentJobs().length, before + 1);
       now = base + 179_000;
       await request('a.example', path + '/maintenance', 'PUT', { endsAt: base + 185_000 });
       outcome = 204;
@@ -375,30 +425,31 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       assert.equal(expiredWindow, null);
       current = await (await request('a.example', '/api/operator')).json();
       assert.deepEqual(current.monitor.lastResult, { at: base + 180_000, outcome: 'maintenance' });
-      assert.equal(current.incidents.find(candidate => candidate.id === incident.id).closedAt, null);
-      assert.deepEqual([deliveries.length, webhooks.length], before.map(n => n + 1), kind + ' overlap after replacement expiry freezes both deliveries');
+      assert.equal(current.incidents.find(candidate => candidate.id === incidentId).closedAt, null);
+      assert.equal(incidentJobs().length, before + 1, kind + ' overlap after replacement expiry suppresses Incident jobs');
       await tick(base + 240_000);
-      assert.deepEqual([deliveries.length, webhooks.length], before.map(n => n + 1), 'overlap does not seed recovery counts');
+      assert.equal(incidentJobs().length, before + 1, 'overlap does not seed recovery counts');
       await tick(base + 300_000);
-      assert.deepEqual([deliveries.length, webhooks.length], before.map(n => n + 2));
-      assert.equal(deliveries.at(-1).incident.id, incident.id);
-      assert.equal(deliveries.at(-1).transition, 'recovered');
+      assert.equal(incidentJobs().length, before + 2);
+      assert.equal(incidentJobs().at(-1).event.incidentId, incidentId);
+      assert.equal(incidentJobs().at(-1).event.kind, 'incident.recovered');
       await request('a.example', path, 'DELETE');
     }
-    // A delivery already submitted before declaration cannot be recalled; a later hook must still be suppressed.
+    // A committed event can wait on Queue acceptance while Maintenance starts.
     now += 60_000; outcome = 503;
     const pending = await (await request('a.example', '/api/operator/monitors', 'POST', { name: 'Committed before window', url: 'https://target.example/', failureThreshold: 1 })).json();
     const pendingId = pending.monitors.at(-1).id;
-    const hookCount = deliveries.length;
-    holdWebhook = true;
-    const submitted = new Promise(resolve => { webhookStarted = resolve; });
-    const dispatch = tick(now);
+    await selectWebhook('/api/operator/monitors/' + pendingId);
+    holdQueue = true;
+    const submitted = new Promise(resolve => { enqueueStarted = resolve; });
+    let dispatched = false;
+    const dispatch = tick(now).then(() => { dispatched = true; });
     await submitted;
     await request('a.example', '/api/operator/monitors/' + pendingId + '/maintenance', 'PUT', { endsAt: now + 180_000 });
-    releaseWebhook();
+    assert.equal(dispatched, false, 'scheduled dispatch awaits Queue acceptance');
+    releaseQueue();
     await dispatch;
-    holdWebhook = false;
-    assert.equal(deliveries.length, hookCount, 'a hook waiting behind an earlier webhook cannot start during Maintenance');
+    holdQueue = false;
     await request('a.example', '/api/operator/monitors/' + pendingId, 'DELETE');
     // Exercise pause through the actual installed contract, never through DO internals.
     const policy = (value, source) => request('a.example', '/test-pause?value=' + value + (source ? '&source=' + source : ''));
@@ -409,14 +460,15 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       const target = kind === 'http' ? { url: 'https://target.example/' } : kind === 'tcp' ? { hostname: 'db.example', port: 5432 } : { silenceSeconds: 60 };
       const added = await (await request('a.example', '/api/operator/monitors', 'POST', { name: 'Pause ' + kind, kind, ...target })).json();
       const path = '/api/operator/monitors/' + added.monitors.at(-1).id;
+      await selectWebhook(path);
       const credential = kind === 'heartbeat' ? (await (await request('a.example', path + '/heartbeat-secret', 'POST')).json()).secret : null;
       const receipt = () => request('a.example', '/heartbeat', 'POST', undefined, credential);
       await tick(base + 60_000); await tick(base + 120_000);
       const before = await read();
       const incident = before.incidents.find(row => row.monitorId === before.monitor.id && row.closedAt === null);
       assert.ok(incident, kind + ' existing Incident');
-      const counts = [targetCount, deliveries.length, webhooks.length];
       await request('a.example', path + '/maintenance', 'PUT', { endsAt: base + 600_000 });
+      const counts = [targetCount, queued.length];
       await policy('true', 'schedule');
       await tick(base + 180_000);
       assert.equal((await read()).paused, true, 'scheduled descriptor pauses persisted context');
@@ -434,7 +486,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       assert.equal(paused.monitor.state, 'paused');
       assert.deepEqual(paused.monitor.history, before.monitor.history, kind + ' pause retains bars/denominator');
       assert.deepEqual(paused.monitor.lastResult, before.monitor.lastResult);
-      assert.deepEqual([targetCount, deliveries.length, webhooks.length], counts, kind + ' pause suppresses checking and both alert paths');
+      assert.deepEqual([targetCount, queued.length], counts, kind + ' pause suppresses checking and Queue handoff');
       assert.ok((await (await request('a.example', '/')).text()).includes('Monitoring paused'));
       assert.equal((await read('b.example')).paused, false);
       if (kind === 'tcp') { await policy('false', 'schedule'); await tick(base + 240_000); }
@@ -451,7 +503,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       now = base + 360_000;
       if (credential) await receipt(); else await tick(now);
       assert.equal((await read()).incidents.find(row => row.id === incident.id).closedAt, now, 'repeated explicit resume is idempotent');
-      assert.deepEqual([deliveries.length, webhooks.length], counts.slice(1).map(n => n + 1));
+      assert.deepEqual(queued.slice(counts[1]).map(job => job.event.kind), ['maintenance.ended', 'incident.recovered']);
       await request('a.example', path, 'DELETE');
       await policy('omit');
     }
@@ -460,7 +512,8 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       const target = kind === 'http' ? { url: 'https://target.example/' } : { hostname: 'db.example', port: 5432 };
       const created = await (await request('a.example', '/api/operator/monitors', 'POST', { name: 'Pending ' + kind, kind, ...target })).json();
       const path = '/api/operator/monitors/' + created.monitor.id;
-      const counts = [deliveries.length, webhooks.length];
+      await selectWebhook(path);
+      const counts = queued.length;
       overlapAction = async () => {
         overlapAction = undefined;
         await policy('true', 'request'); await read();
@@ -470,9 +523,9 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       assert.equal((await read()).monitor.lastResult, null, kind + ' pause/resume while pending discards late result');
       assert.equal((await read()).monitor.history.percentage, null);
       await tick(now + 60_000);
-      assert.deepEqual([deliveries.length, webhooks.length], counts, 'discarded attempt cannot seed detector counts');
+      assert.equal(queued.length, counts, 'discarded attempt cannot seed detector counts');
       await tick(now + 60_000);
-      assert.deepEqual([deliveries.length, webhooks.length], counts.map(n => n + 1));
+      assert.equal(queued.length, counts + 1);
       const open = await read();
       const openIncident = open.incidents.find(row => row.monitorId === open.monitor.id && row.closedAt === null);
       outcome = 204;
@@ -486,9 +539,9 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       assert.deepEqual((await read()).monitor.history, open.monitor.history);
       assert.equal((await read()).incidents.find(row => row.id === openIncident.id).closedAt, null);
       await tick(now + 60_000);
-      assert.deepEqual([deliveries.length, webhooks.length], counts.map(n => n + 1), 'discarded recovery does not seed counts');
+      assert.equal(queued.length, counts + 1, 'discarded recovery does not seed counts');
       await tick(now + 60_000);
-      assert.deepEqual([deliveries.length, webhooks.length], counts.map(n => n + 2));
+      assert.equal(queued.length, counts + 2);
       await request('a.example', path, 'DELETE');
       await policy('omit');
     }
@@ -513,20 +566,6 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     assert.ok(producers.incidents.some(row => row.monitorId === producers.monitors[1].id && row.closedAt === null), 'stale producer follows normal silence evaluation');
     for (const monitor of producers.monitors) await request('a.example', '/api/operator/monitors/' + monitor.id, 'DELETE');
     await policy('omit');
-    // A submitted webhook cannot be recalled, but a hook queued behind it must not start even after resume.
-    now += 60_000; outcome = 503;
-    const queued = await (await request('a.example', '/api/operator/monitors', 'POST', { name: 'Pause during delivery', url: 'https://target.example/', failureThreshold: 1 })).json();
-    const hookBefore = deliveries.length;
-    holdWebhook = true;
-    const submittedBeforePause = new Promise(resolve => { webhookStarted = resolve; });
-    const delivering = tick(now);
-    await submittedBeforePause;
-    await policy('true', 'request'); await read();
-    await policy('false', 'request'); await read();
-    releaseWebhook(); await delivering; holdWebhook = false;
-    assert.equal(deliveries.length, hookBefore, 'pause generation suppresses delayed hosted hook after resume');
-    await request('a.example', '/api/operator/monitors/' + queued.monitor.id, 'DELETE');
-    await policy('omit');
     for (const kind of ['http', 'tcp']) {
       // Calendar is exercised from the separately installed artifact through trusted hosted boundaries.
       now = Math.ceil((now + 60_000) / 60_000) * 60_000;
@@ -538,6 +577,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       assert.equal(calendarResponse.status, 201);
       const calendar = (await calendarResponse.json()).monitors.at(-1);
       const calendarPath = '/api/operator/monitors/' + calendar.id;
+      await selectWebhook(calendarPath);
       assert.equal(calendar.timezone, 'UTC');
       const previewResponse = await request('a.example', '/api/operator/schedule-preview', 'POST', { cron: '0 9 15 * 1', timezone: 'America/New_York' });
       assert.equal(previewResponse.status, 200);
@@ -545,13 +585,13 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       assert.equal((await request('a.example', '/api/operator/schedule-preview', 'POST', { cron: '* * * * *' }, 'reader')).status, 403);
       assert.equal((await request('a.example', calendarPath, 'PATCH', { cron: '0 0 30 2 *' })).status, 400);
       assert.equal((await request('a.example', calendarPath, 'PATCH', { cron: '* * * * *' }, 'reader')).status, 403);
-      const calendarCounts = [targetCount, deliveries.length, webhooks.length];
+      const calendarCounts = [targetCount, queued.length];
       await tick(calendarBase);
       assert.equal(targetCount, calendarCounts[0], 'Calendar creation begins in the future');
       await tick(calendarBase + 60_000);
       const calendarIncident = (await read()).incidents.find(row => row.monitorId === calendar.id && row.closedAt === null);
       assert.ok(calendarIncident);
-      assert.equal(deliveries.at(-1).incident.id, calendarIncident.id);
+      assert.equal(queued.at(-1).event.incidentId, calendarIncident.id);
       assert.equal((await (await request('a.example', '/api/status')).json()).monitors.some(row => row.id === calendar.id), false);
       await policy('true', 'request'); await read();
       const frozen = (await read()).monitor;
@@ -560,7 +600,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       await mf.setOptions(convertV4MiniflareOptions({ ...workerOptions, script: script + '\n// Calendar restart' }));
       assert.equal((await read()).paused, true);
       assert.deepEqual((await read()).monitor.history, frozen.history);
-      assert.deepEqual([targetCount, deliveries.length, webhooks.length], calendarCounts.map(n => n + 1));
+      assert.deepEqual([targetCount, queued.length], calendarCounts.map(n => n + 1));
       await policy('false', 'request'); await read();
       await tick(calendarBase + 180_000);
       assert.equal(targetCount, calendarCounts[0] + 1, 'resume skips paused Calendar occurrences without catch-up');
@@ -573,9 +613,9 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       assert.equal((await read()).incidents.find(row => row.id === calendarIncident.id).closedAt, null);
       await tick(calendarBase + 420_000);
       assert.equal((await read()).incidents.find(row => row.id === calendarIncident.id).closedAt, now);
-      assert.deepEqual(deliveries.filter(event => event.incident.monitorId === calendar.id).map(event => event.transition), ['opened', 'recovered']);
+      assert.deepEqual(incidentTransitionsFor(calendar.id), ['incident.opened', 'incident.recovered']);
       const beforePending = (await read()).monitor;
-      const pendingCounts = [deliveries.length, webhooks.length];
+      const pendingCounts = queued.length;
       outcome = 503;
       overlapAction = async () => {
         overlapAction = undefined;
@@ -585,14 +625,14 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       await tick(calendarBase + 480_000);
       assert.deepEqual((await read()).monitor.lastResult, beforePending.lastResult, kind + ' Calendar pause/resume discards pending result');
       assert.deepEqual((await read()).monitor.history, beforePending.history);
-      assert.deepEqual([deliveries.length, webhooks.length], pendingCounts);
+      assert.equal(queued.length, pendingCounts);
       await tick(calendarBase + 480_000);
-      assert.deepEqual([deliveries.length, webhooks.length], pendingCounts, 'resume starts at a future occurrence');
+      assert.equal(queued.length, pendingCounts, 'resume starts at a future occurrence');
       await tick(calendarBase + 540_000);
-      assert.deepEqual([deliveries.length, webhooks.length], pendingCounts.map(n => n + 1));
+      assert.equal(queued.length, pendingCounts + 1);
       await request('a.example', calendarPath, 'DELETE');
       await policy('omit');
-      console.log('PASS packed ' + kind + ' Calendar: preview, permissions, validation, private dispatch, persisted pause, next-future resume, Maintenance, retained Incident and both transition delivery paths');
+      console.log('PASS packed ' + kind + ' Calendar: preview, permissions, validation, private dispatch, persisted pause, next-future resume, Maintenance, retained Incident and Queue delivery');
     }
     // Calendar Heartbeat retains receipt evidence and credentials through a real isolate restart.
     now = Math.ceil((now + 60_000) / 60_000) * 60_000;
@@ -607,6 +647,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     assert.equal(job.silenceSeconds, undefined);
     assert.equal((await request('a.example', jobPath, 'PATCH', { graceSeconds: 60 })).status, 400);
     assert.equal((await request('a.example', jobPath + '/heartbeat-secret', 'POST', undefined, 'reader')).status, 403);
+    await selectWebhook(jobPath);
     const jobSecret = (await (await request('a.example', jobPath + '/heartbeat-secret', 'POST')).json()).secret;
     now = heartbeatBase + 90_001;
     assert.equal((await request('a.example', '/heartbeat', 'POST', undefined, jobSecret)).status, 204);
@@ -629,7 +670,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     assert.equal((await read()).incidents.find(row => row.id === jobIncident.id).closedAt, null, 'inclusive deadline remains open for receipt ingress');
     await tick(now + 1);
     assert.equal((await read()).incidents.find(row => row.id === jobIncident.id).closedAt, heartbeatBase + 210_000);
-    assert.deepEqual(deliveries.filter(event => event.incident.monitorId === job.id).map(event => event.transition), ['opened', 'recovered']);
+    assert.deepEqual(incidentTransitionsFor(job.id), ['incident.opened', 'incident.recovered']);
     assert.equal((await (await request('a.example', '/api/status')).json()).monitors.some(row => row.id === job.id), false);
     const readerJob = await (await request('a.example', '/api/operator', 'GET', undefined, 'reader')).text();
     assert.equal(readerJob.includes(rotatedJobSecret), false);
@@ -641,15 +682,17 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       name: 'Delayed Calendar producer', kind: 'heartbeat', scheduleMode: 'calendar', cron: '* * * * *', recoveryThreshold: 1,
     })).json()).monitors.at(-1);
     const overlapPath = '/api/operator/monitors/' + overlapJob.id;
+    await selectWebhook(overlapPath);
     const overlapSecret = (await (await request('a.example', overlapPath + '/heartbeat-secret', 'POST')).json()).secret;
     now = overlapBase + 120_000;
     await request('a.example', '/heartbeat', 'POST', undefined, overlapSecret);
     now = overlapBase + 160_000;
     await request('a.example', overlapPath + '/maintenance', 'PUT', { endsAt: overlapBase + 400_000 });
     await tick(now);
-    assert.deepEqual(deliveries.filter(event => event.incident.monitorId === overlapJob.id).map(event => event.transition), ['opened', 'recovered'], 'later Maintenance must not suppress earlier non-overlapping occurrence hooks');
+    assert.deepEqual(incidentTransitionsFor(overlapJob.id), ['incident.opened', 'incident.recovered'], 'later Maintenance must not suppress earlier non-overlapping occurrence jobs');
     await request('a.example', overlapPath, 'DELETE');
-    console.log('PASS packed Calendar Heartbeat: occurrence deadlines, durable evidence/restart, credential rotation, ignored bodies, tenant permissions, privacy, recovery and transition hooks');
-    console.log('PASS packed irisbeat@0.2.2: reproducible artifact, pinned integrity, consumer typecheck, isolated scheduling/Incidents, HTTP/TCP/heartbeat hooks, failure isolation, webhooks rotated tenant credentials and three-kind Maintenance suppression and HTTP/TCP boundary overlap of both delivery paths, persisted pause/resume and omission, paused history, Maintenance precedence, in-flight checks and delivery suppression');
+    assert.deepEqual(deliveries, [], 'the installed legacy override received no Queue-enabled transitions');
+    console.log('PASS packed Calendar Heartbeat: occurrence deadlines, durable evidence/restart, credential rotation, ignored bodies, tenant permissions, privacy, recovery and queued transitions');
+    console.log('PASS packed irisbeat@0.2.2: reproducible artifact, pinned integrity, consumer typecheck, isolated scheduling/Incidents, HTTP/TCP/Heartbeat Queue jobs, exclusive delivery, enqueue failure isolation, rotated tenant credentials and three-kind Maintenance suppression and HTTP/TCP boundary overlap, persisted pause/resume and omission, paused history, Maintenance precedence, in-flight checks and delivery suppression');
   } finally { await mf.dispose(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

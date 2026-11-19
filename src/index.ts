@@ -1,18 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { operatorPage, operatorScript, statusPage, styleSheet, themeScript } from "./ui";
+import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, statusPage, styleSheet, themeScript } from "./ui";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
 import { MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
 import { connect } from "cloudflare:sockets";
-import { DurableObject } from "cloudflare:workers";
+import { parseEmailAddress, type AlertDestination, type ConfirmationIdentity, type ConfirmationJob, type NewNotificationDestination, type NotificationDestination, type NotificationEligibility, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
+import type { NotificationDeliveryIdentity, SubmissionReport } from "./notification-outcomes";
+import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 
 export const CONTRACT_VERSION = "1" as const;
 export interface EngineEnv {
   MONITORING: DurableObjectNamespace<MonitoringContext>;
   INSTALLATION_SECRET?: string;
+  NOTIFICATION_PUBLIC_ORIGIN?: string;
+  NOTIFICATION_EMAIL?: { isConfigured(): Promise<boolean> };
+  NOTIFICATION_QUEUE?: Pick<Queue<NotificationQueueJob>, "sendBatch">;
 }
 type PausePolicy = { paused: boolean; policyRevision: number } | { paused?: undefined; policyRevision?: undefined };
-export type ScheduledContext = { id: string } & PausePolicy;
+export type ScheduledContext = { id: string; notificationOrigin?: string } & PausePolicy;
 function validPolicy(value: { paused?: unknown; policyRevision?: unknown }) {
   return value.paused === undefined ? value.policyRevision === undefined
     : typeof value.paused === "boolean" && typeof value.policyRevision === "number" &&
@@ -35,12 +40,21 @@ export type Incident = {
   openedAt: number;
   closedAt: number | null;
 };
+/** @deprecated Retained for source compatibility with legacy hosted overrides. */
 export type IncidentTransition = {
   contextId: string;
   incident: Incident;
   transition: "opened" | "recovered";
   at: number;
 };
+export type {
+  ConfirmationJob,
+  MaintenanceNotificationEvent,
+  NotificationDestination,
+  NotificationEvent,
+  NotificationJob,
+  NotificationQueueJob,
+} from "./notification-jobs";
 export type { MaintenanceWindow } from "./monitor-configuration";
 const DAY = 86_400_000;
 const historyStart = (at: number) => Math.floor(at / DAY) * DAY - 89 * DAY;
@@ -54,7 +68,22 @@ export type HistoryDay = {
 export type AvailabilityHistory = { days: HistoryDay[]; percentage: number | null };
 type DailyCounts = { day: number; successes: number; failures: number; maintenance: number };
 export type Status = ReturnType<MonitoringContext["status"]>;
-type StoredContext = { pageName: string; monitors: Monitor[]; webhookUrl?: string | null; paused?: boolean; policyRevision?: number; pauseGeneration?: number };
+const CONFIRMATION_COOLDOWN = 5 * 60_000;
+type ConfirmationInvitation = { id: string; token: string; origin: string; expiresAt: number; submitted?: boolean };
+type StoredContext = {
+  pageName: string;
+  monitors: Monitor[];
+  webhookUrl?: string | null;
+  legacyDestinationId?: string;
+  destinations?: (NotificationDestination & { submission?: SubmissionReport & { deliveryId: string } })[];
+  emailConfirmations?: Record<string, ConfirmationInvitation>;
+  emailWithdrawals?: Record<string, { token: string; origin: string }>;
+  confirmationCooldowns?: Record<string, number>;
+  paused?: boolean;
+  policyRevision?: number;
+  pauseGeneration?: number;
+  notificationOrder?: number;
+};
 type LegacyContext = { webhookUrl?: string | null; monitor: (Monitor & { pageName: string }) | null };
 
 type OperatorSubscription = { audience: "operator"; origin: string; expiresAt: number } & (
@@ -77,6 +106,14 @@ function allowedSubscriptionOrigin(request: Request, requireOrigin: boolean) {
 export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableObject<E> {
   constructor(ctx: DurableObjectState, env: E) {
     super(ctx, env);
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS notification_completions (
+      deliveryId TEXT PRIMARY KEY, expiresAt INTEGER NOT NULL
+    )`);
+    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS notification_completions_expiry ON notification_completions (expiresAt)");
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS notification_retries (
+      deliveryId TEXT PRIMARY KEY, attempt INTEGER NOT NULL, at INTEGER NOT NULL, expiresAt INTEGER NOT NULL
+    )`);
+    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS notification_retries_expiry ON notification_retries (expiresAt)");
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS incidents (
       id TEXT PRIMARY KEY, monitorId TEXT NOT NULL, openedAt INTEGER NOT NULL, closedAt INTEGER
     )`);
@@ -229,19 +266,45 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     }
   }
 
-  private read(at = Date.now()): StoredContext {
+  private read(at = Date.now(), expiry: { pending?: Promise<void>[]; suppress?: boolean } = {}): StoredContext {
     const stored = this.ctx.storage.kv.get<StoredContext | LegacyContext>("context");
     if (!stored) return { pageName: "Irisbeat", monitors: [] };
     if ("monitors" in stored) {
       stored.monitors = stored.monitors.map(monitor => { monitor.kind ??= "http"; return { ...timingDefaults, scheduleMode: "interval", ...monitor, createdAt: monitor.createdAt ?? 0, lastSeen: monitor.lastSeen ?? null, recoveryReceiptAt: monitor.recoveryReceiptAt ?? null }; });
-      let changed = false;
+      let changed = this.migrateWebhook(stored);
+      const expired: { monitor: Monitor; window: MaintenanceWindow; order: number }[] = [];
       for (const monitor of stored.monitors) {
-        if (monitor.maintenance && at >= monitor.maintenance.endsAt) {
+        const window = monitor.maintenance;
+        if (window && at >= window.endsAt) {
           this.endMaintenance(monitor);
           changed = true;
+          expired.push({ monitor, window, order: this.nextNotificationOrder(stored) });
         }
       }
-      if (changed) this.ctx.storage.kv.put("context", stored);
+      if (changed) this.ctx.storage.transactionSync(() => {
+        for (const { monitor, window } of expired) {
+          if (monitor.kind !== "heartbeat" || monitor.scheduleMode === "calendar") continue;
+          // Watchdog silence uses scheduled time, even when a wall-clock read expires the window first.
+          this.ctx.storage.sql.exec("DELETE FROM calendar_maintenance WHERE monitorId = ? AND endsAt <= ?", monitor.id, historyStart(at));
+          this.ctx.storage.sql.exec("INSERT INTO calendar_maintenance (monitorId, startedAt, endsAt) VALUES (?, ?, ?)", monitor.id, window.startedAt, window.endsAt);
+        }
+        this.ctx.storage.kv.put("context", stored);
+      });
+      for (const { monitor, window, order } of expired) {
+        if (stored.paused || expiry.suppress || !monitor.notificationSelections?.length) continue;
+        const send = this.enqueueNotifications(monitor, stored.pauseGeneration ?? 0, {
+          id: crypto.randomUUID(),
+          kind: "maintenance.ended",
+          reason: "expired",
+          at: window.endsAt,
+          order,
+          monitorName: monitor.name,
+          ...window,
+        });
+        // Synchronous readers still tie the post-commit handoff to their runtime lifetime.
+        if (expiry.pending) expiry.pending.push(send);
+        else this.ctx.waitUntil(send);
+      }
       return stored;
     }
     const { monitor: legacyMonitor, ...context } = stored;
@@ -257,6 +320,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       const { pageName: _pageName, ...monitor } = stored.monitor;
       state.monitors.push({ ...timingDefaults, scheduleMode: "interval", ...monitor, createdAt: monitor.createdAt ?? 0, lastSeen: monitor.lastSeen ?? null, recoveryReceiptAt: monitor.recoveryReceiptAt ?? null, published: true });
     }
+    this.migrateWebhook(state);
     this.ctx.storage.transactionSync(() => {
       if (stored.monitor) this.ctx.storage.sql.exec(
         "UPDATE incidents SET monitorName = ? WHERE monitorId = ? AND monitorName IS NULL",
@@ -278,7 +342,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
     }
     // Compare and persist policy together, without awaiting external I/O or another RPC.
-    const state = this.read();
+    const state = this.read(Date.now(), { suppress: paused });
     const before = this.subscriptionSnapshot(state);
     state.policyRevision = policyRevision;
     if (!!state.paused === paused) {
@@ -338,13 +402,149 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return this.monitorConfigurations.create(value, limit);
   }
 
-  configureWebhook(url: string | null) {
+  private migrateWebhook(state: StoredContext) {
+    if (state.webhookUrl === undefined) return false;
+    if (state.webhookUrl) {
+      const id = crypto.randomUUID();
+      state.legacyDestinationId = id;
+      state.destinations = [{ id, channel: "webhook", url: state.webhookUrl }];
+    }
+    delete state.webhookUrl;
+    return true;
+  }
+
+  async configureDestination(id: string | null, address: NewNotificationDestination | null, legacy = false, origin?: string) {
     const state = this.read();
+    const destinationId = legacy ? state.legacyDestinationId : id;
+    const destinations = state.destinations ?? [];
+    const existing = destinations.find(destination => destination.id === destinationId);
+    if (destinationId && !existing) return null;
+    if (address?.channel === "webhook" && existing?.channel === "webhook" && existing.url === address.url ||
+        address?.channel === "email" && existing?.channel === "email" && existing.address === address.address) return this.status(true);
     const before = this.subscriptionSnapshot(state);
-    state.webhookUrl = url;
+    const replacement = address && {
+      id: crypto.randomUUID(), ...(address.channel === "email" ? { ...address, confirmed: false } : address),
+    };
+    let job: ConfirmationJob | undefined;
+    if (replacement?.channel === "email") {
+      if (destinations.some(destination => destination !== existing && destination.channel === "email" &&
+          destination.address.toLowerCase() === replacement.address.toLowerCase())) return "duplicate" as const;
+      if (!origin) return "unconfigured" as const;
+      if (!state.paused) {
+        job = this.prepareConfirmation(state, replacement, origin);
+        if (!job) return "cooldown" as const;
+      }
+    }
+    state.destinations = existing
+      ? destinations.flatMap(destination => destination !== existing ? [destination] : replacement ? [replacement] : [])
+      : replacement ? [...destinations, replacement] : destinations;
+    if (legacy || (existing && existing.id === state.legacyDestinationId)) {
+      state.legacyDestinationId = replacement?.channel === "webhook" ? replacement.id : undefined;
+    }
+    if (existing) {
+      if (state.emailConfirmations) delete state.emailConfirmations[existing.id];
+      if (state.emailWithdrawals) delete state.emailWithdrawals[existing.id];
+      for (const monitor of state.monitors) {
+        monitor.notificationSelections = monitor.notificationSelections?.filter(selection => selection.destinationId !== existing.id);
+      }
+    }
     this.ctx.storage.kv.put("context", state);
     this.notify(before);
+    if (job) await this.enqueueConfirmation(job);
     return this.status(true);
+  }
+
+  async resendConfirmation(id: string, origin: string) {
+    const state = this.read();
+    const destination = state.destinations?.find(candidate => candidate.id === id);
+    if (destination?.channel !== "email" || destination.confirmed) return null;
+    if (state.paused) return "paused" as const;
+    const job = this.prepareConfirmation(state, destination, origin);
+    if (!job) return "cooldown" as const;
+    this.ctx.storage.kv.put("context", state);
+    await this.enqueueConfirmation(job);
+    return this.status(true);
+  }
+
+  private prepareConfirmation(state: StoredContext, destination: Extract<NotificationDestination, { channel: "email" }>, origin: string) {
+    const at = Date.now();
+    const inbox = destination.address.toLowerCase();
+    if ((state.confirmationCooldowns?.[inbox] ?? 0) > at) return;
+    state.confirmationCooldowns = Object.fromEntries(Object.entries(state.confirmationCooldowns ?? {})
+      .filter(([, until]) => until > at));
+    state.confirmationCooldowns[inbox] = at + CONFIRMATION_COOLDOWN;
+    const id = crypto.randomUUID();
+    (state.emailConfirmations ??= {})[destination.id] = { id, origin, token: crypto.randomUUID(), expiresAt: at + DAY };
+    return {
+      kind: "email.confirmation", destinationId: destination.id, deliveryId: id, at,
+      order: this.nextNotificationOrder(state),
+      contextId: this.ctx.id.toString(), pauseGeneration: state.pauseGeneration ?? 0,
+    } satisfies ConfirmationJob;
+  }
+
+  private async enqueueConfirmation(job: ConfirmationJob) {
+    try {
+      if (!this.env.NOTIFICATION_QUEUE) throw new Error("Queue binding unavailable");
+      await this.env.NOTIFICATION_QUEUE.sendBatch([{ body: job }]);
+    } catch {
+      console.error(JSON.stringify({ event: "notification_enqueue_failed", kind: job.kind }));
+    }
+  }
+
+  private currentConfirmation(state: StoredContext, job: ConfirmationIdentity) {
+    if (job.contextId !== this.ctx.id.toString() || state.paused ||
+        (state.pauseGeneration ?? 0) !== job.pauseGeneration) return null;
+    const invitation = state.emailConfirmations?.[job.destinationId];
+    if (invitation?.id !== job.deliveryId || invitation.expiresAt <= Date.now() || invitation.submitted) return null;
+    const destination = state.destinations?.find(candidate => candidate.id === job.destinationId);
+    return destination?.channel === "email" && !destination.confirmed ? { invitation, address: destination.address } : null;
+  }
+
+  resolveConfirmation(job: ConfirmationJob) {
+    const current = this.currentConfirmation(this.read(), job);
+    if (!current) return null;
+    return {
+      address: current.address,
+      url: new URL(recipientAction.confirm.path + "#" + current.invitation.token, current.invitation.origin).href,
+    };
+  }
+
+  markConfirmationSubmitted(job: ConfirmationIdentity) {
+    const state = this.read();
+    const current = this.currentConfirmation(state, job);
+    if (!current) return;
+    current.invitation.submitted = true;
+    this.ctx.storage.kv.put("context", state);
+  }
+
+  confirmEmail(token: string, origin: string) {
+    const state = this.read();
+    const now = Date.now();
+    const destination = state.destinations?.find(candidate => {
+      const invitation = state.emailConfirmations?.[candidate.id];
+      return candidate.channel === "email" && !candidate.confirmed &&
+        invitation?.token === token && invitation.origin === origin && invitation.expiresAt > now;
+    });
+    if (destination?.channel !== "email") return false;
+    const before = this.subscriptionSnapshot(state);
+    destination.confirmed = true;
+    (state.emailWithdrawals ??= {})[destination.id] = { token: crypto.randomUUID(), origin };
+    delete state.emailConfirmations?.[destination.id];
+    this.ctx.storage.kv.put("context", state);
+    this.notify(before);
+    return true;
+  }
+
+  async unsubscribeEmail(token: string, origin: string) {
+    const state = this.read();
+    const destination = state.destinations?.find(candidate => {
+      const withdrawal = state.emailWithdrawals?.[candidate.id];
+      return candidate.channel === "email" && candidate.confirmed &&
+        withdrawal?.token === token && withdrawal.origin === origin;
+    });
+    if (!destination) return false;
+    await this.configureDestination(destination.id, null);
+    return true;
   }
 
   async edit(id: string, value: unknown) {
@@ -360,7 +560,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     monitor.recoveryReceiptAt = null;
   }
 
-  maintenance(id: string, value: unknown, end = false) {
+  async maintenance(id: string, value: unknown, end = false) {
     const at = Date.now();
     const state = this.read(at);
     const before = this.subscriptionSnapshot(state);
@@ -370,20 +570,39 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         Object.keys(value).length !== 1 || !("endsAt" in value) ||
         typeof value.endsAt !== "number" || !Number.isSafeInteger(value.endsAt) ||
         value.endsAt <= at || value.endsAt > 8_640_000_000_000_000)) return undefined;
-    if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
-      // Retain actual overlap, not the replaced window's cancelled future portion.
-      this.ctx.storage.sql.exec("UPDATE calendar_maintenance SET endsAt = MIN(endsAt, ?) WHERE monitorId = ? AND endsAt > ?", at, id, at);
-      if (!end) this.ctx.storage.sql.exec("INSERT INTO calendar_maintenance (monitorId, startedAt, endsAt) VALUES (?, ?, ?)", id, at, (value as { endsAt: number }).endsAt);
-    }
-    if (end) {
-      if (monitor.maintenance) this.endMaintenance(monitor);
-    } else {
-      monitor.maintenance = { startedAt: at, endsAt: (value as { endsAt: number }).endsAt };
+    const previous = monitor.maintenance;
+    const next = end ? null : { startedAt: at, endsAt: (value as { endsAt: number }).endsAt };
+    if (previous?.endsAt === next?.endsAt) return this.status(true);
+    const order = this.nextNotificationOrder(state);
+    this.ctx.storage.transactionSync(() => {
+      if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
+        // Retain elapsed overlap when an operator cuts a window short or replaces it.
+        this.ctx.storage.sql.exec("UPDATE calendar_maintenance SET endsAt = MIN(endsAt, ?) WHERE monitorId = ? AND endsAt > ?", at, id, at);
+        if (next) this.ctx.storage.sql.exec("INSERT INTO calendar_maintenance (monitorId, startedAt, endsAt) VALUES (?, ?, ?)", id, next.startedAt, next.endsAt);
+      }
+      if (next) monitor.maintenance = next;
+      else this.endMaintenance(monitor);
+      this.ctx.storage.kv.put("context", state);
+    });
+    if (next) {
       const attempt = this.checking.get(id);
       if (attempt) attempt.maintenance = true;
     }
-    this.ctx.storage.kv.put("context", state);
     this.notify(before);
+    if (!state.paused && monitor.notificationSelections?.length) {
+      const event = { id: crypto.randomUUID(), at, order, monitorName: monitor.name };
+      if (next) {
+        await this.enqueueNotifications(monitor, state.pauseGeneration ?? 0, {
+          ...event, ...next, ...(previous
+            ? { kind: "maintenance.updated", previousEndsAt: previous.endsAt }
+            : { kind: "maintenance.started" }),
+        });
+      } else if (previous) {
+        await this.enqueueNotifications(monitor, state.pauseGeneration ?? 0, {
+          ...event, ...previous, kind: "maintenance.ended", reason: "early",
+        });
+      }
+    }
     return this.status(true);
   }
 
@@ -414,7 +633,9 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   private checking = new Map<string, { maintenance: boolean; paused: boolean }>();
 
   async check(at: number) {
-    await Promise.all(this.read().monitors.map(monitor => this.checkMonitor(monitor.id, at)));
+    const pending: Promise<void>[] = [];
+    const { monitors } = this.read(Math.max(at, Date.now()), { pending });
+    await Promise.all([...pending, ...monitors.map(monitor => this.checkMonitor(monitor.id, at))]);
   }
 
   private async checkMonitor(id: string, at: number) {
@@ -428,7 +649,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
       if (at >= (attempt.lastSeen ?? attempt.createdAt) + attempt.silenceSeconds * 1000) {
         attempt.recoveryReceiptAt = null;
-        await this.record(state, attempt, at, false, 1, attempt.recoveryThreshold);
+        // Active Maintenance suppresses dispatch. Expired windows use the observation time.
+        const maintenance = !!attempt.maintenance ||
+          this.ctx.storage.sql.exec("SELECT 1 FROM calendar_maintenance WHERE monitorId = ? AND startedAt <= ? AND endsAt > ? LIMIT 1", id, at, at).toArray().length > 0;
+        await this.record(state, attempt, at, false, 1, attempt.recoveryThreshold, maintenance);
       }
       return;
     }
@@ -513,7 +737,8 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (current.paused) return;
     const pauseGeneration = current.pauseGeneration ?? 0;
     let transition: "opened" | "recovered" | undefined;
-    let transitionedIncident: Incident | undefined;
+    let transitionedIncident: Pick<Incident, "id" | "openedAt"> | undefined;
+    let order: number | undefined;
     this.ctx.storage.transactionSync(() => {
       monitor.lastResult = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" };
       if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
@@ -543,7 +768,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         transition = "opened";
         monitor.state = "down";
         const incidentId = crypto.randomUUID();
-        transitionedIncident = { id: incidentId, monitorId: monitor.id, monitorName: monitor.name, openedAt: at, closedAt: null };
+        transitionedIncident = { id: incidentId, openedAt: at };
         this.ctx.storage.sql.exec(
           "INSERT INTO incidents (id, monitorId, openedAt, monitorName) VALUES (?, ?, ?, ?)",
           incidentId,
@@ -558,58 +783,145 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
           open.id,
         );
         transition = "recovered";
-        transitionedIncident = { ...open, closedAt: at };
+        transitionedIncident = open;
         monitor.state = "up";
       } else if (!open && success) {
         monitor.state = "up";
       }
       if (resetProgress) { monitor.failures = 0; monitor.successes = 0; }
+      if (transition) order = this.nextNotificationOrder(current);
       this.ctx.storage.kv.put("context", current);
     });
     this.notify(before);
-    if (maintenance) return;
-    // Delivery follows the committed transition; transport failure cannot undo detection.
-    if (transition && current.webhookUrl)
-      await this.deliverWebhook(current.webhookUrl, monitor.name, transition);
-    // Pause/resume during a submitted webhook must also suppress its still-pending hosted hook.
-    const deliveryState = this.read();
-    // Calendar receipt windows already determine exclusion; later Maintenance cannot erase old hooks.
-    const maintenanceBlocksHook = !(monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") && deliveryState.monitors.some(candidate => candidate.id === monitor.id && candidate.maintenance);
-    if (transition && transitionedIncident && !deliveryState.paused && (deliveryState.pauseGeneration ?? 0) === pauseGeneration && !maintenanceBlocksHook) {
+    if (!transition || !transitionedIncident) return;
+    if (monitor.notificationSelections?.length) {
+      await this.enqueueNotifications(monitor, pauseGeneration, {
+        id: transitionedIncident.id + ":" + transition,
+        kind: transition === "opened" ? "incident.opened" : "incident.recovered",
+        at,
+        order,
+        incidentId: transitionedIncident.id,
+        openedAt: transitionedIncident.openedAt,
+        monitorName: monitor.name,
+      });
+    }
+  }
+
+  private nextNotificationOrder(state: StoredContext) {
+    state.notificationOrder = (state.notificationOrder ?? 0) + 1;
+    return state.notificationOrder;
+  }
+
+  private async enqueueNotifications(monitor: Monitor, pauseGeneration: number, event: NotificationJob["event"]) {
+    const contextId = this.ctx.id.toString();
+    const jobs: NotificationJob[] = (monitor.notificationSelections ?? []).map(selection => ({
+      ...selection, contextId, monitorId: monitor.id, pauseGeneration,
+      deliveryId: event.id + ":" + selection.destinationId, event,
+    }));
+    // The storage output gate holds the Queue handoff until the transition is durable.
+    for (let i = 0; i < jobs.length; i += 100) {
       try {
-        await this.onIncidentTransition({ contextId: this.ctx.id.toString(), incident: transitionedIncident, transition, at });
+        if (!this.env.NOTIFICATION_QUEUE) throw new Error("Queue binding unavailable");
+        await this.env.NOTIFICATION_QUEUE.sendBatch(jobs.slice(i, i + 100).map(body => ({ body })));
       } catch {
-        console.error(JSON.stringify({ event: "transition_delivery_failed" }));
+        console.error(JSON.stringify({ event: "notification_enqueue_failed", eventId: event.id }));
       }
     }
   }
 
+  /** @deprecated Retained for source compatibility. The engine no longer calls this method. */
   protected async onIncidentTransition(_event: IncidentTransition): Promise<void> {}
 
-  private async deliverWebhook(
-    url: string,
-    name: string,
-    transition: "opened" | "recovered",
-  ) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10_000);
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: `${name.replace(/\s+/g, " ")}: Incident ${transition}`,
-        }),
-        redirect: "manual",
-        signal: controller.signal,
-      });
-      await response.body?.cancel();
-      if (!response.ok) throw new Error("Delivery failed");
-    } catch {
-      console.error(JSON.stringify({ event: "webhook_delivery_failed" }));
-    } finally {
-      clearTimeout(timeout);
+  resolveAlert(job: NotificationEligibility): AlertDestination | null {
+    if (job.contextId !== this.ctx.id.toString()) return null;
+    const state = this.read();
+    if (state.paused || (state.pauseGeneration ?? 0) !== job.pauseGeneration) return null;
+    const selected = state.monitors.find(monitor => monitor.id === job.monitorId)?.notificationSelections;
+    if (!selected?.some(selection => selection.destinationId === job.destinationId && selection.generation === job.generation)) return null;
+    if (this.notificationCompleted(job.deliveryId)) return null;
+    const destination = state.destinations?.find(candidate => candidate.id === job.destinationId);
+    if (destination?.channel === "webhook") return { channel: "webhook", url: destination.url };
+    if (destination?.channel !== "email" || !destination.confirmed) return null;
+    let withdrawal = state.emailWithdrawals?.[destination.id];
+    if (!withdrawal && this.ctx.id.equals(this.env.MONITORING.idFromName("personal"))) {
+      const origin = notificationOrigin(this.env.NOTIFICATION_PUBLIC_ORIGIN);
+      if (origin) {
+        withdrawal = { token: crypto.randomUUID(), origin };
+        (state.emailWithdrawals ??= {})[destination.id] = withdrawal;
+        this.ctx.storage.kv.put("context", state);
+      }
     }
+    if (!withdrawal) return null;
+    return {
+      channel: "email", address: destination.address,
+      unsubscribeUrl: new URL(recipientAction.unsubscribe.path + "#" + withdrawal.token, withdrawal.origin).href,
+    };
+  }
+
+  resolveWebhook(job: NotificationEligibility) {
+    const destination = this.resolveAlert(job);
+    return destination?.channel === "webhook" ? destination.url : null;
+  }
+
+  protected notificationCompleted(deliveryId: string) {
+    return this.ctx.storage.sql.exec("SELECT 1 FROM notification_completions WHERE deliveryId = ? AND expiresAt > ?", deliveryId, Date.now())
+      .toArray().length > 0;
+  }
+
+  reportSubmission(job: NotificationDeliveryIdentity, report: SubmissionReport) {
+    if (job.contextId !== this.ctx.id.toString()) return;
+    const state = this.read();
+    const destination = state.destinations?.find(destination => destination.id === job.destinationId);
+    if (!destination) return;
+    const accepted = report.result.status === "accepted";
+    if (report.confirmation && (destination.channel !== "email" ||
+        (state.emailConfirmations?.[destination.id]?.id !== job.deliveryId && !(accepted && destination.confirmed)))) return;
+    const current = destination.submission;
+    const terminal = report.result.status !== "retrying";
+    const now = Date.now();
+    let changed = false;
+    this.ctx.storage.transactionSync(() => {
+      const sql = this.ctx.storage.sql;
+      if (!accepted) {
+        if (this.notificationCompleted(job.deliveryId)) return;
+        const [retry] = sql.exec<{ attempt: number; at: number }>(
+          "SELECT attempt, at FROM notification_retries WHERE deliveryId = ? AND expiresAt > ?",
+          job.deliveryId, now,
+        ).toArray();
+        // The latest Settings result may already be for a different event.
+        const latest = retry ?? (current?.deliveryId === job.deliveryId
+          ? { attempt: current.attempt, at: current.result.at } : undefined);
+        if (latest) {
+          const order = report.attempt - latest.attempt || report.result.at - latest.at;
+          if (order < 0 || (order === 0 && !terminal)) return;
+        }
+      }
+      sql.exec("DELETE FROM notification_retries WHERE expiresAt <= ?", now);
+      if (terminal) {
+        // Retain completed identities through the maximum source Queue retention window.
+        sql.exec("DELETE FROM notification_completions WHERE expiresAt <= ?", now);
+        sql.exec("INSERT OR IGNORE INTO notification_completions VALUES (?, ?)", job.deliveryId, now + 14 * DAY);
+        sql.exec("DELETE FROM notification_retries WHERE deliveryId = ?", job.deliveryId);
+      } else {
+        sql.exec("INSERT OR REPLACE INTO notification_retries VALUES (?, ?, ?, ?)",
+          job.deliveryId, report.attempt, report.result.at, now + 14 * DAY);
+      }
+      // An unreported cancellation still closes the delivery against delayed retry reports.
+      if (report.result.status === "canceled" &&
+        (current?.deliveryId !== job.deliveryId || current.result.status !== "retrying")) return;
+      if (current?.deliveryId === job.deliveryId) {
+        if (current.result.status === "accepted") return;
+      } else if (current) {
+        const order = report.eventAt - current.eventAt ||
+          (report.eventOrder ?? 0) - (current.eventOrder ?? 0) || report.queuedAt - current.queuedAt;
+        if (order < 0 || (order === 0 && job.deliveryId < current.deliveryId)) return;
+      }
+      const eventOrder = report.eventOrder ?? (current?.deliveryId === job.deliveryId ? current.eventOrder : undefined);
+      destination.submission = { ...report, eventOrder, deliveryId: job.deliveryId };
+      this.ctx.storage.kv.put("context", state);
+      changed = true;
+    });
+    if (changed) this.broadcast("operator", true);
   }
 
   async heartbeat(id: string, at: number) {
@@ -693,6 +1005,18 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     }
   }
 
+  provisionEmailWithdrawals(origin: string) {
+    // Confirmation-only builds discarded the invitation origin after consent.
+    const state = this.ctx.storage.kv.get<StoredContext | LegacyContext>("context");
+    if (!state || !("monitors" in state)) return;
+    const missing = state.destinations?.filter(destination =>
+      destination.channel === "email" && destination.confirmed && !state.emailWithdrawals?.[destination.id]);
+    if (!missing?.length) return;
+    const withdrawals = state.emailWithdrawals ??= {};
+    for (const { id } of missing) withdrawals[id] = { token: crypto.randomUUID(), origin };
+    this.ctx.storage.kv.put("context", state);
+  }
+
   status(operator = false, secrets = operator) {
     return this.project(this.read(), operator, secrets, Date.now());
   }
@@ -702,6 +1026,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const monitors = state.monitors.filter(monitor => operator || monitor.published).map(monitor => ({
       id: monitor.id, name: monitor.name, kind: monitor.kind, history: this.history(monitor.id, start),
       ...(monitor.kind === "heartbeat" ? { lastSeen: monitor.lastSeen } : {}), state: state.paused ? "paused" as const : monitor.maintenance ? "maintenance" as const : monitor.state, maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult,
+      ...(secrets ? { destinationIds: (monitor.notificationSelections ?? []).map(selection => selection.destinationId) } : {}),
       ...(operator ? {
         kind: monitor.kind,
         ...(monitor.kind === "tcp" ? { hostname: monitor.hostname, port: monitor.port } : monitor.kind === "http" ? { url: monitor.url } : {}),
@@ -714,8 +1039,14 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
           : { timeoutSeconds: monitor.timeoutSeconds, failureThreshold: monitor.failureThreshold }),
       } : {}),
     }));
+    const legacy = state.destinations?.find(destination => destination.id === state.legacyDestinationId);
     return {
-      ...(secrets ? { webhookUrl: state.webhookUrl ?? null } : {}),
+      ...(secrets ? {
+        destinations: (state.destinations ?? []).map(({ submission, ...destination }) => ({
+          ...destination, ...(submission ? { latestSubmission: submission.result } : {}),
+        })),
+        webhookUrl: legacy?.channel === "webhook" ? legacy.url : null,
+      } : {}),
       paused: !!state.paused,
       pageName: state.pageName,
       monitors,
@@ -776,12 +1107,15 @@ function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E
       const context = typeof value === "string" ? { id: value } : value;
       if (!context || typeof context.id !== "string" || !context.id ||
           !validPolicy(context)) throw new Error("Invalid hosted context");
+      const origin = notificationOrigin(context.notificationOrigin);
       const prior = unique.get(context.id);
-      if (prior && (prior.paused !== context.paused || prior.policyRevision !== context.policyRevision)) throw new Error("Conflicting hosted context");
-      unique.set(context.id, context);
+      if (prior && (prior.paused !== context.paused || prior.policyRevision !== context.policyRevision ||
+          prior.notificationOrigin !== origin)) throw new Error("Conflicting hosted context");
+      unique.set(context.id, { ...context, notificationOrigin: origin });
     }
     await Promise.all([...unique.values()].map(async (policy) => {
       const context = env.MONITORING.getByName(policy.id);
+      if (policy.notificationOrigin) await context.provisionEmailWithdrawals(policy.notificationOrigin);
       if (policy.paused !== undefined) await context.setPaused(policy.paused, policy.policyRevision);
       await context.check(controller.scheduledTime);
     }));
@@ -797,6 +1131,35 @@ function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E
 
 export default createWorker();
 
+export class NotificationDelivery extends WorkerEntrypoint<EngineEnv> {
+  async resolveAlert(job: NotificationEligibility) {
+    if (!/^[a-f0-9]{64}$/.test(job.contextId)) return null;
+    return this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId)).resolveAlert(job);
+  }
+
+  async resolveConfirmation(job: ConfirmationJob) {
+    if (!/^[a-f0-9]{64}$/.test(job.contextId)) return null;
+    return this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId)).resolveConfirmation(job);
+  }
+
+  async markConfirmationSubmitted(job: ConfirmationIdentity) {
+    if (!/^[a-f0-9]{64}$/.test(job.contextId)) return;
+    await this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId)).markConfirmationSubmitted(job);
+  }
+
+  async resolveWebhook(job: NotificationEligibility) {
+    if (!/^[a-f0-9]{64}$/.test(job.contextId)) return null;
+    const context = this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId));
+    return context.resolveWebhook(job);
+  }
+
+  async reportSubmission(job: NotificationDeliveryIdentity, report: SubmissionReport) {
+    if (!/^[a-f0-9]{64}$/.test(job.contextId)) return;
+    const context = this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId));
+    await context.reportSubmission(job, report);
+  }
+}
+
 export function createHostedWorker<E extends EngineEnv = EngineEnv>(adapter: HostedAdapter<E>) {
   if (adapter.contractVersion !== CONTRACT_VERSION) throw new Error("Unsupported Irisbeat contract version");
   return createWorker(adapter);
@@ -810,6 +1173,7 @@ type HttpEnv<E extends EngineEnv> = {
     permission: "editor" | "reader";
     value: unknown;
     selectedMonitor: Status["monitor"] | null;
+    emailOrigin: Promise<string | undefined>;
   };
 };
 
@@ -822,9 +1186,66 @@ function methodNotAllowed(allow: string) {
   return new Response(null, { status: 405, headers: { Allow: allow } });
 }
 
-function operatorResponse<E extends EngineEnv>(c: Context<HttpEnv<E>>, result: Status | null, status = 200) {
+function confirmationOrigin<E extends EngineEnv>(c: Context<HttpEnv<E>>) {
+  const cached = c.get("emailOrigin");
+  if (cached) return cached;
+  const origin = configuredConfirmationOrigin(c);
+  c.set("emailOrigin", origin);
+  return origin;
+}
+
+function notificationOrigin(configured: string | undefined) {
+  if (!configured) return;
+  try {
+    const url = new URL(configured);
+    if (url.username || url.password || url.href !== url.origin + "/" ||
+        (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)))) return;
+    return url.origin;
+  } catch {
+    return;
+  }
+}
+
+async function configuredConfirmationOrigin<E extends EngineEnv>(c: Context<HttpEnv<E>>) {
   const resolved = c.get("resolved");
-  return Response.json(result && { ...result, ...(resolved ? { hosted: true, permission: resolved.permission } : {}) }, { status });
+  const origin = notificationOrigin(resolved ? resolved.notificationOrigin : c.env.NOTIFICATION_PUBLIC_ORIGIN);
+  const capability = c.env.NOTIFICATION_EMAIL;
+  if (!origin || !capability || !c.env.NOTIFICATION_QUEUE) return;
+  try {
+    if (await capability.isConfigured()) return origin;
+  } catch {
+    console.error(JSON.stringify({ event: "notification_email_check_failed" }));
+  }
+}
+
+async function operatorResponse<E extends EngineEnv>(c: Context<HttpEnv<E>>, result: Status | null, status = 200) {
+  const resolved = c.get("resolved");
+  const emailConfigured = result && c.get("permission") === "editor" && await confirmationOrigin(c);
+  return Response.json(result && { ...result, ...(emailConfigured ? { emailConfigured: true } : {}),
+    ...(resolved ? { hosted: true, permission: resolved.permission } : {}) }, { status });
+}
+
+async function readBoundedBody(request: Request) {
+  if (Number(request.headers.get("Content-Length")) > 4096) return null;
+  const reader = request.body?.getReader();
+  if (!reader) return "";
+  const decoder = new TextDecoder();
+  let body = "";
+  let bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return body + decoder.decode();
+      bytes += value.length;
+      if (bytes > 4096) {
+        await reader.cancel();
+        return null;
+      }
+      body += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
@@ -850,6 +1271,8 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     const context = c.env.MONITORING.getByName(resolved?.id ?? "personal");
     c.set("resolved", resolved ?? undefined);
     c.set("context", context);
+    const origin = notificationOrigin(resolved?.notificationOrigin);
+    if (origin) await context.provisionEmailWithdrawals(origin);
     if (resolved?.paused !== undefined) await context.setPaused(resolved.paused, resolved.policyRevision);
     await next();
   });
@@ -889,12 +1312,34 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   app.get("/api/operator/events", getOnly, subscribe);
   app.get("/api/status", getOnly, async (c: Context<HttpEnv<E>>) => Response.json(await c.get("context").status()));
 
+  for (const action of ["confirm", "unsubscribe"] as const) {
+    const { path } = recipientAction[action];
+    app.get(path, getOnly, c => c.html(recipientPage(action)));
+    app.get(path + ".js", getOnly, () => new Response(recipientScript, { headers: { "Content-Type": "text/javascript; charset=utf-8" } }));
+    app.post(path, async c => {
+      if (c.req.header("Content-Type")?.split(";")[0] !== "application/x-www-form-urlencoded") return new Response(null, { status: 415 });
+      const body = await readBoundedBody(c.req.raw);
+      if (body === null) return new Response(null, { status: 413 });
+      const tokens = new URLSearchParams(body).getAll("token");
+      const [token] = tokens;
+      const context = c.get("context");
+      const origin = new URL(c.req.url).origin;
+      const accepted = tokens.length === 1 && /^[a-f0-9-]{36}$/.test(token) && (action === "confirm"
+        ? await context.confirmEmail(token, origin)
+        : await context.unsubscribeEmail(token, origin));
+      return c.html(recipientPage(action, accepted), accepted ? 200 : 400);
+    });
+  }
+
   const monitorPath = "/api/operator/monitors/:id";
   const maintenancePath = monitorPath + "/maintenance";
   const rotationPath = monitorPath + "/heartbeat-secret";
   const previewPath = "/api/operator/schedule-preview";
   const ticketPath = "/api/operator/events/ticket";
-  const operatorPaths = [ticketPath, previewPath, "/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
+  const destinationsPath = "/api/operator/destinations";
+  const destinationPath = destinationsPath + "/:id";
+  const resendPath = destinationPath + "/confirmation";
+  const operatorPaths = [ticketPath, previewPath, destinationsPath, destinationPath, resendPath, "/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
   for (const path of operatorPaths) app.use(path, async (c, next) => {
     const resolved = c.get("resolved");
     if (path === rotationPath && !resolved) return c.notFound();
@@ -921,28 +1366,9 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
       return new Response(null, { status: 413 });
     const selectedMonitor: Status["monitor"] | null = c.req.path === "/api/operator" ? (await c.get("context").status(true)).monitor : null;
     c.set("selectedMonitor", selectedMonitor);
+    const body = await readBoundedBody(request);
+    if (body === null) return new Response(null, { status: 413 });
     let value: unknown;
-    const reader = request.body?.getReader();
-    let body = "";
-    let bytes = 0;
-    const decoder = new TextDecoder();
-    if (reader) {
-      try {
-        while (true) {
-          const { done, value: chunk } = await reader.read();
-          if (done) break;
-          bytes += chunk.byteLength;
-          if (bytes > 4096) {
-            await reader.cancel();
-            return new Response(null, { status: 413 });
-          }
-          body += decoder.decode(chunk, { stream: true });
-        }
-        body += decoder.decode();
-      } finally {
-        reader.releaseLock();
-      }
-    }
     try {
       value = JSON.parse(body);
     } catch {
@@ -953,10 +1379,12 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   };
   // IDs are opaque: read the original path rather than Hono's decoded params.
   const monitorId = (c: Context<HttpEnv<E>>) => c.req.path.split("/")[4];
-  for (const path of ["/api/operator", "/api/operator/webhook", "/api/operator/monitors"]) {
-    app.get(path, async (c: Context<HttpEnv<E>>) => c.req.method === "GET"
-      ? operatorResponse(c, await c.get("context").status(true, c.get("permission") === "editor"))
-      : methodNotAllowed(path === "/api/operator/monitors" ? "GET, POST" : "GET, PUT"));
+  for (const path of ["/api/operator", "/api/operator/webhook", "/api/operator/monitors", destinationsPath]) {
+    app.get(path, async (c: Context<HttpEnv<E>>) => {
+      if (c.req.method !== "GET")
+        return methodNotAllowed(path === "/api/operator/monitors" || path === destinationsPath ? "GET, POST" : "GET, PUT");
+      return operatorResponse(c, await c.get("context").status(true, c.get("permission") === "editor"));
+    });
   }
   app.post(rotationPath, async (c: Context<HttpEnv<E>>) => {
     const result = await c.get("context").rotateHeartbeatSecret(monitorId(c));
@@ -975,7 +1403,44 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     const url = value && typeof value === "object" ? (value as Record<string, unknown>).url : undefined;
     const destination = parseWebhook(url);
     if (destination === undefined) return Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
-    return operatorResponse(c, await c.get("context").configureWebhook(destination));
+    return destinationResponse(c, await c.get("context").configureDestination(null, destination ? { channel: "webhook", url: destination } : null, true));
+  });
+  function destinationResponse(c: Context<HttpEnv<E>>, result: Status | null | "duplicate" | "unconfigured" | "cooldown" | "paused", status = 200) {
+    if (result === "unconfigured") return Response.json({ error: "Email sending is unavailable" }, { status: 503 });
+    if (result === "duplicate") return Response.json({ error: "This inbox is already a destination" }, { status: 409 });
+    if (result === "paused") return Response.json({ error: "Confirmation is paused" }, { status: 409 });
+    if (result === "cooldown") return Response.json({ error: "Wait five minutes between confirmations for this inbox" }, { status: 429 });
+    return result ? operatorResponse(c, result, status) : Response.json({ error: "Destination not found" }, { status: 404 });
+  }
+  const saveDestination = async (c: Context<HttpEnv<E>>) => {
+    const value = c.get("value");
+    const fields = value && typeof value === "object" ? value as Record<string, unknown> : {};
+    let destination: NewNotificationDestination;
+    let origin: string | undefined;
+    if (fields.channel === "email") {
+      const address = parseEmailAddress(fields.address);
+      if (!address) return Response.json({ error: "Enter an email address" }, { status: 400 });
+      origin = await confirmationOrigin(c);
+      if (!origin) return destinationResponse(c, "unconfigured");
+      destination = { channel: "email", address };
+    } else {
+      const url = parseWebhook(fields.url);
+      if (!url || (fields.channel !== undefined && fields.channel !== "webhook"))
+        return Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
+      destination = { channel: "webhook", url };
+    }
+    const creating = c.req.method === "POST";
+    const result = await c.get("context").configureDestination(creating ? null : monitorId(c), destination, false, origin);
+    return destinationResponse(c, result, creating ? 201 : 200);
+  };
+  app.post(destinationsPath, readBody, saveDestination);
+  app.put(destinationPath, readBody, saveDestination);
+  app.post(resendPath, async c => {
+    const origin = await confirmationOrigin(c);
+    return destinationResponse(c, origin ? await c.get("context").resendConfirmation(monitorId(c), origin) : "unconfigured");
+  });
+  app.delete(destinationPath, async c => {
+    return destinationResponse(c, await c.get("context").configureDestination(monitorId(c), null));
   });
   app.put(maintenancePath, readBody, async (c: Context<HttpEnv<E>>) => {
     const result = await c.get("context").maintenance(monitorId(c), c.get("value"));
@@ -1014,7 +1479,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     return result ? operatorResponse(c, result) : Response.json({ error: "Monitor changed; reload before saving" }, { status: 409 });
   });
   for (const path of operatorPaths) app.all(path, () => methodNotAllowed(
-    (path === rotationPath || path === previewPath) ? "POST" : path === maintenancePath ? "PUT, DELETE" : path === monitorPath ? "PATCH, DELETE" : path === "/api/operator/monitors" ? "GET, POST" : "GET, PUT",
+    (path === rotationPath || path === previewPath) ? "POST" : path === maintenancePath ? "PUT, DELETE" : path === monitorPath ? "PATCH, DELETE" : path === destinationPath ? "PUT, DELETE" : (path === "/api/operator/monitors" || path === destinationsPath) ? "GET, POST" : "GET, PUT",
   ));
   return app;
 }

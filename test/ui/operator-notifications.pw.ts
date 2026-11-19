@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { expect, test, type WebSocketRoute } from '@playwright/test';
 
-const snapshot = { pageName: 'Private session', webhookUrl: 'https://private.example/hook', monitors: [{ id: 'private', name: 'Private Monitor', kind: 'http', url: 'https://private.example', state: 'up', published: false }], incidents: [] };
+const snapshot = { pageName: 'Private session', destinations: [{ id: 'hook', channel: 'webhook', url: 'https://private.example/hook' }], monitors: [{ id: 'private', name: 'Private Monitor', kind: 'http', url: 'https://private.example', state: 'up', published: false }], incidents: [] };
 async function login(page: import('@playwright/test').Page) {
   await page.goto('/operator'); await page.locator('#secret').fill('ui-test-secret');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -26,15 +26,16 @@ test('renews on the same socket, reauthorizes snapshots and clears private state
   await expect(page.locator('#updates-mode')).toBeHidden();
   await expect.poll(() => reads).toBe(2);
   await page.locator('#settings-button').click();
-  await page.locator('#webhookUrl').fill('https://draft.example/hook');
+  await page.getByRole('button', { name: 'Add webhook' }).click();
+  await page.locator('#destination-address').fill('https://draft.example/hook');
   await page.clock.runFor(240001);
   await expect.poll(() => tickets).toBe(2);
   await expect.poll(() => frames.some(frame => frame.includes('"renew"'))).toBe(true);
   expect(connections).toBe(1);
-  await expect(page.locator('#webhookUrl')).toHaveValue('https://draft.example/hook');
+  await expect(page.locator('#destination-address')).toHaveValue('https://draft.example/hook');
   denied = true; await page.clock.runFor(240001);
   await expect(page.locator('#login')).toBeVisible();
-  await expect(page.locator('#monitor-rows')).toBeEmpty(); await expect(page.locator('#webhookUrl')).toHaveValue('');
+  await expect(page.locator('#monitor-rows')).toBeEmpty(); await expect(page.locator('#destination-address')).toHaveValue('');
   await expect(page.locator('#configuration')).toBeHidden();
   const count = tickets;
   await page.clock.runFor(600000); expect(tickets).toBe(count); expect(connections).toBe(1);
@@ -91,7 +92,7 @@ for (const boundary of ['ticket', 'snapshot', 'renewal']) {
     await expect(page.locator('#login')).toBeVisible();
     await page.clock.runFor(600000);
     await expect(page.locator('#editor')).toBeHidden(); await expect(page.locator('#monitor-rows')).toBeEmpty();
-    await expect(page.locator('#webhookUrl')).toHaveValue('');
+    await expect(page.locator('#destination-address')).toHaveValue('');
     expect(frames.length).toBe(count); expect(connections).toBe(1);
     expect(await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }))).not.toContain('grant');
     expect(await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }))).not.toContain('ui-test-secret');

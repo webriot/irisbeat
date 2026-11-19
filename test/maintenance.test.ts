@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { captureNotifications, selectWebhooks } from "./notification-queue";
 import { connect } from "cloudflare:sockets";
 import worker, { type Status } from '../src/index';
 import { env, exports } from 'cloudflare:workers';
@@ -24,6 +25,50 @@ async function create(extra = {}) {
 async function tick(offset: number) { await worker.scheduled(createScheduledController({ scheduledTime: start + offset, cron: '* * * * *' }), env); }
 const maintenance = (id: string, endsAt?: number) => mutate('/api/operator/monitors/' + id + '/maintenance', endsAt === undefined ? 'DELETE' : 'PUT', endsAt === undefined ? undefined : { endsAt });
 afterEach(async () => { vi.restoreAllMocks(); network.resetHandlers(); await reset(); });
+it('queues one expiration for a selected private Monitor after restart and delayed dispatch', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+  const monitor = await create({ kind: 'heartbeat', url: undefined, published: false });
+  const notifications = await captureNotifications();
+  await mutate('/api/operator/webhook', 'PUT', { url: 'https://alerts.example/hook' });
+  await maintenance(monitor.id, start + 25_000);
+  await selectWebhooks(mutate);
+  expect(await notifications.jobs()).toEqual([]);
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  clock.mockReturnValue(start + 60_000);
+  await tick(60_000);
+  expect(await notifications.jobs()).toMatchObject([{
+    monitorId: monitor.id,
+    event: { kind: 'maintenance.ended', reason: 'expired', at: start + 25_000, startedAt: start, endsAt: start + 25_000 },
+  }]);
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  await tick(60_000);
+  await maintenance(monitor.id);
+  expect(await notifications.jobs()).toHaveLength(1);
+  expect((await operator()).monitor?.maintenance).toBeNull();
+  expect((await status()).monitors).toEqual([]);
+});
+
+it('preserves a committed Maintenance start when Queue handoff fails without replaying it', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+  const monitor = await create({ kind: 'heartbeat', url: undefined });
+  await mutate('/api/operator/webhook', 'PUT', { url: 'https://alerts.example/private-token' });
+  await selectWebhooks(mutate);
+  await captureNotifications(true);
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const endsAt = start + 25_000;
+  expect((await maintenance(monitor.id, endsAt)).status).toBe(200);
+  expect(log).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/^\{"event":"notification_enqueue_failed","eventId":"[a-f0-9-]+"\}$/));
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  clock.mockReturnValue(start + 10_000);
+  const notifications = await captureNotifications();
+  const unchanged = await maintenance(monitor.id, endsAt);
+  expect((await unchanged.json<Status>()).monitor?.maintenance).toEqual({ startedAt: start, endsAt });
+  expect(await notifications.jobs()).toEqual([]);
+  clock.mockReturnValue(start + 60_000);
+  await tick(60_000);
+  expect((await notifications.jobs()).map(({ event }) => event.kind)).toEqual(['maintenance.ended']);
+});
+
 it('authenticates and validates immediate per-Monitor windows, replaces, persists and ends them', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
   const monitor = await create();
@@ -54,27 +99,27 @@ it.each(['http', 'tcp'] as const)('continues %s attempts in Maintenance, suppres
   const monitor = await create(kind === 'tcp' ? { kind, url: undefined, hostname: 'db.example', port: 5432 } : {});
   let up = false;
   let attempts = 0;
-  const messages: unknown[] = [];
-  network.use(http.get('https://target.example/', () => { attempts++; return new HttpResponse(null, { status: up ? 200 : 503 }); }),
-    http.post('https://alerts.example/hook', async ({ request }) => { messages.push(await request.json()); return new HttpResponse(null, { status: 204 }); }));
+  const notifications = await captureNotifications();
+  network.use(http.get('https://target.example/', () => { attempts++; return new HttpResponse(null, { status: up ? 200 : 503 }); }));
   vi.mocked(connect).mockImplementation(() => {
     attempts++;
     return { opened: up ? Promise.resolve({}) : Promise.reject(new Error('refused')), closed: Promise.resolve(), close: async () => {} } as Socket;
   });
   await mutate('/api/operator/webhook', 'PUT', { url: 'https://alerts.example/hook' });
+  await selectWebhooks(mutate);
   await tick(0); // One pre-window failure must not survive expiry.
   await maintenance(monitor.id, start + 180_000);
   await tick(60_000); await tick(120_000);
   expect(attempts).toBe(3);
   expect((await status()).monitor).toMatchObject({ state: 'maintenance', lastResult: { at: start + 120_000, outcome: 'maintenance' } });
   expect((await status()).incidents).toEqual([]);
-  expect(messages).toEqual([]);
+  expect((await notifications.summaries())).toEqual([]);
   clock.mockReturnValue(start + 180_000);
   await tick(180_000);
   expect((await status()).incidents).toEqual([]);
   await tick(240_000);
   expect((await status()).incidents).toMatchObject([{ openedAt: start + 240_000, closedAt: null }]);
-  expect(messages).toEqual([{ text: 'Website: Incident opened' }]);
+  expect((await notifications.summaries())).toEqual(['Website: Incident opened']);
   clock.mockReturnValue(start + 250_000);
   await maintenance(monitor.id, start + 600_000);
   up = true;
@@ -84,28 +129,28 @@ it.each(['http', 'tcp'] as const)('continues %s attempts in Maintenance, suppres
   await maintenance(monitor.id);
   up = false;
   await tick(420_000); await tick(480_000);
-  expect(messages).toHaveLength(1);
+  expect((await notifications.summaries())).toHaveLength(1);
   up = true;
   await tick(540_000);
   expect((await status()).incidents[0].closedAt).toBeNull();
   await tick(600_000);
   expect((await status()).incidents).toMatchObject([{ closedAt: start + 600_000 }]);
-  expect(messages).toEqual([{ text: 'Website: Incident opened' }, { text: 'Website: Incident recovered' }]);
+  expect((await notifications.summaries())).toEqual(['Website: Incident opened', 'Website: Incident recovered']);
 });
 it('keeps fresh and silent Heartbeats observable without transitions and requires post-window recovery receipts', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
   const monitor = await create({ kind: 'heartbeat', url: undefined });
   const receipt = () => request('/heartbeat/' + monitor.id, { method: 'POST', headers: { authorization }, body: 'ignored' });
-  const messages: unknown[] = [];
-  network.use(http.post('https://alerts.example/hook', async ({ request }) => { messages.push(await request.json()); return new HttpResponse(null, { status: 204 }); }));
+  const notifications = await captureNotifications();
   await mutate('/api/operator/webhook', 'PUT', { url: 'https://alerts.example/hook' });
+  await selectWebhooks(mutate);
   await maintenance(monitor.id, start + 600_000);
   await tick(180_000);
   expect((await status()).monitor).toMatchObject({ lastSeen: null, lastResult: { outcome: 'maintenance' } });
   clock.mockReturnValue(start + 200_000); await receipt();
   clock.mockReturnValue(start + 260_000); await receipt();
   expect((await status()).monitor).toMatchObject({ lastSeen: start + 260_000, lastResult: { at: start + 260_000, outcome: 'maintenance' } });
-  expect(messages).toEqual([]);
+  expect((await notifications.summaries())).toEqual([]);
   clock.mockReturnValue(start + 300_000); await maintenance(monitor.id);
   await tick(300_000);
   expect((await status()).incidents).toEqual([]);
@@ -119,7 +164,7 @@ it('keeps fresh and silent Heartbeats observable without transitions and require
   clock.mockReturnValue(start + 600_000); await receipt();
   await tick(780_000);
   expect((await status()).incidents[0].closedAt).toBeNull();
-  expect(messages).toHaveLength(1);
+  expect((await notifications.summaries())).toHaveLength(1);
   clock.mockReturnValue(start + 800_000);
   await tick(800_000); // Still silent; no duplicate opening.
   clock.mockReturnValue(start + 810_000); await receipt(); await receipt();
@@ -127,7 +172,7 @@ it('keeps fresh and silent Heartbeats observable without transitions and require
   expect((await status()).incidents[0].closedAt).toBeNull();
   clock.mockReturnValue(start + 870_000); await receipt();
   expect((await status()).incidents).toMatchObject([{ openedAt: start + 440_000, closedAt: start + 870_000 }]);
-  expect(messages).toEqual([{ text: 'Website: Incident opened' }, { text: 'Website: Incident recovered' }]);
+  expect((await notifications.summaries())).toEqual(['Website: Incident opened', 'Website: Incident recovered']);
 });
 it('renders ledger Maintenance controls and published banners with open outage precedence', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(start);
@@ -179,9 +224,9 @@ it('keeps healthy state, skips missing executions, and makes repeated early end 
 it.each(['http', 'tcp'].flatMap(kind => ['early end', 'expiry', 'active window'].map(boundary => ({ kind, boundary }))))('retains $kind overlap evidence when starting before declaration through $boundary', async ({ kind, boundary }) => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
   const monitor = await create(kind === 'tcp' ? { kind, url: undefined, hostname: 'db.example', port: 5432 } : {});
-  const messages: unknown[] = [];
-  network.use(http.post('https://alerts.example/hook', async ({ request }) => { messages.push(await request.json()); return new HttpResponse(null, { status: 204 }); }));
+  const notifications = await captureNotifications();
   await mutate('/api/operator/webhook', 'PUT', { url: 'https://alerts.example/hook' });
+  await selectWebhooks(mutate);
   const duringAttempt = async () => {
     clock.mockReturnValue(start + 1_000);
     await maintenance(monitor.id, start + 5_000);
@@ -199,7 +244,7 @@ it.each(['http', 'tcp'].flatMap(kind => ['early end', 'expiry', 'active window']
   await tick(0);
   expect((await status()).monitor).toMatchObject({ state: boundary === 'active window' ? 'maintenance' : 'unknown', lastResult: { at: start, outcome: 'maintenance' } });
   expect((await status()).incidents).toEqual([]);
-  expect(messages).toEqual([]);
+  expect((await notifications.summaries())).toEqual([]);
   // Overlap cannot contribute the first failure after the window.
   target.mockImplementation(async (input, init) => init?.method === 'POST' ? outbound(input, init) : new Response(null, { status: 503 }));
   vi.mocked(connect).mockImplementation(() => ({ opened: Promise.reject(new Error('refused')), closed: Promise.resolve(), close: async () => {} } as Socket));
@@ -207,15 +252,15 @@ it.each(['http', 'tcp'].flatMap(kind => ['early end', 'expiry', 'active window']
   expect((await status()).incidents).toEqual([]);
   clock.mockReturnValue(start + 120_000); await tick(120_000);
   expect((await status()).incidents).toMatchObject([{ openedAt: start + 120_000 }]);
-  expect(messages).toEqual([{ text: 'Website: Incident opened' }]);
+  expect((await notifications.summaries())).toEqual(['Website: Incident opened']);
 });
 
 it.each(['http', 'tcp'].flatMap(kind => ['expiry', 'early end'].map(boundary => ({ kind, boundary }))))('freezes an open $kind Incident across replacement and $boundary until post-window recovery', async ({ kind, boundary }) => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
   const monitor = await create(kind === 'tcp' ? { kind, url: undefined, hostname: 'db.example', port: 5432 } : {});
-  const messages: unknown[] = [];
-  network.use(http.post('https://alerts.example/hook', async ({ request }) => { messages.push(await request.json()); return new HttpResponse(null, { status: 204 }); }));
+  const notifications = await captureNotifications();
   await mutate('/api/operator/webhook', 'PUT', { url: 'https://alerts.example/hook' });
+  await selectWebhooks(mutate);
   let up = false;
   let duringAttempt = async () => {};
   const outbound = globalThis.fetch;
@@ -246,13 +291,13 @@ it.each(['http', 'tcp'].flatMap(kind => ['expiry', 'early end'].map(boundary => 
   expect(maintenanceAfterBoundary).toBeNull();
   expect((await status()).monitor).toMatchObject({ state: 'down', lastResult: { at: start + 120_000, outcome: 'maintenance' } });
   expect((await status()).incidents).toEqual([incident]);
-  expect(messages).toEqual([{ text: 'Website: Incident opened' }]);
+  expect((await notifications.summaries())).toEqual(['Website: Incident opened']);
   duringAttempt = async () => {};
   clock.mockReturnValue(start + 180_000); await tick(180_000);
   expect((await status()).incidents).toEqual([incident]);
   clock.mockReturnValue(start + 240_000); await tick(240_000);
   expect((await status()).incidents).toEqual([{ ...incident, closedAt: start + 240_000 }]);
-  expect(messages).toEqual([{ text: 'Website: Incident opened' }, { text: 'Website: Incident recovered' }]);
+  expect((await notifications.summaries())).toEqual(['Website: Incident opened', 'Website: Incident recovered']);
 });
 
 it.each(['http', 'tcp'] as const)('counts a %s attempt starting exactly at the Maintenance end normally', async kind => {
