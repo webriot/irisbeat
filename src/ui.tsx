@@ -34,11 +34,31 @@ function PublicIncidents({ data }: { data: Status }) {
   return <section id="public-incidents" hidden={!data.monitors.length} aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>{raw(statusLedger.incidents(data))}</section>;
 }
 
-function OperatorRows({ monitors, canEdit }: { monitors: ViewMonitor[]; canEdit: boolean }) {
-  if (!monitors.length) return <tr><td colSpan={4}>No Monitors</td></tr>;
+function scheduleDuration(seconds: number) {
+  for (const [factor, unit] of [[86400, "d"], [3600, "h"], [60, "min"]] as const) {
+    if (seconds % factor === 0) return `${seconds / factor} ${unit}`;
+  }
+  return `${seconds} s`;
+}
+
+function operatorSchedule(monitor: ViewMonitor, floor: number) {
+  if (!("scheduleMode" in monitor)) return "";
+  if (monitor.scheduleSuspensionFloorSeconds !== undefined) {
+    const suspendedAt = monitor.scheduleSuspensionFloorSeconds;
+    return `Suspended (${scheduleDuration(suspendedAt)} minimum${suspendedAt === floor ? "" : " at suspension"})`;
+  }
+  if (monitor.scheduleMode === "calendar") return "Calendar";
+  if (monitor.kind === "heartbeat") return "Watchdog";
+  const saved = monitor.intervalSeconds ?? floor;
+  const effective = monitor.effectiveIntervalSeconds ?? saved;
+  return `Every ${scheduleDuration(effective)}${saved === effective ? "" : ` (saved ${scheduleDuration(saved)})`}`;
+}
+
+function OperatorRows({ monitors, canEdit, floor }: { monitors: ViewMonitor[]; canEdit: boolean; floor: number }) {
+  if (!monitors.length) return <tr><td colSpan={5}>No Monitors</td></tr>;
   return <>{monitors.map(monitor => <>
     <tr data-key={monitor.id}>
-      <td>{monitor.name}</td><td class="status" data-state={monitor.state}>{statusLedger.stateLabel[monitor.state]}</td><td>{"published" in monitor && monitor.published ? "Published" : "Private"}</td>
+      <td>{monitor.name}</td><td class="status" data-state={monitor.state}>{statusLedger.stateLabel[monitor.state]}</td><td>{operatorSchedule(monitor, floor)}</td><td>{"published" in monitor && monitor.published ? "Published" : "Private"}</td>
       <td><div class="monitor-actions" id={`actions-${monitor.id}`} role="group" aria-label={`Actions ${monitor.name}`}>
         {canEdit && monitorActions({ published: "published" in monitor && monitor.published }).map(({ key, label, icon }) =>
           <button type="button" data-key={key} class={key === "delete" ? "monitor-action danger" : "monitor-action"} title={label} aria-label={`${label} ${monitor.name}`}>
@@ -46,7 +66,7 @@ function OperatorRows({ monitors, canEdit }: { monitors: ViewMonitor[]; canEdit:
           </button>)}
       </div></td>
     </tr>
-    <tr data-key={`${monitor.id}:history`}><td colSpan={4} id={`history-${monitor.id}`} aria-label={`${monitor.name} availability`}>{raw(statusLedger.history(monitor.history, monitor.id))}</td></tr>
+    <tr data-key={`${monitor.id}:history`}><td colSpan={5} id={`history-${monitor.id}`} aria-label={`${monitor.name} availability`}>{raw(statusLedger.history(monitor.history, monitor.id))}</td></tr>
   </>)}</>;
 }
 
@@ -90,9 +110,9 @@ export function renderViewPartial(scope: ViewScope, data: Status, audience: View
     default: {
       const all = scope === "monitors";
       const html = operator
-        ? (data.monitors.length || all ? String(<OperatorRows monitors={data.monitors} canEdit={audience === "editor"} />) : "")
+        ? (data.monitors.length || all ? String(<OperatorRows monitors={data.monitors} canEdit={audience === "editor"} floor={data.minCheckIntervalSeconds ?? 60} />) : "")
         : String(<PublicRows monitors={data.monitors} />);
-      return { html, ...(operator ? { monitors: data.monitors.map(({ history: _history, ...monitor }) => monitor) } : {}) };
+      return { html, ...(operator ? { monitors: data.monitors.map(({ history: _history, ...monitor }) => monitor), minCheckIntervalSeconds: data.minCheckIntervalSeconds } : {}) };
     }
   }
 }
@@ -182,7 +202,7 @@ function Operator({ hosted }: { hosted: boolean }) {
       <Paused paused={false} />
       <div id="workspace">
         <div id="new-monitor-panel"></div>
-      <table aria-label="Monitors"><colgroup><col class="monitor-column" /><col class="state-column" /><col class="publication-column" /><col class="actions-column" /></colgroup><thead><tr><th scope="col">Monitor</th><th scope="col">State</th><th scope="col">Publication</th><th scope="col">Actions</th></tr></thead><tbody id="monitor-rows"></tbody></table>
+      <table aria-label="Monitors"><colgroup><col class="monitor-column" /><col class="state-column" /><col class="schedule-column" /><col class="publication-column" /><col class="actions-column" /></colgroup><thead><tr><th scope="col">Monitor</th><th scope="col">State</th><th scope="col">Schedule</th><th scope="col">Publication</th><th scope="col">Actions</th></tr></thead><tbody id="monitor-rows"></tbody></table>
       <dialog id="maintenance-dialog" aria-labelledby="maintenance-heading"><form id="maintenance" hidden aria-labelledby="maintenance-heading">
         <h2 id="maintenance-heading">Maintenance</h2>
         <label for="maintenance-end">End time</label><input id="maintenance-end" type="datetime-local" required />
@@ -217,7 +237,7 @@ function Operator({ hosted }: { hosted: boolean }) {
           <fieldset id="destination-selection" hidden><legend tabindex={-1}>Notification destinations</legend>
             <div id="destination-choices"></div><p id="no-destination-choices">No destinations</p>
           </fieldset>
-          <p id="monitor-deleted" role="status" hidden>This Monitor was deleted. Copy your draft or cancel.</p><button id="save-monitor">Save Monitor</button><button id="cancel-edit" type="button">Cancel</button>
+          <p id="monitor-deleted" role="status" hidden>This Monitor was deleted. Copy your draft or cancel.</p><button id="save-monitor">Save Monitor</button><button id="resume-schedule" hidden>Save and Resume</button><button id="cancel-edit" type="button">Cancel</button>
         </form>
       <section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2><div id="incidents"></div></section>
       </div>
@@ -622,7 +642,8 @@ h2 { margin: 0; font-size: 16px; font-weight: 650; }
 .ledger-row[data-state="maintenance"] .status, .status[data-state="maintenance"], .ledger-row[data-state="paused"] .status, .status[data-state="paused"] { color: var(--info); }
 table { width: 100%; table-layout: fixed; border-spacing: 0; margin-top: 20px; }
 .monitor-column { width: auto; }
-.state-column, .publication-column { width: 19%; }
+.state-column, .schedule-column { width: 17%; }
+.publication-column { width: 15%; }
 .actions-column { width: 226px; }
 th, td { padding: 12px 16px; text-align: left; }
 th { font-size: 12px; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--line); }
@@ -818,6 +839,7 @@ function renderDestinations(next, monitors, markup) {
 
 let hosted = false;
 let monitorIds = new Set();
+let monitorFloor = 60;
 function updateDeleted() {
   monitorEditor.update(monitorIds);
   const maintenanceMissing = !maintenanceForm.hidden && !monitorIds.has(maintenanceForm.dataset.monitorId);
@@ -858,7 +880,10 @@ function clearSession() {
 function bindMonitorActions(group, monitor) {
   const path = '/api/operator/monitors/' + encodeURIComponent(monitor.id);
   const actions = {
-    edit: () => monitorEditor.open(monitor, hosted),
+    edit: () => {
+      monitorEditor.setSchedulePolicy(monitorFloor, monitor.scheduleSuspended === true);
+      monitorEditor.open(monitor, hosted);
+    },
     publication: () => run(path, 'PATCH', { published: !monitor.published }),
     maintenance: () => declareMaintenance(monitor),
     delete: () => { if (confirm('Delete ' + monitor.name + '? Checks and publication stop. Incident history is retained.')) run(path, 'DELETE'); },
@@ -890,6 +915,9 @@ function renderOperatorPartials(partials, savedField) {
       renderDestinations(data.destinations, data.selections, next);
       monitorEditor.refreshDestinations(destinations, data.selections.find(monitor => monitor.id === monitorEditor.id)?.destinationIds);
     } else {
+      monitorFloor = data.minCheckIntervalSeconds ?? 60;
+      const edited = data.monitors.find(monitor => monitor.id === monitorEditor.id);
+      if (edited || !monitorEditor.id) monitorEditor.setSchedulePolicy(monitorFloor, edited?.scheduleSuspended === true);
       const id = scope.startsWith('monitor/') ? scope.slice(8) : null;
       if (id) {
         if (data.monitors.length) monitorIds.add(id);
@@ -1013,7 +1041,7 @@ function showSettings(settings) {
 }
 byId('settings-button').addEventListener('click', () => { showSettings(true); byId('pageName').focus(); });
 byId('back-monitors').addEventListener('click', () => { showSettings(false); byId('settings-button').focus(); });
-byId('new-monitor').addEventListener('click', () => monitorEditor.open(null, hosted));
+byId('new-monitor').addEventListener('click', () => { monitorEditor.setSchedulePolicy(monitorFloor, false); monitorEditor.open(null, hosted); });
 byId('retry').addEventListener('click', () => run());
 byId('logout').addEventListener('click', session.signOut);
 `;
