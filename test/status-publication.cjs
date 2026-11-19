@@ -214,12 +214,17 @@ module.exports = async function test({ mf, options, application, request, tick, 
   assert.equal((await (await request('/api/operator')).json()).monitors.at(-1).state, 'down');
   // Warm long-window cache entries must recover through a scoped retry and an ordinary GET.
   await mf.setOptions(options(application, 'history-state', true, undefined, { STATUS_RENDER_INTERVAL_SECONDS: '86400' }));
-  const day = Date.UTC(2026, 10, 19);
+  const day = Date.now() - Date.now() % 86_400_000;
   const readAt = (path, at) => request(path, 'GET', undefined, at).then(response => response.json());
   const heartbeat = name => request('/api/operator/monitors', 'POST', { name, kind: 'heartbeat' }, day + 1000).then(response => response.json());
   const first = (await heartbeat('First history')).monitor;
   const second = (await heartbeat('Second history')).monitors[1];
-  for (const monitor of [first, second]) await request('/heartbeat/' + monitor.id, 'POST', undefined, day + 2000);
+  for (const monitor of [first, second]) {
+    assert.equal((await request('/heartbeat/' + monitor.id, 'POST', undefined, day + 2000)).status, 204);
+  }
+  const operatorWithHistory = await readAt('/api/operator', day + 2000);
+  assert.equal(operatorWithHistory.monitors[0].history?.percentage, 100);
+  assert.equal(operatorWithHistory.monitors[1].history?.percentage, 100);
   const mode = value => request('/test-history-mode?mode=' + value);
   await mode('failed');
   const publishedAt = day + 86_400_000 + 1000;
@@ -227,7 +232,7 @@ module.exports = async function test({ mf, options, application, request, tick, 
   const old = await readAt('/api/status', publishedAt);
   assert.equal(old.monitors[0].history, null);
   assert.match((await readAt(firstRow, publishedAt)).html, /Bars unavailable/);
-  assert.equal((await readAt('/test-history-queries', publishedAt)).length, 1, 'warm unresolved reads respect the retry deadline');
+  assert.equal((await readAt('/test-history-queries', publishedAt)).length, 2, 'warm unresolved reads respect the retry deadline');
   await request('/api/operator/monitors/' + first.id, 'PATCH', { published: false }, publishedAt + 1500);
   // This later receipt is deliberately backdated into the old day.
   await request('/heartbeat/' + first.id, 'POST', undefined, day + 3000);

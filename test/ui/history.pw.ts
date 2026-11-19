@@ -264,7 +264,11 @@ for (const { path, unavailable } of [{ path: '/', unavailable: false }, { path: 
         if (scopedReads === 1) { await route.fulfill({ status: 503 }); return; }
         const response = await route.fetch();
         const data = await response.json();
-        data.html = data.html.replace(/ data-history-retry="[^"]*"/g, '');
+        if (scopedReads < 4) {
+          data.html = data.html.replace('100.00%', 'No observations');
+        } else {
+          data.html = data.html.replace(/ data-history-retry="[^"]*"/g, '');
+        }
         await route.fulfill({ response, json: data });
       });
       await page.goto(path);
@@ -280,9 +284,15 @@ for (const { path, unavailable } of [{ path: '/', unavailable: false }, { path: 
       await expect.poll(() => scopedReads).toBe(1);
       await expect(page.getByText('Updates unavailable', { exact: true })).toBeHidden();
       await page.clock.fastForward(30_000);
+      await expect.poll(() => scopedReads).toBe(2);
+      await expect(row.locator('.percentage')).toHaveText('No observations');
+      await page.clock.fastForward(30_000);
+      await expect.poll(() => scopedReads).toBe(3);
+      await expect(row.locator('.percentage')).toHaveText('No observations');
+      await page.clock.fastForward(30_000);
       await expect(row.getByText('100.00%', { exact: true })).toBeVisible();
       await page.clock.fastForward(90_000);
-      expect(scopedReads).toBe(2);
+      expect(scopedReads).toBe(4);
       expect(fullReads).toBe(unavailable ? 2 : 1);
       expect(connections).toBe(1);
     } finally {

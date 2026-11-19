@@ -264,22 +264,37 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   async alarm() {
     const now = Date.now();
-    const state = this.read(now);
+    this.read(now);
     if ((this.availability.flushAt ?? Infinity) <= now) {
+      // Persist the next wakeup before handing off any points from this alarm.
+      this.availability.delayFlush(now);
+      this.scheduleSubscriptionAlarm();
+      await this.drainAvailability(availabilityWriteLimit);
+    }
+    if (this.liveSockets("public").length && this.statusPublicationAt() <= now)
+      await this.advanceStatusPublication(this.read(now), now);
+    this.scheduleSubscriptionAlarm();
+  }
+
+  private async drainAvailability(limit: number) {
+    if (limit <= 0 || this.availability.flushAt === undefined) return;
+    // Keep new observations and other drains out until the selected work is durable.
+    await this.ctx.blockConcurrencyWhile(async () => {
+      await this.ctx.storage.sync();
+      const now = Date.now();
+      const state = this.ctx.storage.kv.get<StoredContext>("context");
       this.ctx.storage.transactionSync(() => {
-        const changed = this.availability.flush(now);
-        for (const monitor of state.monitors) {
+        const changed = this.availability.flush(now, limit);
+        for (const monitor of state?.monitors ?? []) {
           if (changed.has(monitor.id)) {
             monitor.historyRevision = (monitor.historyRevision ?? 0) + 1;
             monitor.historyChangedAt = now;
           }
         }
-        if (changed.size) this.ctx.storage.kv.put("context", state);
+        if (state && changed.size) this.ctx.storage.kv.put("context", state);
+        this.scheduleSubscriptionAlarm();
       });
-    }
-    if (this.liveSockets("public").length && this.statusPublicationAt() <= now)
-      await this.advanceStatusPublication(state, now);
-    this.scheduleSubscriptionAlarm();
+    });
   }
 
   private pendingStatus() {
@@ -523,10 +538,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       if (day !== undefined) clock.day = day;
       else clock.day ??= Math.floor(Date.now() / DAY);
       if (day !== undefined || Object.keys(hints).length) this.ctx.storage.kv.put("view-clock", clock);
+      if (Object.keys(hints).length) this.scheduleSubscriptionAlarm();
       return { hints, revision: clock.editor };
     });
     if (Object.keys(hints).length) {
-      this.scheduleSubscriptionAlarm();
       this.publishViewChanges(hints);
     }
     return { revision, scopes: hints.editor?.scopes ?? [] };
@@ -966,28 +981,28 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   async check(at: number, writeLimit = availabilityWriteLimit) {
-    const budget = { remaining: writeLimit };
     const pending: Promise<void>[] = [];
     const { monitors } = this.read(Math.max(at, Date.now()), { pending });
     const calendarPolicy = this.prepareOutboundCalendars();
     await Promise.all([calendarPolicy, ...pending, ...monitors.map(async monitor => {
       if (monitor.kind !== "heartbeat" && monitor.scheduleMode === "calendar") await calendarPolicy;
-      await this.checkMonitor(monitor.id, at, budget);
+      await this.checkMonitor(monitor.id, at);
     })]);
     if (this.availability.flushAt !== undefined) this.scheduleSubscriptionAlarm();
+    await this.drainAvailability(Math.min(writeLimit, availabilityWriteLimit));
   }
 
   protected outboundStartTime(_scheduledAt: number) {
     return Date.now();
   }
 
-  private async checkMonitor(id: string, at: number, budget: { remaining: number }) {
+  private async checkMonitor(id: string, at: number) {
     const state = this.read(at);
     const attempt = state.monitors.find(monitor => monitor.id === id);
     if (!attempt || state.paused) return;
     if (attempt.kind === "heartbeat") {
       if (attempt.scheduleMode === "calendar") {
-        await this.checkCalendarHeartbeat(id, at, budget);
+        await this.checkCalendarHeartbeat(id, at);
         return;
       }
       if (at >= (attempt.lastSeen ?? attempt.createdAt) + attempt.silenceSeconds * 1000) {
@@ -995,7 +1010,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         // Active Maintenance suppresses dispatch. Expired windows use the observation time.
         const maintenance = !!attempt.maintenance ||
           this.ctx.storage.sql.exec("SELECT 1 FROM calendar_maintenance WHERE monitorId = ? AND startedAt <= ? AND endsAt > ? LIMIT 1", id, at, at).toArray().length > 0;
-        await this.record(state, attempt, at, false, 1, attempt.recoveryThreshold, maintenance, false, budget);
+        await this.record(state, attempt, at, false, 1, attempt.recoveryThreshold, maintenance);
       }
       return;
     }
@@ -1069,12 +1084,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     // Record the executed attempt without overwriting newer configuration.
     const monitor = current.monitors.find(monitor => monitor.id === attempt.id);
     if (!monitor || current.paused || observation.paused) return;
-    await this.record(current, monitor, at, success, attempt.failureThreshold, attempt.recoveryThreshold, observation.maintenance, (monitor.scheduleRevision ?? 0) !== (attempt.scheduleRevision ?? 0), budget);
+    await this.record(current, monitor, at, success, attempt.failureThreshold, attempt.recoveryThreshold, observation.maintenance, (monitor.scheduleRevision ?? 0) !== (attempt.scheduleRevision ?? 0));
   }
 
   private calendarChecking = new Set<string>();
 
-  private async checkCalendarHeartbeat(id: string, at: number, budget: { remaining: number }) {
+  private async checkCalendarHeartbeat(id: string, at: number) {
     if (this.calendarChecking.has(id)) return;
     this.calendarChecking.add(id);
     const initial = this.read(at);
@@ -1094,14 +1109,14 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         monitor.nextDue = calendar(monitor.cron, monitor.timezone).next(occurrence)[0];
         const endedBetweenWindows = this.ctx.storage.sql.exec("SELECT 1 FROM calendar_maintenance WHERE monitorId = ? AND endsAt > ? AND endsAt <= ? LIMIT 1", id, monitor.lastResult?.at ?? monitor.createdAt, occurrence).toArray().length > 0;
         if (maintenance || endedBetweenWindows) { monitor.failures = 0; monitor.successes = 0; }
-        await this.record(current, monitor, deadline, success, 1, monitor.recoveryThreshold, maintenance, false, budget);
+        await this.record(current, monitor, deadline, success, 1, monitor.recoveryThreshold, maintenance);
       }
     } finally {
       this.calendarChecking.delete(id);
     }
   }
 
-  private async record(current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number, maintenance = !!monitor.maintenance, resetProgress = false, budget?: { remaining: number }) {
+  private async record(current: StoredContext, monitor: Monitor, at: number, success: boolean, failureThreshold: number, recoveryThreshold: number, maintenance = !!monitor.maintenance, resetProgress = false) {
     if (current.paused) return;
     const pauseGeneration = current.pauseGeneration ?? 0;
     let transition: "opened" | "recovered" | undefined;
@@ -1110,14 +1125,13 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const observation = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" } as const;
     const now = Date.now();
     const inRange = this.availability.configured && at >= historyStart(Math.max(at, now));
-    const deferred = inRange && budget?.remaining === 0;
     this.commitViewChanges(() => {
       const previousState = monitor.state;
       monitor.lastResult = observation;
       if (inRange) {
         monitor.historyRevision = (monitor.historyRevision ?? 0) + 1;
         monitor.historyChangedAt = now;
-        if (deferred) this.availability.defer(monitor.id, observation, monitor.historyRevision!);
+        this.availability.enqueue(monitor.id, observation, monitor.historyRevision);
       }
       if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
         this.ctx.storage.sql.exec("DELETE FROM calendar_receipts WHERE monitorId = ? AND occurrence < ?", monitor.id, monitor.nextDue);
@@ -1167,13 +1181,6 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       if (transition || previousState !== monitor.state) scopes.push("banner");
       return monitorScopes(monitor, ...scopes);
     });
-    if (inRange && !deferred) {
-      if (budget) budget.remaining--;
-      if (!this.availability.write(monitor.id, observation, monitor.historyRevision!)) {
-        this.availability.defer(monitor.id, observation, monitor.historyRevision!);
-        this.scheduleSubscriptionAlarm();
-      }
-    }
     if (!transition || !transitionedIncident) return;
     if (monitor.notificationSelections?.length) {
       await this.enqueueNotifications(monitor, pauseGeneration, {
@@ -1321,10 +1328,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       commitFreshness();
     } else if (monitor.maintenance) {
       await this.record(current, monitor, at, true, 1, monitor.recoveryThreshold, !!monitor.maintenance);
+      await this.drainAvailability(1);
     } else if (monitor.state !== "down" || monitor.recoveryReceiptAt === null ||
         at >= monitor.recoveryReceiptAt + monitor.recoverySpacingSeconds * 1000) {
       monitor.recoveryReceiptAt = at;
       await this.record(current, monitor, at, true, 1, monitor.recoveryThreshold, !!monitor.maintenance);
+      await this.drainAvailability(1);
     } else {
       commitFreshness();
     }
@@ -1360,10 +1369,11 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return state.monitors.filter(monitor => selected.has(monitor.id));
   }
 
-  private readAvailability(state: StoredContext, projection: Status, at: number) {
+  private readAvailability(state: StoredContext, projection: Status, at: number, operator: boolean) {
     return this.availability.read(this.projectedMonitors(state, projection), at, () => {
       const state = this.ctx.storage.kv.get<StoredContext>("context");
-      return new Map(state?.monitors.map(monitor => [monitor.id, monitor.historyRevision]));
+      return new Map(state?.monitors.filter(monitor => operator || monitor.published)
+        .map(monitor => [monitor.id, monitor.historyRevision]));
     });
   }
 
@@ -1392,7 +1402,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const at = Date.now();
     const state = this.read(at);
     const data = this.project(state, operator, secrets, at);
-    return attachAvailability(data, await this.readAvailability(state, data, at));
+    return attachAvailability(data, await this.readAvailability(state, data, at, operator));
   }
 
   async readView(scope: ViewScope, audience: ViewAudience, minimum = 0) {
@@ -1402,7 +1412,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const operator = audience !== "public";
     const data = this.project(state, operator, audience === "editor", at, scope);
     if (revision < minimum || !includesLedger(scope) || !data.monitors.length) return { revision, data };
-    const history = await this.readAvailability(state, data, at);
+    const history = await this.readAvailability(state, data, at, operator);
     return { revision, data: attachAvailability(data, history) };
   }
 

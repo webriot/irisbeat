@@ -7,6 +7,7 @@ import { createMonitorEditor } from "./monitor-editor";
 import type { Child } from "hono/jsx";
 import { raw } from "hono/html";
 import { createStatusLedger, monitorActions } from "./status-ledger";
+import { historyRetryAttempts, historyRetryInterval } from "./availability-history";
 
 import { mergeScopes, type ViewAudience, type ViewScope } from "./view-changes";
 
@@ -345,7 +346,7 @@ function liveSnapshots(path, read, authorize) {
   function historyRows() {
     const ids = [...document.querySelectorAll('[data-history-retry]')].map(node => node.dataset.historyRetry);
     for (const id of historyAttempts.keys()) if (!ids.includes(id)) historyAttempts.delete(id);
-    return ids.filter(id => (historyAttempts.get(id) || 0) < 4)
+    return ids.filter(id => (historyAttempts.get(id) || 0) < ${historyRetryAttempts})
       .sort((a, b) => (historyAttempts.get(a) || 0) - (historyAttempts.get(b) || 0)).slice(0, 32);
   }
   function scheduleHistory() {
@@ -361,7 +362,7 @@ function liveSnapshots(path, read, authorize) {
           if (ids.length) enqueue({ revision: minimumRevision, scopes: ids.map(id => 'monitor/' + id), history: true });
         }
         scheduleHistory();
-      }, 30000);
+      }, ${historyRetryInterval});
     }
   }
   function pollingMode() {

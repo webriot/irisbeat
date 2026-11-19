@@ -156,7 +156,7 @@ it('re-resolves hosted reader/editor access for each ticket and keeps context, o
     permission: 'reader', revision: 1, html: expect.stringContaining('Tenant private'),
     monitors: [{ id: tenantMonitor.monitor!.id }],
   });
-  expect(await (await fetch('b.example', row)).json()).toEqual({ permission: 'reader', revision: 1, html: '', monitors: [] });
+  expect(await (await fetch('b.example', row)).json()).toEqual({ permission: 'reader', revision: 1, html: '', monitors: [], minCheckIntervalSeconds: 60 });
   permission = null;
   expect((await fetch('a.example', '/api/operator/events/ticket', 'POST')).status).toBe(401);
   expect((await fetch('a.example', '/api/operator')).status).toBe(401);
