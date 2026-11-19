@@ -1000,7 +1000,7 @@ function renderOperatorSnapshot(data, savedField) {
   restoreOperatorFocus(focused);
 }
 
-const session = createOperatorSession(liveSnapshots, {
+const session = createOperatorSession(liveSnapshots, mergeScopes, {
   partials: renderOperatorPartials,
   snapshot: renderOperatorSnapshot,
   pageNameSaved() { savedPageName = byId('pageName').value; },

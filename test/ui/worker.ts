@@ -15,6 +15,7 @@ const hosted = createHostedWorker({
   contractVersion: '1',
   resolve(request) {
     const token = request.headers.get('authorization');
+    if (token === 'Bearer ui-partials-editor') return { id: 'ui-operator-partials', monitorLimit: 10, permission: 'editor' };
     return {
       id: 'ui-hosted', monitorLimit: 10,
       permission: token === 'Bearer ui-editor' ? 'editor' : token === 'Bearer ui-reader' ? 'reader' : null,

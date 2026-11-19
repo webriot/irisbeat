@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import type { ViewHint, ViewScope } from './view-changes';
+import type { mergeScopes, ViewHint, ViewScope } from './view-changes';
 
 type OperatorPartial = { scope: ViewScope; data: { html: string } };
 type PartialData = { html: string; revision: number; permission: 'reader' | 'editor' };
+type PartialBatch = { revision: number; permission: 'reader' | 'editor'; partials: OperatorPartial[] };
 
 type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 type OperatorSnapshot = { partials: OperatorPartial[]; permission: 'reader' | 'editor'; hosted: boolean };
@@ -31,7 +32,7 @@ export interface OperatorSessionCallbacks {
 }
 
 // Self-contained: ui.tsx embeds this factory into the classic Operator script.
-export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: OperatorSessionCallbacks) {
+export function createOperatorSession(liveSnapshots: LiveSnapshots, mergeViewScopes: typeof mergeScopes, ui: OperatorSessionCallbacks) {
   let secret = '';
   let permission: 'reader' | 'editor' = 'editor';
   let generation = 0;
@@ -42,22 +43,40 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
   let updates: ReturnType<LiveSnapshots> | undefined;
   let previewSequence = 0;
   let previewTimer: ReturnType<typeof setTimeout> | undefined;
+  const applied = new Map<ViewScope, number>();
   // Object methods avoid bundler name helpers outside the stringified factory.
   const lifecycle = {
     latest(started: number, version: number) { return started === generation && version === requestVersion; },
-    async readPartials(change: MutationAck, signal: AbortSignal, started: number) {
-      return Promise.all(change.scopes.map(async scope => {
-        const response = await fetch('/api/operator/partials/' + scope + '?revision=' + change.revision, {
-          headers: { Authorization: 'Bearer ' + secret }, signal,
-        });
-        if (started === generation && response.status === 401) lifecycle.unauthorized();
-        if (!response.ok) throw new Error('Request failed');
-        const data = await response.json() as PartialData;
-        if (data.permission !== permission || !Number.isSafeInteger(data.revision) || data.revision < change.revision) {
-          throw new Error('Revision or permission changed');
+    async readPartials(scopes: ViewScope[], minimum: number, signal: AbortSignal, started: number) {
+      const query = new URLSearchParams({ revision: String(minimum) });
+      let path = '/api/operator/partials';
+      if (scopes.length === 1) path += '/' + scopes[0];
+      else for (const scope of scopes) query.append('scope', scope);
+      const response = await fetch(path + '?' + query, { headers: { Authorization: 'Bearer ' + secret }, signal });
+      if (started === generation && response.status === 401) lifecycle.unauthorized();
+      if (!response.ok) throw new Error('Request failed');
+      const data = await response.json() as PartialBatch | PartialData;
+      if (data.permission !== permission || !Number.isSafeInteger(data.revision) || data.revision < minimum) {
+        throw new Error('Revision or permission changed');
+      }
+      const partials = 'partials' in data ? data.partials : [{ scope: scopes[0], data }];
+      if (partials.length !== scopes.length || partials.some(({ scope, data }, index) =>
+        scope !== scopes[index] || typeof data.html !== 'string')) throw new Error('Sections unavailable');
+      return { revision: data.revision, partials };
+    },
+    appliedRevision(scope: ViewScope) {
+      return Math.max(applied.get(scope) ?? -1, scope.startsWith('monitor/') ? applied.get('monitors') ?? -1 : -1);
+    },
+    applyPartials({ revision, partials }: Pick<PartialBatch, 'revision' | 'partials'>) {
+      ui.partials(partials);
+      for (const { scope } of partials) {
+        applied.set(scope, revision);
+        if (scope === 'monitors') {
+          for (const [row, rowRevision] of applied) {
+            if (row.startsWith('monitor/') && rowRevision <= revision) applied.delete(row);
+          }
         }
-        return { scope, data };
-      }));
+      }
     },
     startUpdates() {
       if (updates) return;
@@ -79,9 +98,10 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
     unauthorized() { session.signOut(); ui.failed('Unauthorized', false); },
   };
   const session = {
-    signIn(credential: string) { ++generation; secret = credential; return session.run(); },
+    signIn(credential: string) { ++generation; applied.clear(); secret = credential; return session.run(); },
     signOut() {
       ++generation; ++requestVersion; secret = ''; writeDone = undefined; pendingRefresh = false; activeRead = undefined;
+      applied.clear();
       updates?.stop(); updates = undefined;
       session.cancelPreview();
       ui.signedOut();
@@ -106,10 +126,13 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
       let refreshingWrite = false;
       try {
         if (hint) {
-          const partials = await lifecycle.readPartials(hint, controller.signal, started);
+          const scopes = mergeViewScopes([], hint.scopes).filter(scope => hint.history || lifecycle.appliedRevision(scope) < hint.revision);
+          const batch = scopes.length ? await lifecycle.readPartials(scopes, hint.revision, controller.signal, started) : undefined;
           if (lifecycle.latest(started, version) && current()) {
-            ui.partials(partials);
-            if (!hint.history) ui.reading?.('success');
+            if (batch) {
+              lifecycle.applyPartials(batch);
+              if (!hint.history) ui.reading?.('success');
+            }
           }
           return;
         }
@@ -131,6 +154,7 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
           if (!current()) return;
           if (!('partials' in data)) throw new Error('Snapshot unavailable');
           permission = data.permission;
+          applied.clear();
           ui.snapshot(data);
           ui.reading?.('success');
           lifecycle.startUpdates();
@@ -140,9 +164,12 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
             refreshingWrite = true;
             if (method === 'PUT' && path === '/api/operator') ui.pageNameSaved();
             try {
-              const partials = await lifecycle.readPartials(data, controller.signal, started);
-              if (!lifecycle.latest(started, version)) return;
-              ui.partials(partials);
+              const scopes = mergeViewScopes([], data.scopes);
+              if (scopes.length) {
+                const batch = await lifecycle.readPartials(scopes, data.revision, controller.signal, started);
+                if (!lifecycle.latest(started, version)) return;
+                lifecycle.applyPartials(batch);
+              }
             } catch {
               if (!lifecycle.latest(started, version)) return;
               ui.failed('Updates unavailable', true);
@@ -150,6 +177,7 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
             }
           } else if ('partials' in data) {
             permission = data.permission;
+            applied.clear();
             if (method === 'PUT' && path === '/api/operator') ui.pageNameSaved();
             ui.snapshot(data);
           }

@@ -1472,23 +1472,31 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   async readView(scope: ViewScope, audience: ViewAudience, minimum = 0) {
+    return this.readViews([scope], audience, minimum);
+  }
+
+  async readViews(scopes: ViewScope[], audience: ViewAudience, minimum: number) {
     const at = Date.now();
     const state = this.read(at);
     const revision = this.viewClock()[audience];
     const operator = audience !== "public";
-    const data = this.project(state, operator, audience === "editor", at, scope);
-    if (revision < minimum || !includesLedger(scope) || !data.monitors.length) return { revision, data };
-    const history = await this.readAvailability(state, data, at, operator);
+    const data = this.project(state, operator, audience === "editor", at, scopes);
+    if (revision < minimum || !scopes.some(includesLedger)) return { revision, data };
+    const monitors = scopes.includes("monitors") ? data.monitors
+      : data.monitors.filter(monitor => scopes.includes(`monitor/${monitor.id}`));
+    if (!monitors.length) return { revision, data };
+    const history = await this.readAvailability(state, { ...data, monitors }, at, operator);
     return { revision, data: attachAvailability(data, history) };
   }
 
-  private project(state: StoredContext, operator: boolean, secrets: boolean, at: number, scope?: ViewScope) {
+  private project(state: StoredContext, operator: boolean, secrets: boolean, at: number, scopes?: ViewScope[]) {
     const start = historyStart(at);
-    const row = scope?.startsWith("monitor/") ? scope.slice("monitor/".length) : null;
-    const withHistory = !scope || includesLedger(scope);
-    const withIncidents = !scope || scope === "incidents" || scope === "banner" && !operator;
-    const visible = withHistory || withIncidents || scope === "destinations"
-      ? state.monitors.filter(monitor => (operator || monitor.published) && (row === null || monitor.id === row)) : [];
+    const publicBanner = !operator && scopes?.includes("banner");
+    const withIncidents = !scopes || scopes.includes("incidents") || publicBanner;
+    const withAllMonitors = withIncidents || scopes?.includes("monitors") || scopes?.includes("destinations");
+    const visible = withAllMonitors || scopes?.some(includesLedger)
+      ? state.monitors.filter(monitor => (operator || monitor.published) &&
+        (withAllMonitors || scopes?.includes(`monitor/${monitor.id}`))) : [];
     const monitors = visible.map(monitor => ({
       ...publicMonitor(monitor, !!state.paused),
       history: null as AvailabilityHistory | null,
@@ -1511,7 +1519,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
           : { timeoutSeconds: monitor.timeoutSeconds, failureThreshold: monitor.failureThreshold }),
       } : {}),
     }));
-    const includeDestinations = secrets && (!scope || scope === "destinations");
+    const includeDestinations = secrets && (!scopes || scopes.includes("destinations"));
     const legacy = includeDestinations && state.destinations?.find(destination => destination.id === state.legacyDestinationId);
     return {
       ...(includeDestinations ? {
@@ -1527,9 +1535,9 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       monitor: monitors[0] ?? null,
       incidents: withIncidents ? this.ctx.storage.sql
         .exec<Incident>(operator ? "SELECT * FROM incidents ORDER BY openedAt DESC, id"
-          : scope === "banner" ? "SELECT * FROM incidents WHERE openedAt < ? AND closedAt IS NULL"
+          : publicBanner ? "SELECT * FROM incidents WHERE openedAt < ? AND closedAt IS NULL"
           : "SELECT * FROM incidents WHERE openedAt < ? AND (closedAt IS NULL OR closedAt > ?) ORDER BY openedAt DESC, id",
-          ...(operator ? [] : scope === "banner" ? [start + 90 * DAY] : [start + 90 * DAY, start]))
+          ...(operator ? [] : publicBanner ? [start + 90 * DAY] : [start + 90 * DAY, start]))
         .toArray().filter(incident => operator || visible.some(monitor => monitor.id === incident.monitorId)) : [],
     };
   }
@@ -1891,7 +1899,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   const readinessPath = "/api/operator/history/readiness";
   const publicPartials = "/api/status/partials";
   const operatorPartials = "/api/operator/partials";
-  const operatorPartialPaths = [operatorPartials + "/:section", operatorPartials + "/monitor/:id"];
+  const operatorPartialPaths = [operatorPartials, operatorPartials + "/:section", operatorPartials + "/monitor/:id"];
   const operatorPaths = [readinessPath, ...operatorPartialPaths, ticketPath, previewPath, destinationsPath, destinationPath, resendPath, "/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
   for (const path of operatorPaths) app.use(path, async (c, next) => {
     const resolved = c.get("resolved");
@@ -1906,19 +1914,30 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   const partial = async (c: Context<HttpEnv<E>>) => {
     const operator = c.req.path.startsWith(operatorPartials);
     const prefix = operator ? operatorPartials : publicPartials;
-    const resource = c.req.path.slice(prefix.length + 1);
+    const batch = c.req.path === operatorPartials;
+    const resources = batch ? c.req.queries("scope") ?? [] : [c.req.path.slice(prefix.length + 1)];
     const audience: ViewAudience = operator ? c.get("permission")! : "public";
     const sections = audience === "editor" ? ["page", "banner", "monitors", "incidents", "destinations"]
       : ["page", "banner", "monitors", "incidents"];
-    if (!sections.includes(resource) && !/^monitor\/[A-Za-z0-9_-]{1,80}$/.test(resource)) return c.notFound();
+    if (!resources.length || resources.length > 37) return c.text("Invalid sections", 400);
+    if (resources.some(resource => !sections.includes(resource) && !/^monitor\/[A-Za-z0-9_-]{1,80}$/.test(resource))) return c.notFound();
     const minimum = c.req.query("revision") ?? "0";
     if (!/^\d+$/.test(minimum) || !Number.isSafeInteger(Number(minimum))) return c.text("Invalid revision", 400);
-    const scope = resource as ViewScope;
-    if (!operator) return publicRender(c, scope, Number(minimum));
-    const { revision, data } = await c.get("context").readView(scope, audience, Number(minimum));
+    const requested = resources as ViewScope[];
+    if (!operator) return publicRender(c, requested[0], Number(minimum));
+    const scopes = batch ? mergeScopes([], requested) : requested;
+    const { revision, data } = await c.get("context").readViews(scopes, audience, Number(minimum));
     if (revision < Number(minimum)) return c.text("Revision unavailable", 409);
-    const emailConfigured = scope === "destinations" && !!await confirmationOrigin(c);
-    return c.json({ revision, ...renderViewPartial(scope, data, audience, emailConfigured), permission: audience });
+    const emailConfigured = scopes.includes("destinations") && !!await confirmationOrigin(c);
+    const partials = scopes.map(scope => {
+      if (!scope.startsWith("monitor/")) return { scope, data: renderViewPartial(scope, data, audience, emailConfigured) };
+      const id = scope.slice("monitor/".length);
+      const monitor = data.monitors.find(monitor => monitor.id === id) ?? null;
+      const projection = { ...data, monitors: monitor ? [monitor] : [] };
+      return { scope, data: renderViewPartial(scope, projection, audience, emailConfigured) };
+    });
+    return batch ? c.json({ revision, permission: audience, partials })
+      : c.json({ revision, ...partials[0].data, permission: audience });
   };
   for (const path of [publicPartials + "/:section", publicPartials + "/monitor/:id", ...operatorPartialPaths]) {
     app.get(path, getOnly, partial);
