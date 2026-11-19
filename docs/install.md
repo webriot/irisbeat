@@ -152,7 +152,16 @@ secret fails closed for administration and receipts.
 
 Open `/operator`, sign in, save the Status page name and add HTTP(S), TCP or
 Heartbeat Monitors. Publish selected rows. The anonymous `/` and `/api/status`
-show published rows only. HTTP/TCP targets must be reachable from Cloudflare;
+show published rows only. Changes can take up to 60 seconds to appear. Set
+`STATUS_RENDER_INTERVAL_SECONDS` as a quoted Wrangler `vars` value in the
+local deployment configuration to change this window. For example,
+`"STATUS_RENDER_INTERVAL_SECONDS": "120"` uses two minutes. Positive values
+through 86,400 choose UTC-aligned windows in whole seconds. An explicit `"0"`
+opts into immediate public rendering. An invalid binding falls back to 60
+seconds and logs `invalid_status_render_interval`. Operator authorization,
+Checks, and alert delivery run independently of public rendering.
+
+HTTP/TCP targets must be reachable from Cloudflare;
 TCP is plain connection establishment, not TLS/protocol verification. Cloudflare
 [socket restrictions](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/)
 still apply (including prohibited ports/addresses).
@@ -362,6 +371,8 @@ npx playwright install chromium
 npm run test:ui
 node test/upgrade.cjs --notifications
 node test/upgrade.cjs --analytics
+node test/upgrade.cjs --live-views
+npm run test:status:publication
 npm run test:delivery:upgrade
 ```
 

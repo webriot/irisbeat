@@ -122,7 +122,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     const secret = randomBytes(32).toString('hex');
     mf = new Miniflare(convertV4MiniflareOptions({ unsafeLocalExplorer: true, workers: [
       { name: monitoringName, modules: true, script, compatibilityDate: '2026-11-13',
-        bindings: { INSTALLATION_SECRET: secret, ...producerConfig.vars },
+        bindings: { INSTALLATION_SECRET: secret, STATUS_RENDER_INTERVAL_SECONDS: "0", ...producerConfig.vars },
         serviceBindings: { [emailService.binding]: serviceTarget(emailService) },
         durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } },
         queueProducers: { [queueProducer.binding]: queueProducer.queue },

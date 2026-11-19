@@ -94,7 +94,7 @@ record no new observations. Previously committed points can still drain.
 Cloudflare controls retention and asynchronous ingestion.
 See [Workers Analytics Engine SQL and sampling](https://developers.cloudflare.com/analytics/analytics-engine/sql-api/).
 
-A read uses only visible, active Monitor IDs from the current context. Successful
+Operator and immediate reads use only visible, active Monitor IDs from the current context. Successful
 daily aggregates are cached in the context for 60 seconds and refreshed on a
 new observation or UTC day change. While observations are queued or in the
 two-minute window following handoff, successful aggregates remain eligible for
@@ -111,7 +111,7 @@ pending, stale, or unavailable. Status, detection, Incidents,
 and notification handoff commit independently of query availability.
 
 The first activation with both the write binding and query configuration drops
-the previous SQLite raw observations table and indexes. Readiness reports
+the previous SQLite raw observations table and indexes. Retained SQLite Status renders and their series are invalidated. Readiness reports
 whether an observation can be read back. Transient SQL failures do not delay
 activation or monitoring. There is no backfill. Monitor configuration, latest results,
 detection progress, Maintenance and Incidents are preserved. Rolling the code back
@@ -119,18 +119,19 @@ cannot restore the retired rows.
 
 ## Integration
 
-The full Status and Operator read paths use
-`MonitoringContext.status(operator, secrets)`. Scoped reads use
-`MonitoringContext.readView(scope, audience)`. The context queries only active
-Monitors in the authorized ledger or row. Public reads include only published
-Monitors. Mutation responses carry cached history, empty bars, or unavailable
-history without waiting for a query. Observations and mutations produce scoped
-hints from committed state. Renders preserve the `stale` and `pending` flags with the series.
-The public render windows in [#93](https://github.com/Webriot/irisbeat/pull/93)
-need to let scoped history retries reach refreshed aggregates within the four
-30-second attempts, including the last attempt at about two minutes. If a
-render window outlasts those attempts, it needs a later retry window or a
-history-only render update signal.
+Operator reads use `MonitoringContext.status(operator, secrets)` and
+`MonitoringContext.readView(scope, audience)`. Mutation responses carry cached
+history, empty bars, or unavailable history without waiting for a query.
+Delayed Status reads query the published Monitor IDs and the UTC range captured
+for that publication. The window end is an exclusive cutoff on Analytics Engine's
+built-in logging `timestamp`. A queued observation handed off at or after that
+cutoff belongs to a later publication. The handoff schedules a scoped update
+for affected published Monitors when it crosses a window boundary. The bars still
+count the observation on the UTC day of its actual timestamp. Points already
+logged before the cutoff can appear on retry after ingestion. Renders preserve
+`stale` and `pending` flags. History-only recovery
+advances the render generation independently of the public revision and updates
+the cache keys for the Status page, JSON, negotiated snapshot, ledger and row.
 
 See [installation and readiness](install.md#availability-history) for self-hosted
 configuration and [the trusted query interface](hosted-contract.md#availability-history)

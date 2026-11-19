@@ -273,7 +273,7 @@ async function main(runFixture, emailEnabled = true, upgrade, packageName) {
     handleStructuredLogs: log => { if (log.level === 'error') errors.push(log.message); },
     workers: [
       { name: 'monitoring', modules: true, script: monitoring, compatibilityDate: '2026-11-13',
-        bindings: { INSTALLATION_SECRET: 'test-installation-secret', NOTIFICATION_PUBLIC_ORIGIN: 'https://personal.example' },
+        bindings: { INSTALLATION_SECRET: 'test-installation-secret', STATUS_RENDER_INTERVAL_SECONDS: '0', NOTIFICATION_PUBLIC_ORIGIN: 'https://personal.example' },
         durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } },
         queueProducers: { NOTIFICATION_QUEUE: 'notifications', FINAL_QUEUE: 'final-notifications' },
         serviceBindings: {

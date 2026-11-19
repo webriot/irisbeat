@@ -4,6 +4,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-11-13",
   "workers_dev": true,
+  "version_metadata": { "binding": "IRISBEAT_VERSION" },
   "keep_vars": true,
   "analytics_engine_datasets": [
     { "binding": "AVAILABILITY_HISTORY", "dataset": "irisbeat_availability" },

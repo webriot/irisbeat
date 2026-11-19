@@ -4,26 +4,26 @@ import type { AvailabilityQuery, AvailabilityRow } from "../src/index";
 // Wrangler discards local Analytics Engine writes. This fake replaces that external boundary.
 export function availabilityFixture(storage?: DurableObjectStorage) {
   const key = "test:analytics-points";
-  const points = storage?.kv.get<AnalyticsEngineDataPoint[]>(key) ?? [];
+  const records = storage?.kv.get<{ point: AnalyticsEngineDataPoint; loggedAt: number }[]>(key) ?? [];
   const queries: AvailabilityQuery[] = [];
   let mode = "available";
   let holdFailure = false;
   return {
-    points,
+    get points() { return records.map(({ point }) => point); },
     queries,
     setMode(value: string) {
       if (value === "held-failure") holdFailure = true;
       if (value === "release-failure" || value === "available") holdFailure = false;
       mode = value;
-      if (value === "available") { points.length = 0; queries.length = 0; }
+      if (value === "available") { records.length = 0; queries.length = 0; }
     },
     bindings: {
       AVAILABILITY_HISTORY: {
         writeDataPoint(point?: AnalyticsEngineDataPoint) {
           if (mode === "write-rejected") throw new Error("Substituted synchronous Analytics Engine write failure");
           if (point && mode !== "write-failed") {
-            points.push(point);
-            storage?.kv.put(key, points);
+            records.push({ point, loggedAt: Math.floor(Date.now() / 1000) });
+            storage?.kv.put(key, records);
           }
         },
       },
@@ -37,11 +37,11 @@ export function availabilityFixture(storage?: DurableObjectStorage) {
           if (mode === "lagging") return [];
           if (mode === "failed" || mode === "missing") throw new Error("Substituted Analytics Engine query failure");
           const rows = new Map<string, AvailabilityRow>();
-          for (const point of points) {
+          for (const { point, loggedAt } of records) {
             const [monitorId, outcome] = point.blobs ?? [];
             const at = point.doubles?.[0]!;
             if (typeof monitorId !== "string" || !query.monitorIds.includes(monitorId) || point.indexes?.[0] !== query.tenantKey ||
-                at < query.start || at >= query.end || (query.observation && (at !== query.observation.at || outcome !== query.observation.outcome))) continue;
+                at < query.start || at >= query.end || (query.loggedBefore !== undefined && loggedAt >= query.loggedBefore) || (query.observation && (at !== query.observation.at || outcome !== query.observation.outcome))) continue;
             const date = new Date(at).toISOString().slice(0, 10);
             const key = monitorId + ":" + date;
             const row = rows.get(key) ?? { monitorId, date, successes: 0, failures: 0, maintenance: 0 };

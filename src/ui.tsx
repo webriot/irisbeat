@@ -125,7 +125,8 @@ function PublicContent({ data }: { data: StatusProjection }) {
 }
 
 export function statusJson(data: StatusProjection) {
-  const monitors = data.monitors.map(({ historyRetryToken: _token, ...monitor }) => monitor);
+  const monitors = data.monitors.map(({ historyRetryToken: _token, historyRevision: _revision, ...monitor }:
+    ViewMonitor & { historyRevision?: number }) => monitor);
   return { ...data, monitors, monitor: monitors[0] ?? null };
 }
 
@@ -878,7 +879,6 @@ function renderDestinations(next, monitors, markup) {
 
 let hosted = false;
 let monitorIds = new Set();
-let monitorFloor = 60;
 function updateDeleted() {
   monitorEditor.update(monitorIds);
   const maintenanceMissing = !maintenanceForm.hidden && !monitorIds.has(maintenanceForm.dataset.monitorId);
@@ -916,6 +916,7 @@ function clearSession() {
   updateDeleted();
   message.textContent = ''; byId('secret').value = ''; byId('secret').focus();
 }
+let monitorFloor = 60;
 function bindMonitorActions(group, monitor) {
   const path = '/api/operator/monitors/' + encodeURIComponent(monitor.id);
   const actions = {

@@ -13,12 +13,14 @@ export type HistoryDay = {
 export type AvailabilityHistory = { days: HistoryDay[]; percentage: number | null; stale?: true; pending?: true };
 
 type Observation = NonNullable<Monitor["lastResult"]>;
+export type HistoryFence = { id: string; revision: number; changedAt?: number };
 export type AvailabilityQuery = {
   tenantKey: string;
   monitorIds: string[];
   start: number;
   end: number;
   observation?: Observation;
+  loggedBefore?: number;
 };
 export type AvailabilityRow = Omit<HistoryDay, "state"> & { monitorId: string };
 export interface AvailabilityQueryService {
@@ -48,7 +50,7 @@ const batchSize = 50;
 export const availabilityWriteLimit = 250;
 const timeout = 3_000;
 const freshFor = 60_000;
-const retryAfter = 15_000;
+export const availabilityRetryAfter = 15_000;
 export const historyRetryInterval = 30_000;
 export const historyRetryAttempts = 4;
 const historyRetryWindow = historyRetryInterval * historyRetryAttempts;
@@ -84,11 +86,12 @@ function queryConfiguration(env: AvailabilityEnv) {
 async function directQuery(env: AvailabilityEnv, query: AvailabilityQuery) {
   const config = queryConfiguration(env);
   if (!config) throw new Error("Analytics Engine SQL configuration missing");
-  const { tenantKey, monitorIds, start, end, observation } = query;
+  const { tenantKey, monitorIds, start, end, observation, loggedBefore } = query;
   if (!/^[a-f0-9]{64}$/.test(tenantKey) || monitorIds.some(id => !/^[a-zA-Z0-9_-]{1,128}$/.test(id)))
     throw new Error("Invalid Analytics Engine scope");
   const selection = monitorIds.map(id => "'" + id + "'").join(", ");
   const exact = observation ? ` AND double1 = ${observation.at} AND blob2 = '${observation.outcome}'` : "";
+  const cutoff = loggedBefore === undefined ? "" : ` AND timestamp < toDateTime(${loggedBefore}, 'UTC')`;
   const sql = `SELECT blob1 AS monitorId,
     formatDateTime(toDateTime(double1 / 1000, 'UTC'), '%Y-%m-%d', 'UTC') AS date,
     SUM(IF(blob2 = 'success', _sample_interval, 0)) AS successes,
@@ -96,7 +99,7 @@ async function directQuery(env: AvailabilityEnv, query: AvailabilityQuery) {
     SUM(IF(blob2 = 'maintenance', _sample_interval, 0)) AS maintenance
     FROM ${config.dataset}
     WHERE index1 = '${tenantKey}' AND blob1 IN (${selection})
-      AND double1 >= ${start} AND double1 < ${end}${exact}
+      AND double1 >= ${start} AND double1 < ${end}${exact}${cutoff}
     GROUP BY monitorId, date
     LIMIT ${monitorIds.length * 90}
     FORMAT JSON`;
@@ -199,8 +202,8 @@ export class Availability {
     this.ctx.storage.kv.delete(cacheKey(monitorId));
   }
 
-  private async query(ids: string[], start: number, end: number, observation?: Observation) {
-    const query = { tenantKey: this.ctx.id.toString(), monitorIds: ids, start, end, ...(observation ? { observation } : {}) };
+  private async query(ids: string[], start: number, end: number, observation?: Observation, loggedBefore?: number) {
+    const query = { tenantKey: this.ctx.id.toString(), monitorIds: ids, start, end, ...(observation ? { observation } : {}), ...(loggedBefore === undefined ? {} : { loggedBefore }) };
     const service = this.env.AVAILABILITY_QUERY;
     if (!service) return checkedRows(await directQuery(this.env, query), query);
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -212,6 +215,35 @@ export class Availability {
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
+  }
+
+  async readPublished(fences: HistoryFence[], at: number, loggedBefore: number | undefined, now: number, fallback: Map<string, AvailabilityHistory | null>) {
+    const start = historyStart(at);
+    const end = start + 90 * DAY;
+    const configured = this.configured;
+    const result = new Map<string, AvailabilityHistory | null>();
+    for (const { id, revision } of fences) {
+      const previous = fallback.get(id);
+      result.set(id, previous ? { ...previous, stale: true } : !revision && configured ? series([], start) : null);
+    }
+    if (!configured || loggedBefore === undefined) return result;
+    const observed = fences.filter(fence => fence.revision);
+    const batches = [];
+    for (let offset = 0; offset < observed.length; offset += batchSize) batches.push(observed.slice(offset, offset + batchSize));
+    await Promise.all(batches.map(async batch => {
+      try {
+        const rows = await this.query(batch.map(({ id }) => id), start, end, undefined, loggedBefore);
+        const byMonitor = new Map(batch.map(({ id }) => [id, [] as AvailabilityRow[]]));
+        for (const row of rows) byMonitor.get(row.monitorId)!.push(row);
+        for (const { id, changedAt } of batch) {
+          const pending = now < (changedAt ?? -Infinity) + historyRetryWindow;
+          result.set(id, series(byMonitor.get(id)!, start, false, pending));
+        }
+      } catch {
+        console.error(JSON.stringify({ event: "history_query_failed" }));
+      }
+    }));
+    return result;
   }
 
   async readiness(monitors: Monitor[], now: number): Promise<
@@ -285,8 +317,8 @@ export class Availability {
           const pendingUntil = (historyChangedAt ?? -Infinity) + historyRetryWindow;
           const queued = this.ctx.storage.sql.exec("SELECT 1 FROM availability_outbox WHERE monitorId = ? LIMIT 1", id).toArray().length > 0;
           const pending = queued || now < pendingUntil;
-          const freshUntil = queued ? now + retryAfter
-            : pending ? Math.min(now + retryAfter, pendingUntil) : now + freshFor;
+          const freshUntil = queued ? now + availabilityRetryAfter
+            : pending ? Math.min(now + availabilityRetryAfter, pendingUntil) : now + freshFor;
           let latest: CachedSeries = {
             start, revision, queriedAt: now, freshUntil,
             rows: rowsByMonitor.get(id)!, pending,
@@ -309,7 +341,7 @@ export class Availability {
           const latest = this.ctx.storage.kv.get<CachedSeries>(cacheKey(id));
           result.set(id, revisions.has(id) ? this.cachedHistory(latest, revision, Date.now(), start, configured) : null);
           if (historyRevision === revision && (!latest || latest.revision !== revision || queriedAt(latest) < now)) {
-            this.nextAttempt.set(id, Math.max(this.nextAttempt.get(id) ?? -Infinity, now + retryAfter));
+            this.nextAttempt.set(id, Math.max(this.nextAttempt.get(id) ?? -Infinity, now + availabilityRetryAfter));
           }
         }
         console.error(JSON.stringify({ event: "history_query_failed" }));

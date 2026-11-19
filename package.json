@@ -13,6 +13,7 @@
     "build:delivery": "wrangler deploy --dry-run --config wrangler.delivery.jsonc",
     "test:delivery": "node test/notification-delivery.cjs",
     "test:delivery:upgrade": "node test/notification-delivery.cjs --upgrade",
+    "test:status:publication": "node test/upgrade.cjs --status-publication",
     "pack:engine": "mkdir -p dist && npm pack --pack-destination dist",
     "test:consumer": "node test/consumer.cjs",
     "deploy": "wrangler deploy",

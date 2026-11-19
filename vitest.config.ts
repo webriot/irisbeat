@@ -8,7 +8,7 @@ export default defineConfig({
       main: "./test/history-worker.ts",
       wrangler: { configPath: "./wrangler.jsonc" },
       miniflare: {
-        bindings: { INSTALLATION_SECRET: "test-installation-secret" },
+        bindings: { INSTALLATION_SECRET: "test-installation-secret", STATUS_RENDER_INTERVAL_SECONDS: "0" },
       },
     }),
   ],

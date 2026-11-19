@@ -235,6 +235,43 @@ it('reports setup readiness only after an actual observation can be read back', 
   expect(await (await mutate(path, 'GET')).json()).toEqual({ ready: true });
 });
 
+it('requires a read from the dataset that received the observation', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(today);
+  const monitor = await create();
+  const outbound = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await tick(today);
+  const ready = '/api/operator/history/readiness';
+  const { points } = await (await request('/__test-history')).json<{ points: AnalyticsEngineDataPoint[] }>();
+  outbound.mockImplementation(async (_input, init) => {
+    const sql = String(init?.body);
+    assertReadback(sql);
+    const rows = sql.includes('FROM irisbeat_availability') ? [{ monitorId: monitor.id, date: '2026-11-13', successes: '1', failures: '0', maintenance: '0' }] : [];
+    return Response.json({ data: rows });
+  });
+  function assertReadback(sql: string) {
+    expect(sql).not.toContain("double2");
+    expect(sql).not.toContain("timestamp <");
+    expect(points[0].blobs).toEqual([monitor.id, 'success']);
+    expect(sql).toContain("index1 = '" + points[0].indexes?.[0] + "'");
+    expect(sql).toContain("AND double1 = " + points[0].doubles?.[0] + " AND blob2 = 'success'");
+  }
+  await request('/__test-history?mode=direct&dataset=wrong_dataset');
+  const wrong = await mutate(ready, 'GET');
+  expect(wrong.status).toBe(503);
+  expect(await wrong.json()).toEqual({ ready: false, reason: 'observation_unconfirmed' });
+  await request('/__test-history?mode=direct&dataset=irisbeat_availability');
+  outbound.mockImplementationOnce(async () => {
+    return new Response(null, { status: 302, headers: { Location: 'https://redirect.example/' } });
+  });
+  const redirect = await mutate(ready, 'GET');
+  expect(outbound.mock.lastCall?.[1]?.redirect).toBe('manual');
+  expect(redirect.status).toBe(503);
+  expect(await redirect.json()).toEqual({ ready: false, reason: 'query_unavailable' });
+  const matched = await mutate(ready, 'GET');
+  expect(matched.status).toBe(200);
+  expect(await matched.json()).toEqual({ ready: true });
+});
+
 it('keeps the last successful bars after query failure and Durable Object eviction', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
   await create();
