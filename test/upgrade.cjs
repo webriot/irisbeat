@@ -14,27 +14,45 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
 const legacyNotificationRevision = '70ba924ee9a2b15a3d6b6cc49abc8039aedb7f70';
 const liveViews = process.argv.includes('--live-views');
 const statusPublication = process.argv.includes('--status-publication');
-const base = (statusPublication ? 'c4fcfa3a2eeac1f8ee18cb962c499c3d81f2d59a' : liveViews ? '4f9442a0e660907b02c00c942e05ed4e43abab3c' : process.argv.includes('--notifications') ? legacyNotificationRevision : process.argv[2]) || '6fb95ccec52d9c5c29b82f82c3d77ed3a7e356d3';
+const analyticsUpgrade = process.argv.includes('--analytics');
+const base = (statusPublication ? 'c4fcfa3a2eeac1f8ee18cb962c499c3d81f2d59a' : liveViews || analyticsUpgrade ? '4f9442a0e660907b02c00c942e05ed4e43abab3c' : process.argv.includes('--notifications') ? legacyNotificationRevision : process.argv[2]) || '6fb95ccec52d9c5c29b82f82c3d77ed3a7e356d3';
 const tcp = process.argv[3] === 'tcp';
 const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
 (async () => {
-  const sources = execFileSync('git', ['ls-tree', '-r', '--name-only', base, 'src'], { encoding: 'utf8' }).trim().split('\n');
-  for (const source of sources) {
-    const destination = join(temporary, source.slice(4));
-    mkdirSync(dirname(destination), { recursive: true });
-    writeFileSync(destination, execFileSync('git', ['show', `${base}:${source}`]));
-  }
+  const extractSource = (revision, directory) => {
+    const sources = execFileSync('git', ['ls-tree', '-r', '--name-only', revision, 'src'], { encoding: 'utf8' }).trim().split('\n');
+    for (const source of sources) {
+      const destination = join(directory, source.slice(4));
+      mkdirSync(dirname(destination), { recursive: true });
+      writeFileSync(destination, execFileSync('git', ['show', `${revision}:${source}`]));
+    }
+    return join(directory, 'index.ts');
+  };
+  const predecessor = extractSource(base, temporary);
   const wrapper = index => {
     const source = JSON.stringify(index);
     const publicationFixture = statusPublication && index.startsWith(project);
+    const current = index.startsWith(project);
+    const analyticsFixture = current ? `import { availabilityFixture } from './test/availability-fixture.ts';` : '';
+    const analyticsConstructor = `constructor(ctx, env) {
+      const analytics = availabilityFixture(ctx.storage);
+      const bindings = { ...analytics.bindings };
+      if (env.TEST_AVAILABILITY === 'no-write') delete bindings.AVAILABILITY_HISTORY;
+      if (env.TEST_AVAILABILITY === 'no-query') delete bindings.AVAILABILITY_QUERY;
+      super(ctx, { ...env, ...bindings });
+      this.testAnalytics = analytics;
+    }`;
     const bindings = publicationFixture
       ? `import { createHostedWorker, MonitoringContext as EngineContext, NotificationDelivery } from ${source};
         export { NotificationDelivery };
         const wallNow = Date.now;
         export class MonitoringContext extends EngineContext {
+          ${analyticsConstructor}
+          testHistoryMode(mode) { this.testAnalytics.setMode(mode); }
+          testHistoryQueries() { return this.testAnalytics.queries; }
           testClock(at) { Date.now = at === null ? wallNow : () => at; }
           testAlarmAt() { return this.ctx.storage.getAlarm(); }
-          testDelayedAlarm() { this.alarm(); }
+          testDelayedAlarm() { return this.alarm(); }
           testPublished() { return this.ctx.storage.kv.get("test-publication") ?? null; }
           onStatusPublished(hint) {
             const partials = hint.scopes.map(scope => [scope, JSON.parse(this.readPublishedStatus(scope, hint.revision).body)]);
@@ -50,16 +68,22 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
           },
           contexts: () => [],
         });`
-      : `export { MonitoringContext${index.startsWith(project) ? ', NotificationDelivery' : ''} } from ${source};`;
-    return `import app from ${source}; ${bindings}
+      : current ? `import { MonitoringContext as EngineContext } from ${source};
+        export { NotificationDelivery } from ${source};
+        export class MonitoringContext extends EngineContext { ${analyticsConstructor} }`
+      : `export { MonitoringContext } from ${source};`;
+    return `import app from ${source}; ${analyticsFixture} ${bindings}
       export default { async fetch(request, env, ctx) {
         const url = new URL(request.url);
-        if (url.pathname === '/test-tick') {
-          await app.scheduled({ scheduledTime: Number(url.searchParams.get('at')) }, env, ctx);
-          return new Response('checked');
-        }
         ${publicationFixture ? `if (url.pathname === '/test-status-alarm') {
           return Response.json(await env.MONITORING.getByName('personal').testAlarmAt());
+        }
+        if (url.pathname === '/test-history-mode') {
+          await env.MONITORING.getByName('personal').testHistoryMode(url.searchParams.get('mode'));
+          return new Response(null, { status: 204 });
+        }
+        if (url.pathname === '/test-history-queries') {
+          return Response.json(await env.MONITORING.getByName('personal').testHistoryQueries());
         }
         if (url.pathname === '/test-status-delayed-alarm') {
           await env.MONITORING.getByName('personal').testDelayedAlarm();
@@ -73,10 +97,22 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
           await env.MONITORING.getByName('personal').testClock(at === null ? null : Number(at));
           return new Response(null, { status: 204 });
         }` : ''}
-        const testAt = request.headers.get('x-test-at');
+        const scheduledAt = url.pathname === '/test-tick' ? url.searchParams.get('at') : null;
+        const testAt = request.headers.get('x-test-at') ?? ${statusPublication ? 'null' : 'scheduledAt'};
         const now = Date.now;
         if (testAt) Date.now = () => Number(testAt);
-        try { return await ${publicationFixture ? "(url.hostname === 'tenants.example' ? hosted : app)" : "app"}.fetch(request, env, ctx); }
+        try {
+          ${publicationFixture ? `if (url.pathname === '/test-backdated-heartbeat') {
+            const id = url.searchParams.get('id');
+            const observedAt = Number(url.searchParams.get('observed-at'));
+            const accepted = await env.MONITORING.getByName('personal').heartbeat(id, observedAt);
+            return new Response(null, { status: accepted ? 204 : 404 });
+          }` : ''}
+          if (scheduledAt !== null) {
+            await app.scheduled({ scheduledTime: Number(scheduledAt) }, env, ctx);
+            return new Response('checked');
+          }
+          return await ${publicationFixture ? "(url.hostname === 'tenants.example' ? hosted : app)" : "app"}.fetch(request, env, ctx); }
         finally { Date.now = now; }
       } };`;
   };
@@ -142,7 +178,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
       }] : [])],
     });
   }
-  let mf = new Miniflare(options(await bundle(join(temporary,'index.ts'))));
+  let mf = new Miniflare(options(await bundle(predecessor)));
   const request = (path, method='GET', body, at) => mf.dispatchFetch('https://irisbeat.example'+path,{method,headers:{authorization:'Bearer upgrade-test-secret','content-type':'application/json',...(at === undefined ? {} : {'x-test-at':String(at)})},...(body?{body:JSON.stringify(body)}:{})});
   const tick = at => request('/test-tick?at='+at);
   const start = Date.UTC(2026,10,13);
@@ -150,7 +186,8 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     if (statusPublication) {
       const test = require('./status-publication.cjs');
       const application = await bundle(join(project, 'src/index.ts'));
-      await test({ mf, options, application, request, tick, deliveries });
+      const cachedSQLite = await bundle(extractSource('6acaa65552a4d93bd9c43136a51abd324cc1e346', join(temporary, 'cached-sqlite')));
+      await test({ mf, options, application, cachedSQLite, request, tick, deliveries, fresh: options => new Miniflare(options) });
       return;
     }
     if (liveViews) {
@@ -167,6 +204,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
           previous.goto(url),
         ]);
         assert.equal(await previous.title(), 'Before upgrade');
+        assert.equal(await previous.locator('.percentage').textContent(), '100.00%');
 
         async function signIn(page) {
           await page.goto(new URL('/operator', url).href);
@@ -197,7 +235,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
         ]);
         await next.locator('#updates-mode').waitFor({ state: 'hidden' });
         await next.getByRole('heading', { name: 'Retained Heartbeat' }).waitFor();
-        assert.equal(await next.locator('.percentage').textContent(), '100.00%');
+        assert.equal(await next.locator('.percentage').textContent(), 'No observations');
         const nextOperator = await browser.newPage();
         const authorized = nextOperator.waitForEvent('websocket', socket => socket.url().endsWith('/api/operator/events/v2'))
           .then(socket => socket.waitForEvent('framereceived', frame => frame.payload === 'authorized'));
@@ -214,7 +252,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
         const legacyData = await (await legacyWrite).json();
         assert.equal(legacyData.pageName, 'After upgrade');
         assert.equal(legacyData.monitors[0].id, monitor.id);
-        assert.equal(legacyData.monitors[0].history.percentage, 100);
+        assert.equal(legacyData.monitors[0].history.percentage, null);
         assert.deepEqual(await (await operatorPartial).json(), {
           revision: 1, html: '<h1>After upgrade</h1>', pageName: 'After upgrade', permission: 'editor',
         });
@@ -223,11 +261,65 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
         assert.equal(await previousOperator.getByLabel('Monitor name', { exact: true }).inputValue(), 'Unsaved draft');
         assert.deepEqual(await (await partial).json(), { revision: 1, html: '<h1>After upgrade</h1>' });
         await next.getByRole('heading', { name: 'After upgrade' }).waitFor();
+        const row = next.waitForResponse(response => response.url().includes('/api/status/partials/monitor/' + monitor.id + '?revision=2'));
+        assert.equal((await request('/heartbeat/' + monitor.id, 'POST')).status, 204);
+        assert.match((await (await row).json()).html, /100\.00%/);
+        await next.getByText('100.00%').waitFor();
         await previous.bringToFront();
         await previous.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
         await previous.getByRole('heading', { name: 'After upgrade' }).waitFor();
         console.log('PASS: legacy Status and Operator recover through HTTP and new tabs receive scoped revisions over preserved Monitor state');
       } finally { await browser.close(); }
+      return;
+    }
+    if (analyticsUpgrade) {
+      const read = at => request('/api/operator', 'GET', undefined, at).then(response => response.json());
+      assert.equal((await request('/api/operator/monitors', 'POST', {
+        name: 'Existing HTTP', url: 'https://target.example/health', failureThreshold: 1, recoveryThreshold: 2,
+      }, start)).status, 201);
+      await tick(start);
+      outcome = 204;
+      await tick(start + 60_000);
+      const before = await read(start + 60_000);
+      assert.equal(before.monitor.history.percentage, 50);
+      assert.equal(before.monitor.state, 'down');
+      const maintenance = await request('/api/operator/monitors', 'POST', { name: 'Private', kind: 'heartbeat', published: false }, start).then(response => response.json());
+      const privateId = maintenance.monitors[1].id;
+      assert.equal((await request('/api/operator/monitors/' + privateId + '/maintenance', 'PUT', {
+        endsAt: start + 360_000,
+      }, start + 60_000)).status, 200);
+      const beforeUpgrade = await read(start + 60_000);
+      const upgraded = await bundle(join(project, 'src/index.ts'));
+      const legacy = await bundle(predecessor);
+      for (const missing of ['no-write', 'no-query']) {
+        await mf.setOptions(options(upgraded, 'state', false, undefined, { TEST_AVAILABILITY: missing }));
+        const readiness = await request('/api/operator/history/readiness', 'GET', undefined, start + 60_000);
+        assert.equal(readiness.status, 503);
+        assert.deepEqual(await readiness.json(), { ready: false, reason: 'configuration_missing' });
+        assert.equal((await read(start + 60_000)).monitor.history, null);
+        await mf.setOptions(options(legacy));
+        assert.equal((await read(start + 60_000)).monitor.history.percentage, 50);
+      }
+      await mf.setOptions(options(upgraded));
+      const after = await read(start + 60_000);
+      const { history: oldHistory, ...oldMonitor } = beforeUpgrade.monitor;
+      const { history: newHistory, ...newMonitor } = after.monitor;
+      assert.equal(oldHistory.percentage, 50);
+      assert.deepEqual(newMonitor, { ...oldMonitor, effectiveIntervalSeconds: 60 });
+      assert.deepEqual(after.incidents, beforeUpgrade.incidents);
+      assert.deepEqual(after.monitors[1].maintenance, beforeUpgrade.monitors[1].maintenance);
+      assert.equal(after.monitors[1].published, false);
+      assert.equal(newHistory.days.length, 90);
+      assert.ok(newHistory.days.every(day => day.state === 'empty'));
+      assert.equal(newHistory.percentage, null);
+      await tick(start + 120_000);
+      const recovered = await read(start + 120_000);
+      assert.equal(recovered.monitor.state, 'up');
+      assert.equal(recovered.incidents[0].id, beforeUpgrade.incidents[0].id);
+      assert.equal(recovered.incidents[0].closedAt, start + 120_000);
+      assert.equal(recovered.monitor.history.days.at(-1).successes, 1);
+      assert.equal(recovered.monitor.history.percentage, 100);
+      console.log('PASS: Irisbeat 0.3.0 -> current resets only availability history and records the first Analytics Engine observation');
       return;
     }
     if (process.argv.includes('--heartbeat')) {
@@ -325,14 +417,8 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     assert.equal(after.incidents[0].closedAt,null);
     assert.deepEqual(after.monitors[0].lastResult,{at:start+120000,outcome:'success'});
     assert.equal(after.monitors[0].history.days.length, 90);
-    if (process.argv.includes('--history') || process.argv.includes('--notifications')) {
-      assert.equal(after.monitors[0].history.days.at(-1).successes, 1);
-      assert.equal(after.monitors[0].history.days.at(-1).failures, 2);
-      assert.ok(Math.abs(after.monitors[0].history.percentage - 100 / 3) < 1e-10);
-    } else if (base === '6fb95ccec52d9c5c29b82f82c3d77ed3a7e356d3') {
-      assert.equal(after.monitors[0].history.percentage, null, 'lastResult must not fabricate earlier observations');
-      assert.ok(after.monitors[0].history.days.every(day => day.state === 'empty'));
-    }
+    assert.equal(after.monitors[0].history.percentage, null, 'the Analytics Engine cutover starts with empty bars');
+    assert.ok(after.monitors[0].history.days.every(day => day.state === 'empty'));
     await tick(start+120000); assert.equal(attempts,3);
     await tick(start+180000);
     const recovered = await (await request('/api/status')).json();
@@ -363,7 +449,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     assert.equal((await (await request('/api/operator')).json()).incidents[0].monitorName,'Legacy service');
     if (supportsWebhook) {
       await mf.dispose();
-      mf = new Miniflare(options(await bundle(join(temporary,'index.ts')), 'webhook-only'));
+      mf = new Miniflare(options(await bundle(predecessor), 'webhook-only'));
       assert.equal((await request('/api/operator/webhook','PUT',{url:destination})).status,200);
       await mf.setOptions(options(await bundle(join(project,'src/index.ts')), 'webhook-only'));
       const upgraded = await (await request('/api/operator')).json();

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import worker, { type Status } from '../src/index';
 import { env, exports } from 'cloudflare:workers';
-import { createScheduledController, evictDurableObject, reset } from 'cloudflare:test';
-import { afterEach, expect, it, vi } from 'vitest';
+import { createScheduledController, evictDurableObject, reset, runDurableObjectAlarm } from 'cloudflare:test';
+import { afterEach, expect, expectTypeOf, it, vi } from 'vitest';
 
 const day = 86_400_000;
 const today = Date.UTC(2026, 10, 13);
@@ -197,26 +197,7 @@ it('retains operator Incidents after observation rollover without removing newer
   expect((await status()).incidents).toEqual([]);
   expect((await status(true)).incidents).toEqual([{ ...original, closedAt: today - 99 * day }]);
   expect((await status()).monitor!.history).toMatchObject({ percentage: 100, days: expect.arrayContaining([expect.objectContaining({ date: '2026-11-13', successes: 1 })]) });
-  // Rewinding the query window makes bounded retention observable without storage inspection.
-  clock.mockReturnValue(today - 100 * day);
-  expect((await status(true)).monitor!.history!.percentage).toBeNull();
 });
-
-it('bounds observation cleanup per execution while preserving the unfinished UTC day', async () => {
-  const clock = vi.spyOn(Date, 'now').mockReturnValue(today - 100 * day);
-  const monitor = await create({ kind: 'heartbeat', url: undefined, failureThreshold: undefined });
-  const receipt = () => request('/heartbeat/' + monitor.id, { method: 'POST', headers: { authorization } });
-  for (let index = 0; index < 1001; index++) expect((await receipt()).status).toBe(204);
-  clock.mockReturnValue(today + 1_000);
-  await receipt(); // Deletes at most 1,000 expired observations.
-  clock.mockReturnValue(today - 100 * day);
-  expect((await status()).monitor!.history!.days.at(-1)?.successes).toBe(1);
-  clock.mockReturnValue(today + 2_000);
-  await receipt();
-  expect((await status()).monitor!.history!.days.at(-1)?.successes).toBe(2);
-  clock.mockReturnValue(today - 100 * day);
-  expect((await status()).monitor!.history!.percentage).toBeNull();
-}, 30_000); // The retention boundary requires 1,001 sequential HTTP receipts on shared CI runners.
 
 it('keeps percentages per Monitor and uses down for failure with Maintenance', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(today);
@@ -234,22 +215,377 @@ it('keeps percentages per Monitor and uses down for failure with Maintenance', a
   expect(html.match(/class="percentage"/g)).toHaveLength(2);
 });
 
-it('acknowledges a bundled page-name write and renders its refresh without querying Monitor history', async () => {
+it('reports setup readiness only after an actual observation can be read back', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(today);
+  const path = '/api/operator/history/readiness';
+  expect((await request(path)).status).toBe(401);
+  await request('/__test-history?mode=unconfigured');
+  const missing = await mutate(path, 'GET');
+  expect(missing.status).toBe(503);
+  expect(await missing.json()).toEqual({ ready: false, reason: 'configuration_missing' });
+  await request('/__test-history?mode=available');
+  expect(await (await mutate(path, 'GET')).json()).toEqual({ ready: false, reason: 'observation_pending' });
   await create();
-  await create({ name: 'Another Monitor' });
-  await request('/__test-history');
-  const response = await request('/api/operator', {
-    method: 'PUT', headers: { authorization, 'Content-Type': 'application/json', Accept: 'application/vnd.irisbeat.view+json' },
-    body: JSON.stringify({ pageName: 'Renamed page' }),
-  });
-  expect(response.status).toBe(200);
-  const { revision, scopes } = await response.json() as { revision: number; scopes: string[] };
-  expect(scopes).toEqual(['page']);
-  const partial = await request('/api/operator/partials/page?revision=' + revision, { headers: { authorization } });
-  expect(await partial.json()).toMatchObject({ pageName: 'Renamed page', revision });
-  expect(await (await request('/__test-history?reads')).json()).toBe(0);
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await request('/__test-history?mode=write-failed');
+  await tick(today);
+  expect(await (await mutate(path, 'GET')).json()).toEqual({ ready: false, reason: 'observation_unconfirmed' });
+  await request('/__test-history?mode=available');
+  await tick(today + 60_000);
+  expect(await (await mutate(path, 'GET')).json()).toEqual({ ready: true });
+});
 
+it('requires a read from the dataset that received the observation', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(today);
+  const monitor = await create();
+  const outbound = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await tick(today);
+  const ready = '/api/operator/history/readiness';
+  const { points } = await (await request('/__test-history')).json<{ points: AnalyticsEngineDataPoint[] }>();
+  outbound.mockImplementation(async (_input, init) => {
+    const sql = String(init?.body);
+    assertReadback(sql);
+    const rows = sql.includes('FROM irisbeat_availability') ? [{ monitorId: monitor.id, date: '2026-11-13', successes: '1', failures: '0', maintenance: '0' }] : [];
+    return Response.json({ data: rows });
+  });
+  function assertReadback(sql: string) {
+    expect(sql).not.toContain("double2");
+    expect(sql).not.toContain("timestamp <");
+    expect(points[0].blobs).toEqual([monitor.id, 'success']);
+    expect(sql).toContain("index1 = '" + points[0].indexes?.[0] + "'");
+    expect(sql).toContain("AND double1 = " + points[0].doubles?.[0] + " AND blob2 = 'success'");
+  }
+  await request('/__test-history?mode=direct&dataset=wrong_dataset');
+  const wrong = await mutate(ready, 'GET');
+  expect(wrong.status).toBe(503);
+  expect(await wrong.json()).toEqual({ ready: false, reason: 'observation_unconfirmed' });
+  await request('/__test-history?mode=direct&dataset=irisbeat_availability');
+  outbound.mockImplementationOnce(async () => {
+    return new Response(null, { status: 302, headers: { Location: 'https://redirect.example/' } });
+  });
+  const redirect = await mutate(ready, 'GET');
+  expect(outbound.mock.lastCall?.[1]?.redirect).toBe('manual');
+  expect(redirect.status).toBe(503);
+  expect(await redirect.json()).toEqual({ ready: false, reason: 'query_unavailable' });
+  const matched = await mutate(ready, 'GET');
+  expect(matched.status).toBe(200);
+  expect(await matched.json()).toEqual({ ready: true });
+});
+
+it('keeps the last successful bars after query failure and Durable Object eviction', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
+  await create();
+  const target = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await tick(today);
+  const cached = (await status()).monitor!.history!;
+  expect(cached.percentage).toBe(100);
+  await request('/__test-history?mode=failed');
+  clock.mockReturnValue(today + 60_000);
+  target.mockResolvedValue(new Response(null, { status: 503 }));
+  await tick(today + 60_000);
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  expect((await status()).monitor).toMatchObject({ state: 'down', history: { ...cached, stale: true } });
+  expect(await (await request('/')).text()).toContain('Availability history is stale');
+  expect((await status()).incidents).toHaveLength(1);
+});
+
+it('queries only published Monitor IDs, reuses their aggregates, and shares no private or deleted bars', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(today);
+  const published = await create();
+  const hidden = await create({ published: false });
+  const deleted = await create();
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await tick(today);
+  const { points } = await (await request('/__test-history')).json<{ points: AnalyticsEngineDataPoint[] }>();
+  expect(points.find(point => point.blobs?.[0] === published.id)).toEqual({
+    indexes: [expect.stringMatching(/^[a-f0-9]{64}$/)], blobs: [published.id, 'success'], doubles: [today],
+  });
+  await mutate('/api/operator/monitors/' + deleted.id, 'DELETE');
+  await request('/__test-history?mode=direct'); // Keep existing points, disable the managed reader temporarily.
+  vi.spyOn(Date, 'now').mockReturnValue(today + 60_000);
+  const sqlCalls: string[] = [];
+  vi.mocked(fetch).mockImplementation(async (input, init) => {
+    expect(String(input)).toBe('https://api.cloudflare.com/client/v4/accounts/' + 'a'.repeat(32) + '/analytics_engine/sql');
+    expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer test-analytics-token');
+    expect(init?.redirect).toBe('manual');
+    const sql = String(init?.body);
+    sqlCalls.push(sql);
+    expect(sql).toMatch(/index1 = '[a-f0-9]{64}'/);
+    expect(sql).toContain("toDateTime(double1 / 1000, 'UTC')");
+    expect(sql).toContain("SUM(IF(blob2 = 'success', _sample_interval, 0))");
+    expect(sql).toContain('double1 >= ' + (today - 89 * day) + ' AND double1 < ' + (today + day));
+    expect(sql).toContain("blob1 IN ('" + published.id + "')");
+    expect(sql).not.toContain(hidden.id);
+    expect(sql).not.toContain(deleted.id);
+    return Response.json({ data: [
+      { monitorId: published.id, date: '2026-11-12', successes: '3', failures: '2', maintenance: '12' },
+    ] });
+  });
+  const publicStatus = await status();
+  expect(publicStatus.monitors.map(monitor => monitor.id)).toEqual([published.id]);
+  expect(publicStatus.monitor!.history).toMatchObject({ percentage: 60, days: expect.arrayContaining([
+    { date: '2026-11-12', state: 'degraded', successes: 3, failures: 2, maintenance: 12 },
+  ]) });
+  expect((await status()).monitor!.history).toEqual(publicStatus.monitor!.history);
+  expect(sqlCalls).toHaveLength(1);
+});
+
+it('enqueues the Incident while the history reader is unavailable', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
+  const monitor = await create();
+  await mutate('/api/operator/destinations', 'POST', { url: 'https://hooks.example/history' });
+  const operator = await status(true);
+  await mutate('/api/operator/monitors/' + monitor.id, 'PATCH', { destinationIds: [operator.destinations![0].id] });
+  await request('/__test-notification-queue', { method: 'DELETE' });
+  await request('/__test-history?mode=failed');
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 503 }));
+  clock.mockReturnValue(today + 60_000);
+  await tick(today + 60_000);
+  const { queries } = await (await request('/__test-history')).json<{ queries: unknown[] }>();
+  expect(queries).toHaveLength(0);
+  expect(await (await request('/__test-notification-queue')).json()).toMatchObject([{ event: { kind: 'incident.opened' } }]);
+  expect((await status()).monitor).toMatchObject({ state: 'down', history: null });
+  await request('/__test-notification-queue', { method: 'DELETE' });
+});
+
+it('queries history for only the requested authorized ledger rows and never for mutations', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(today);
+  const first = await create({ name: 'First' });
+  const second = await create({ name: 'Second' });
+  const hidden = await create({ name: 'Private', published: false });
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await tick(today);
+
+  const update = await mutate('/api/operator/monitors/' + first.id, 'PATCH', { name: 'Renamed' });
+  expect(update.status).toBe(200);
+  expect(await update.json()).toMatchObject({ monitor: { id: first.id, name: 'Renamed', state: 'up' } });
+  const publicPartials = '/api/status/partials/';
+  const operatorPartials = '/api/operator/partials/';
+  const queriedIds = async () => (await (await request('/__test-history')).json<{ queries: { monitorIds: string[] }[] }>())
+    .queries.map(query => query.monitorIds);
+  for (const scope of ['page', 'banner', 'incidents', 'monitor/' + hidden.id]) {
+    expect((await request(publicPartials + scope)).status).toBe(200);
+  }
+  expect((await mutate(operatorPartials + 'destinations', 'GET')).status).toBe(200);
+  expect((await request(publicPartials + 'monitors?revision=999')).status).toBe(409);
+  expect(await queriedIds()).toEqual([]);
+
+  const row = await (await request(publicPartials + 'monitor/' + first.id)).json<{ revision: number; html: string }>();
+  expect(row.revision).toBeGreaterThan(0);
+  expect(row.html).toContain('100.00%');
+  expect(row.html).toContain('Renamed');
+  expect(await queriedIds()).toEqual([[first.id]]);
+  const ledger = await (await request(publicPartials + 'monitors')).json<{ revision: number; html: string }>();
+  expect(ledger.revision).toBe(row.revision);
+  expect(ledger.html).toContain('Second');
+  expect(ledger.html).not.toContain('Private');
+  expect(await queriedIds()).toEqual([[first.id], [second.id]]);
+  const privateRow = await (await mutate(operatorPartials + 'monitor/' + hidden.id, 'GET')).json<{ html: string }>();
+  expect(privateRow.html).toContain('Private');
+  expect(privateRow.html).toContain('100.00%');
+  const saved = await mutate('/api/operator', 'PUT', { pageName: 'Renamed status page' });
+  expect(await saved.json()).toMatchObject({ pageName: 'Renamed status page', monitor: { history: { percentage: 100 } } });
+  expect(await queriedIds()).toEqual([[first.id], [second.id], [hidden.id]]);
+});
+
+
+it('submits a committed Calendar Heartbeat after restart without replaying its observation', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
+  const monitor = await create({ kind: 'heartbeat', scheduleMode: 'calendar', cron: '* * * * *',
+    timezone: 'UTC', graceSeconds: 30, url: undefined, failureThreshold: undefined });
+  const deadline = today + 90_000;
+  clock.mockReturnValue(deadline + 1);
+  await request('/__test-history?mode=interrupt-observation');
+  await expect(tick(deadline + 1)).rejects.toThrow('Interrupted before Analytics Engine handoff');
+  const points = async () => (await (await request('/__test-history')).json<{ points: AnalyticsEngineDataPoint[] }>()).points;
+  expect(await points()).toEqual([]);
+
+  const context = env.MONITORING.getByName('personal');
+  await evictDurableObject(context);
+  await request('/__test-history?mode=write-rejected');
+  expect((await status()).monitor).toMatchObject({ state: 'down', lastResult: { at: deadline } });
+  clock.mockReturnValue(deadline + 5_001);
+  expect(await runDurableObjectAlarm(context)).toBe(true);
+  expect(await points()).toEqual([]);
+  await evictDurableObject(context);
+  await request('/__test-history?mode=ingested');
+  clock.mockReturnValue(deadline + 10_001);
+  expect(await runDurableObjectAlarm(context)).toBe(true);
+  await tick(deadline + 10_001);
+  expect(await points()).toEqual([expect.objectContaining({ blobs: [monitor.id, 'failure'], doubles: [deadline] })]);
+});
+
+it('bounds a dispatch across Monitors and drains overflow after eviction without delaying detection', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
+  const input = { kind: 'heartbeat', scheduleMode: 'calendar', cron: '* * * * *', timezone: 'UTC', graceSeconds: 30 };
+  const calendars = [];
+  for (let i = 0; i < 4; i++) {
+    calendars.push(await create({ ...input, url: undefined, failureThreshold: undefined, published: i === 0 }));
+  }
+  await create({ name: 'Outbound check' });
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await request('/__test-history?mode=failed');
+  const catchUp = today + 129 * 60_000;
+  clock.mockReturnValue(catchUp);
+  await tick(catchUp);
+  const calls = async () => (await (await request('/__test-history')).json<{ points: AnalyticsEngineDataPoint[]; queries: unknown[] }>());
+  expect((await calls()).points).toHaveLength(250);
+  expect((await calls()).queries).toHaveLength(0);
+  const before = await status(true);
+  expect(before.monitors.map(monitor => monitor.state)).toEqual(['down', 'down', 'down', 'down', 'up']);
+  expect(before.incidents).toHaveLength(4);
+
+  const context = env.MONITORING.getByName('personal');
+  await evictDurableObject(context);
+  clock.mockReturnValue(catchUp + 5_000);
+  expect(await runDurableObjectAlarm(context)).toBe(true);
+  expect((await calls()).points).toHaveLength(500);
+  clock.mockReturnValue(catchUp + 10_000);
+  expect(await runDurableObjectAlarm(context)).toBe(true);
+  const { points } = await calls();
+  expect(points).toHaveLength(513);
+  for (const monitor of calendars) {
+    expect(points.filter(point => point.blobs?.[0] === monitor.id).map(point => point.doubles?.[0]))
+      .toEqual(Array.from({ length: 128 }, (_, i) => today + (i + 1) * 60_000 + 30_000));
+  }
+  expect(await runDurableObjectAlarm(context)).toBe(false);
+});
+
+it('keeps a successful first query when a newer observation commits while it is in flight', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
+  await create();
+  const target = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await tick(today);
+  await request('/__test-history?mode=held');
+  const initial = status();
+  // The test binding snapshots rows before holding the response.
+  await vi.waitFor(async () => {
+    const { queries } = await (await request('/__test-history')).json<{ queries: unknown[] }>();
+    expect(queries).toHaveLength(1);
+  });
+  clock.mockReturnValue(today + 60_000);
+  target.mockResolvedValue(new Response(null, { status: 503 }));
+  await tick(today + 60_000);
+  await request('/__test-history?mode=failed');
+  expect((await initial).monitor!.history).toMatchObject({ percentage: 100, stale: true });
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  expect((await status()).monitor).toMatchObject({ state: 'down', history: { percentage: 100, stale: true } });
+});
+
+it('returns the newer successful scoped series when an earlier query fails', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
+  const monitor = await create();
+  await create({ published: false });
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await tick(today);
+  const path = '/api/status/partials/monitor/' + monitor.id;
+  const read = async () => (await request(path)).json<{ html: string }>();
+  const queries = async () => (await (await request('/__test-history')).json<{ queries: { monitorIds: string[] }[] }>()).queries;
+  await request('/__test-history?mode=held-failure');
+  const earlier = read();
+  await vi.waitFor(async () => expect(await queries()).toHaveLength(1));
+  clock.mockReturnValue(today + 1_000);
+  await request('/__test-history?mode=ingested');
+  expect((await read()).html).toContain('100.00%');
+  await request('/__test-history?mode=release-failure');
+  const { html } = await earlier;
+  expect(html).toContain('100.00%');
+  expect(html).not.toContain('Availability history is stale');
+  clock.mockReturnValue(today + 16_000);
+  expect((await read()).html).toContain('100.00%');
+  expect((await queries()).map(query => query.monitorIds)).toEqual([[monitor.id], [monitor.id], [monitor.id]]);
+});
+
+it('marks aggregates pending during ingestion and refreshes them without another observation', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
+  const monitor = await create();
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await tick(today);
+  await request('/__test-history?mode=lagging');
+  expect((await status()).monitor!.history).toMatchObject({ percentage: null, pending: true });
+  clock.mockReturnValue(today + 14_999);
+  expect((await status()).monitor!.history?.percentage).toBeNull();
+  const path = '/api/status/partials/monitor/' + monitor.id;
+  const read = async () => (await request(path)).json<{ html: string }>();
+  for (const offset of [30_000, 60_000, 90_000, 119_000]) {
+    clock.mockReturnValue(today + offset);
+    const { html } = await read();
+    expect(html).toContain('No observations');
+    expect(html).toContain('data-history-retry');
+  }
+  await request('/__test-history?mode=ingested');
+  clock.mockReturnValue(today + 120_000);
+  const { html } = await (await request(path)).json<{ html: string }>();
+  expect(html).toContain('100.00%');
+  expect(html).not.toContain('data-history-retry');
+});
+
+it('shares scoped history rendering with negotiated snapshots and keeps mutation acknowledgments query-free', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(today);
+  const published = await create({ name: 'Public row' });
+  const hidden = await create({ name: 'Private row', published: false });
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await tick(today);
+
+  const headers = { authorization, 'Content-Type': 'application/json', Accept: 'application/vnd.irisbeat.view+json' };
+  const response = await request('/api/operator', { method: 'PUT', headers, body: JSON.stringify({ pageName: 'Renamed page' }) });
+  expect(response.status).toBe(200);
+  const { revision, scopes } = await response.json<{ revision: number; scopes: string[] }>();
+  expect(scopes).toEqual(['page']);
+  const partial = await request('/api/operator/partials/page?revision=' + revision, { headers });
+  expect(await partial.json()).toMatchObject({ pageName: 'Renamed page', revision });
+
+  const monitorWrite = await request('/api/operator/monitors/' + published.id, {
+    method: 'PATCH', headers, body: JSON.stringify({ name: 'Renamed public row' }),
+  });
+  expect(await monitorWrite.json()).toMatchObject({ scopes: ['monitor/' + published.id, 'incidents'] });
   const legacy = await mutate('/api/operator', 'PUT', { pageName: 'Legacy page' });
-  expect(await legacy.json()).toMatchObject({ pageName: 'Legacy page', monitors: [{ history: { days: expect.any(Array) } }, { history: { days: expect.any(Array) } }] });
-  expect(await (await request('/__test-history?reads')).json()).toBe(2);
+  expect(await legacy.json()).toMatchObject({ pageName: 'Legacy page', monitors: [{ history: null }, { history: null }] });
+  const queriedIds = async () => (await (await request('/__test-history')).json<{ queries: { monitorIds: string[] }[] }>())
+    .queries.map(query => query.monitorIds);
+  expect(await queriedIds()).toEqual([]);
+
+  for (const [api, name] of [['status', 'Renamed public row'], ['operator', 'Private row']]) {
+    const snapshot = await (await request('/api/' + api, { headers })).json<{
+      html?: string; partials?: { scope: string; data: { html: string } }[];
+    }>();
+    const html = snapshot.html ?? snapshot.partials!.find(partial => partial.scope === 'monitors')!.data.html;
+    expect(html).toContain(name);
+    expect(html).toContain('100.00%');
+    if (api === 'status') expect(html).not.toContain('Private row');
+    const scoped = await (await request('/api/' + api + '/partials/monitors', { headers })).json<{ html: string }>();
+    expect(html).toContain(scoped.html);
+  }
+  expect(await queriedIds()).toEqual([[published.id], [hidden.id]]);
+});
+
+it('uses opaque retry tokens without exposing private observation counts after republication', async () => {
+  expectTypeOf<Extract<keyof Status['monitors'][number], 'historyRevision' | 'historyRetryToken'>>().toBeNever();
+  expectTypeOf<Extract<keyof NonNullable<Status['monitor']>, 'historyRevision' | 'historyRetryToken'>>().toBeNever();
+  vi.spyOn(Date, 'now').mockReturnValue(today);
+  const monitor = await create({ name: 'Heartbeat visibility', kind: 'heartbeat', url: undefined, failureThreshold: undefined });
+  const configuration = '/api/operator/monitors/' + monitor.id;
+  const partial = '/api/status/partials/monitor/' + monitor.id;
+  const token = async () => (await (await request(partial)).json<{ html: string }>()).html
+    .match(/data-history-token="([^"]+)"/)?.[1];
+  const receipt = () => mutate('/heartbeat/' + monitor.id, 'POST');
+  expect((await receipt()).status).toBe(204);
+  const before = await token();
+  expect(before).toMatch(/^[0-9a-f-]{36}$/);
+  expect(await token()).toBe(before);
+  expect((await status()).monitor).not.toHaveProperty('historyRevision');
+
+  expect((await mutate(configuration, 'PATCH', { published: false })).status).toBe(200);
+  expect(await token()).toBeUndefined();
+  expect((await receipt()).status).toBe(204);
+  expect((await receipt()).status).toBe(204);
+  expect((await mutate(configuration, 'PATCH', { published: true })).status).toBe(200);
+  const after = await token();
+  expect(after).toMatch(/^[0-9a-f-]{36}$/);
+  expect(after).not.toBe(before);
+  expect(await token()).toBe(after);
+  const publicStatus = await status();
+  expect(publicStatus.monitor).not.toHaveProperty('historyRevision');
+  expect(publicStatus.monitors[0]).not.toHaveProperty('historyRetryToken');
+  expect(publicStatus.monitor).not.toHaveProperty('historyRetryToken');
 });

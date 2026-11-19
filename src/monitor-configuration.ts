@@ -20,12 +20,21 @@ const timingBounds = {
   recoverySpacingSeconds: [60, 86_400],
   graceSeconds: [1, 86_400],
 } as const;
+export function minimumCheckIntervalSeconds(value: string | number | undefined) {
+  const [min, max] = timingBounds.intervalSeconds;
+  if (value === undefined) return min;
+  const seconds = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : value;
+  if (typeof seconds !== "number" || !Number.isInteger(seconds) || seconds < min || seconds > max)
+    throw new Error("MIN_CHECK_INTERVAL_SECONDS must be a whole number from 60 to 86400");
+  return seconds;
+}
 type Timing = typeof timingDefaults;
 type Target =
   | { kind: "http"; url: string; hostname?: never; port?: never }
   | { kind: "tcp"; hostname: string; port: number; url?: never }
   | { kind: "heartbeat"; url?: never; hostname?: never; port?: never };
 type MonitorConfiguration = { name: string; published?: boolean } & Target & Partial<Timing> & Schedule;
+type ScheduleConfiguration = Pick<MonitorConfiguration, "kind" | "scheduleMode" | "cron" | "timezone" | "graceSeconds">;
 type Configuration = MonitorConfiguration & { pageName: string };
 
 type CheckResult = { at: number; outcome: "success" | "failure" | "maintenance" };
@@ -39,16 +48,23 @@ export type Monitor = MonitorConfiguration & Timing & {
   failures: number;
   successes: number;
   nextDue: number;
+  lastOutboundCheckAt?: number;
+  lastOutboundStartedAt?: number;
+  outboundCalendarFloor?: { seconds: number; compatible: boolean };
   createdAt: number;
   lastSeen: number | null;
   recoveryReceiptAt: number | null;
   heartbeatDigest?: ArrayBuffer;
   scheduleRevision?: number;
+  historyRevision?: number;
+  historyRetryToken?: string;
+  historyChangedAt?: number;
   notificationSelections?: NotificationSelection[];
 };
 
-// Internal synchronous operations owned by MonitoringContext. Only grace validation may yield.
+// Internal synchronous operations owned by MonitoringContext. Only Calendar validation may yield.
 type ConfigurationRuntime<State, Result> = {
+  minimumCheckIntervalSeconds(): number;
   read(): State;
   commit(state: State, previousName: string, previous?: Monitor, current?: Monitor): Result;
 };
@@ -56,14 +72,30 @@ type ConfigurationRuntime<State, Result> = {
 export class MonitorConfigurations<State extends { pageName: string; monitors: Monitor[]; destinations?: NotificationDestination[] }, Result> {
   constructor(private runtime: ConfigurationRuntime<State, Result>) {}
 
-  private graceProof(configuration: Pick<MonitorConfiguration, "kind" | "scheduleMode" | "cron" | "timezone" | "graceSeconds">, current?: MonitorConfiguration) {
-    if (configuration.kind !== "heartbeat" || configuration.scheduleMode !== "calendar") return null;
+  private validInterval(patch: Partial<MonitorConfiguration>, current?: MonitorConfiguration) {
+    if ((patch.kind ?? current?.kind) === "heartbeat" || (patch.scheduleMode ?? current?.scheduleMode) === "calendar") return true;
+    const interval = patch.intervalSeconds ?? (patch.scheduleMode === "interval" && current?.scheduleMode === "calendar" ? current.intervalSeconds : undefined);
+    return interval === undefined || interval >= this.runtime.minimumCheckIntervalSeconds();
+  }
+
+  private scheduleProof(configuration: ScheduleConfiguration, fields: object, current?: Monitor) {
+    if (configuration.scheduleMode !== "calendar") return null;
+    if (configuration.kind !== "heartbeat") {
+      if (current?.scheduleMode === "calendar" && !("scheduleMode" in fields || "cron" in fields || "timezone" in fields)) return null;
+      const floor = this.runtime.minimumCheckIntervalSeconds();
+      if (current?.outboundCalendarFloor?.compatible && current.outboundCalendarFloor.seconds === floor &&
+          current.cron === configuration.cron && current.timezone === configuration.timezone) return null;
+      return JSON.stringify([configuration.cron, configuration.timezone, floor]);
+    }
     const key = JSON.stringify([configuration.cron, configuration.timezone, configuration.graceSeconds ?? timingDefaults.graceSeconds]);
     return current?.scheduleMode === "calendar" && key === JSON.stringify([current.cron, current.timezone, current.graceSeconds]) ? null : key;
   }
 
-  private async acceptsProof(configuration: Pick<MonitorConfiguration, "cron" | "timezone" | "graceSeconds">) {
-    return calendar(configuration.cron, configuration.timezone).acceptsGraceAsync(configuration.graceSeconds ?? timingDefaults.graceSeconds, Date.now());
+  private acceptsProof(configuration: ScheduleConfiguration) {
+    const parsed = calendar(configuration.cron, configuration.timezone);
+    return configuration.kind === "heartbeat"
+      ? parsed.acceptsGraceAsync(configuration.graceSeconds ?? timingDefaults.graceSeconds, Date.now())
+      : parsed.acceptsMinimumGap(this.runtime.minimumCheckIntervalSeconds(), Date.now());
   }
 
   async configure(value: unknown, expectedMonitorId: string | null = null) {
@@ -74,6 +106,7 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
       const fields = value as Record<string, unknown>;
       const state = this.runtime.read();
       let configuration: Configuration | { pageName: string };
+      let validatedSchedule = false;
       if (Object.keys(fields).length === 1 && "pageName" in fields) {
         if (typeof fields.pageName !== "string" || !fields.pageName.trim() || fields.pageName.length > 120) return undefined;
         configuration = { pageName: fields.pageName.trim() };
@@ -86,13 +119,14 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
           ? { scheduleMode: monitor.scheduleMode, cron: monitor.cron, timezone: monitor.timezone } : {};
         const grace = monitor?.kind === "heartbeat" && (fields.scheduleMode ?? monitor.scheduleMode) === "calendar" ? { graceSeconds: monitor.graceSeconds } : {};
         const parsed = parseConfiguration({ ...schedule, ...grace, ...fields }, monitor?.kind, monitor);
-        if (!parsed || !validKindFields({ ...fields, scheduleMode: parsed.scheduleMode ?? "interval" }, parsed.kind) || (monitor && monitor.kind !== parsed.kind)) return undefined;
-        const proof = this.graceProof(parsed, monitor);
+        if (!parsed || !validKindFields({ ...fields, scheduleMode: parsed.scheduleMode ?? "interval" }, parsed.kind) || (monitor && monitor.kind !== parsed.kind) || !this.validInterval(parsed, monitor)) return undefined;
+        const proof = this.scheduleProof(parsed, fields, monitor);
         if (proof && !proofs.has(proof)) {
           if (!await this.acceptsProof(parsed)) return undefined;
           proofs.add(proof);
           continue;
         }
+        validatedSchedule = proof !== null;
         configuration = parsed;
       }
       const previousName = state.pageName;
@@ -100,7 +134,7 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
       if ("kind" in configuration) {
         const { pageName: _pageName, ...settings } = configuration;
         const monitor = state.monitors[0];
-        if (monitor) this.applyEdit(monitor, settings);
+        if (monitor) this.applyEdit(monitor, settings, validatedSchedule);
         else state.monitors.push(this.newMonitor(settings));
       }
       state.pageName = configuration.pageName;
@@ -109,7 +143,10 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
   }
 
   private newMonitor(configuration: MonitorConfiguration): Monitor {
-    return { ...timingDefaults, scheduleMode: "interval", ...configuration, id: crypto.randomUUID(), published: configuration.published ?? true, state: "unknown", lastResult: null,
+    const intervalSeconds = configuration.kind !== "heartbeat" && configuration.scheduleMode !== "calendar"
+      ? this.runtime.minimumCheckIntervalSeconds() : timingDefaults.intervalSeconds;
+    return { ...timingDefaults, intervalSeconds, scheduleMode: "interval", ...configuration, id: crypto.randomUUID(), published: configuration.published ?? true, state: "unknown", lastResult: null,
+      ...(configuration.kind !== "heartbeat" && configuration.scheduleMode === "calendar" ? { outboundCalendarFloor: this.compatibleFloor() } : {}),
       failures: 0, successes: 0, nextDue: configuration.scheduleMode === "calendar" ? calendar(configuration.cron, configuration.timezone).next(Date.now())[0] : 0, createdAt: Date.now(), lastSeen: null, recoveryReceiptAt: null };
   }
 
@@ -117,8 +154,8 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
     if (value && typeof value === "object" && "destinationIds" in value &&
         (!Array.isArray(value.destinationIds) || value.destinationIds.length)) return undefined;
     const configuration = parseMonitorPatch(value);
-    if (!configuration) return undefined;
-    if (this.graceProof(configuration) && !await this.acceptsProof(configuration)) return undefined;
+    if (!configuration || !this.validInterval(configuration)) return undefined;
+    if (this.scheduleProof(configuration, configuration) && !await this.acceptsProof(configuration)) return undefined;
     const state = this.runtime.read();
     // No await between allowance check and synchronous persistence: concurrent RPCs serialize.
     if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0 || state.monitors.length >= limit)) return null;
@@ -135,9 +172,9 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
       const monitor = state.monitors.find(monitor => monitor.id === id);
       if (!monitor) return null;
       const patch = parseMonitorPatch(value, monitor);
-      if (!patch) return undefined;
+      if (!patch || !this.validInterval(patch, monitor)) return undefined;
       const configuration = { ...monitor, ...patch };
-      const proof = this.graceProof(configuration, monitor);
+      const proof = this.scheduleProof(configuration, value as object, monitor);
       if (proof && !proofs.has(proof)) {
         if (!await this.acceptsProof(configuration)) return undefined;
         proofs.add(proof);
@@ -166,16 +203,22 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
           existing.find(selection => selection.destinationId === destinationId) ??
           { destinationId, generation: crypto.randomUUID() });
       }
-      this.applyEdit(monitor, patch);
+      this.applyEdit(monitor, patch, proof !== null);
       return this.runtime.commit(state, state.pageName, previous, monitor);
     }
   }
 
-  private applyEdit(monitor: Monitor, patch: Partial<MonitorConfiguration>) {
-    const changed = (["scheduleMode", "cron", "timezone", "graceSeconds"] as const).some(key => patch[key] !== undefined && patch[key] !== monitor[key]);
+  private compatibleFloor() {
+    return { seconds: this.runtime.minimumCheckIntervalSeconds(), compatible: true };
+  }
+
+  private applyEdit(monitor: Monitor, patch: Partial<MonitorConfiguration>, validatedSchedule: boolean) {
+    const resume = validatedSchedule && monitor.outboundCalendarFloor?.compatible === false;
+    if (validatedSchedule && monitor.kind !== "heartbeat") monitor.outboundCalendarFloor = this.compatibleFloor();
+    const changed = resume || (["scheduleMode", "cron", "timezone", "graceSeconds"] as const).some(key => patch[key] !== undefined && patch[key] !== monitor[key]);
     if (changed) {
       Object.assign(monitor, patch);
-      if (monitor.scheduleMode === "interval") { delete monitor.cron; delete monitor.timezone; }
+      if (monitor.scheduleMode === "interval") { delete monitor.cron; delete monitor.timezone; delete monitor.outboundCalendarFloor; }
       monitor.recoveryReceiptAt = null;
       monitor.scheduleRevision = (monitor.scheduleRevision ?? 0) + 1;
       monitor.nextDue = monitor.scheduleMode === "calendar" ? calendar(monitor.cron, monitor.timezone).next(Date.now())[0] : Date.now() + monitor.intervalSeconds * 1000;

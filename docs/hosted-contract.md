@@ -62,6 +62,10 @@ HTML or script receives heartbeat credentials or their digests. Operator JSON ad
 `hosted: true` and `permission`; the existing ledger hides editing controls for
 readers and offers hosted credential rotation for editors.
 
+The monitoring Worker's optional `MIN_CHECK_INTERVAL_SECONDS` binding applies
+the same outbound check floor across all resolved contexts. Operator snapshots
+include the effective Interval or Calendar suspension details. [Monitor API](monitor-api.md#outbound-check-floor)
+
 Creation passes the adapter's allowance into the same synchronous DO operation
 that checks the active collection and saves the new Monitor. Private Monitors
 count; deleted ones release capacity. Lowering the allowance does not delete
@@ -70,6 +74,46 @@ existing configuration or prevent edits/checking. Hosted callers must create via
 so they cannot bypass the allowance. Page-only `PUT /api/operator` still works.
 The personal default export retains its complete existing interface and unlimited
 creation with the installation secret.
+
+## Availability history
+
+Bind `AVAILABILITY_HISTORY` as an Analytics Engine dataset on the Worker that
+hosts `MonitoringContext`. Configure the self-hosted SQL inputs or supply
+`AVAILABILITY_QUERY` as a trusted service binding on that Worker. The query service
+and the write binding use the same Analytics Engine account and dataset. The
+service binding takes precedence over the direct credentials when supplied.
+
+Import `AvailabilityQueryService`, `AvailabilityQuery`, and `AvailabilityRow`
+from `irisbeat`. The engine calls
+`queryAvailability(query: AvailabilityQuery): Promise<AvailabilityRow[]>`.
+The request carries an opaque `tenantKey` (the context's Durable Object ID),
+a batch of 1–50 authorized `monitorIds`, and `start` and `end` in Unix
+milliseconds. The service always filters by the tenant key and the listed IDs.
+Filter on the actual observation timestamp and include `start`, excluding
+`end`. Group by Monitor and UTC day. Return one
+`{ monitorId, date, successes, failures, maintenance }` per observed day, with
+`date` as `YYYY-MM-DD` and each count weighted by `_sample_interval`. Return
+an empty array when no rows match and reject on read failure.
+
+Delayed Status requests include `loggedBefore`, an exclusive cutoff in Unix
+seconds for Analytics Engine's built-in `timestamp` column, which records when
+the Worker logged the point. Apply `timestamp < toDateTime(loggedBefore, 'UTC')`
+alongside the actual observation range before grouping. Use the same cutoff for
+retries of a retained publication, including after a visibility change. Points
+logged exactly at the cutoff are eligible for a subsequent publication. A
+point logged before the cutoff can appear in the same publication when it
+becomes queryable. When the request includes `observation: { at, outcome }`,
+apply both exact filters for the installation readiness probe. Operator,
+immediate Status and readiness queries omit `loggedBefore`.
+
+Keep this service private to trusted Worker
+callers. The caller supplies identity after authorizing the public or Operator
+read, and the service never accepts scopes from browser headers or URLs.
+
+The field layout and cutover are in the
+[availability history handoff](history-api.md). The readiness endpoint is
+editor-only. Existing status payloads keep the 90-day history shape with an
+optional `stale: true` on previously successful aggregates.
 
 ## Heartbeat credentials
 
@@ -522,7 +566,7 @@ stay independent of the public window.
 Cloudflare's Cache API stores anonymous documents, snapshots, and partials
 regionally. The MonitoringContext resolves the eligible publication revision
 before the HTTP Worker looks up a cache entry. The key includes the trusted
-Durable Object ID, resource and publication revision, so ordinary GETs catch up
+Durable Object ID, resource, publication revision, and render generation, so ordinary GETs catch up
 even when an edge clock differs from the publication clock or a client missed a
 hint. A hinted revision is a lower bound on the same URL. An edge miss renders
 the published projection and an unavailable minimum returns 409. Static assets
@@ -532,46 +576,27 @@ retain `Cache-Control: no-store`. Hosted deployments can bind
 deployed Worker version. See [Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/)
 and [Durable Object alarms](https://developers.cloudflare.com/durable-objects/api/alarms/).
 
-#### Analytics Engine handoff for #89
+#### Availability in a public publication
 
-`sealStatusWindow(clock, at)` captures the committed public Monitor fields,
-Incident inputs, history day and observation fence for an elapsed window.
-`advanceStatusPublication(at)` consumes those inputs after `read(at)` applies
-any due expiry and UTC rollover. `projectStatusBaseline(baseline)` assembles
-availability from the same retained inputs for both elapsed windows and the
-first-read baseline. `publishStatus(data, revision, scopes)` renders and saves
-that projection and invokes `onStatusPublished(hint)`, while newer pending
-changes keep their own window. The HTTP-facing `statusPublicationRevision()`
-and `readPublishedStatus(resource, minimum)` retain their signatures.
+The MonitoringContext seals an elapsed window before a later change can alter
+its Monitor set, Incidents, observation revisions or UTC history range. A later
+open window retains its own pending changes. Maintenance expiry and UTC rollover
+use their effective time when discovered after idle periods. The MonitoringContext queries before
+rendering, persisting the projection, and sending the public hint. An observation
+committed later stays outside that series even if its observation timestamp is
+in the published range. Check commits, notification handoff and Operator
+authorization proceed independently of the query.
 
-Attach Analytics Engine availability when assembling the retained projection
-and the initial live projection if no retained inputs exist. The SQLite
-`queryHistory(id, start, end, throughId)` hook still accepts an observation
-fence. Capture each Monitor's history revision with the inputs before
-awaiting the provider.
-Recheck those inputs and the publication revision before saving so a late
-query cannot publish newer visibility or roll back a newer publication. The
-observation write belongs after the Check transaction commits. Provider reads
-belong on publication and history reads, while Check commits, alerts, and
-Operator authorization can proceed independently.
-
-For the combined candidate, expose a durable render generation alongside the
-published revision from `statusPublicationRevision()` and return both from
-`readPublishedStatus()` for cache admission. Include the generation in the edge
-key. When a published row reports stale or pending history, its existing
-scoped retry GET should let the MonitoringContext revalidate that row on the
-provider's retry schedule even when an edge entry is warm. Keep a short
-retry-after deadline for unresolved history. After the browser's four
-attempts, a later ordinary GET past that deadline can revalidate only the
-unresolved rows relevant to its resource. On recovery, recheck the published Monitor and its history revision, then replace the row
-and advance the generation together. Use the new generation for the full
-Status, negotiated snapshot and ledger as well as the affected row, and rebuild
-those representations from the corrected retained projection as requested.
-The public hint revision remains a minimum and the configured window still
-controls when new Monitor data becomes public. Verify warm edges under a long
-window return the repaired row and full snapshot when the provider recovers
-during the four attempts over roughly two minutes, including after eviction.
-Also exercise a recovery after that cycle through an ordinary GET.
+`statusPublicationRevision(resource?, minimum?)` resolves the eligible revision
+and render generation before an edge lookup. `readPublishedStatus(resource,
+minimum)` reads the prepared render with the same version fields. A scoped
+retry GET can revalidate a stale, pending or unavailable row even on a warm
+edge. The MonitoringContext records a per-row retry deadline. An ordinary GET
+after that deadline can revalidate the unresolved rows it reads even after the
+browser finishes its four retries. Successful changes persist the corrected
+series and advance the render generation together. All anonymous representations
+use the resulting generation. The public hint revision and the publication
+window still control when new Monitor state and visibility become public.
 
 ### Upgrade from unscoped subscriptions
 

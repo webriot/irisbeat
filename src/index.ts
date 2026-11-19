@@ -1,21 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, renderViewPartial, renderViewSnapshot, styleSheet, themeScript } from "./ui";
+import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, renderViewPartial, renderViewSnapshot, statusJson, styleSheet, themeScript, type StatusProjection } from "./ui";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
-import { MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
+import { minimumCheckIntervalSeconds, MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
 import { connect } from "cloudflare:sockets";
 import { parseEmailAddress, type AlertDestination, type ConfirmationIdentity, type ConfirmationJob, type NewNotificationDestination, type NotificationDestination, type NotificationEligibility, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
 import type { NotificationDeliveryIdentity, SubmissionReport } from "./notification-outcomes";
 import { configurationScopes, mergeScopes, monitorScopes, sharedScopes, type ViewAudience, type ViewChanges, type ViewHint, type ViewScope } from "./view-changes";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { cachedRenderResponse, HTML, readEdge, renderResponse, renderStatus, statusRenderInterval, statusWindowEnd, writeEdge, type StatusRender, type StatusResource } from "./status-publication";
+import { Availability, availabilityRetryAfter, availabilityWriteLimit, DAY, historyStart, type AvailabilityEnv, type AvailabilityHistory, type HistoryFence } from "./availability-history";
+export type { AvailabilityHistory, AvailabilityQuery, AvailabilityQueryService, AvailabilityRow, HistoryDay } from "./availability-history";
 
 export const CONTRACT_VERSION = "1" as const;
-export interface EngineEnv {
+export interface EngineEnv extends AvailabilityEnv {
   MONITORING: DurableObjectNamespace<MonitoringContext>;
   INSTALLATION_SECRET?: string;
   STATUS_RENDER_INTERVAL_SECONDS?: string;
   IRISBEAT_VERSION?: { id: string };
+  MIN_CHECK_INTERVAL_SECONDS?: string | number;
   NOTIFICATION_PUBLIC_ORIGIN?: string;
   NOTIFICATION_EMAIL?: { isConfigured(): Promise<boolean> };
   NOTIFICATION_QUEUE?: Pick<Queue<NotificationQueueJob>, "sendBatch">;
@@ -60,19 +63,8 @@ export type {
   NotificationQueueJob,
 } from "./notification-jobs";
 export type { MaintenanceWindow } from "./monitor-configuration";
-const DAY = 86_400_000;
-const historyStart = (at: number) => Math.floor(at / DAY) * DAY - 89 * DAY;
-export type HistoryDay = {
-  date: string;
-  state: "up" | "down" | "degraded" | "maintenance" | "empty";
-  successes: number;
-  failures: number;
-  maintenance: number;
-};
-export type AvailabilityHistory = { days: HistoryDay[]; percentage: number | null };
-type DailyCounts = { day: number; successes: number; failures: number; maintenance: number };
 export type { ViewAudience, ViewHint, ViewScope } from "./view-changes";
-export type Status = ReturnType<MonitoringContext["status"]>;
+export type Status = ReturnType<typeof statusJson>;
 const CONFIRMATION_COOLDOWN = 5 * 60_000;
 type ConfirmationInvitation = { id: string; token: string; origin: string; expiresAt: number; submitted?: boolean };
 type StoredContext = {
@@ -100,16 +92,13 @@ type Subscription = { protocol: 2; pending: boolean; queued?: ViewHint } & (
   | OperatorSubscription
 );
 type PendingStatus = { since: number; scopes: ViewScope[] };
-type PublishedStatus = {
-  revision: number;
-  data: Status;
-  renders: Map<StatusResource, StatusRender>;
-};
-type PublishedStatusMeta = Pick<Status, "paused" | "pageName"> & { revision: number };
+type PublishedStatusMeta = Pick<StatusProjection, "paused" | "pageName"> & { revision: number; loggedBefore?: number };
+type PublishedHistory = HistoryFence & { retryAt?: number };
+type PublicationInput = { revision: number; at: number; loggedBefore?: number; data: StatusProjection; history: Map<string, PublishedHistory> };
+type PublishedStatus = PublicationInput & { generation: number; renders: Map<StatusResource, StatusRender> };
 type StatusBaseline = PublishedStatusMeta & {
-  monitors: ReturnType<typeof publicMonitor>[];
+  monitors: (ReturnType<typeof publicMonitor> & { historyFence?: HistoryFence })[];
   at: number;
-  observationId: number;
   publication?: { dueAt: number; scopes: ViewScope[] };
 };
 type MutationAck = Pick<ViewHint, "revision" | "scopes">;
@@ -123,6 +112,7 @@ function publicMonitor(monitor: Monitor, paused: boolean) {
     ...(kind === "heartbeat" ? { lastSeen: monitor.lastSeen ?? null } : {}),
     state: paused ? "paused" as const : monitor.maintenance ? "maintenance" as const : monitor.state,
     maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult,
+    ...(monitor.historyRetryToken ? { historyRetryToken: monitor.historyRetryToken } : {}),
   };
 }
 
@@ -136,6 +126,7 @@ function allowedSubscriptionOrigin(request: Request, requireOrigin: boolean) {
 export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableObject<E> {
   private readonly renderInterval = statusRenderInterval(this.env.STATUS_RENDER_INTERVAL_SECONDS);
   private publishedStatus?: PublishedStatus;
+  private publicationRetryAt = 0;
 
   constructor(ctx: DurableObjectState, env: E) {
     super(ctx, env);
@@ -150,9 +141,6 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS incidents (
       id TEXT PRIMARY KEY, monitorId TEXT NOT NULL, openedAt INTEGER NOT NULL, closedAt INTEGER
     )`);
-    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS observations (
-      id INTEGER PRIMARY KEY, monitorId TEXT NOT NULL, at INTEGER NOT NULL, outcome TEXT NOT NULL
-    )`);
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS subscription_tickets (
       token TEXT PRIMARY KEY, scope TEXT NOT NULL, expiresAt INTEGER NOT NULL
     )`);
@@ -163,8 +151,6 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       id INTEGER PRIMARY KEY, monitorId TEXT NOT NULL, startedAt INTEGER NOT NULL, endsAt INTEGER NOT NULL
     )`);
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS calendar_maintenance_monitor ON calendar_maintenance (monitorId, endsAt)");
-    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS observations_monitor_at ON observations (monitorId, at)");
-    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS observations_at ON observations (at)");
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS incidents_opened ON incidents (openedAt DESC, id)");
     if (this.renderInterval) {
       ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS status_publication (
@@ -270,21 +256,58 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const hasPublicSubscribers = this.liveSockets("public").length > 0;
     const observed = operators.some(state => state.authenticated) ? monitors
       : hasPublicSubscribers ? monitors.filter(monitor => monitor.published) : [];
-    const publication = hasPublicSubscribers
-      ? this.statusBaseline()?.publication?.dueAt ?? this.statusPublicationAt()
-      : Infinity;
+    const publication = hasPublicSubscribers ? Math.max(this.eligiblePublicationAt(), this.publicationRetryAt) : Infinity;
     const day = this.viewClock().day ?? Math.floor(now / DAY);
     const boundary = observed.length ? Math.min((day + 1) * DAY,
       ...observed.flatMap(monitor => monitor.maintenance ? [monitor.maintenance.endsAt] : [])) : Infinity;
-    const at = Math.min(boundary, publication, ...operators.map(state => state.expiresAt));
+    const at = Math.min(boundary, publication, this.availability.flushAt ?? Infinity, ...operators.map(state => state.expiresAt));
     this.ctx.waitUntil(Number.isFinite(at) ? this.ctx.storage.setAlarm(at) : this.ctx.storage.deleteAlarm());
   }
 
-  alarm() {
-    const at = Date.now();
-    this.read(at);
-    if (this.liveSockets("public").length) this.advanceStatusPublication(at);
+  async alarm() {
+    const now = Date.now();
+    this.read(now);
+    if ((this.availability.flushAt ?? Infinity) <= now) {
+      // Persist the next wakeup before handing off any points from this alarm.
+      this.availability.delayFlush(now);
+      this.scheduleSubscriptionAlarm();
+      await this.drainAvailability(availabilityWriteLimit);
+    }
+    if (this.liveSockets("public").length && this.eligiblePublicationAt() <= now)
+      await this.advanceStatusPublication(this.read(now), now);
     this.scheduleSubscriptionAlarm();
+  }
+
+  private async drainAvailability(limit: number) {
+    if (limit <= 0 || this.availability.flushAt === undefined) return;
+    // Keep new observations and other drains out until the selected work is durable.
+    await this.ctx.blockConcurrencyWhile(async () => {
+      await this.ctx.storage.sync();
+      const now = Date.now();
+      const state = this.ctx.storage.kv.get<StoredContext>("context");
+      this.commitViewChanges(() => {
+        const changed = this.availability.flush(now, limit);
+        const operator: ViewScope[] = [];
+        const publicScopes: ViewScope[] = [];
+        for (const monitor of state?.monitors ?? []) {
+          if (!changed.has(monitor.id)) continue;
+          const changedAt = monitor.historyChangedAt ?? -Infinity;
+          const crossedWindow = this.renderInterval > 0 && (!Number.isFinite(changedAt) ||
+            now >= statusWindowEnd(changedAt, this.renderInterval));
+          monitor.historyRevision = (monitor.historyRevision ?? 0) + 1;
+          monitor.historyChangedAt = now;
+          // A handoff in the observation's window already has a pending public scope.
+          if (!crossedWindow && now < changedAt + availabilityRetryAfter) continue;
+          const scope = `monitor/${monitor.id}` as const;
+          monitor.historyRetryToken = crypto.randomUUID();
+          operator.push(scope);
+          if (monitor.published && (crossedWindow || !this.renderInterval)) publicScopes.push(scope);
+        }
+        if (state && changed.size) this.ctx.storage.kv.put("context", state);
+        return { public: publicScopes, reader: operator, editor: operator };
+      }, undefined, now);
+      this.scheduleSubscriptionAlarm();
+    });
   }
 
   private pendingStatus() {
@@ -295,13 +318,15 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return pending ? statusWindowEnd(pending.since, this.renderInterval) : Infinity;
   }
 
-  private captureStatusBaseline(revision: number, at: number, publication?: StatusBaseline["publication"]) {
+  private eligiblePublicationAt() {
+    return this.statusBaseline()?.publication?.dueAt ?? this.statusPublicationAt();
+  }
+
+  private captureStatusBaseline(revision: number, at: number, loggedBefore: number, publication?: StatusBaseline["publication"]) {
     const stored = this.ctx.storage.kv.get<StoredContext>("context");
     const paused = !!stored?.paused;
-    const monitors = stored?.monitors?.filter(monitor => monitor.published).map(monitor => publicMonitor(monitor, paused)) ?? [];
-    const observationId = monitors.length ? this.ctx.storage.sql.exec<{ id: number }>(
-      "SELECT COALESCE(MAX(id), 0) AS id FROM observations",
-    ).one().id : 0;
+    const monitors = stored?.monitors?.filter(monitor => monitor.published)
+      .map(monitor => ({ ...publicMonitor(monitor, paused), historyFence: this.historyFence(monitor) })) ?? [];
     this.ctx.storage.sql.exec("DELETE FROM status_publication WHERE kind = 'baseline-incident'");
     if (monitors.length) this.ctx.storage.sql.exec(
       `INSERT INTO status_publication (kind, position, data)
@@ -311,7 +336,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
        AND monitorId IN (SELECT value FROM json_each(?))`,
       historyStart(at) + 90 * DAY, historyStart(at), JSON.stringify(monitors.map(monitor => monitor.id)),
     );
-    const baseline: StatusBaseline = { revision, at, observationId, monitors, pageName: stored?.pageName ?? "Irisbeat", paused, publication };
+    const baseline: StatusBaseline = { revision, at, loggedBefore, monitors, pageName: stored?.pageName ?? "Irisbeat", paused, publication };
     this.ctx.storage.kv.put("status-baseline", baseline);
   }
 
@@ -322,7 +347,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const end = this.statusPublicationAt(pending);
     if (end > at) return;
     const prior = this.statusBaseline()?.publication;
-    this.captureStatusBaseline(clock.public, (clock.day ?? Math.floor(pending.since / DAY)) * DAY, {
+    this.captureStatusBaseline(clock.public, (clock.day ?? Math.floor(pending.since / DAY)) * DAY, end / 1000, {
       dueAt: prior?.dueAt ?? end,
       scopes: mergeScopes(prior?.scopes ?? [], pending.scopes),
     });
@@ -339,39 +364,50 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     )].map(row => JSON.parse(row.data) as T);
   }
 
+  private historyFence(monitor: Monitor): HistoryFence {
+    return { id: monitor.id, revision: monitor.historyRevision ?? 0, changedAt: monitor.historyChangedAt };
+  }
+
   private loadPublishedStatus(): PublishedStatus | undefined {
     if (this.publishedStatus) return this.publishedStatus;
-    const meta = this.ctx.storage.kv.get<PublishedStatusMeta>("status-published");
+    const meta = this.ctx.storage.kv.get<PublishedStatusMeta & { generation?: number; at?: number }>("status-published");
     if (!meta) return;
-    const { revision, ...fields } = meta;
-    const monitors = this.publicationRows<Status["monitors"][number]>("monitor");
+    const { revision, generation, at, loggedBefore, ...fields } = meta;
+    const history = new Map<string, PublishedHistory>();
+    const monitors = this.publicationRows<StatusProjection["monitors"][number] & { historyFence?: PublishedHistory }>("monitor")
+      .map(({ historyFence, ...monitor }) => {
+        history.set(monitor.id, historyFence ?? { id: monitor.id, revision: 0, retryAt: 0 });
+        // Publications from the SQLite build may contain aggregates from the retired table.
+        return { ...monitor, history: generation === undefined ? null : monitor.history };
+      });
     return this.publishedStatus = {
-      revision, data: { ...fields, monitors, monitor: monitors[0] ?? null, incidents: this.publicationRows<Incident>("incident") }, renders: new Map(),
+      revision, generation: generation ?? 0, at: at ?? Date.now(), loggedBefore, history,
+      data: { ...fields, monitors, monitor: monitors[0] ?? null, incidents: this.publicationRows<Incident>("incident") },
+      renders: new Map(),
     };
   }
 
-  private projectStatusBaseline(baseline: StatusBaseline): Status {
-    const { pageName, paused, at, observationId } = baseline;
-    const monitors = baseline.monitors.map(monitor => ({ ...monitor, history: this.history(monitor.id, historyStart(at), observationId) }));
-    return { pageName, paused, monitors, monitor: monitors[0] ?? null, incidents: this.publicationRows<Incident>("baseline-incident") };
+  private storePublicRow(monitor: StatusProjection["monitors"][number], position: number, historyFence: PublishedHistory) {
+    this.ctx.storage.sql.exec("INSERT OR REPLACE INTO status_publication VALUES ('monitor', ?, ?)", position,
+      JSON.stringify({ ...monitor, historyFence }));
   }
 
-  private publishStatus(data: Status, revision: number, scopes: ViewScope[] = []): PublishedStatus {
+  private savePublication(input: PublicationInput, previous: PublishedStatus | undefined, scopes: ViewScope[] = []) {
+    const { revision, at, loggedBefore, data, history } = input;
+    const generation = (previous?.generation ?? 0) + 1;
     const renders = new Map<StatusResource, StatusRender>();
     for (const scope of scopes) renders.set(scope, renderStatus(scope, data, revision));
-
-    // Persist the public projection so a cold edge can render this revision after eviction.
     this.ctx.storage.transactionSync(() => {
       const { pageName, paused, monitors, incidents } = data;
       this.ctx.storage.sql.exec("DELETE FROM status_publication");
-      const store = (kind: string, values: readonly unknown[]) => values.forEach((value, position) =>
-        this.ctx.storage.sql.exec("INSERT INTO status_publication VALUES (?, ?, ?)", kind, position, JSON.stringify(value)));
-      store("monitor", monitors);
-      store("incident", incidents);
-      this.ctx.storage.kv.put("status-published", { revision, pageName, paused });
+      monitors.forEach((monitor, position) => this.storePublicRow(monitor, position, history.get(monitor.id)!));
+      incidents.forEach((incident, position) => this.ctx.storage.sql.exec(
+        "INSERT INTO status_publication VALUES ('incident', ?, ?)", position, JSON.stringify(incident),
+      ));
+      this.ctx.storage.kv.put("status-published", { revision, generation, at, loggedBefore, pageName, paused });
       this.ctx.storage.kv.delete("status-baseline");
     });
-    const published = this.publishedStatus = { revision, data, renders };
+    const published = this.publishedStatus = { ...input, generation, renders };
     if (scopes.length) {
       try {
         this.onStatusPublished({ type: "changed", scopes, revision });
@@ -386,54 +422,136 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     this.broadcast("public", { public: hint });
   }
 
-  private advanceStatusPublication(at: number) {
-    const clock = this.viewClock();
-    if (this.statusPublicationAt() <= at)
-      this.ctx.storage.transactionSync(() => this.sealStatusWindow(clock, at));
+  private capturePublicationInput(state: StoredContext, revision: number, at: number): PublicationInput {
+    const data = this.project(state, false, false, at);
+    const history = new Map(state.monitors.filter(monitor => monitor.published).map(monitor => [monitor.id, this.historyFence(monitor)]));
+    return { revision, at, loggedBefore: Math.floor(at / 1000), data, history };
+  }
+
+  private baselinePublicationInput(baseline: StatusBaseline): PublicationInput {
+    const { revision, at, pageName, paused, publication } = baseline;
+    const loggedBefore = baseline.loggedBefore ?? (publication && publication.dueAt / 1000);
+    const history = new Map<string, PublishedHistory>();
+    const monitors = baseline.monitors.map(({ historyFence, ...monitor }) => {
+      history.set(monitor.id, historyFence ?? { id: monitor.id, revision: 0 });
+      return { ...monitor, history: null };
+    });
+    return { revision, at, loggedBefore, history, data: {
+      pageName, paused, monitors, monitor: monitors[0] ?? null, incidents: this.publicationRows<Incident>("baseline-incident"),
+    } };
+  }
+
+  private async advanceStatusPublication(state: StoredContext, now: number) {
+    const revision = this.viewClock().public;
+    if (this.statusPublicationAt() <= now) {
+      this.ctx.storage.transactionSync(() => this.sealStatusWindow(this.viewClock(), now));
+    }
+    const previous = this.loadPublishedStatus();
     const baseline = this.statusBaseline();
-    if (baseline?.publication) {
-      this.publishStatus(this.projectStatusBaseline(baseline), baseline.revision, baseline.publication.scopes);
-      this.scheduleSubscriptionAlarm();
-      return baseline.revision;
+    if (previous && !baseline?.publication) return previous;
+    const input = baseline ? this.baselinePublicationInput(baseline) : this.capturePublicationInput(state, revision, now);
+    const enriched = await this.attachPublicationHistory(input, previous, now);
+
+    const current = this.loadPublishedStatus();
+    const retained = this.statusBaseline();
+    // A later sealed window can supersede this one. An open window cannot change its inputs.
+    if ((current && current.revision >= input.revision) ||
+        retained?.revision !== baseline?.revision || retained?.publication?.dueAt !== baseline?.publication?.dueAt ||
+        (!baseline && this.viewClock().public !== revision)) {
+      if (this.eligiblePublicationAt() <= now) this.publicationRetryAt = Date.now() + 1_000;
+      return current;
     }
-    if (this.pendingStatus()) {
-      return this.ctx.storage.kv.get<PublishedStatusMeta>("status-published")?.revision
-        ?? baseline?.revision ?? clock.public;
-    }
-    return clock.public;
+    this.publicationRetryAt = 0;
+    return this.savePublication(enriched, current, baseline?.publication?.scopes);
   }
 
-  // Only the publishing DO can say which revision an ordinary GET may reuse.
-  statusPublicationRevision() {
-    const at = Date.now();
-    this.read(at);
-    return {
-      revision: this.advanceStatusPublication(at),
-      cacheSeconds: this.renderInterval / 1000,
-    };
+  private async attachPublicationHistory(input: PublicationInput, previous: PublishedStatus | undefined, now: number): Promise<PublicationInput> {
+    const fallback = new Map<string, AvailabilityHistory | null>();
+    const resolved = new Map<string, AvailabilityHistory | null>();
+    if (previous && historyStart(previous.at) === historyStart(input.at)) {
+      for (const { id, history } of previous.data.monitors) {
+        if (history && (previous.history.get(id)?.revision ?? Infinity) <= (input.history.get(id)?.revision ?? -Infinity)) {
+          if (!history.stale && !history.pending && previous.history.get(id)?.revision === input.history.get(id)?.revision)
+            resolved.set(id, history);
+          else fallback.set(id, history);
+        }
+      }
+    }
+    const fences = [...input.history.values()].filter(fence => !resolved.has(fence.id));
+    for (const [id, history] of await this.availability.readPublished(fences, input.at, input.loggedBefore, now, fallback)) {
+      resolved.set(id, history);
+      input.history.get(id)!.retryAt = now + availabilityRetryAfter;
+    }
+    return { ...input, data: attachAvailability(input.data, resolved) };
   }
 
+  private async retryPublishedHistory(published: PublishedStatus, resource: StatusResource, now: number) {
+    if (!(resource === "/" || resource === "snapshot" || resource === "/api/status" || includesLedger(resource))) return;
+    const row = resource.startsWith("monitor/") ? resource.slice("monitor/".length) : null;
+    const retry = published.data.monitors.flatMap((monitor, position) => {
+      const fence = published.history.get(monitor.id)!;
+      return (row === null || row === monitor.id) && (!monitor.history || monitor.history.stale || monitor.history.pending) &&
+        now >= (fence.retryAt ?? 0) ? [{ monitor, position, fence }] : [];
+    });
+    if (!retry.length) return;
+    this.ctx.storage.transactionSync(() => {
+      for (const { monitor, position, fence } of retry) {
+        fence.retryAt = now + availabilityRetryAfter;
+        this.storePublicRow(monitor, position, fence);
+      }
+    });
+    const result = await this.availability.readPublished(retry.map(({ fence }) => fence), published.at, published.loggedBefore, now,
+      new Map(retry.map(({ monitor }) => [monitor.id, monitor.history])));
+    const current = this.loadPublishedStatus();
+    if (!current || current.revision !== published.revision || current.at !== published.at) return;
+    const monitors = [...current.data.monitors];
+    const changes = retry.filter(({ monitor, position, fence }) => current.data.monitors[position] === monitor &&
+      current.history.get(monitor.id) === fence && fence.retryAt === now + availabilityRetryAfter &&
+      JSON.stringify(result.get(monitor.id)) !== JSON.stringify(monitor.history));
+    if (!changes.length) return;
+    const generation = current.generation + 1;
+    const { revision, at, loggedBefore, data } = current;
+    this.ctx.storage.transactionSync(() => {
+      for (const { monitor, position, fence } of changes) {
+        monitors[position] = { ...monitor, history: result.get(monitor.id) ?? null };
+        this.storePublicRow(monitors[position], position, fence);
+      }
+      this.ctx.storage.kv.put("status-published", { revision, generation, at, loggedBefore, pageName: data.pageName, paused: data.paused });
+    });
+    this.publishedStatus = { ...current, generation, data: { ...data, monitors, monitor: monitors[0] ?? null }, renders: new Map() };
+  }
+
+  // Resolve the durable render version before the HTTP Worker looks in its regional cache.
+  async statusPublicationRevision(resource: StatusResource = "/api/status", minimum = 0) {
+    if (!this.renderInterval) return { revision: this.viewClock().public, generation: 0, cacheSeconds: 0 };
+    const now = Date.now();
+    const state = this.read(now);
+    const due = this.eligiblePublicationAt() <= now;
+    let published = await this.advanceStatusPublication(state, now);
+    if (due) this.scheduleSubscriptionAlarm();
+    if (!published) published = await this.advanceStatusPublication(this.read(now), now);
+    if (published && published.revision >= minimum) await this.retryPublishedHistory(published, resource, now);
+    const eligible = this.loadPublishedStatus();
+    return { revision: eligible?.revision ?? -1, generation: eligible?.generation ?? 0, cacheSeconds: this.renderInterval / 1000 };
+  }
+
+  // The synchronous publication hook can read the committed partials directly.
   readPublishedStatus(resource: StatusResource, minimum: number) {
-    const at = Date.now();
-    const state = this.read(at);
-    const revision = this.advanceStatusPublication(at);
-    if (revision < minimum) return null;
-    if (!this.renderInterval) {
-      const scope = resource === "/" || resource === "/api/status" || resource === "snapshot" ? undefined : resource;
-      return { revision, ...renderStatus(resource, this.project(state, false, false, at, scope), revision), cacheable: false };
-    }
-    let published = this.loadPublishedStatus();
-    if (published?.revision !== revision) {
-      const baseline = this.pendingStatus() && this.statusBaseline();
-      published = baseline?.revision === revision
-        ? this.publishedStatus = { revision, data: this.projectStatusBaseline(baseline), renders: new Map() }
-        : this.publishStatus(this.project(state, false, false, at), revision);
-    }
-    const { data, renders } = published;
+    const published = this.loadPublishedStatus();
+    if (!published || published.revision < minimum) return null;
+    const { data, renders, revision, generation } = published;
     const render = renders.get(resource) ?? renderStatus(resource, data, revision);
     const cacheable = !resource.startsWith("monitor/") || data.monitors.some(monitor => monitor.id === resource.slice("monitor/".length));
     if (cacheable) renders.set(resource, render);
-    return { revision, ...render, cacheable };
+    return { revision, generation, ...render, cacheable };
+  }
+
+  async readLiveStatusRender(resource: StatusResource, minimum: number) {
+    if (resource === "/" || resource === "/api/status" || resource === "snapshot") {
+      return renderStatus(resource, await this.status(), 0);
+    }
+    const { revision, data } = await this.readView(resource, "public", minimum);
+    return revision < minimum ? null : renderStatus(resource, data, revision);
   }
 
   private viewClock(): ViewClock {
@@ -446,7 +564,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       const clock = this.viewClock();
       this.sealStatusWindow(clock, at);
       if (this.renderInterval && !this.ctx.storage.kv.get("status-published") && !this.statusBaseline())
-        this.captureStatusBaseline(clock.public, (clock.day ?? Math.floor(at / DAY)) * DAY);
+        this.captureStatusBaseline(clock.public, (clock.day ?? Math.floor(at / DAY)) * DAY, Math.floor(at / 1000));
       const changes = write();
       const hints: Partial<Record<ViewAudience, ViewHint>> = {};
       for (const audience of ["public", "reader", "editor"] as const) {
@@ -462,10 +580,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       if (day !== undefined) clock.day = day;
       else clock.day ??= Math.floor(at / DAY);
       if (day !== undefined || Object.keys(hints).length) this.ctx.storage.kv.put("view-clock", clock);
+      if (Object.keys(hints).length) this.scheduleSubscriptionAlarm();
       return { hints, revision: clock.editor };
     });
     if (Object.keys(hints).length) {
-      this.scheduleSubscriptionAlarm();
       this.publishViewChanges(hints);
     }
     return { revision, scopes: hints.editor?.scopes ?? [] };
@@ -636,6 +754,9 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       const parsed = calendar(value.cron, value.timezone === undefined ? "UTC" : value.timezone);
       if ("graceSeconds" in value && (typeof value.graceSeconds !== "number" || !Number.isInteger(value.graceSeconds) || value.graceSeconds < 1 || value.graceSeconds > 86400 || !await parsed.acceptsGraceAsync(value.graceSeconds, after)))
         throw new Error("Grace must be 1–86400 whole seconds and shorter than every occurrence gap");
+      const floor = minimumCheckIntervalSeconds(this.env.MIN_CHECK_INTERVAL_SECONDS);
+      if (value.outbound === true && !await parsed.acceptsMinimumGap(floor, after))
+        throw new Error(`Calendar occurrences must be at least ${floor} seconds apart`);
       return { cron: parsed.cron, timezone: parsed.timezone, explanation: parsed.explanation, occurrences: parsed.next(after, 3) };
     } catch (error) {
       return { error: error instanceof Error ? error.message : "Enter a valid Calendar Schedule" };
@@ -643,6 +764,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   private monitorConfigurations = new MonitorConfigurations({
+    minimumCheckIntervalSeconds: () => minimumCheckIntervalSeconds(this.env.MIN_CHECK_INTERVAL_SECONDS),
     read: () => this.read(),
     commit: (state: StoredContext, previousName: string, previous?: Monitor, current?: Monitor) => {
       return this.commitViewChanges(() => {
@@ -888,6 +1010,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (!monitor) return null;
     return this.commitViewChanges(() => {
       this.clearCalendarEvidence(id);
+      this.availability.remove(id);
       state.monitors = state.monitors.filter(monitor => monitor.id !== id);
       this.ctx.storage.kv.put("context", state);
       return configurationScopes(monitor, undefined, false);
@@ -897,10 +1020,43 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   // Keep overlap evidence with the running attempt even after a window is replaced or ends.
   private checking = new Map<string, { maintenance: boolean; paused: boolean }>();
 
-  async check(at: number) {
+  async prepareOutboundCalendars() {
+    const floor = minimumCheckIntervalSeconds(this.env.MIN_CHECK_INTERVAL_SECONDS);
+    if (floor === timingDefaults.intervalSeconds) return;
+    const needsProof = (monitor: Monitor) => monitor.kind !== "heartbeat" && monitor.scheduleMode === "calendar" &&
+      monitor.outboundCalendarFloor?.compatible !== false && monitor.outboundCalendarFloor?.seconds !== floor;
+    for (;;) {
+      const candidate = this.ctx.storage.kv.get<StoredContext>("context")?.monitors?.find(needsProof);
+      if (!candidate) return;
+      const compatible = await calendar(candidate.cron, candidate.timezone).acceptsMinimumGap(floor, Date.now());
+      const state = this.read();
+      // Another request may have changed the schedule while the proof was running.
+      const matches = state.monitors.filter(monitor => needsProof(monitor) &&
+        monitor.cron === candidate.cron && monitor.timezone === candidate.timezone);
+      if (!matches.length) continue;
+      this.commitViewChanges(() => {
+        for (const monitor of matches) monitor.outboundCalendarFloor = { seconds: floor, compatible };
+        this.ctx.storage.kv.put("context", state);
+        const scopes = compatible ? [] : matches.map(({ id }) => `monitor/${id}` as const);
+        return { reader: scopes, editor: scopes };
+      });
+    }
+  }
+
+  async check(at: number, writeLimit = availabilityWriteLimit) {
     const pending: Promise<void>[] = [];
     const { monitors } = this.read(Math.max(at, Date.now()), { pending });
-    await Promise.all([...pending, ...monitors.map(monitor => this.checkMonitor(monitor.id, at))]);
+    const calendarPolicy = this.prepareOutboundCalendars();
+    await Promise.all([calendarPolicy, ...pending, ...monitors.map(async monitor => {
+      if (monitor.kind !== "heartbeat" && monitor.scheduleMode === "calendar") await calendarPolicy;
+      await this.checkMonitor(monitor.id, at);
+    })]);
+    if (this.availability.flushAt !== undefined) this.scheduleSubscriptionAlarm();
+    await this.drainAvailability(Math.min(writeLimit, availabilityWriteLimit));
+  }
+
+  protected outboundStartTime(_scheduledAt: number) {
+    return Date.now();
   }
 
   private async checkMonitor(id: string, at: number) {
@@ -921,10 +1077,35 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
       return;
     }
-    if (this.checking.has(id) || at < attempt.nextDue) return;
+    if (this.checking.has(id) || at < attempt.nextDue || attempt.outboundCalendarFloor?.compatible === false) return;
+    const floor = minimumCheckIntervalSeconds(this.env.MIN_CHECK_INTERVAL_SECONDS) * 1000;
+    const calendarMode = attempt.scheduleMode === "calendar";
+    const earliest = calendarMode
+      ? (attempt.lastOutboundCheckAt ?? attempt.lastResult?.at ?? -Infinity) + floor
+      : Math.max(attempt.nextDue ? attempt.nextDue - attempt.intervalSeconds * 1000 : -Infinity,
+        attempt.lastOutboundCheckAt ?? -Infinity) + floor;
+    if (at < earliest) {
+      if (calendarMode) {
+        attempt.nextDue = calendar(attempt.cron, attempt.timezone).next(earliest - 1)[0];
+        this.ctx.storage.kv.put("context", state);
+      }
+      return;
+    }
+    const nextDue = calendarMode ? calendar(attempt.cron, attempt.timezone).next(at)[0] : at + attempt.intervalSeconds * 1000;
+    // Cron timestamps anchor observations and recurrence. The target sees wall-clock starts.
+    const startedAt = this.outboundStartTime(at);
+    if (startedAt < (attempt.lastOutboundStartedAt ?? -Infinity) + floor) {
+      if (calendarMode) {
+        attempt.nextDue = nextDue;
+        this.ctx.storage.kv.put("context", state);
+      }
+      return;
+    }
     const observation = { maintenance: !!attempt.maintenance, paused: false };
     this.checking.set(id, observation);
-    attempt.nextDue = attempt.scheduleMode === "calendar" ? calendar(attempt.cron, attempt.timezone).next(at)[0] : at + attempt.intervalSeconds * 1000;
+    attempt.lastOutboundCheckAt = at;
+    attempt.lastOutboundStartedAt = startedAt;
+    attempt.nextDue = nextDue;
     this.ctx.storage.kv.put("context", state);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), attempt.timeoutSeconds * 1000);
@@ -1004,22 +1185,22 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     let transition: "opened" | "recovered" | undefined;
     let transitionedIncident: Pick<Incident, "id" | "openedAt"> | undefined;
     let order: number | undefined;
+    const observation = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" } as const;
+    const now = Date.now();
+    const inRange = this.availability.configured && at >= historyStart(Math.max(at, now));
     this.commitViewChanges(() => {
       const previousState = monitor.state;
-      monitor.lastResult = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" };
+      monitor.lastResult = observation;
+      if (inRange) {
+        monitor.historyRevision = (monitor.historyRevision ?? 0) + 1;
+        monitor.historyChangedAt = now;
+        monitor.historyRetryToken = crypto.randomUUID();
+        this.availability.enqueue(monitor.id, observation);
+      }
       if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
         this.ctx.storage.sql.exec("DELETE FROM calendar_receipts WHERE monitorId = ? AND occurrence < ?", monitor.id, monitor.nextDue);
         this.ctx.storage.sql.exec("DELETE FROM calendar_maintenance WHERE monitorId = ? AND endsAt <= ?", monitor.id, at);
       }
-      if (monitor.kind !== "heartbeat" || monitor.scheduleMode !== "calendar" || at >= historyStart(Math.max(at, Date.now())))
-        this.ctx.storage.sql.exec("INSERT INTO observations (monitorId, at, outcome) VALUES (?, ?, ?)", monitor.id, at, monitor.lastResult.outcome);
-      // Keep the retained inputs readable until their projection has been saved.
-      const baseline = this.statusBaseline();
-      const retainBaseline = baseline?.observationId ? baseline : undefined;
-      this.ctx.storage.sql.exec(
-        "DELETE FROM observations WHERE id IN (SELECT id FROM observations WHERE at < ? AND id != ? ORDER BY at LIMIT 1000)",
-        historyStart(Math.min(Math.max(at, Date.now()), retainBaseline?.at ?? Infinity)), retainBaseline?.observationId ?? 0,
-      );
       if (maintenance) {
         this.ctx.storage.kv.put("context", current);
         return monitorScopes(monitor, `monitor/${monitor.id}`);
@@ -1064,7 +1245,6 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       if (transition || previousState !== monitor.state) scopes.push("banner");
       return monitorScopes(monitor, ...scopes);
     });
-    // Analytics Engine observation writes belong after the Check commit, before any alert handoff.
     if (!transition || !transitionedIncident) return;
     if (monitor.notificationSelections?.length) {
       await this.enqueueNotifications(monitor, pauseGeneration, {
@@ -1212,10 +1392,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       commitFreshness();
     } else if (monitor.maintenance) {
       await this.record(current, monitor, at, true, 1, monitor.recoveryThreshold, !!monitor.maintenance);
+      await this.drainAvailability(1);
     } else if (monitor.state !== "down" || monitor.recoveryReceiptAt === null ||
         at >= monitor.recoveryReceiptAt + monitor.recoverySpacingSeconds * 1000) {
       monitor.recoveryReceiptAt = at;
       await this.record(current, monitor, at, true, 1, monitor.recoveryThreshold, !!monitor.maintenance);
+      await this.drainAvailability(1);
     } else {
       commitFreshness();
     }
@@ -1240,36 +1422,23 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return monitor ? this.heartbeat(monitor.id, at) : false;
   }
 
-  // Separate series reads so their failure never hides current state or Incidents.
-  protected queryHistory(id: string, start: number, end: number, throughId?: number): DailyCounts[] | null {
-    return this.ctx.storage.sql.exec<DailyCounts>(
-      `SELECT CAST(at / ${DAY} AS INTEGER) AS day,
-        SUM(outcome = 'success') AS successes, SUM(outcome = 'failure') AS failures,
-        SUM(outcome = 'maintenance') AS maintenance
-       FROM observations WHERE monitorId = ? AND at >= ? AND at < ? AND id <= COALESCE(?, id) GROUP BY day`,
-      id, start, end, throughId ?? null,
-    ).toArray();
+  private availability = new Availability(this.env, this.ctx);
+
+  availabilityReadiness() {
+    return this.availability.readiness(this.read().monitors, Date.now());
   }
 
-  private history(id: string, start: number, throughId?: number): AvailabilityHistory | null {
-    try {
-      const rows = this.queryHistory(id, start, start + 90 * DAY, throughId);
-      if (!rows) return null;
-      const counts = new Map(rows.map(row => [row.day, row]));
-      const days: HistoryDay[] = Array.from({ length: 90 }, (_, index) => {
-        const at = start + index * DAY;
-        const { successes = 0, failures = 0, maintenance = 0 } = counts.get(at / DAY) ?? {};
-        return { date: new Date(at).toISOString().slice(0, 10),
-          state: successes && failures ? "degraded" : successes ? "up" : failures ? "down" : maintenance ? "maintenance" : "empty",
-          successes, failures, maintenance };
-      });
-      const successes = days.reduce((total, day) => total + day.successes, 0);
-      const failures = days.reduce((total, day) => total + day.failures, 0);
-      return { days, percentage: successes + failures ? successes / (successes + failures) * 100 : null };
-    } catch {
-      console.error(JSON.stringify({ event: "history_query_failed" }));
-      return null;
-    }
+  private projectedMonitors(state: StoredContext, projection: StatusProjection) {
+    const selected = new Set(projection.monitors.map(monitor => monitor.id));
+    return state.monitors.filter(monitor => selected.has(monitor.id));
+  }
+
+  private readAvailability(state: StoredContext, projection: StatusProjection, at: number, operator: boolean) {
+    return this.availability.read(this.projectedMonitors(state, projection), at, () => {
+      const state = this.ctx.storage.kv.get<StoredContext>("context");
+      return new Map(state?.monitors.filter(monitor => operator || monitor.published)
+        .map(monitor => [monitor.id, monitor.historyRevision]));
+    });
   }
 
   provisionEmailWithdrawals(origin: string) {
@@ -1286,33 +1455,53 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   firstMonitorId() { return this.read().monitors[0]?.id ?? null; }
 
-  status(operator = false, secrets = operator) {
-    const at = Date.now();
-    return this.project(this.read(at), operator, secrets, at);
-  }
-
-  readView(scope: ViewScope, audience: ViewAudience) {
+  snapshot(operator = false, secrets = operator) {
     const at = Date.now();
     const state = this.read(at);
-    return { revision: this.viewClock()[audience], data: this.project(state, audience !== "public", audience === "editor", at, scope) };
+    const data = this.project(state, operator, secrets, at);
+    return attachAvailability(data, this.availability.cached(this.projectedMonitors(state, data), at));
+  }
+
+  async status(operator = false, secrets = operator): Promise<StatusProjection> {
+    const at = Date.now();
+    const state = this.read(at);
+    const data = this.project(state, operator, secrets, at);
+    return attachAvailability(data, await this.readAvailability(state, data, at, operator));
+  }
+
+  async readView(scope: ViewScope, audience: ViewAudience, minimum = 0) {
+    const at = Date.now();
+    const state = this.read(at);
+    const revision = this.viewClock()[audience];
+    const operator = audience !== "public";
+    const data = this.project(state, operator, audience === "editor", at, scope);
+    if (revision < minimum || !includesLedger(scope) || !data.monitors.length) return { revision, data };
+    const history = await this.readAvailability(state, data, at, operator);
+    return { revision, data: attachAvailability(data, history) };
   }
 
   private project(state: StoredContext, operator: boolean, secrets: boolean, at: number, scope?: ViewScope) {
     const start = historyStart(at);
     const row = scope?.startsWith("monitor/") ? scope.slice("monitor/".length) : null;
-    const withHistory = !scope || scope === "monitors" || row !== null;
+    const withHistory = !scope || includesLedger(scope);
     const withIncidents = !scope || scope === "incidents" || scope === "banner" && !operator;
     const visible = withHistory || withIncidents || scope === "destinations"
       ? state.monitors.filter(monitor => (operator || monitor.published) && (row === null || monitor.id === row)) : [];
     const monitors = visible.map(monitor => ({
       ...publicMonitor(monitor, !!state.paused),
-      history: withHistory ? this.history(monitor.id, start) : null,
+      history: null as AvailabilityHistory | null,
       ...(secrets ? { destinationIds: (monitor.notificationSelections ?? []).map(selection => selection.destinationId) } : {}),
       ...(operator ? {
         kind: monitor.kind,
         ...(monitor.kind === "tcp" ? { hostname: monitor.hostname, port: monitor.port } : monitor.kind === "http" ? { url: monitor.url } : {}),
         published: monitor.published,
         scheduleMode: monitor.scheduleMode ?? "interval",
+        ...(monitor.kind !== "heartbeat" && monitor.scheduleMode !== "calendar"
+          ? { effectiveIntervalSeconds: Math.max(monitor.intervalSeconds, minimumCheckIntervalSeconds(this.env.MIN_CHECK_INTERVAL_SECONDS)) } : {}),
+        ...(monitor.kind !== "heartbeat" && monitor.scheduleMode === "calendar" ? {
+          scheduleSuspended: monitor.outboundCalendarFloor?.compatible === false,
+          ...(monitor.outboundCalendarFloor?.compatible === false ? { scheduleSuspensionFloorSeconds: monitor.outboundCalendarFloor.seconds } : {}),
+        } : {}),
         ...(monitor.scheduleMode === "calendar" ? { cron: monitor.cron, timezone: monitor.timezone ?? "UTC" } : {}),
         ...(monitor.kind !== "heartbeat" || monitor.scheduleMode !== "calendar" ? { intervalSeconds: monitor.intervalSeconds } : {}), recoveryThreshold: monitor.recoveryThreshold,
         ...(monitor.kind === "heartbeat"
@@ -1329,6 +1518,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         })),
         webhookUrl: legacy && legacy.channel === "webhook" ? legacy.url : null,
       } : {}),
+      ...(operator ? { minCheckIntervalSeconds: minimumCheckIntervalSeconds(this.env.MIN_CHECK_INTERVAL_SECONDS) } : {}),
       paused: !!state.paused,
       pageName: state.pageName,
       monitors,
@@ -1341,6 +1531,15 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         .toArray().filter(incident => operator || visible.some(monitor => monitor.id === incident.monitorId)) : [],
     };
   }
+}
+
+function includesLedger(scope: ViewScope) {
+  return scope === "monitors" || scope.startsWith("monitor/");
+}
+
+function attachAvailability(status: StatusProjection, history: Map<string, AvailabilityHistory | null>): StatusProjection {
+  const monitors = status.monitors.map(monitor => ({ ...monitor, history: history.get(monitor.id) ?? null }));
+  return { ...status, monitors, monitor: monitors[0] ?? null };
 }
 
 async function authorized(request: Request, secret: string | undefined) {
@@ -1384,6 +1583,7 @@ function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E
   const app = createApp(adapter);
   return {
   async scheduled(controller: ScheduledController, env: E) {
+    minimumCheckIntervalSeconds(env.MIN_CHECK_INTERVAL_SECONDS);
     const contexts = adapter ? await adapter.contexts(env) : ["personal"];
     const unique = new Map<string, ScheduledContext>();
     for (const value of contexts) {
@@ -1396,14 +1596,23 @@ function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E
           prior.notificationOrigin !== origin)) throw new Error("Conflicting hosted context");
       unique.set(context.id, { ...context, notificationOrigin: origin });
     }
-    await Promise.all([...unique.values()].map(async (policy) => {
+    if (!unique.size) return;
+    const perContext = Math.floor(availabilityWriteLimit / unique.size);
+    const extra = availabilityWriteLimit % unique.size;
+    await Promise.all([...unique.values()].map(async (policy, index) => {
       const context = env.MONITORING.getByName(policy.id);
       if (policy.notificationOrigin) await context.provisionEmailWithdrawals(policy.notificationOrigin);
       if (policy.paused !== undefined) await context.setPaused(policy.paused, policy.policyRevision);
-      await context.check(controller.scheduledTime);
+      await context.check(controller.scheduledTime, perContext + Number(index < extra));
     }));
   },
   async fetch(request: Request, env: E) {
+    try {
+      minimumCheckIntervalSeconds(env.MIN_CHECK_INTERVAL_SECONDS);
+    } catch (error) {
+      console.error(JSON.stringify({ event: "invalid_configuration", message: (error as Error).message }));
+      return requestFailed(request);
+    }
     try {
       return await app.fetch(request, env);
     } catch {
@@ -1503,15 +1712,17 @@ async function configuredConfirmationOrigin<E extends EngineEnv>(c: Context<Http
 
 const viewMediaType = "application/vnd.irisbeat.view+json";
 
-async function operatorSnapshot<E extends EngineEnv>(c: Context<HttpEnv<E>>, status = 200) {
+async function operatorSnapshot<E extends EngineEnv>(c: Context<HttpEnv<E>>, status = 200, cached = false) {
   const resolved = c.get("resolved");
   const permission = c.get("permission")!;
-  const result = await c.get("context").status(true, permission === "editor");
+  const context = c.get("context");
+  const result = cached ? await context.snapshot(true, permission === "editor")
+    : await context.status(true, permission === "editor");
   const emailConfigured = permission === "editor" && !!await confirmationOrigin(c);
   if (c.req.header("Accept") === viewMediaType) {
     return Response.json({ ...renderViewSnapshot(result, permission, emailConfigured), hosted: !!resolved, permission }, { status });
   }
-  return Response.json({ ...result, ...(emailConfigured ? { emailConfigured: true } : {}),
+  return Response.json({ ...statusJson(result), ...(emailConfigured ? { emailConfigured: true } : {}),
     ...(resolved ? { hosted: true, permission: resolved.permission } : {}) }, { status });
 }
 
@@ -1520,7 +1731,7 @@ function operatorMutationResponse<E extends EngineEnv>(c: Context<HttpEnv<E>>, a
     const scopes = refresh ? mergeScopes(ack.scopes, [refresh]) : ack.scopes;
     return Response.json({ ...ack, scopes }, { status });
   }
-  return operatorSnapshot(c, status);
+  return operatorSnapshot(c, status, true);
 }
 
 async function readBoundedBody(request: Request) {
@@ -1601,17 +1812,22 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   ));
   const publicRender = async (c: Context<HttpEnv<E>>, resource: StatusResource, minimum = 0) => {
     const context = c.get("context");
-    const keyFor = (revision: number) => edgeKey(c, resource, `${c.env.IRISBEAT_VERSION?.id ?? "source"}:published:${revision}`);
-    const publication = c.env.STATUS_RENDER_INTERVAL_SECONDS === "0" ? null : await context.statusPublicationRevision();
-    if (publication && publication.revision < minimum) return c.text("Revision unavailable", 409);
-    if (publication?.cacheSeconds) {
-      const cached = await readEdge(keyFor(publication.revision));
+    const keyFor = (revision: number, generation: number) => edgeKey(c, resource,
+      `${c.env.IRISBEAT_VERSION?.id ?? "source"}:published:${revision}:${generation}`);
+    const publication = await context.statusPublicationRevision(resource, minimum);
+    if (publication.cacheSeconds && publication.revision < minimum) return c.text("Revision unavailable", 409);
+    if (publication.cacheSeconds) {
+      const cached = await readEdge(keyFor(publication.revision, publication.generation));
       if (cached) return cachedRenderResponse(cached);
+    }
+    if (!publication.cacheSeconds) {
+      const live = await context.readLiveStatusRender(resource, minimum);
+      return live ? renderResponse(live) : c.text("Revision unavailable", 409);
     }
     const render = await context.readPublishedStatus(resource, minimum);
     if (!render) return c.text("Revision unavailable", 409);
-    if (publication?.cacheSeconds && render.cacheable)
-      await writeEdge(keyFor(render.revision), render, publication.cacheSeconds);
+    if (render.cacheable)
+      await writeEdge(keyFor(render.revision, render.generation), render, publication.cacheSeconds);
     return renderResponse(render);
   };
   app.get("/", getOnly, (c: Context<HttpEnv<E>>) => publicRender(c, "/"));
@@ -1670,10 +1886,11 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   const destinationsPath = "/api/operator/destinations";
   const destinationPath = destinationsPath + "/:id";
   const resendPath = destinationPath + "/confirmation";
+  const readinessPath = "/api/operator/history/readiness";
   const publicPartials = "/api/status/partials";
   const operatorPartials = "/api/operator/partials";
   const operatorPartialPaths = [operatorPartials + "/:section", operatorPartials + "/monitor/:id"];
-  const operatorPaths = [...operatorPartialPaths, ticketPath, previewPath, destinationsPath, destinationPath, resendPath, "/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
+  const operatorPaths = [readinessPath, ...operatorPartialPaths, ticketPath, previewPath, destinationsPath, destinationPath, resendPath, "/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
   for (const path of operatorPaths) app.use(path, async (c, next) => {
     const resolved = c.get("resolved");
     if (path === rotationPath && !resolved) return c.notFound();
@@ -1681,6 +1898,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     if (!permission) return Response.json({ error: "Unauthorized" }, { status: 401 });
     if (permission !== "editor" && c.req.method !== "GET" && path !== ticketPath) return Response.json({ error: "Forbidden" }, { status: 403 });
     c.set("permission", permission);
+    if (path !== ticketPath && path !== previewPath) await c.get("context").prepareOutboundCalendars();
     await next();
   });
   const partial = async (c: Context<HttpEnv<E>>) => {
@@ -1695,7 +1913,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     if (!/^\d+$/.test(minimum) || !Number.isSafeInteger(Number(minimum))) return c.text("Invalid revision", 400);
     const scope = resource as ViewScope;
     if (!operator) return publicRender(c, scope, Number(minimum));
-    const { revision, data } = await c.get("context").readView(scope, audience);
+    const { revision, data } = await c.get("context").readView(scope, audience, Number(minimum));
     if (revision < Number(minimum)) return c.text("Revision unavailable", 409);
     const emailConfigured = scope === "destinations" && !!await confirmationOrigin(c);
     return c.json({ revision, ...renderViewPartial(scope, data, audience, emailConfigured), permission: audience });
@@ -1703,6 +1921,11 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   for (const path of [publicPartials + "/:section", publicPartials + "/monitor/:id", ...operatorPartialPaths]) {
     app.get(path, getOnly, partial);
   }
+  app.get(readinessPath, getOnly, async (c: Context<HttpEnv<E>>) => {
+    if (c.get("permission") !== "editor") return Response.json({ error: "Forbidden" }, { status: 403 });
+    const result = await c.get("context").availabilityReadiness();
+    return Response.json(result, { status: result.ready ? 200 : 503 });
+  });
   app.post(ticketPath, async c => {
     const url = new URL(c.req.url);
     if (!allowedSubscriptionOrigin(c.req.raw, false)) return new Response(null, { status: 403 });
@@ -1833,7 +2056,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     return result ? operatorMutationResponse(c, result) : Response.json({ error: "Monitor changed; reload before saving" }, { status: 409 });
   });
   for (const path of operatorPaths) app.all(path, () => methodNotAllowed(
-    (path === rotationPath || path === previewPath) ? "POST" : path === maintenancePath ? "PUT, DELETE" : path === monitorPath ? "PATCH, DELETE" : path === destinationPath ? "PUT, DELETE" : (path === "/api/operator/monitors" || path === destinationsPath) ? "GET, POST" : "GET, PUT",
+    path === readinessPath ? "GET" : (path === rotationPath || path === previewPath) ? "POST" : path === maintenancePath ? "PUT, DELETE" : path === monitorPath ? "PATCH, DELETE" : path === destinationPath ? "PUT, DELETE" : (path === "/api/operator/monitors" || path === destinationsPath) ? "GET, POST" : "GET, PUT",
   ));
   return app;
 }

@@ -20,7 +20,7 @@ async function eventually(assertion, deadline = Date.now() + 3_000) {
   }
 }
 
-module.exports = async function test({ mf, options, application, request, tick, deliveries }) {
+module.exports = async function test({ mf, options, application, cachedSQLite, request, tick, deliveries, fresh }) {
   const update = name => request('/api/operator', 'PUT', { pageName: name });
   const status = async () => (await request('/api/status')).json();
   const browserSnapshot = async () => (await mf.dispatchFetch(origin + '/api/status', {
@@ -47,7 +47,7 @@ module.exports = async function test({ mf, options, application, request, tick, 
   assert.equal(baseline.pageName, 'Before publication', 'the first upgraded GET retains the pre-write baseline');
   assert.equal(baseline.monitor.id, oldId, 'the pending deletion is hidden');
   assert.equal(baseline.incidents[0].monitorId, oldId);
-  assert.equal(baseline.monitor.history.days.reduce((sum, day) => sum + day.failures, 0), 1, 'the later Check is hidden');
+  assert.ok(baseline.monitor.history.days.every(day => day.state === 'empty'), 'SQLite history is retired and the later Check is hidden');
   const snapshot = await browserSnapshot();
   assert.equal(snapshot.pageName, baseline.pageName);
   assert.match(snapshot.html, /Pre-upgrade Monitor/);
@@ -294,6 +294,7 @@ module.exports = async function test({ mf, options, application, request, tick, 
     assert.equal(eligible.pageName, 'Elapsed before delayed alarm');
     assert.deepEqual(eligible.monitors.map(monitor => monitor.id), ids);
     assert.equal(eligible.monitor.lastSeen, null);
+    assert.equal(eligible.monitor.history.days.at(-1).successes, 0, 'the next window cannot leak history into the sealed publication');
     assert.deepEqual(await readPage(prior.hint.revision + 1), {
       revision: prior.hint.revision + 1, html: '<h1>Elapsed before delayed alarm</h1>',
     });
@@ -311,6 +312,7 @@ module.exports = async function test({ mf, options, application, request, tick, 
     const latest = await status();
     assert.deepEqual(latest.monitors.map(monitor => monitor.id), [ids[0], ids[2]]);
     assert.equal(latest.monitor.lastSeen, nextDay + 181_000);
+    assert.equal(latest.monitor.history.days.at(-1).successes, 1, 'the eligible publication includes the received Heartbeat');
     const lateClose = new Promise(resolve => lateSocket.addEventListener('close', resolve, { once: true }));
     lateSocket.close(1000);
     await lateClose;
@@ -322,5 +324,162 @@ module.exports = async function test({ mf, options, application, request, tick, 
   } finally {
     await clock();
   }
+
+  // A predecessor can have SQLite history in an already-published projection.
+  const cached = fresh(options(cachedSQLite, 'cached-state', false, undefined, { STATUS_RENDER_INTERVAL_SECONDS: '60' }));
+  try {
+    const day = Date.now() - Date.now() % 86_400_000;
+    const send = (path, time, method = 'GET', body) => cached.dispatchFetch(origin + path, {
+      method, headers: { authorization: 'Bearer upgrade-test-secret', 'content-type': 'application/json', 'x-test-at': String(time) },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    const created = await send('/api/operator/monitors', day + 1000, 'POST', { name: 'SQLite history', kind: 'heartbeat' });
+    assert.equal(created.status, 201);
+    const { monitor } = await created.json();
+    assert.equal((await send('/heartbeat/' + monitor.id, day + 2000, 'POST')).status, 204);
+    const publishedAt = day + 61_000;
+    const read = () => send('/api/status', publishedAt + 1000).then(response => response.json());
+    const before = await read();
+    assert.equal(before.monitor.history.days.at(-1).successes, 1);
+    await send('/api/operator', publishedAt + 1000, 'PUT', { pageName: 'Pending rename' });
+    await cached.setOptions(options(application, 'cached-state', false, undefined, { STATUS_RENDER_INTERVAL_SECONDS: '60' }));
+    const after = await read();
+    assert.equal(after.pageName, before.pageName);
+    assert.equal(after.monitor.id, before.monitor.id);
+    assert.deepEqual(after.monitor.lastResult, before.monitor.lastResult);
+    assert.ok(after.monitor.history.days.every(day => day.state === 'empty'));
+  } finally { await cached.dispose(); }
+
+  // Warm long-window cache entries must recover through a scoped retry and an ordinary GET.
+  const history = fresh(options(application, 'history-state', false, undefined, { STATUS_RENDER_INTERVAL_SECONDS: '86400' }));
+  try {
+    const day = Date.now() - Date.now() % 86_400_000;
+    const at = (path, time, method = 'GET', body, accept) => history.dispatchFetch(origin + path, {
+      method, headers: { authorization: 'Bearer upgrade-test-secret', 'content-type': 'application/json',
+        'x-test-at': String(time), ...(accept ? { Accept: accept } : {}) },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    const readAt = (path, time, accept) => at(path, time, 'GET', undefined, accept).then(response => response.json());
+    const heartbeat = async name => {
+      const response = await at('/api/operator/monitors', day + 1000, 'POST', { name, kind: 'heartbeat' });
+      assert.equal(response.status, 201);
+      const monitor = (await response.json()).monitors.at(-1);
+      assert.equal((await at('/heartbeat/' + monitor.id, day + 2000, 'POST')).status, 204);
+      return monitor;
+    };
+    const first = await heartbeat('First history');
+    const second = await heartbeat('Second history');
+    const third = await heartbeat('Third history');
+    const mode = value => at('/test-history-mode?mode=' + value, day);
+    await mode('failed');
+    const publishedAt = day + 86_400_000 + 1000;
+    const json = '/api/status';
+    const accept = 'application/vnd.irisbeat.view+json';
+    const ledger = '/api/status/partials/monitors';
+    const row = id => '/api/status/partials/monitor/' + id;
+    const old = await readAt(json, publishedAt);
+    assert.equal(old.monitors[0].history, null);
+    for (const record of [old.monitor, ...old.monitors]) {
+      assert.equal(Object.hasOwn(record, 'historyRetryToken'), false);
+      assert.equal(Object.hasOwn(record, 'historyRevision'), false);
+    }
+    assert.match((await readAt(json, publishedAt, accept)).html, /Bars unavailable/);
+    assert.match((await readAt(ledger, publishedAt)).html, /Bars unavailable/);
+    const pendingRow = await readAt(row(first.id), publishedAt);
+    assert.match(pendingRow.html, /Bars unavailable/);
+    assert.match(pendingRow.html, /data-history-token="[a-f0-9-]{36}"/);
+    assert.equal((await readAt('/test-history-queries', publishedAt)).length, 1, 'warm unresolved reads respect the retry deadline');
+    await at('/api/operator/monitors/' + first.id, publishedAt + 1500, 'PATCH', { published: false });
+    // This later receipt is deliberately backdated into the old day.
+    assert.equal((await at('/test-backdated-heartbeat?id=' + first.id + '&observed-at=' + (day + 3000),
+      publishedAt + 2000, 'POST')).status, 204);
+    await history.unsafeEvictDurableObject('irisbeat', 'MonitoringContext', { name: 'personal', webSockets: 'hibernate' });
+    await mode('ingested');
+    const retryAt = publishedAt + 30_000;
+    assert.match((await readAt(row(first.id), retryAt)).html, /100.00%/);
+    assert.deepEqual((await readAt('/test-history-queries', retryAt)).map(query => query.monitorIds), [[first.id]]);
+    await mode('failed');
+    for (const offset of [30_000, 60_000, 90_000, 120_000]) {
+      assert.match((await readAt(row(third.id), publishedAt + offset)).html, /Bars unavailable/);
+    }
+    await mode('ingested');
+    const afterRetries = publishedAt + 150_000;
+    const repaired = await readAt(json, afterRetries);
+    assert.equal(repaired.monitors[0].id, first.id, 'the unpublished Monitor stays visible until its next publication');
+    const publishedDay = new Date(day).toISOString().slice(0, 10);
+    assert.equal(repaired.monitors[0].history.days.at(-1).date, publishedDay);
+    assert.equal(repaired.monitors[0].history.days.at(-1).successes, 1, 'the published fence excludes the later backdated observation');
+    for (const monitor of repaired.monitors.slice(1)) assert.equal(monitor.history.days.at(-1).successes, 1);
+    assert.deepEqual((await readAt('/test-history-queries', afterRetries)).map(query => query.monitorIds).at(-1), [second.id, third.id]);
+    for (const html of [(await readAt(json, afterRetries, accept)).html, (await readAt(ledger, afterRetries)).html]) {
+      assert.match(html, /100.00%/);
+      assert.doesNotMatch(html, /Bars unavailable/);
+    }
+    assert.equal((await at('/heartbeat/' + second.id, afterRetries + 1000, 'POST')).status, 204);
+    const queries = () => readAt('/test-history-queries', afterRetries);
+    const queryCount = (await queries()).length;
+    await mode('held');
+    const nextWindow = publishedAt + 86_400_000;
+    const inFlight = readAt(json, nextWindow);
+    await eventually(async () => assert.equal((await queries()).length, queryCount + 1));
+    assert.equal((await at('/api/operator/monitors/' + second.id, nextWindow + 1000, 'PATCH', { published: false })).status, 200);
+    await mode('ingested');
+    const sealed = await inFlight;
+    assert.deepEqual(sealed.monitors.map(monitor => monitor.id), [second.id, third.id],
+      'an Operator edit during a query cannot replace its sealed publication');
+    assert.equal(sealed.monitor.history.days.at(-1).successes, 1);
+    assert.deepEqual((await queries()).at(-1).monitorIds, [second.id, third.id]);
+    assert.ok(await history.purgeCache() > 0, 'warm recovery repopulates the public cache under a new generation');
+  } finally { await history.dispose(); }
+
+  // Recover an older Calendar outcome at the exact boundary, then ingest it late.
+  const deferred = fresh(options(application, 'deferred-history-state', false, undefined, { STATUS_RENDER_INTERVAL_SECONDS: '60' }));
+  try {
+    const midnight = Date.now() - Date.now() % 86_400_000;
+    const cutoff = midnight + 12 * 3_600_000;
+    const actual = midnight - 30_000;
+    const at = (path, time, method = 'GET', body) => deferred.dispatchFetch(origin + path, {
+      method, headers: { authorization: 'Bearer upgrade-test-secret', 'content-type': 'application/json', 'x-test-at': String(time) },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    const json = (path, time) => at(path, time).then(response => response.json());
+    const created = await at('/api/operator/monitors', midnight - 61_000, 'POST', {
+      name: 'Deferred Calendar', kind: 'heartbeat', scheduleMode: 'calendar', cron: '59 23 * * *', timezone: 'UTC', graceSeconds: 30,
+    });
+    assert.equal(created.status, 201);
+    const { monitor } = await created.json();
+    const row = '/api/status/partials/monitor/' + monitor.id;
+    const run = (time, schedule = time) => at('/test-tick?at=' + schedule, time);
+    await at('/test-history-mode?mode=write-rejected', cutoff - 30_000);
+    assert.equal((await run(cutoff - 30_000)).status, 200);
+    const operator = await json('/api/operator', cutoff - 30_000);
+    assert.deepEqual(operator.monitor.lastResult, { at: actual, outcome: 'failure' });
+    assert.equal(operator.incidents.length, 1);
+    await deferred.unsafeEvictDurableObject('irisbeat', 'MonitoringContext', { name: 'personal', webSockets: 'hibernate' });
+    await at('/test-history-mode?mode=lagging', cutoff);
+    assert.equal((await run(cutoff, cutoff - 30_000)).status, 200);
+    const sealed = await json('/api/status', cutoff);
+    assert.equal(sealed.monitor.history.days.at(-2).failures, 0);
+    const sealedHint = (await json('/test-status-published', cutoff)).hint;
+
+    await at('/test-history-mode?mode=ingested', cutoff + 15_000);
+    assert.match((await json(row, cutoff + 15_000)).html, /No observations/);
+    assert.equal((await json('/api/status', cutoff + 15_000)).monitor.history.days.at(-2).failures, 0,
+      'a point logged exactly at the cutoff is excluded, even after it becomes queryable');
+
+    await at('/test-history-mode?mode=lagging', cutoff + 60_000);
+    assert.match((await json(row, cutoff + 60_000)).html, /No observations/);
+    const published = await json('/test-status-published', cutoff + 60_000);
+    assert.deepEqual(published.hint.scopes, ['monitor/' + monitor.id]);
+    assert.ok(published.hint.revision > sealedHint.revision);
+    await at('/test-history-mode?mode=ingested', cutoff + 75_000);
+    assert.match((await json(row, cutoff + 75_000)).html, /0.00%/);
+    const repaired = await json('/api/status', cutoff + 75_000);
+    assert.equal(repaired.monitor.history.days.at(-2).failures, 1, 'the Calendar outcome counts on its actual UTC day');
+    assert.equal(repaired.monitor.history.days.at(-1).failures, 0);
+    assert.deepEqual((await json('/test-history-queries', cutoff + 75_000)).map(query => query.loggedBefore),
+      [cutoff / 1000, cutoff / 1000, (cutoff + 60_000) / 1000, (cutoff + 60_000) / 1000]);
+  } finally { await deferred.dispose(); }
+
   console.log('PASS: Worker upgrade, configurable publication, regional misses, hibernation, unsubscribe, alerts, and tenant isolation');
 };

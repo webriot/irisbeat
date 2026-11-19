@@ -1,2 +1,5 @@
 # Generate a unique installation secret; replace this empty value in Cloudflare's setup form.
 INSTALLATION_SECRET=
+
+# For deployed Analytics Engine SQL reads, use a secret scoped to the account.
+AVAILABILITY_API_TOKEN=

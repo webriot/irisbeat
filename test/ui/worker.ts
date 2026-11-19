@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { statusPage } from '../../src/ui';
-import personal, { createHostedWorker, type Status } from '../../src/index';
-export { MonitoringContext } from '../../src/index';
+import personal, { createHostedWorker, MonitoringContext as EngineContext, type Status } from '../../src/index';
+import { availabilityFixture } from '../availability-fixture';
+
+const analytics = availabilityFixture();
+export class MonitoringContext extends EngineContext {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, { ...env, ...analytics.bindings });
+  }
+}
 
 // Test-only trusted host/token resolution; never shipped in the engine artifact.
 const hosted = createHostedWorker({
