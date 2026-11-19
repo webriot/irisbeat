@@ -41,6 +41,7 @@ export function availabilityFixture(storage?: DurableObjectStorage) {
             if (outcome === "maintenance") row.maintenance++;
             rows.set(key, row);
           }
+          while (mode === "held") await new Promise(resolve => setTimeout(resolve, 10));
           return [...rows.values()];
         },
       },

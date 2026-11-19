@@ -30,7 +30,12 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
       import { availabilityFixture } from './test/availability-fixture.ts';
       const analytics = availabilityFixture();
       export class MonitoringContext extends EngineContext {
-        constructor(ctx, env) { super(ctx, { ...env, ...analytics.bindings }); }
+        constructor(ctx, env) {
+          const bindings = { ...analytics.bindings };
+          if (env.TEST_AVAILABILITY === 'no-write') delete bindings.AVAILABILITY_HISTORY;
+          if (env.TEST_AVAILABILITY === 'no-query') delete bindings.AVAILABILITY_QUERY;
+          super(ctx, { ...env, ...bindings });
+        }
       }` : 'export { EngineContext as MonitoringContext };'}
     export default { async fetch(request, env, ctx) {
       const url = new URL(request.url);
@@ -80,10 +85,10 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     entryPoints: ['src/notification-delivery.ts'], bundle: true, write: false,
     format: 'esm', platform: 'neutral', external: ['cloudflare:workers'],
   })).outputFiles[0].text;
-  function options(script, stateDirectory = 'state', withQueue = false, port) {
+  function options(script, stateDirectory = 'state', withQueue = false, port, availability) {
     const monitoring = {
       name: 'irisbeat', modules: true, script, compatibilityDate: '2026-11-13',
-      bindings: { INSTALLATION_SECRET: 'upgrade-test-secret' },
+      bindings: { INSTALLATION_SECRET: 'upgrade-test-secret', ...(availability ? { TEST_AVAILABILITY: availability } : {}) },
       durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } },
       ...(withQueue ? { queueProducers: { NOTIFICATION_QUEUE: 'upgrade-notifications' } } : {}),
       outboundService: request => {
@@ -169,7 +174,18 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
         endsAt: start + 360_000,
       }, start + 60_000)).status, 200);
       const beforeUpgrade = await read(start + 60_000);
-      await mf.setOptions(options(await bundle(join(project, 'src/index.ts'))));
+      const upgraded = await bundle(join(project, 'src/index.ts'));
+      const legacy = await bundle(join(temporary, 'index.ts'));
+      for (const missing of ['no-write', 'no-query']) {
+        await mf.setOptions(options(upgraded, 'state', false, undefined, missing));
+        const readiness = await request('/api/operator/history/readiness', 'GET', undefined, start + 60_000);
+        assert.equal(readiness.status, 503);
+        assert.deepEqual(await readiness.json(), { ready: false, reason: 'configuration_missing' });
+        assert.equal((await read(start + 60_000)).monitor.history, null);
+        await mf.setOptions(options(legacy));
+        assert.equal((await read(start + 60_000)).monitor.history.percentage, 50);
+      }
+      await mf.setOptions(options(upgraded));
       const after = await read(start + 60_000);
       const { history: oldHistory, ...oldMonitor } = beforeUpgrade.monitor;
       const { history: newHistory, ...newMonitor } = after.monitor;

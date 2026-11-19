@@ -4,6 +4,7 @@ import type { ViewHint, ViewScope } from './view-changes';
 
 type PartialData = { html: string; revision: number; permission: 'reader' | 'editor' };
 type OperatorPartial = { scope: ViewScope; data: PartialData };
+type ReadHint = ViewHint & { history?: true };
 
 type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 type OperatorResponse = Status | { secret: string };
@@ -11,7 +12,7 @@ export type SchedulePreview = { explanation: string; timezone: string; occurrenc
 export type ScheduleInput = { cron: string; timezone: string; graceSeconds?: number | null };
 export type LiveSnapshots = (
   path: string,
-  read: (current: () => boolean, hint?: ViewHint) => Promise<boolean | void>,
+  read: (current: () => boolean, hint?: ReadHint) => Promise<boolean | void>,
   authorize: () => Promise<string>,
 ) => { sync(): void; stop(): void };
 export interface OperatorSessionCallbacks {
@@ -67,14 +68,14 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
       session.cancelPreview();
       ui.signedOut();
     },
-    async run(path = '/api/operator', method: Method = 'GET', body?: unknown, after?: (data: OperatorResponse) => void, current = () => true, hint?: ViewHint) {
+    async run(path = '/api/operator', method: Method = 'GET', body?: unknown, after?: (data: OperatorResponse) => void, current = () => true, hint?: ReadHint) {
       const reading = method === 'GET';
-      if (busy) { if (reading) pendingRefresh = true; return; }
+      if (busy) { if (reading && !hint?.history) pendingRefresh = true; return; }
       const supersedesRead = !reading && readingVersion === requestVersion;
       const version = ++requestVersion;
       const started = generation;
       if (!reading) busy = true;
-      else { readingVersion = version; ui.reading?.('pending'); }
+      else { readingVersion = version; if (!hint?.history) ui.reading?.('pending'); }
       const finishWriting = reading ? undefined : ui.writing();
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 10000);
@@ -94,7 +95,7 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
           }));
           if (started === generation && version === requestVersion && current()) {
             ui.partials?.(partials);
-            ui.reading?.('success');
+            if (!hint.history) ui.reading?.('success');
           }
           return;
         }
@@ -124,7 +125,7 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
         if (started === generation && version === requestVersion) {
           // A failed write has no snapshot to replace the read it superseded.
           if (supersedesRead) pendingRefresh = true;
-          if (!reading || current()) {
+          if (!hint?.history && (!reading || current())) {
             ui.failed((error as Error).message, reading);
             return false;
           }
@@ -134,7 +135,7 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
         if (hint) controller.abort();
         if (reading && started === generation && version === readingVersion) {
           readingVersion = undefined;
-          ui.reading?.('idle');
+          if (!hint?.history) ui.reading?.('idle');
         }
         if (!reading && started === generation) {
           busy = false; finishWriting?.();

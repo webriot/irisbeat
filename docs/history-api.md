@@ -19,7 +19,8 @@ history: {
     maintenance: number;
   }>;
   percentage: number | null; // 0–100, unrounded; null means no denominator
-  stale?: true; // last successful query, pending or after an unsuccessful refresh
+  stale?: true; // last successful query while a refresh is needed
+  pending?: true; // recent or deferred observations may be absent from the totals
 } | null; // unavailable with no usable cached result
 ```
 
@@ -56,8 +57,13 @@ ongoing after deletion. No page-wide percentage is added.
 
 ## Writes, reads and cutover
 
-After committing an observation, the MonitoringContext submits one Analytics
-Engine data point. The dataset contains these Irisbeat fields:
+For each in-range observation, the MonitoringContext submits one Analytics
+Engine data point. Scheduled dispatch shares the
+[250-point invocation limit](https://developers.cloudflare.com/analytics/analytics-engine/limits/)
+across its contexts and Monitors. Excess submissions go to a durable outbox
+in the same transaction as the observation. An alarm drains the outbox in
+batches of up to 250, dropping entries that age out of the displayed window.
+Submitted entries are removed. The dataset contains these Irisbeat fields:
 
 | Column | Value |
 | --- | --- |
@@ -76,15 +82,20 @@ See [Workers Analytics Engine SQL and sampling](https://developers.cloudflare.co
 
 A read uses only visible, active Monitor IDs from the current context. Successful
 daily aggregates are cached in the context for 60 seconds and refreshed on a
-new observation or UTC day change. Query errors leave the last usable aggregates
+new observation or UTC day change. While observations are settling or waiting
+in the outbox, the cache is refreshed after 15 seconds. Query errors leave the last usable aggregates
 visible as stale, including after Durable Object eviction. Without cached data
 a failed read yields unavailable history. Before any new observation, a configured
 Monitor has an empty series. History may lag current status while an observation
-is being ingested or the cached totals age out. Status, detection, Incidents,
+is being ingested or the cached totals age out. Connected, visible pages retry
+only affected rows, every 30 seconds, up to four attempts while a row stays
+pending, stale, or unavailable. Status, detection, Incidents,
 and notification handoff commit independently of query availability.
 
-The first activation of the new build drops the previous SQLite raw observations
-table and indexes. There is no backfill. Monitor configuration, latest results,
+The first activation with both the write binding and query configuration drops
+the previous SQLite raw observations table and indexes. Readiness reports
+whether an observation can be read back. Transient SQL failures do not delay
+activation or monitoring. There is no backfill. Monitor configuration, latest results,
 detection progress, Maintenance and Incidents are preserved. Rolling the code back
 cannot restore the retired rows.
 
@@ -96,7 +107,11 @@ The full Status and Operator read paths use
 Monitors in the authorized ledger or row. Public reads include only published
 Monitors. Mutation responses carry cached history, empty bars, or unavailable
 history without waiting for a query. Observations and mutations produce scoped
-hints from committed state. Renders preserve the `stale` flag with the series.
+hints from committed state. Renders preserve the `stale` and `pending` flags with the series.
+[#88](https://github.com/Webriot/irisbeat/issues/88) must let these scoped
+recovery requests reach a refreshed render once the configured cache window
+allows it. A window longer than the browser retry period needs a later retry
+window or a history-only render update signal.
 
 See [installation and readiness](install.md#availability-history) for self-hosted
 configuration and [the trusted query interface](hosted-contract.md#availability-history)

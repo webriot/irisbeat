@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import worker, { type Status } from '../src/index';
 import { env, exports } from 'cloudflare:workers';
-import { createScheduledController, evictDurableObject, reset } from 'cloudflare:test';
+import { createScheduledController, evictDurableObject, reset, runDurableObjectAlarm } from 'cloudflare:test';
 import { afterEach, expect, it, vi } from 'vitest';
 
 const day = 86_400_000;
@@ -348,4 +348,57 @@ it('queries history for only the requested authorized ledger rows and never for 
   const saved = await mutate('/api/operator', 'PUT', { pageName: 'Renamed status page' });
   expect(await saved.json()).toMatchObject({ pageName: 'Renamed status page', monitor: { history: { percentage: 100 } } });
   expect(await queriedIds()).toEqual([[first.id], [second.id], [hidden.id]]);
+});
+
+
+it('bounds a dispatch across Monitors and drains overflow after eviction without delaying detection', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
+  const input = { kind: 'heartbeat', scheduleMode: 'calendar', cron: '* * * * *', timezone: 'UTC', graceSeconds: 30 };
+  const first = await create({ ...input, url: undefined, failureThreshold: undefined });
+  const second = await create({ ...input, url: undefined, failureThreshold: undefined, published: false });
+  await create({ name: 'Outbound check' });
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await request('/__test-history?mode=failed');
+  const catchUp = today + 129 * 60_000;
+  clock.mockReturnValue(catchUp);
+  await tick(catchUp);
+  const calls = async () => (await (await request('/__test-history')).json<{ points: AnalyticsEngineDataPoint[]; queries: unknown[] }>());
+  expect((await calls()).points).toHaveLength(250);
+  expect((await calls()).queries).toHaveLength(0);
+  const before = await status(true);
+  expect(before.monitors.map(monitor => monitor.state)).toEqual(['down', 'down', 'up']);
+  expect(before.incidents).toHaveLength(2);
+
+  const context = env.MONITORING.getByName('personal');
+  await evictDurableObject(context);
+  clock.mockReturnValue(catchUp + 5_000);
+  expect(await runDurableObjectAlarm(context)).toBe(true);
+  const { points } = await calls();
+  expect(points).toHaveLength(257);
+  for (const monitor of [first, second]) {
+    expect(points.filter(point => point.blobs?.[0] === monitor.id).map(point => point.doubles?.[0]))
+      .toEqual(Array.from({ length: 128 }, (_, i) => today + (i + 1) * 60_000 + 30_000));
+  }
+  expect(await runDurableObjectAlarm(context)).toBe(false);
+});
+
+it('keeps a successful first query when a newer observation commits while it is in flight', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
+  await create();
+  const target = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await tick(today);
+  await request('/__test-history?mode=held');
+  const initial = status();
+  // The test binding snapshots rows before holding the response.
+  await vi.waitFor(async () => {
+    const { queries } = await (await request('/__test-history')).json<{ queries: unknown[] }>();
+    expect(queries).toHaveLength(1);
+  });
+  clock.mockReturnValue(today + 60_000);
+  target.mockResolvedValue(new Response(null, { status: 503 }));
+  await tick(today + 60_000);
+  await request('/__test-history?mode=failed');
+  expect((await initial).monitor!.history).toMatchObject({ percentage: 100, stale: true });
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  expect((await status()).monitor).toMatchObject({ state: 'down', history: { percentage: 100, stale: true } });
 });

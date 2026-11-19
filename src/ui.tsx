@@ -297,19 +297,43 @@ function fragment(html) {
 }
 function liveSnapshots(path, read, authorize) {
   let running, queued, ackSocket;
-  let socket, retry, handshake, renewal, polling, stopped = false, ready = false, delay = 1000;
+  let socket, retry, handshake, renewal, polling, historyTimer, stopped = false, ready = false, delay = 1000;
+  const historyAttempts = new Map();
+  function historyRows() {
+    const ids = [...document.querySelectorAll('[data-history-retry]')].map(node => node.dataset.historyRetry);
+    for (const id of historyAttempts.keys()) if (!ids.includes(id)) historyAttempts.delete(id);
+    return ids.filter(id => (historyAttempts.get(id) || 0) < 4)
+      .sort((a, b) => (historyAttempts.get(a) || 0) - (historyAttempts.get(b) || 0)).slice(0, 32);
+  }
+  function scheduleHistory() {
+    if (!ready || stopped || document.hidden) {
+      clearTimeout(historyTimer); historyTimer = undefined;
+    } else if (!historyTimer && historyRows().length) {
+      historyTimer = setTimeout(() => {
+        historyTimer = undefined;
+        if (!ready || stopped || document.hidden) return;
+        if (!running) {
+          const ids = historyRows();
+          for (const id of ids) historyAttempts.set(id, (historyAttempts.get(id) || 0) + 1);
+          if (ids.length) enqueue({ revision: 0, scopes: ids.map(id => 'monitor/' + id), history: true });
+        }
+        scheduleHistory();
+      }, 30000);
+    }
+  }
   function pollingMode() {
     const mode = document.getElementById('updates-mode');
     if (mode) mode.hidden = ready;
     if (ready || document.hidden || stopped) { clearInterval(polling); polling = undefined; }
     else if (!polling) polling = setInterval(sync, 60000);
+    scheduleHistory();
   }
   function sync() { enqueue({ full: true }); }
   async function enqueue(request) {
     if (stopped) return;
     if (running) {
       const previous = queued || running;
-      queued = request.full || previous.full ? { full: true } : {
+      queued = previous.history ? request : request.full || previous.full ? { full: true } : {
         revision: Math.max(previous.revision, request.revision),
         scopes: mergeScopes(previous.scopes, request.scopes),
       };
@@ -317,14 +341,15 @@ function liveSnapshots(path, read, authorize) {
     }
     running = request;
     const source = socket;
-    if (!authorize) snapshotPending(true);
+    if (!authorize && !request.history) snapshotPending(true);
     try {
       const success = await read(() => !stopped && !queued && (request.full || source === socket), request.full ? undefined : request);
       if (success === false) socket?.close();
       else if (ready) delay = 1000;
     } finally {
       running = undefined;
-      if (!authorize) snapshotPending(false);
+      if (!authorize && !request.history) snapshotPending(false);
+      scheduleHistory();
       if (queued && !stopped) {
         const next = queued;
         queued = undefined;
@@ -394,6 +419,7 @@ function liveSnapshots(path, read, authorize) {
   function visible() { pollingMode(); if (!document.hidden) sync(); }
   function suspend() {
     stopped = true; ready = false; queued = undefined; clearTimeout(retry); clearTimeout(handshake); clearTimeout(renewal); clearInterval(polling); polling = undefined;
+    clearTimeout(historyTimer); historyTimer = undefined;
     const previous = socket; socket = undefined; ackSocket = undefined; previous?.close();
   }
   function resume() { if (stopped) { stopped = false; pollingMode(); connect(); } }
@@ -534,9 +560,10 @@ document.addEventListener('DOMContentLoaded', () => {
           reconcile(document.getElementById('public-status'), fragment(statusLedger.render(data)));
           document.title = data.pageName;
         }
-        initializeDisplay(hint?.scopes); snapshotFailure(false);
+        initializeDisplay(hint?.scopes);
+        if (!hint?.history) snapshotFailure(false);
       } catch {
-        if (current()) { snapshotFailure(true); return false; }
+        if (!hint?.history && current()) { snapshotFailure(true); return false; }
       } finally { clearTimeout(timeout); if (hint) controller.abort(); }
     });
     document.getElementById('retry').addEventListener('click', updates.sync);

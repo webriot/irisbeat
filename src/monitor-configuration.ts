@@ -45,6 +45,7 @@ export type Monitor = MonitorConfiguration & Timing & {
   heartbeatDigest?: ArrayBuffer;
   scheduleRevision?: number;
   historyRevision?: number;
+  historyChangedAt?: number;
   notificationSelections?: NotificationSelection[];
 };
 
