@@ -5,6 +5,7 @@ const { readFileSync, rmSync, writeFileSync } = require('node:fs');
 const { join } = require('node:path');
 const { createHash } = require('node:crypto');
 const assert = require('node:assert/strict');
+const { version } = require('../package.json');
 const project = process.cwd();
 const localRequire = createRequire(join(project, 'node_modules/@cloudflare/vitest-plugin/package.json'));
 const { build } = localRequire('esbuild');
@@ -15,23 +16,24 @@ function availabilityTotals({ history }) {
 (async () => {
   const prepared = process.argv.includes('--prepared');
   if (!prepared) execFileSync('npm', ['run', 'pack:engine'], { stdio: 'inherit' });
-  const artifact = 'dist/irisbeat-0.3.0.tgz';
+  const filename = `irisbeat-${version}.tgz`;
+  const artifact = 'dist/' + filename;
   const checksum = createHash('sha256').update(readFileSync(artifact)).digest('hex');
   if (!prepared) execFileSync('npm', ['run', 'pack:engine'], { stdio: 'pipe' });
   assert.equal(createHash('sha256').update(readFileSync(artifact)).digest('hex'), checksum, 'packing the same revision is reproducible');
   if (prepared) {
     const release = JSON.parse(readFileSync('dist/release.json'));
-    assert.equal(checksum, release.sha256['irisbeat-0.3.0.tgz'], 'consume the exact prepared release artifact');
-  } else writeFileSync('dist/SHA256SUMS', checksum + '  irisbeat-0.3.0.tgz\n');
+    assert.equal(checksum, release.sha256[filename], 'consume the exact prepared release artifact');
+  } else writeFileSync('dist/SHA256SUMS', checksum + '  ' + filename + '\n');
   rmSync('test/consumer/node_modules', { recursive: true, force: true });
   rmSync('test/consumer/package-lock.json', { force: true });
   execFileSync('npm', ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: join(project, 'test/consumer'), stdio: 'inherit' });
   execFileSync('npm', ['ci', '--ignore-scripts', '--offline', '--no-audit', '--no-fund'], { cwd: join(project, 'test/consumer'), stdio: 'inherit' });
   execFileSync(join(project, 'node_modules/.bin/tsc'), ['--noEmit', '--project', 'test/consumer/tsconfig.json'], { stdio: 'inherit' });
   const installed = JSON.parse(readFileSync('test/consumer/node_modules/irisbeat/package.json', 'utf8'));
-  assert.equal(installed.version, '0.3.0');
+  assert.equal(installed.version, version);
   const lock = JSON.parse(readFileSync('test/consumer/package-lock.json', 'utf8'));
-  assert.equal(lock.packages['node_modules/irisbeat'].version, '0.3.0');
+  assert.equal(lock.packages['node_modules/irisbeat'].version, version);
   assert.equal(lock.packages['node_modules/irisbeat'].integrity, 'sha512-' + createHash('sha512').update(readFileSync(artifact)).digest('base64'));
   await require('./notification-delivery.cjs').testInstalledDelivery();
   const script = (await build({ entryPoints: ['test/consumer/worker.ts'], bundle: true, write: false, format: 'esm', platform: 'neutral', external: ['cloudflare:workers'], plugins: [{
@@ -696,6 +698,6 @@ function availabilityTotals({ history }) {
     await request('a.example', overlapPath, 'DELETE');
     assert.deepEqual(deliveries, [], 'the installed legacy override received no Queue-enabled transitions');
     console.log('PASS packed Calendar Heartbeat: occurrence deadlines, durable evidence/restart, credential rotation, ignored bodies, tenant permissions, privacy, recovery and queued transitions');
-    console.log('PASS packed irisbeat@0.3.0: reproducible artifact, pinned integrity, consumer typecheck, isolated scheduling/Incidents, HTTP/TCP/Heartbeat Queue jobs, exclusive delivery, enqueue failure isolation, rotated tenant credentials and three-kind Maintenance suppression and HTTP/TCP boundary overlap, persisted pause/resume and omission, paused history, Maintenance precedence, in-flight checks and delivery suppression');
+    console.log(`PASS packed irisbeat@${version}: reproducible artifact, pinned integrity, consumer typecheck, isolated scheduling/Incidents, HTTP/TCP/Heartbeat Queue jobs, exclusive delivery, enqueue failure isolation, rotated tenant credentials and three-kind Maintenance suppression and HTTP/TCP boundary overlap, persisted pause/resume and omission, paused history, Maintenance precedence, in-flight checks and delivery suppression`);
   } finally { await mf.dispose(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

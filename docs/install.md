@@ -51,7 +51,7 @@ State. Heartbeat scheduling continues to use its own timing rules.
 ## Exact-source CLI installation
 
 Requires Node >=22.12, npm, a Cloudflare account and its workers.dev subdomain.
-Download `irisbeat-0.3.0-source.tar.gz`, `release.json` and `SHA256SUMS` from the
+Download `irisbeat-0.4.0-source.tar.gz`, `release.json` and `SHA256SUMS` from the
 reviewed release, verifying that the manifest's full revision is the intended one.
 For an unpublished candidate, use the artifacts produced by `release:prepare`
 from its reviewed Git revision instead of a release download.
@@ -59,8 +59,8 @@ Download the engine tarball too if checking the entire checksum file.
 
 ```sh
 sha256sum --check SHA256SUMS
-tar -xzf irisbeat-0.3.0-source.tar.gz
-cd irisbeat-0.3.0
+tar -xzf irisbeat-0.4.0-source.tar.gz
+cd irisbeat-0.4.0
 npm ci
 npm run check
 npm run build
@@ -384,8 +384,8 @@ These checks use local workerd, controlled time and synthetic recipients.
 
 | Artifact | Use |
 | --- | --- |
-| `irisbeat-0.3.0-source.tar.gz` | Exact committed source, lockfile, config, tests, build/install instructions, LICENSE and NOTICE |
-| `irisbeat-0.3.0.tgz` | TypeScript exports for both Workers, configuration references, integration docs, LICENSE and NOTICE |
+| `irisbeat-0.4.0-source.tar.gz` | Exact committed source, lockfile, config, tests, build/install instructions, LICENSE and NOTICE |
+| `irisbeat-0.4.0.tgz` | TypeScript exports for both Workers, configuration references, integration docs, LICENSE and NOTICE |
 | `release.json` | Full Git revision, version, contract 1, SHA-256 hashes and engine npm SHA-512 integrity |
 | `SHA256SUMS` | SHA-256 integrity for both archives and the manifest |
 

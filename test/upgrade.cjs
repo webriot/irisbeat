@@ -283,6 +283,11 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
       const before = await read(start + 60_000);
       assert.equal(before.monitor.history.percentage, 50);
       assert.equal(before.monitor.state, 'down');
+      const monitorPath = '/api/operator/monitors/' + before.monitor.id;
+      const webhook = await request('/api/operator/destinations', 'POST', { url: destination }, start + 60_000);
+      assert.equal(webhook.status, 201);
+      const webhookId = (await webhook.json()).destinations[0].id;
+      assert.equal((await request(monitorPath, 'PATCH', { destinationIds: [webhookId] }, start + 60_000)).status, 200);
       const maintenance = await request('/api/operator/monitors', 'POST', { name: 'Private', kind: 'heartbeat', published: false }, start).then(response => response.json());
       const privateId = maintenance.monitors[1].id;
       assert.equal((await request('/api/operator/monitors/' + privateId + '/maintenance', 'PUT', {
@@ -300,12 +305,14 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
         await mf.setOptions(options(legacy));
         assert.equal((await read(start + 60_000)).monitor.history.percentage, 50);
       }
-      await mf.setOptions(options(upgraded));
+      await mf.setOptions(options(upgraded, 'state', true));
       const after = await read(start + 60_000);
       const { history: oldHistory, ...oldMonitor } = beforeUpgrade.monitor;
       const { history: newHistory, ...newMonitor } = after.monitor;
       assert.equal(oldHistory.percentage, 50);
       assert.deepEqual(newMonitor, { ...oldMonitor, effectiveIntervalSeconds: 60 });
+      assert.deepEqual(after.destinations, beforeUpgrade.destinations);
+      assert.deepEqual(after.monitor.destinationIds, [webhookId]);
       assert.deepEqual(after.incidents, beforeUpgrade.incidents);
       assert.deepEqual(after.monitors[1].maintenance, beforeUpgrade.monitors[1].maintenance);
       assert.equal(after.monitors[1].published, false);
@@ -319,7 +326,16 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
       assert.equal(recovered.incidents[0].closedAt, start + 120_000);
       assert.equal(recovered.monitor.history.days.at(-1).successes, 1);
       assert.equal(recovered.monitor.history.percentage, 100);
-      console.log('PASS: Irisbeat 0.3.0 -> current resets only availability history and records the first Analytics Engine observation');
+      const deliveryDeadline = Date.now() + 5000;
+      while (deliveries.length === 0) {
+        assert.ok(Date.now() < deliveryDeadline, 'timed out waiting for the recovery alert');
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      assert.equal(deliveries.length, 1);
+      assert.equal(deliveries[0].url, destination);
+      assert.match(deliveries[0].body.text, /Existing HTTP` · Incident recovered/);
+      assert.ok(deliveries[0].body.text.includes(new Date(start + 120_000).toISOString()));
+      console.log('PASS: Irisbeat 0.3.0 -> current resets availability history and preserves the selected webhook through recovery');
       return;
     }
     if (process.argv.includes('--heartbeat')) {
