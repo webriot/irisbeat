@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import type { Status } from "./index";
-import { renderViewPartial, renderViewSnapshot, statusJson, statusPage } from "./ui";
+import { renderViewPartial, renderViewSnapshot, statusJson, statusPage, type StatusProjection } from "./ui";
 import type { ViewScope } from "./view-changes";
 
 export type StatusResource = "/" | "/api/status" | "snapshot" | ViewScope;
@@ -20,7 +19,7 @@ export function statusWindowEnd(now: number, interval: number) {
   return now - now % interval + interval;
 }
 
-export function renderStatus(resource: StatusResource, data: Status, revision: number): StatusRender {
+export function renderStatus(resource: StatusResource, data: StatusProjection, revision: number): StatusRender {
   if (resource === "/") return { body: statusPage(data), contentType: HTML };
   const row = resource.startsWith("monitor/") ? resource.slice("monitor/".length) : null;
   const body = resource === "/api/status" ? statusJson(data) : resource === "snapshot" ? renderViewSnapshot(data, "public", false) : {

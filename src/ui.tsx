@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /** @jsxRuntime automatic */
 /** @jsxImportSource hono/jsx */
-import type { Status } from "./index";
+import type { MonitoringContext, Status } from "./index";
 import { createOperatorSession } from "./operator-session";
 import { createMonitorEditor } from "./monitor-editor";
 import type { Child } from "hono/jsx";
@@ -12,7 +12,8 @@ import { historyRetryAttempts, historyRetryInterval } from "./availability-histo
 import { mergeScopes, type ViewAudience, type ViewScope } from "./view-changes";
 
 const statusLedger = createStatusLedger();
-type ViewMonitor = Status["monitors"][number];
+export type StatusProjection = ReturnType<MonitoringContext["project"]>;
+type ViewMonitor = StatusProjection["monitors"][number];
 
 function PublicBanner({ data }: { data: Status }) {
   const label = statusLedger.banner(data);
@@ -100,7 +101,7 @@ function DestinationRows({ destinations, emailConfigured }: { destinations: NonN
   })}</>;
 }
 
-export function renderViewPartial(scope: ViewScope, data: Status, audience: ViewAudience, emailConfigured: boolean) {
+export function renderViewPartial(scope: ViewScope, data: StatusProjection, audience: ViewAudience, emailConfigured: boolean) {
   const operator = audience !== "public";
   switch (scope) {
     case "page": return { html: String(<PageHeading name={data.pageName} />), ...(operator ? { pageName: data.pageName } : {}) };
@@ -118,18 +119,18 @@ export function renderViewPartial(scope: ViewScope, data: Status, audience: View
   }
 }
 
-function PublicContent({ data }: { data: Status }) {
+function PublicContent({ data }: { data: StatusProjection }) {
   return <><PageHeading name={data.pageName} /><PublicBanner data={data} />
     <div class="ledger"><PublicRows monitors={data.monitors} /></div><PublicIncidents data={data} /></>;
 }
 
-export function statusJson(data: Status) {
+export function statusJson(data: StatusProjection) {
   const monitors = data.monitors.map(({ historyRetryToken: _token, historyRevision: _revision, ...monitor }:
     ViewMonitor & { historyRevision?: number }) => monitor);
   return { ...data, monitors, monitor: monitors[0] ?? null };
 }
 
-export function renderViewSnapshot(data: Status, audience: ViewAudience, emailConfigured: boolean) {
+export function renderViewSnapshot(data: StatusProjection, audience: ViewAudience, emailConfigured: boolean) {
   if (audience === "public") return { pageName: data.pageName, html: String(<PublicContent data={data} />) };
   const scopes: ViewScope[] = ["page", "banner", "monitors", "incidents", "destinations"];
   return { partials: scopes.map(scope => ({ scope, data: renderViewPartial(scope, data, audience, emailConfigured) })) };
@@ -152,7 +153,7 @@ function Document({ title, operator = false, children }: { title: string; operat
   </body></html>;
 }
 
-export function statusPage(status: Status) {
+export function statusPage(status: StatusProjection) {
   return "<!doctype html>" + <Document title={status.pageName}><div id="public-status"><PublicContent data={status} /></div></Document>;
 }
 

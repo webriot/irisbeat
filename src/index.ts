@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, renderViewPartial, renderViewSnapshot, statusJson, styleSheet, themeScript } from "./ui";
+import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, renderViewPartial, renderViewSnapshot, statusJson, styleSheet, themeScript, type StatusProjection } from "./ui";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
 import { minimumCheckIntervalSeconds, MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
@@ -64,7 +64,7 @@ export type {
 } from "./notification-jobs";
 export type { MaintenanceWindow } from "./monitor-configuration";
 export type { ViewAudience, ViewHint, ViewScope } from "./view-changes";
-export type Status = ReturnType<MonitoringContext["project"]>;
+export type Status = ReturnType<typeof statusJson>;
 const CONFIRMATION_COOLDOWN = 5 * 60_000;
 type ConfirmationInvitation = { id: string; token: string; origin: string; expiresAt: number; submitted?: boolean };
 type StoredContext = {
@@ -92,9 +92,9 @@ type Subscription = { protocol: 2; pending: boolean; queued?: ViewHint } & (
   | OperatorSubscription
 );
 type PendingStatus = { since: number; scopes: ViewScope[] };
-type PublishedStatusMeta = Pick<Status, "paused" | "pageName"> & { revision: number };
+type PublishedStatusMeta = Pick<StatusProjection, "paused" | "pageName"> & { revision: number };
 type PublishedHistory = HistoryFence & { retryAt?: number };
-type PublicationInput = { revision: number; at: number; data: Status; history: Map<string, PublishedHistory> };
+type PublicationInput = { revision: number; at: number; data: StatusProjection; history: Map<string, PublishedHistory> };
 type PublishedStatus = PublicationInput & { generation: number; renders: Map<StatusResource, StatusRender> };
 type StatusBaseline = PublishedStatusMeta & {
   monitors: (ReturnType<typeof publicMonitor> & { historyFence?: HistoryFence })[];
@@ -111,7 +111,8 @@ function publicMonitor(monitor: Monitor, paused: boolean) {
     id: monitor.id, name: monitor.name, kind,
     ...(kind === "heartbeat" ? { lastSeen: monitor.lastSeen ?? null } : {}),
     state: paused ? "paused" as const : monitor.maintenance ? "maintenance" as const : monitor.state,
-    maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult, historyRetryToken: monitor.historyRetryToken,
+    maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult,
+    ...(monitor.historyRetryToken ? { historyRetryToken: monitor.historyRetryToken } : {}),
   };
 }
 
@@ -362,7 +363,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (!meta) return;
     const { revision, generation, at, ...fields } = meta;
     const history = new Map<string, PublishedHistory>();
-    const monitors = this.publicationRows<Status["monitors"][number] & { historyFence?: PublishedHistory }>("monitor")
+    const monitors = this.publicationRows<StatusProjection["monitors"][number] & { historyFence?: PublishedHistory }>("monitor")
       .map(({ historyFence, ...monitor }) => {
         history.set(monitor.id, historyFence ?? { id: monitor.id, revision: 0, retryAt: 0 });
         // Publications from the SQLite build may contain aggregates from the retired table.
@@ -375,7 +376,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     };
   }
 
-  private storePublicRow(monitor: Status["monitors"][number], position: number, historyFence: PublishedHistory) {
+  private storePublicRow(monitor: StatusProjection["monitors"][number], position: number, historyFence: PublishedHistory) {
     this.ctx.storage.sql.exec("INSERT OR REPLACE INTO status_publication VALUES ('monitor', ?, ?)", position,
       JSON.stringify({ ...monitor, historyFence }));
   }
@@ -1415,12 +1416,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return this.availability.readiness(this.read().monitors, Date.now());
   }
 
-  private projectedMonitors(state: StoredContext, projection: Status) {
+  private projectedMonitors(state: StoredContext, projection: StatusProjection) {
     const selected = new Set(projection.monitors.map(monitor => monitor.id));
     return state.monitors.filter(monitor => selected.has(monitor.id));
   }
 
-  private readAvailability(state: StoredContext, projection: Status, at: number, operator: boolean) {
+  private readAvailability(state: StoredContext, projection: StatusProjection, at: number, operator: boolean) {
     return this.availability.read(this.projectedMonitors(state, projection), at, () => {
       const state = this.ctx.storage.kv.get<StoredContext>("context");
       return new Map(state?.monitors.filter(monitor => operator || monitor.published)
@@ -1449,7 +1450,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return attachAvailability(data, this.availability.cached(this.projectedMonitors(state, data), at));
   }
 
-  async status(operator = false, secrets = operator): Promise<Status> {
+  async status(operator = false, secrets = operator): Promise<StatusProjection> {
     const at = Date.now();
     const state = this.read(at);
     const data = this.project(state, operator, secrets, at);
@@ -1524,7 +1525,7 @@ function includesLedger(scope: ViewScope) {
   return scope === "monitors" || scope.startsWith("monitor/");
 }
 
-function attachAvailability(status: Status, history: Map<string, AvailabilityHistory | null>): Status {
+function attachAvailability(status: StatusProjection, history: Map<string, AvailabilityHistory | null>): StatusProjection {
   const monitors = status.monitors.map(monitor => ({ ...monitor, history: history.get(monitor.id) ?? null }));
   return { ...status, monitors, monitor: monitors[0] ?? null };
 }
