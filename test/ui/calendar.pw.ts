@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { fulfillView } from './view-response';
 import { test, expect } from '@playwright/test';
 import { monitorAction } from './actions';
+
+const headers = { authorization: 'Bearer ui-test-secret' };
+
 for (const kind of ['http', 'tcp']) {
   test('operator configures Calendar ' + kind + ' with authoritative live explanation and zone preview, then returns to Interval', async ({ page, request }) => {
-    const headers = { authorization: 'Bearer ui-test-secret' };
     await page.setViewportSize({ width: 390, height: 900 });
     await page.goto('/operator');
     await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
@@ -42,7 +45,7 @@ for (const kind of ['http', 'tcp']) {
     await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
     const saved = await saving;
     expect(saved.status()).toBe(201);
-    const monitor = (await saved.json()).monitors.at(-1);
+    const monitor = (await (await request.get('/api/operator', { headers })).json()).monitors.find((item: { name: string }) => item.name === 'Calendar UI');
     try {
       expect(monitor).toMatchObject({ kind, scheduleMode: 'calendar', cron: '0 9 15 * 1', timezone: 'America/New_York', intervalSeconds: 60 });
       await monitorAction(page, 'Edit Calendar UI');
@@ -60,14 +63,15 @@ for (const kind of ['http', 'tcp']) {
       await page.getByLabel('Interval', { exact: true }).fill('5');
       const editing = page.waitForResponse(response => response.request().method() === 'PATCH');
       await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
-      expect((await (await editing).json()).monitors.find((item: { id: string }) => item.id === monitor.id)).toMatchObject({ id: monitor.id, scheduleMode: 'interval', intervalSeconds: 300 });
+      expect((await editing).status()).toBe(200);
+      expect((await (await request.get('/api/operator', { headers })).json()).monitors.find((item: { id: string }) => item.id === monitor.id)).toMatchObject({ id: monitor.id, scheduleMode: 'interval', intervalSeconds: 300 });
     } finally { await request.delete('/api/operator/monitors/' + monitor.id, { headers }); }
   });
 
 }
 
 test('Calendar preview authorization loss clears the operator session', async ({ page }) => {
-  await page.route('**/api/operator', route => route.fulfill({ json: { pageName: 'Private page', monitors: [], incidents: [], webhookUrl: null } }));
+  await page.route('**/api/operator', route => fulfillView(route, { json: { pageName: 'Private page', monitors: [], incidents: [], webhookUrl: null } }));
   await page.route('**/api/operator/schedule-preview', route => route.fulfill({ status: 401, json: { error: 'Unauthorized' } }));
   await page.goto('/operator');
   await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
@@ -106,7 +110,7 @@ test('operator configures Calendar Heartbeat grace in duration units and returns
   await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
   const saved = await saving;
   expect(saved.status()).toBe(201);
-  const monitor = (await saved.json()).monitors.at(-1);
+  const monitor = (await (await request.get('/api/operator', { headers })).json()).monitors.find((item: { name: string }) => item.name === 'Calendar producer');
   try {
     expect(monitor).toMatchObject({ kind: 'heartbeat', scheduleMode: 'calendar', graceSeconds: 90, recoveryThreshold: 3 });
     await monitorAction(page, 'Edit Calendar producer');
@@ -119,9 +123,10 @@ test('operator configures Calendar Heartbeat grace in duration units and returns
     await expect(page.getByLabel('Recovery spacing', { exact: true })).toBeVisible();
     const editing = page.waitForResponse(response => response.request().method() === 'PATCH');
     await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
-    expect((await (await editing).json()).monitors.find((item: { id: string }) => item.id === monitor.id)).toMatchObject({ id: monitor.id, scheduleMode: 'interval', silenceSeconds: 180 });
+    expect((await editing).status()).toBe(200);
+    expect((await (await request.get('/api/operator', { headers })).json()).monitors.find((item: { id: string }) => item.id === monitor.id)).toMatchObject({ id: monitor.id, scheduleMode: 'interval', silenceSeconds: 180 });
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-  } finally { await request.delete('/api/operator/monitors/' + monitor.id, { headers: { authorization: 'Bearer ui-test-secret' } }); }
+  } finally { await request.delete('/api/operator/monitors/' + monitor.id, { headers }); }
 });
 
 test('switching a draft between kinds and schedules saves only the final supported fields', async ({ page, request }) => {
@@ -147,7 +152,7 @@ test('switching a draft between kinds and schedules saves only the final support
   await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
   const response = await saving;
   expect(response.status()).toBe(201);
-  const monitor = (await response.json()).monitors.at(-1);
+  const monitor = (await (await request.get('/api/operator', { headers })).json()).monitors.find((item: { name: string }) => item.name === 'Switched draft');
   try {
     expect(response.request().postDataJSON()).toEqual({
       name: 'Switched draft', kind: 'tcp', published: true, hostname: 'db.example', port: 5432,
@@ -158,6 +163,6 @@ test('switching a draft between kinds and schedules saves only the final support
     await expect(page.getByLabel('Check type', { exact: true })).toBeDisabled();
     await expect(page.getByLabel('Hostname', { exact: true })).toHaveValue('db.example');
   } finally {
-    await request.delete('/api/operator/monitors/' + monitor.id, { headers: { authorization: 'Bearer ui-test-secret' } });
+    await request.delete('/api/operator/monitors/' + monitor.id, { headers });
   }
 });

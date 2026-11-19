@@ -1,22 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import type { Status } from './index';
 import type { ViewHint, ViewScope } from './view-changes';
 
+type OperatorPartial = { scope: ViewScope; data: { html: string } };
 type PartialData = { html: string; revision: number; permission: 'reader' | 'editor' };
-type OperatorPartial = { scope: ViewScope; data: PartialData };
 
 type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
-type OperatorResponse = Status | { secret: string };
+type OperatorSnapshot = { partials: OperatorPartial[]; permission: 'reader' | 'editor'; hosted: boolean };
+type MutationAck = Pick<ViewHint, 'revision' | 'scopes'>;
 export type SchedulePreview = { explanation: string; timezone: string; occurrences: number[] };
 export type ScheduleInput = { cron: string; timezone: string; graceSeconds?: number | null };
 export type LiveSnapshots = (
   path: string,
   read: (current: () => boolean, hint?: ViewHint) => Promise<boolean | void>,
   authorize: () => Promise<string>,
-) => { sync(): void; stop(): void };
+) => { sync(hint?: ViewHint): void; stop(): void };
 export interface OperatorSessionCallbacks {
-  partials?(data: OperatorPartial[]): void;
-  received(data: OperatorResponse, savedField?: 'pageName'): void;
+  partials(data: OperatorPartial[]): void;
+  snapshot(data: OperatorSnapshot): void;
+  pageNameSaved(): void;
+  credential(secret: string): void;
   reading?(state: 'pending' | 'success' | 'idle'): void;
   signedOut(): void;
   failed(message: string, reading: boolean): void;
@@ -32,14 +34,29 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
   let permission: 'reader' | 'editor' = 'editor';
   let generation = 0;
   let requestVersion = 0;
-  let readingVersion: number | undefined;
-  let busy = false;
+  let activeRead: { version: number; hint?: ViewHint } | undefined;
+  let writeDone: Promise<void> | undefined;
   let pendingRefresh = false;
   let updates: ReturnType<LiveSnapshots> | undefined;
   let previewSequence = 0;
   let previewTimer: ReturnType<typeof setTimeout> | undefined;
   // Object methods avoid bundler name helpers outside the stringified factory.
   const lifecycle = {
+    latest(started: number, version: number) { return started === generation && version === requestVersion; },
+    async readPartials(change: MutationAck, signal: AbortSignal, started: number) {
+      return Promise.all(change.scopes.map(async scope => {
+        const response = await fetch('/api/operator/partials/' + scope + '?revision=' + change.revision, {
+          headers: { Authorization: 'Bearer ' + secret }, signal,
+        });
+        if (started === generation && response.status === 401) lifecycle.unauthorized();
+        if (!response.ok) throw new Error('Request failed');
+        const data = await response.json() as PartialData;
+        if (data.permission !== permission || !Number.isSafeInteger(data.revision) || data.revision < change.revision) {
+          throw new Error('Revision or permission changed');
+        }
+        return { scope, data };
+      }));
+    },
     startUpdates() {
       if (updates) return;
       const started = generation;
@@ -62,83 +79,103 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
   const session = {
     signIn(credential: string) { ++generation; secret = credential; return session.run(); },
     signOut() {
-      ++generation; ++requestVersion; secret = ''; busy = false; pendingRefresh = false; readingVersion = undefined;
+      ++generation; ++requestVersion; secret = ''; writeDone = undefined; pendingRefresh = false; activeRead = undefined;
       updates?.stop(); updates = undefined;
       session.cancelPreview();
       ui.signedOut();
     },
-    async run(path = '/api/operator', method: Method = 'GET', body?: unknown, after?: (data: OperatorResponse) => void, current = () => true, hint?: ViewHint) {
+    async run(path = '/api/operator', method: Method = 'GET', body?: unknown, after?: () => void, current = () => true, hint?: ViewHint): Promise<boolean | void> {
       const reading = method === 'GET';
-      if (busy) { if (reading) pendingRefresh = true; return; }
-      const supersedesRead = !reading && readingVersion === requestVersion;
-      const version = ++requestVersion;
       const started = generation;
-      if (!reading) busy = true;
-      else { readingVersion = version; ui.reading?.('pending'); }
+      if (writeDone) {
+        if (!reading) return;
+        await writeDone;
+        if (started === generation && current()) return session.run(path, method, body, after, current, hint);
+        return;
+      }
+      const superseded = !reading && activeRead?.version === requestVersion ? activeRead : undefined;
+      const version = ++requestVersion;
+      let finish: (() => void) | undefined;
+      if (!reading) writeDone = new Promise<void>(resolve => { finish = resolve; });
+      else { activeRead = { version, hint }; ui.reading?.('pending'); }
       const finishWriting = reading ? undefined : ui.writing();
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 10000);
+      let refreshingWrite = false;
       try {
         if (hint) {
-          const partials = await Promise.all(hint.scopes.map(async scope => {
-            const response = await fetch(path + '/partials/' + scope + '?revision=' + hint.revision, {
-              headers: { Authorization: 'Bearer ' + secret }, signal: controller.signal,
-            });
-            if (started === generation && response.status === 401) lifecycle.unauthorized();
-            if (!response.ok) throw new Error('Request failed');
-            const data = await response.json() as PartialData;
-            if (data.permission !== permission || !Number.isSafeInteger(data.revision) || data.revision < hint.revision) {
-              throw new Error('Revision or permission changed');
-            }
-            return { scope, data };
-          }));
-          if (started === generation && version === requestVersion && current()) {
-            ui.partials?.(partials);
+          const partials = await lifecycle.readPartials(hint, controller.signal, started);
+          if (lifecycle.latest(started, version) && current()) {
+            ui.partials(partials);
             ui.reading?.('success');
           }
           return;
         }
         const response = await fetch(path, {
           signal: controller.signal,
-          method, headers: { Authorization: 'Bearer ' + secret, 'Content-Type': 'application/json' },
+          method, headers: { Authorization: 'Bearer ' + secret, 'Content-Type': 'application/json', Accept: 'application/vnd.irisbeat.view+json' },
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         });
         if (started !== generation) return;
         if (response.status === 401 || (reading && response.status === 403)) { lifecycle.unauthorized(); return; }
-        if (version !== requestVersion) return;
-        const data = await response.json() as OperatorResponse & { error?: string };
-        if (started !== generation || version !== requestVersion) return;
+        if (!lifecycle.latest(started, version)) return;
+        const data = await response.json() as (OperatorSnapshot | MutationAck | { secret: string }) & { error?: string };
+        if (!lifecycle.latest(started, version)) return;
         if (!response.ok) {
           if (response.status === 403) pendingRefresh = true;
           throw new Error(data.error || 'Request failed');
         }
-        if (reading && !current()) return;
-        if (!('secret' in data)) permission = (data as Status & { permission?: 'reader' | 'editor' }).permission ?? 'editor';
-        else if (supersedesRead) pendingRefresh = true;
-        ui.received(data, method === 'PUT' && path === '/api/operator' ? 'pageName' : undefined);
-        if (reading) ui.reading?.('success');
-        lifecycle.startUpdates();
-        if (after) after(data);
-        if (!reading) ui.saved(path, method);
-      } catch (error) {
-        if (started === generation && version === requestVersion) {
-          // A failed write has no snapshot to replace the read it superseded.
-          if (supersedesRead) pendingRefresh = true;
-          if (!reading || current()) {
-            ui.failed((error as Error).message, reading);
-            return false;
+        if (reading) {
+          if (!current()) return;
+          if (!('partials' in data)) throw new Error('Snapshot unavailable');
+          permission = data.permission;
+          ui.snapshot(data);
+          ui.reading?.('success');
+          lifecycle.startUpdates();
+        } else {
+          if ('secret' in data) ui.credential(data.secret);
+          else if ('scopes' in data) {
+            refreshingWrite = true;
+            if (method === 'PUT' && path === '/api/operator') ui.pageNameSaved();
+            try {
+              const partials = await lifecycle.readPartials(data, controller.signal, started);
+              if (!lifecycle.latest(started, version)) return;
+              ui.partials(partials);
+            } catch {
+              if (!lifecycle.latest(started, version)) return;
+              ui.failed('Updates unavailable', true);
+              pendingRefresh = true;
+            }
+          } else if ('partials' in data) {
+            permission = data.permission;
+            if (method === 'PUT' && path === '/api/operator') ui.pageNameSaved();
+            ui.snapshot(data);
           }
+          after?.();
+          ui.saved(path, method);
+        }
+      } catch (error) {
+        if (lifecycle.latest(started, version) && (!reading || current())) {
+          ui.failed((error as Error).message, reading);
+          return false;
         }
       } finally {
         clearTimeout(timeout);
-        if (hint) controller.abort();
-        if (reading && started === generation && version === readingVersion) {
-          readingVersion = undefined;
+        if (hint || refreshingWrite) controller.abort();
+        if (reading && started === generation && version === activeRead?.version) {
+          activeRead = undefined;
           ui.reading?.('idle');
         }
-        if (!reading && started === generation) {
-          busy = false; finishWriting?.();
-          if (pendingRefresh) { pendingRefresh = false; updates?.sync(); }
+        if (finish) {
+          if (started === generation) {
+            writeDone = undefined;
+            finishWriting?.();
+            if (pendingRefresh || superseded) {
+              updates?.sync(pendingRefresh ? undefined : superseded?.hint);
+              pendingRefresh = false;
+            }
+          }
+          finish();
         }
       }
     },

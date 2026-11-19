@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { fulfillView } from './view-response';
 import { expect, test, type WebSocketRoute } from '@playwright/test';
 import { monitorAction } from './actions';
 
@@ -218,7 +219,7 @@ test('Settings preserves webhook and page drafts across independent saves, failu
   await page.addInitScript(() => { Object.defineProperty(window, 'WebSocket', { value: class { constructor() { throw new Error('offline'); } } }); });
   await page.route('**/api/operator', route => {
     if (route.request().method() === 'PUT') data = { ...data, pageName: route.request().postDataJSON().pageName };
-    return route.fulfill({ json: data });
+    return fulfillView(route, { json: data });
   });
   await page.route('**/api/operator/destinations/original', route => route.fulfill({ status: 503, json: { error: 'Save unavailable' } }));
   await page.goto('/operator');
@@ -264,7 +265,7 @@ test('Settings preserves webhook and page drafts across independent saves, failu
   await url.fill(draft);
   await page.route('**/api/operator/destinations', route => {
     data.destinations.push({ id: 'saved', channel: 'webhook', url: route.request().postDataJSON().url });
-    return route.fulfill({ status: 201, json: data });
+    return fulfillView(route, { status: 201, json: data });
   });
   await page.getByRole('button', { name: 'Save webhook', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Replace ' + draft, exact: true })).toBeVisible();
@@ -273,7 +274,7 @@ test('Settings preserves webhook and page drafts across independent saves, failu
 
 test('Settings distinguishes provider acceptance, retries and terminal failure', async ({ page }) => {
   const at = Date.UTC(2026, 10, 18, 9, 30);
-  await page.route('**/api/operator', route => route.fulfill({ json: {
+  await page.route('**/api/operator', route => fulfillView(route, { json: {
     pageName: 'Status', monitors: [], incidents: [],
     destinations: [
       { id: 'ok', channel: 'webhook', url: 'https://alerts.example/ok', latestSubmission: { status: 'accepted', at } },

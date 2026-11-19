@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { fulfillView } from './view-response';
 import { expect, test } from '@playwright/test';
 
 for (const scenario of [
@@ -33,7 +34,7 @@ for (const scenario of [
     });
     let reads = 0;
     let snapshot = data;
-    await page.route('**/api/status', route => { reads++; return route.fulfill({ json: snapshot }); });
+    await page.route('**/api/status', route => { reads++; return fulfillView(route, { json: snapshot }); });
     const rendered = await request.post('/__ui/status', { data });
     expect(rendered.ok()).toBe(true);
     const initial = await rendered.text();

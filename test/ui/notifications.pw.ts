@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { fulfillView } from './view-response';
 import { expect, test } from '@playwright/test';
 test('subscribes before resync, coalesces notices and reconnects', async ({ page, request }) => {
   await request.put('/api/operator', { headers: { Authorization: 'Bearer ui-test-secret' }, data: { pageName: 'Initial socket page' } });
@@ -12,7 +13,7 @@ test('subscribes before resync, coalesces notices and reconnects', async ({ page
   let held = false;
   await page.route('**/api/status', route => {
     reads++;
-    return route.fulfill({ json: { pageName: name, paused: false, monitors: [], incidents: [] } });
+    return fulfillView(route, { json: { pageName: name, paused: false, monitors: [], incidents: [] } });
   });
   let partialReads = 0;
   let stale = false;
@@ -83,7 +84,7 @@ test('failed reconnect attempts back off without postponing visible fallback pol
     Object.defineProperty(document, 'hidden', { configurable: true, value: false });
   });
   let reads = 0;
-  await page.route('**/api/status', route => { reads++; return route.fulfill({ json: { pageName: 'Fallback works', paused: false, monitors: [], incidents: [] } }); });
+  await page.route('**/api/status', route => { reads++; return fulfillView(route, { json: { pageName: 'Fallback works', paused: false, monitors: [], incidents: [] } }); });
   await page.goto('/');
   await page.clock.runFor(61000);
   await expect(page).toHaveTitle('Fallback works');
