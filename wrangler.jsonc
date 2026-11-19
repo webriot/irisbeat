@@ -4,6 +4,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-11-13",
   "workers_dev": true,
+  "version_metadata": { "binding": "IRISBEAT_VERSION" },
   "triggers": {
     "crons": ["* * * * *"],
   },

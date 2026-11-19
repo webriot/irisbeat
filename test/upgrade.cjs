@@ -13,7 +13,8 @@ const { build } = localRequire('esbuild');
 const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
 const legacyNotificationRevision = '70ba924ee9a2b15a3d6b6cc49abc8039aedb7f70';
 const liveViews = process.argv.includes('--live-views');
-const base = (liveViews ? '4f9442a0e660907b02c00c942e05ed4e43abab3c' : process.argv.includes('--notifications') ? legacyNotificationRevision : process.argv[2]) || '6fb95ccec52d9c5c29b82f82c3d77ed3a7e356d3';
+const statusPublication = process.argv.includes('--status-publication');
+const base = (statusPublication ? '4f7e794da35b4d3af46b1851d126c02cd09c1ed1' : liveViews ? '4f9442a0e660907b02c00c942e05ed4e43abab3c' : process.argv.includes('--notifications') ? legacyNotificationRevision : process.argv[2]) || '6fb95ccec52d9c5c29b82f82c3d77ed3a7e356d3';
 const tcp = process.argv[3] === 'tcp';
 const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
 (async () => {
@@ -23,7 +24,41 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     mkdirSync(dirname(destination), { recursive: true });
     writeFileSync(destination, execFileSync('git', ['show', `${base}:${source}`]));
   }
-  const wrapper = index => `import app from ${JSON.stringify(index)}; export {MonitoringContext${index.startsWith(project) ? ', NotificationDelivery' : ''}} from ${JSON.stringify(index)}; export default { async fetch(request, env, ctx) { const url = new URL(request.url); if(url.pathname === '/test-tick') { await app.scheduled({scheduledTime:Number(url.searchParams.get('at'))}, env, ctx); return new Response('checked'); } const testAt = request.headers.get('x-test-at'); const now = Date.now; if (testAt) Date.now = () => Number(testAt); try { return await app.fetch(request, env, ctx); } finally { Date.now = now; } } };`;
+  const wrapper = index => {
+    const source = JSON.stringify(index);
+    const publicationFixture = statusPublication && index.startsWith(project);
+    const bindings = publicationFixture
+      ? `import { createHostedWorker, MonitoringContext as EngineContext, NotificationDelivery } from ${source};
+        export { NotificationDelivery };
+        export class MonitoringContext extends EngineContext {
+          testAlarmAt() { return this.ctx.storage.getAlarm(); }
+        }
+        const hosted = createHostedWorker({
+          contractVersion: "1",
+          resolve(request) {
+            const id = request.headers.get("x-test-tenant");
+            return id && { id, monitorLimit: 10, permission: request.headers.has("Authorization") ? "editor" : null };
+          },
+          contexts: () => [],
+        });`
+      : `export { MonitoringContext${index.startsWith(project) ? ', NotificationDelivery' : ''} } from ${source};`;
+    return `import app from ${source}; ${bindings}
+      export default { async fetch(request, env, ctx) {
+        const url = new URL(request.url);
+        if (url.pathname === '/test-tick') {
+          await app.scheduled({ scheduledTime: Number(url.searchParams.get('at')) }, env, ctx);
+          return new Response('checked');
+        }
+        ${publicationFixture ? `if (url.pathname === '/test-status-alarm') {
+          return Response.json(await env.MONITORING.getByName('personal').testAlarmAt());
+        }` : ''}
+        const testAt = request.headers.get('x-test-at');
+        const now = Date.now;
+        if (testAt) Date.now = () => Number(testAt);
+        try { return await ${publicationFixture ? "(url.hostname === 'tenants.example' ? hosted : app)" : "app"}.fetch(request, env, ctx); }
+        finally { Date.now = now; }
+      } };`;
+  };
   const socketTarget = {
     name: 'substitute-tcp-target',
     setup(builder) {
@@ -59,10 +94,10 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     entryPoints: ['src/notification-delivery.ts'], bundle: true, write: false,
     format: 'esm', platform: 'neutral', external: ['cloudflare:workers'],
   })).outputFiles[0].text;
-  function options(script, stateDirectory = 'state', withQueue = false, port) {
+  function options(script, stateDirectory = 'state', withQueue = false, port, vars = {}) {
     const monitoring = {
       name: 'irisbeat', modules: true, script, compatibilityDate: '2026-11-13',
-      bindings: { INSTALLATION_SECRET: 'upgrade-test-secret' },
+      bindings: { INSTALLATION_SECRET: 'upgrade-test-secret', ...(!statusPublication ? { STATUS_RENDER_INTERVAL_SECONDS: liveViews ? '1' : '0' } : {}), ...vars },
       durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } },
       ...(withQueue ? { queueProducers: { NOTIFICATION_QUEUE: 'upgrade-notifications' } } : {}),
       outboundService: request => {
@@ -87,6 +122,12 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
   const tick = at => request('/test-tick?at='+at);
   const start = Date.UTC(2026,10,13);
   try {
+    if (statusPublication) {
+      const test = require('./status-publication.cjs');
+      const application = await bundle(join(project, 'src/index.ts'));
+      await test({ mf, options, application, request, tick, deliveries });
+      return;
+    }
     if (liveViews) {
       const { chromium } = require('@playwright/test');
       const browser = await chromium.launch();

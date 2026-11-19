@@ -50,7 +50,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
   let holdQueue = false;
   let overlapAction;
   let now = 0;
-  const workerOptions = { name: 'consumer', modules: true, script, compatibilityDate: '2026-11-13', durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } }, outboundService: async request => {
+  const workerOptions = { name: 'consumer', modules: true, script, compatibilityDate: '2026-11-13', bindings: { STATUS_RENDER_INTERVAL_SECONDS: '0' }, durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } }, outboundService: async request => {
     if (request.url.startsWith('https://policy-gate.example/')) {
       const gate = policyGates.get(new URL(request.url).pathname.slice(1));
       gate.captured(); await gate.released;

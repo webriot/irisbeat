@@ -359,7 +359,8 @@ drafts. A gone or invisible row returns empty HTML, as does an unknown row.
 An inaccessible section returns 404. A successful response has a revision at
 least as high as the requested minimum (409 if unavailable). The default
 minimum is zero. Each partial uses the current request's trusted tenant and
-permissions. All partials are uncached in this release.
+permissions. Operator partials bypass shared caches. Public partials use the
+published Status revision and a regional edge cache.
 
 After processing a notice and its reads, send exactly `ack`. Each socket holds
 one pending hint and a coalesced successor covering the union of queued scopes
@@ -471,20 +472,42 @@ inferring hidden activity from revision gaps. A revision is meaningful within
 its trusted context and audience. It is independent of hosted policy revision.
 
 `MonitoringContext.publishViewChanges(hints)` is the synchronous post-commit
-publication point. Each entry is a `ViewHint` containing the committed revision
-and affected resources for its audience. `readView(scope, audience)` returns
+hook for committed changes. Each entry is a `ViewHint` containing the committed
+revision and affected resources for its audience. Hosted overrides should treat
+a public hint here as pending until its revision has been published. `readView(scope, audience)` returns
 projection input and its committed revision together. Hono owns the HTML
 rendering. The availability provider is consulted only for ledger or row reads.
 The internal mutation RPCs return a success marker. Compatibility HTTP writes
 fetch their existing JSON response after commit.
 
-For delayed public publication ([#88](https://github.com/Webriot/irisbeat/issues/88)),
-the publisher can retain the public hint while forwarding reader and editor
-hints immediately. Coalesce the public resource set and retain its highest
-revision. Publish rendered resources at least as new as that revision before
-releasing the public hint. Use the resolved tenant and resource for cache
-identity and the requested revision as a lower bound. A cold edge can use
-`readView` and Hono to fill a resource directly from committed data.
+Public publication coalesces revisions and scopes in a durable pending record.
+`STATUS_RENDER_INTERVAL_SECONDS` defaults to 60. Positive values through 86,400
+set a UTC-aligned window. An explicit `"0"` opts into immediate public
+rendering. Use the same binding in the HTTP Worker and the MonitoringContext
+Worker when they are configured separately. Invalid values fail the Worker
+request or scheduled invocation.
+
+With public subscribers, the existing subscription alarm also wakes at the
+next publication boundary. The Hono render functions prepare affected partials
+and the MonitoringContext stores their public projection before releasing the
+coalesced hint. Reader and editor hints still follow their committed revisions
+immediately. The published projection survives hibernation. With no public
+subscribers, the first GET after the boundary advances the publication. The
+first public read of a context without a saved publication bootstraps from
+committed data. An unpublish can take the same window to appear on anonymous
+Status. Operator data, authorization, Check commits, and alert handoff stay
+independent of the public window.
+
+Cloudflare's Cache API stores anonymous documents, snapshots, and partials
+regionally. The Worker keys them by the resolved Durable Object ID, resource,
+and publication window, so an ordinary GET after the window catches up even
+when it missed the hint. A hinted revision is a lower bound on the same URL.
+An edge miss reads the published projection and an unavailable minimum returns
+409. Static assets and the generic Operator shell use content-based cache keys.
+Client-facing responses retain `Cache-Control: no-store`. Hosted deployments
+can bind `IRISBEAT_VERSION` using Wrangler version metadata to isolate Status
+edge entries by deployed Worker version. See [Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/)
+and [Durable Object alarms](https://developers.cloudflare.com/durable-objects/api/alarms/).
 
 ### Upgrade from unscoped subscriptions
 
