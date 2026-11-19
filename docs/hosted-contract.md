@@ -89,13 +89,18 @@ installation secret and ignores bodies.
 ## Incident notifications
 
 Use one Queue for the monitoring Worker's `NOTIFICATION_QUEUE` producer and
-the isolated delivery Worker's consumer trigger. Use `irisbeat/notification-delivery`
-as the delivery Worker entrypoint. Export `NotificationDelivery` from the hosted
-monitoring Worker and bind the delivery Worker's `NOTIFICATION_DELIVERY` service
-to that named entrypoint. It resolves a destination only while the original context,
+the isolated delivery Worker's consumer trigger and `NOTIFICATION_HANDOFF`
+producer. Configure a second Queue in the same jurisdiction for the delivery
+Worker's `NOTIFICATION_DLQ` producer. Keep native dead-letter routing unset
+because it forwards the original job body. Use `irisbeat/notification-delivery`
+as the delivery Worker entrypoint and bind its exported SQLite Durable Object
+`NotificationRecovery` as `NOTIFICATION_RECOVERY`, with a SQLite class migration.
+Export `NotificationDelivery` from the hosted monitoring Worker and bind the
+delivery Worker's `NOTIFICATION_DELIVERY` service to that named entrypoint.
+It resolves a webhook or confirmed inbox only while the original context,
 Monitor, destination and selection remain eligible. Keep the Queue and service
-binding under trusted deployment control. Delivery lookup is available through
-service RPC. Keep Workers Logs enabled on the delivery Worker and disable
+binding under trusted deployment control. The same service RPC records submission
+results. Keep Workers Logs enabled on the delivery Worker and disable
 automatic traces because fetch spans can include credential-bearing webhook URLs.
 
 Editors manage webhook destinations with `POST /api/operator/destinations` and
@@ -112,14 +117,47 @@ HTTP, TCP and Heartbeat share post-commit Incident and Maintenance enqueueing. A
 event and delivery IDs, original event time and safe rendering data. Address
 changes replace the destination identity and clear prior selections. A failed
 enqueue logs `notification_enqueue_failed` and leaves the change committed.
-Queue acceptance starts durable delivery. This slice makes one bounded provider
-submission per message and logs `webhook_submission_failed` or
-`email_alert_submission_failed` on failure. The alert consumer uses
-`NotificationDelivery.resolveAlert` to resolve webhook and confirmed email
-destinations over trusted RPC. It checks the original selection and pause
-generation on each lookup. Deploy the monitoring Worker with that service
-entrypoint before deploying the email-alert consumer. The monitoring Worker
-continues to support the older consumer's `resolveWebhook` RPC.
+Queue acceptance starts durable delivery for webhooks, email confirmations and alert emails.
+The consumer calls the trusted `resolveAlert` RPC for webhook and email alerts.
+The monitoring Worker continues to support the earlier `resolveWebhook` RPC.
+The delivery Worker rechecks eligibility immediately before it reserves a
+submission in the delivery's SQLite Recovery object and calls the provider.
+Duplicate Queue copies share a ten-submission budget, even at the same broker
+ordinal. No provider call starts once the job is one hour old. Temporary
+failures back off exponentially. Eligibility and Recovery RPC errors can
+consume broker deliveries without spending the provider budget. Keep the broker
+configured for ten retries. Its final delivery is reserved for terminal
+bookkeeping and does not submit to a provider.
+
+The Recovery object records terminal outcomes before the source is acknowledged.
+Result reporting, confirmation marking and sanitized dead-letter writes then
+recover independently through the object's alarm, for up to 14 days. If Recovery
+is unavailable on the final broker delivery, the consumer submits a delayed,
+bookkeeping-only message to the source Queue and acknowledges the original
+after that write succeeds. The handoff retains the original eligibility evidence
+and timestamps, omits Monitor names and addresses, and cannot submit to a provider.
+If Recovery and the handoff write both fail on the final delivery, the broker
+can discard the exhausted source. Settings can retain its preceding result and
+the dead-letter Queue can receive no diagnostic for that job. A durable provider
+reservation can consume a slot if the Worker crashes before making the request.
+
+Editor snapshots expose the optional `destinations[].latestSubmission` with
+`status`, `at` (Unix milliseconds) and a safe `reason` for failures.
+A recorded acceptance closes submission while Settings or confirmation marking
+is pending. An acceptance from a request already submitted is preserved even if
+a newer attempt started. Exhaustion and its dead-letter diagnostic wait for
+outstanding requests for that delivery identity to settle. A crash before
+recording the provider outcome, or a transport timeout with unknown provider outcome, can still lead to duplicates.
+Acceptance records provider submission. At equal event times, Settings uses the
+order recorded with the monitoring commit. Ordered events take precedence over
+legacy jobs at the same event time. Legacy jobs still use broker time and
+delivery identity when compared with one another.
+
+Confirmation eligibility uses the original invitation and pause generation.
+The Recovery object stores only opaque identities, timestamps, the pause
+generation needed for confirmation marking, and sanitized outcome fields.
+Dead-letter diagnostics include the reserved provider attempt count and have
+no automatic replay.
 
 Hosted and self-hosted notifications require explicit Monitor selections
 and the Queue and delivery Worker above. Monitoring and Incident recording

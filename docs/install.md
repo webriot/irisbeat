@@ -53,7 +53,7 @@ npx wrangler whoami
 
 Select the intended account using `CLOUDFLARE_ACCOUNT_ID` in the shell, outside
 this repository, if more than one account is available. Choose names unique in
-that account for this installation's two Workers and Queue. For a fresh or
+that account for this installation's two Workers and two Queues. For a fresh or
 disposable install, verify that the names are unused before provisioning. Do not
 use a temporary claim account.
 
@@ -61,7 +61,9 @@ use a temporary claim account.
 IRISBEAT_WORKER_NAME="irisbeat-my-install"
 IRISBEAT_DELIVERY_WORKER_NAME="${IRISBEAT_WORKER_NAME}-delivery"
 IRISBEAT_QUEUE_NAME="${IRISBEAT_WORKER_NAME}-notifications"
+IRISBEAT_DLQ_NAME="${IRISBEAT_QUEUE_NAME}-dead-letter"
 npx wrangler queues create "$IRISBEAT_QUEUE_NAME"
+npx wrangler queues create "$IRISBEAT_DLQ_NAME"
 ```
 
 In your local extracted source, set the following Wrangler values to the shell
@@ -71,10 +73,14 @@ variable values above. Keep deployment-specific configuration out of version con
 | --- | --- | --- |
 | `wrangler.jsonc` | `queues.producers[0].queue` | `IRISBEAT_QUEUE_NAME` |
 | `wrangler.delivery.jsonc` | `queues.consumers[0].queue` | `IRISBEAT_QUEUE_NAME` |
+| `wrangler.delivery.jsonc` | `queues.producers[0].queue` (`NOTIFICATION_DLQ`) | `IRISBEAT_DLQ_NAME` |
+| `wrangler.delivery.jsonc` | `queues.producers[1].queue` (`NOTIFICATION_HANDOFF`) | `IRISBEAT_QUEUE_NAME` |
 | `wrangler.delivery.jsonc` | `services[0].service` | `IRISBEAT_WORKER_NAME` |
 
 Keep the binding names, `NotificationDelivery` entrypoint and migrations from
-the reviewed configs. Each install needs its own Queue because Cloudflare
+the reviewed configs. Leave the source Queue's native dead-letter routing unset
+so only the delivery Worker's sanitized diagnostics reach the dead-letter Queue.
+Each install needs its own Queue because Cloudflare
 allows one active consumer per Queue.
 See [Cloudflare's Queue setup instructions](https://developers.cloudflare.com/queues/get-started/#connect-the-consumer-worker-to-your-queue).
 
@@ -153,9 +159,20 @@ operator Incidents. Detailed bounds and semantics are in README and the API hand
 
 Cron runs each minute; [new trigger propagation](https://developers.cloudflare.com/workers/configuration/cron-triggers/) can take up to 15 minutes.
 Do not expect a live `/__scheduled` endpoint: it is a Wrangler-local test route.
-Monitor Workers Logs for sanitized `notification_enqueue_failed` and
-`webhook_submission_failed` events and cron errors. The Incident remains committed
-if Queue handoff fails. This slice has one provider submission per message.
+Settings shows the latest submission result per destination. “Submission accepted”
+means the provider accepted the request. Temporary failures retry independently
+with exponential delays, up to ten attempts and one hour from Queue acceptance.
+Permanent failures stop immediately. Exhausted jobs go to the dead-letter Queue,
+which has no automatic replay. Keep both Queues in the same jurisdiction.
+If the Recovery object and the bookkeeping-only handoff to the source Queue
+both reject writes on the final broker delivery, the broker can discard the job.
+Settings can retain its previous result and the dead-letter Queue can receive
+no diagnostic for that job.
+Monitor Workers Logs for sanitized `notification_enqueue_failed`,
+`notification_submission_failed`, `notification_submission_report_failed`,
+`notification_dead_letter_failed`, `notification_recovery_unavailable`
+and `notification_handoff_unavailable` events. The Incident or Maintenance
+change remains committed if Queue handoff fails.
 
 For upgrades, retain the same Worker, `MONITORING` binding, class and migration
 history, and deploy the reviewed new source. Back up operational configuration via
@@ -165,22 +182,23 @@ compatibility before rollback. Never delete/recreate a production namespace to u
 
 ### Upgrade and roll back notification Workers
 
-On an existing Queue installation, keep the Worker names, Queue and service
-binding. Deploy the Maintenance-aware delivery Worker first, then deploy the
-monitoring Worker that produces Maintenance jobs. The new consumer handles
-Incident jobs from the previous producer, so existing Monitor selections can
-stay in place. The previous consumer renders Maintenance jobs as Incident
-recoveries.
+On an existing Queue installation, keep the Worker names, source Queue and
+service binding. Configure the handoff producer on the existing source Queue,
+the dead-letter Queue and the Recovery migration before upgrading the delivery
+Worker. Deploy the monitoring Worker first to make the trusted `resolveAlert`
+RPC available, then deploy the consumer. Existing Monitor selections stay in
+place and the new consumer handles Incident jobs from the previous producer.
+If your current consumer predates Maintenance rendering, deploy a
+Maintenance-aware consumer before enabling Maintenance producers.
 
-To roll back, restore the previous monitoring Worker first so it stops
-producing Maintenance jobs. Keep the Maintenance-aware consumer running until
-all queued and in-flight Maintenance jobs have been handled. Restore the
-previous consumer only after that drain is confirmed. Keep the Maintenance-aware
-consumer in place if any Maintenance jobs could still be delivered or replayed.
+To roll back, let pending result and diagnostic writes settle before restoring
+a delivery Worker that lacks Recovery. Before restoring a consumer that cannot
+render Maintenance events, stop emitting them and drain queued and in-flight
+Maintenance jobs. Keep compatible monitoring and delivery Workers in place while
+bookkeeping messages can still reach the source Queue. Restore a monitoring Worker
+without `resolveAlert` after switching to a consumer that supports its RPC.
 
-From a Maintenance-aware Queue deployment, deploy the email-alert monitoring
-Worker before its consumer so the trusted `resolveAlert` RPC is available. When
-upgrading from the confirmation-only build, existing inboxes retain consent and
+When upgrading from the confirmation-only build, existing inboxes retain consent and
 Monitor selections. The engine provisions withdrawal credentials from
 `NOTIFICATION_PUBLIC_ORIGIN` for self-hosted alerts and from the trusted
 [context origin](hosted-contract.md#trusted-adapter) for hosted alerts.
@@ -223,8 +241,7 @@ SMTP processing after acceptance.
 
 Cloudflare still processes recipient metadata for transport. Keep addresses and
 recipient links out of Irisbeat logs and Queue diagnostics. The delivery Worker
-logs sanitized `email_confirmation_submission_failed` and
-`email_alert_submission_failed` events for failed submissions.
+reports sanitized submission results in Settings and records exhausted jobs in the dead-letter Queue.
 
 `npm run test:delivery` and the rendered Settings acceptance test read HTML, plain
 text and synthetic sender and recipient metadata through the simulated
@@ -307,9 +324,9 @@ channels or arbitrary public sites. Use default one-minute intervals, thresholds
    persists. Local suites cover exact timing/UTC boundaries; live evidence covers
    actual Cloudflare socket/cron/secret/resource behavior.
 6. Stop producers, remove the drill webhook in Settings, and delete only drill Monitors.
-   Verify both disposable Worker names, the Queue and the account. Delete the
+   Verify both disposable Worker names, both Queues and the account. Delete the
    delivery Worker first, then the monitoring Worker using
-   `npx wrangler delete <worker-name>`. Delete the disposable Queue with
+   `npx wrangler delete <worker-name>`. Delete both disposable Queues with
    `npx wrangler queues delete <queue-name>`. Worker deletion destroys its
    associated DO data. Confirm removal, then remove any separate controlled
    target service, cloned test build/repository connection and private local
@@ -353,7 +370,7 @@ After the reviewed code is on main and the tag, release and artifacts are public
    and confirm the public/operator Source link downloads the matching source archive.
 2. Use the Deploy to Cloudflare button to install into another unused Worker. Record
    the installed revision and verify the secret prompt and build/deploy configuration.
-   Give that installation its own Queue and deploy its delivery Worker using the
+   Give that installation its own Queues and deploy its delivery Worker using the
    exact-source binding steps above, then run runtime acceptance.
 3. Remove the disposable installation and controlled targets using the cleanup step
    above. Record sanitized evidence for both the candidate CLI and published button

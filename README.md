@@ -100,7 +100,9 @@ paths normalize to `/slack`. Each alert email links to an account-free withdrawa
 form. Withdrawal removes the inbox and its Monitor selections in that context
 and cancels queued alerts that have yet to be submitted. Queue handoff errors
 record `notification_enqueue_failed` and preserve the committed change.
-See [installation](docs/install.md) and [hosted integration](docs/hosted-contract.md#incident-notifications).
+The delivery Worker retries temporary submission failures and sends exhausted
+jobs to a dead-letter Queue. Settings shows each destination's latest submission
+result. See [installation](docs/install.md) and [hosted integration](docs/hosted-contract.md#incident-notifications).
 
 ## Runtime verification
 

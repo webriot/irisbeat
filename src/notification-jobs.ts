@@ -34,6 +34,7 @@ export type NotificationSelection = {
 type EventIdentity = {
   id: string;
   at: number;
+  order?: number;
   monitorName: string;
 };
 
@@ -68,9 +69,18 @@ export type ConfirmationJob = {
   deliveryId: string;
   pauseGeneration: number;
   at: number;
+  order?: number;
 };
 
+export type ConfirmationIdentity = Pick<ConfirmationJob, "contextId" | "destinationId" | "deliveryId" | "pauseGeneration">;
+
 export type NotificationQueueJob = NotificationJob | ConfirmationJob;
+
+export type NotificationEligibility = Omit<NotificationJob, "event">;
+
+export type TerminalNotificationJob = (ConfirmationJob | (NotificationEligibility & {
+  event: Pick<NotificationEvent, "at" | "order">;
+})) & { terminal: true; queuedAt: number };
 
 export type AlertDestination =
   | { channel: "webhook"; url: string }

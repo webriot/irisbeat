@@ -4,7 +4,8 @@ import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
 import { MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
 import { connect } from "cloudflare:sockets";
-import { parseEmailAddress, type AlertDestination, type ConfirmationJob, type NewNotificationDestination, type NotificationDestination, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
+import { parseEmailAddress, type AlertDestination, type ConfirmationIdentity, type ConfirmationJob, type NewNotificationDestination, type NotificationDestination, type NotificationEligibility, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
+import type { NotificationDeliveryIdentity, SubmissionReport } from "./notification-outcomes";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 
 export const CONTRACT_VERSION = "1" as const;
@@ -74,13 +75,14 @@ type StoredContext = {
   monitors: Monitor[];
   webhookUrl?: string | null;
   legacyDestinationId?: string;
-  destinations?: NotificationDestination[];
+  destinations?: (NotificationDestination & { submission?: SubmissionReport & { deliveryId: string } })[];
   emailConfirmations?: Record<string, ConfirmationInvitation>;
   emailWithdrawals?: Record<string, { token: string; origin: string }>;
   confirmationCooldowns?: Record<string, number>;
   paused?: boolean;
   policyRevision?: number;
   pauseGeneration?: number;
+  notificationOrder?: number;
 };
 type LegacyContext = { webhookUrl?: string | null; monitor: (Monitor & { pageName: string }) | null };
 
@@ -104,6 +106,14 @@ function allowedSubscriptionOrigin(request: Request, requireOrigin: boolean) {
 export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableObject<E> {
   constructor(ctx: DurableObjectState, env: E) {
     super(ctx, env);
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS notification_completions (
+      deliveryId TEXT PRIMARY KEY, expiresAt INTEGER NOT NULL
+    )`);
+    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS notification_completions_expiry ON notification_completions (expiresAt)");
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS notification_retries (
+      deliveryId TEXT PRIMARY KEY, attempt INTEGER NOT NULL, at INTEGER NOT NULL, expiresAt INTEGER NOT NULL
+    )`);
+    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS notification_retries_expiry ON notification_retries (expiresAt)");
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS incidents (
       id TEXT PRIMARY KEY, monitorId TEXT NOT NULL, openedAt INTEGER NOT NULL, closedAt INTEGER
     )`);
@@ -262,13 +272,13 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if ("monitors" in stored) {
       stored.monitors = stored.monitors.map(monitor => { monitor.kind ??= "http"; return { ...timingDefaults, scheduleMode: "interval", ...monitor, createdAt: monitor.createdAt ?? 0, lastSeen: monitor.lastSeen ?? null, recoveryReceiptAt: monitor.recoveryReceiptAt ?? null }; });
       let changed = this.migrateWebhook(stored);
-      const expired: { monitor: Monitor; window: MaintenanceWindow }[] = [];
+      const expired: { monitor: Monitor; window: MaintenanceWindow; order: number }[] = [];
       for (const monitor of stored.monitors) {
         const window = monitor.maintenance;
         if (window && at >= window.endsAt) {
           this.endMaintenance(monitor);
           changed = true;
-          expired.push({ monitor, window });
+          expired.push({ monitor, window, order: this.nextNotificationOrder(stored) });
         }
       }
       if (changed) this.ctx.storage.transactionSync(() => {
@@ -280,13 +290,14 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         }
         this.ctx.storage.kv.put("context", stored);
       });
-      for (const { monitor, window } of expired) {
+      for (const { monitor, window, order } of expired) {
         if (stored.paused || expiry.suppress || !monitor.notificationSelections?.length) continue;
         const send = this.enqueueNotifications(monitor, stored.pauseGeneration ?? 0, {
           id: crypto.randomUUID(),
           kind: "maintenance.ended",
           reason: "expired",
           at: window.endsAt,
+          order,
           monitorName: monitor.name,
           ...window,
         });
@@ -466,6 +477,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     (state.emailConfirmations ??= {})[destination.id] = { id, origin, token: crypto.randomUUID(), expiresAt: at + DAY };
     return {
       kind: "email.confirmation", destinationId: destination.id, deliveryId: id, at,
+      order: this.nextNotificationOrder(state),
       contextId: this.ctx.id.toString(), pauseGeneration: state.pauseGeneration ?? 0,
     } satisfies ConfirmationJob;
   }
@@ -479,7 +491,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     }
   }
 
-  private currentConfirmation(state: StoredContext, job: ConfirmationJob) {
+  private currentConfirmation(state: StoredContext, job: ConfirmationIdentity) {
     if (job.contextId !== this.ctx.id.toString() || state.paused ||
         (state.pauseGeneration ?? 0) !== job.pauseGeneration) return null;
     const invitation = state.emailConfirmations?.[job.destinationId];
@@ -497,7 +509,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     };
   }
 
-  markConfirmationSubmitted(job: ConfirmationJob) {
+  markConfirmationSubmitted(job: ConfirmationIdentity) {
     const state = this.read();
     const current = this.currentConfirmation(state, job);
     if (!current) return;
@@ -561,6 +573,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const previous = monitor.maintenance;
     const next = end ? null : { startedAt: at, endsAt: (value as { endsAt: number }).endsAt };
     if (previous?.endsAt === next?.endsAt) return this.status(true);
+    const order = this.nextNotificationOrder(state);
     this.ctx.storage.transactionSync(() => {
       if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
         // Retain elapsed overlap when an operator cuts a window short or replaces it.
@@ -577,7 +590,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     }
     this.notify(before);
     if (!state.paused && monitor.notificationSelections?.length) {
-      const event = { id: crypto.randomUUID(), at, monitorName: monitor.name };
+      const event = { id: crypto.randomUUID(), at, order, monitorName: monitor.name };
       if (next) {
         await this.enqueueNotifications(monitor, state.pauseGeneration ?? 0, {
           ...event, ...next, ...(previous
@@ -725,6 +738,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const pauseGeneration = current.pauseGeneration ?? 0;
     let transition: "opened" | "recovered" | undefined;
     let transitionedIncident: Pick<Incident, "id" | "openedAt"> | undefined;
+    let order: number | undefined;
     this.ctx.storage.transactionSync(() => {
       monitor.lastResult = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" };
       if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
@@ -775,6 +789,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         monitor.state = "up";
       }
       if (resetProgress) { monitor.failures = 0; monitor.successes = 0; }
+      if (transition) order = this.nextNotificationOrder(current);
       this.ctx.storage.kv.put("context", current);
     });
     this.notify(before);
@@ -784,11 +799,17 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         id: transitionedIncident.id + ":" + transition,
         kind: transition === "opened" ? "incident.opened" : "incident.recovered",
         at,
+        order,
         incidentId: transitionedIncident.id,
         openedAt: transitionedIncident.openedAt,
         monitorName: monitor.name,
       });
     }
+  }
+
+  private nextNotificationOrder(state: StoredContext) {
+    state.notificationOrder = (state.notificationOrder ?? 0) + 1;
+    return state.notificationOrder;
   }
 
   private async enqueueNotifications(monitor: Monitor, pauseGeneration: number, event: NotificationJob["event"]) {
@@ -811,12 +832,13 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   /** @deprecated Retained for source compatibility. The engine no longer calls this method. */
   protected async onIncidentTransition(_event: IncidentTransition): Promise<void> {}
 
-  resolveAlert(job: NotificationJob): AlertDestination | null {
+  resolveAlert(job: NotificationEligibility): AlertDestination | null {
     if (job.contextId !== this.ctx.id.toString()) return null;
     const state = this.read();
     if (state.paused || (state.pauseGeneration ?? 0) !== job.pauseGeneration) return null;
     const selected = state.monitors.find(monitor => monitor.id === job.monitorId)?.notificationSelections;
     if (!selected?.some(selection => selection.destinationId === job.destinationId && selection.generation === job.generation)) return null;
+    if (this.notificationCompleted(job.deliveryId)) return null;
     const destination = state.destinations?.find(candidate => candidate.id === job.destinationId);
     if (destination?.channel === "webhook") return { channel: "webhook", url: destination.url };
     if (destination?.channel !== "email" || !destination.confirmed) return null;
@@ -836,9 +858,69 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     };
   }
 
-  resolveWebhook(job: NotificationJob) {
+  resolveWebhook(job: NotificationEligibility) {
     const destination = this.resolveAlert(job);
     return destination?.channel === "webhook" ? destination.url : null;
+  }
+
+  protected notificationCompleted(deliveryId: string) {
+    return this.ctx.storage.sql.exec("SELECT 1 FROM notification_completions WHERE deliveryId = ? AND expiresAt > ?", deliveryId, Date.now())
+      .toArray().length > 0;
+  }
+
+  reportSubmission(job: NotificationDeliveryIdentity, report: SubmissionReport) {
+    if (job.contextId !== this.ctx.id.toString()) return;
+    const state = this.read();
+    const destination = state.destinations?.find(destination => destination.id === job.destinationId);
+    if (!destination) return;
+    const accepted = report.result.status === "accepted";
+    if (report.confirmation && (destination.channel !== "email" ||
+        (state.emailConfirmations?.[destination.id]?.id !== job.deliveryId && !(accepted && destination.confirmed)))) return;
+    const current = destination.submission;
+    const terminal = report.result.status !== "retrying";
+    if (report.result.status === "canceled" &&
+      (current?.deliveryId !== job.deliveryId || current.result.status !== "retrying")) return;
+    const now = Date.now();
+    let changed = false;
+    this.ctx.storage.transactionSync(() => {
+      const sql = this.ctx.storage.sql;
+      if (!accepted) {
+        if (this.notificationCompleted(job.deliveryId)) return;
+        const [retry] = sql.exec<{ attempt: number; at: number }>(
+          "SELECT attempt, at FROM notification_retries WHERE deliveryId = ? AND expiresAt > ?",
+          job.deliveryId, now,
+        ).toArray();
+        // The latest Settings result may already be for a different event.
+        const latest = retry ?? (current?.deliveryId === job.deliveryId
+          ? { attempt: current.attempt, at: current.result.at } : undefined);
+        if (latest) {
+          const order = report.attempt - latest.attempt || report.result.at - latest.at;
+          if (order < 0 || (order === 0 && !terminal)) return;
+        }
+      }
+      sql.exec("DELETE FROM notification_retries WHERE expiresAt <= ?", now);
+      if (terminal) {
+        // Retain completed identities through the maximum source Queue retention window.
+        sql.exec("DELETE FROM notification_completions WHERE expiresAt <= ?", now);
+        sql.exec("INSERT OR IGNORE INTO notification_completions VALUES (?, ?)", job.deliveryId, now + 14 * DAY);
+        sql.exec("DELETE FROM notification_retries WHERE deliveryId = ?", job.deliveryId);
+      } else {
+        sql.exec("INSERT OR REPLACE INTO notification_retries VALUES (?, ?, ?, ?)",
+          job.deliveryId, report.attempt, report.result.at, now + 14 * DAY);
+      }
+      if (current?.deliveryId === job.deliveryId) {
+        if (current.result.status === "accepted") return;
+      } else if (current) {
+        const order = report.eventAt - current.eventAt ||
+          (report.eventOrder ?? 0) - (current.eventOrder ?? 0) || report.queuedAt - current.queuedAt;
+        if (order < 0 || (order === 0 && job.deliveryId < current.deliveryId)) return;
+      }
+      const eventOrder = report.eventOrder ?? (current?.deliveryId === job.deliveryId ? current.eventOrder : undefined);
+      destination.submission = { ...report, eventOrder, deliveryId: job.deliveryId };
+      this.ctx.storage.kv.put("context", state);
+      changed = true;
+    });
+    if (changed) this.broadcast("operator", true);
   }
 
   async heartbeat(id: string, at: number) {
@@ -959,7 +1041,9 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const legacy = state.destinations?.find(destination => destination.id === state.legacyDestinationId);
     return {
       ...(secrets ? {
-        destinations: state.destinations ?? [],
+        destinations: (state.destinations ?? []).map(({ submission, ...destination }) => ({
+          ...destination, ...(submission ? { latestSubmission: submission.result } : {}),
+        })),
         webhookUrl: legacy?.channel === "webhook" ? legacy.url : null,
       } : {}),
       paused: !!state.paused,
@@ -1047,7 +1131,7 @@ function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E
 export default createWorker();
 
 export class NotificationDelivery extends WorkerEntrypoint<EngineEnv> {
-  async resolveAlert(job: NotificationJob) {
+  async resolveAlert(job: NotificationEligibility) {
     if (!/^[a-f0-9]{64}$/.test(job.contextId)) return null;
     return this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId)).resolveAlert(job);
   }
@@ -1057,15 +1141,21 @@ export class NotificationDelivery extends WorkerEntrypoint<EngineEnv> {
     return this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId)).resolveConfirmation(job);
   }
 
-  async markConfirmationSubmitted(job: ConfirmationJob) {
+  async markConfirmationSubmitted(job: ConfirmationIdentity) {
     if (!/^[a-f0-9]{64}$/.test(job.contextId)) return;
     await this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId)).markConfirmationSubmitted(job);
   }
 
-  async resolveWebhook(job: NotificationJob) {
+  async resolveWebhook(job: NotificationEligibility) {
     if (!/^[a-f0-9]{64}$/.test(job.contextId)) return null;
     const context = this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId));
     return context.resolveWebhook(job);
+  }
+
+  async reportSubmission(job: NotificationDeliveryIdentity, report: SubmissionReport) {
+    if (!/^[a-f0-9]{64}$/.test(job.contextId)) return;
+    const context = this.env.MONITORING.get(this.env.MONITORING.idFromString(job.contextId));
+    await context.reportSubmission(job, report);
   }
 }
 
