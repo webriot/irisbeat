@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, renderViewPartial, renderViewSnapshot, styleSheet, themeScript } from "./ui";
+import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, renderViewPartial, renderViewSnapshot, statusJson, styleSheet, themeScript } from "./ui";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
 import { minimumCheckIntervalSeconds, MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
@@ -111,7 +111,7 @@ function publicMonitor(monitor: Monitor, paused: boolean) {
     id: monitor.id, name: monitor.name, kind,
     ...(kind === "heartbeat" ? { lastSeen: monitor.lastSeen ?? null } : {}),
     state: paused ? "paused" as const : monitor.maintenance ? "maintenance" as const : monitor.state,
-    maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult, historyRevision: monitor.historyRevision,
+    maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult, historyRetryToken: monitor.historyRetryToken,
   };
 }
 
@@ -1181,6 +1181,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       if (inRange) {
         monitor.historyRevision = (monitor.historyRevision ?? 0) + 1;
         monitor.historyChangedAt = now;
+        monitor.historyRetryToken = crypto.randomUUID();
         this.availability.enqueue(monitor.id, observation, monitor.historyRevision);
       }
       if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
@@ -1708,7 +1709,7 @@ async function operatorSnapshot<E extends EngineEnv>(c: Context<HttpEnv<E>>, sta
   if (c.req.header("Accept") === viewMediaType) {
     return Response.json({ ...renderViewSnapshot(result, permission, emailConfigured), hosted: !!resolved, permission }, { status });
   }
-  return Response.json({ ...result, ...(emailConfigured ? { emailConfigured: true } : {}),
+  return Response.json({ ...statusJson(result), ...(emailConfigured ? { emailConfigured: true } : {}),
     ...(resolved ? { hosted: true, permission: resolved.permission } : {}) }, { status });
 }
 

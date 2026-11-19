@@ -67,7 +67,7 @@ function OperatorRows({ monitors, canEdit, floor }: { monitors: ViewMonitor[]; c
           </button>)}
       </div></td>
     </tr>
-    <tr data-key={`${monitor.id}:history`}><td colSpan={5} id={`history-${monitor.id}`} aria-label={`${monitor.name} availability`}>{raw(statusLedger.history(monitor.history, monitor.id, monitor.historyRevision))}</td></tr>
+    <tr data-key={`${monitor.id}:history`}><td colSpan={5} id={`history-${monitor.id}`} aria-label={`${monitor.name} availability`}>{raw(statusLedger.history(monitor.history, monitor.id, monitor.historyRetryToken))}</td></tr>
   </>)}</>;
 }
 
@@ -75,7 +75,7 @@ function PublicRow({ monitor }: { monitor: ViewMonitor }) {
   const heading = `monitor-name-${monitor.id}`;
   return <article data-key={monitor.id} aria-labelledby={heading}>
     <div class="ledger-row" data-state={monitor.state}><h2 id={heading}>{monitor.name}</h2><span class="status">{statusLedger.stateLabel[monitor.state]}</span></div>
-    {raw(statusLedger.history(monitor.history, monitor.id, monitor.historyRevision))}
+    {raw(statusLedger.history(monitor.history, monitor.id, monitor.historyRetryToken))}
   </article>;
 }
 
@@ -113,7 +113,7 @@ export function renderViewPartial(scope: ViewScope, data: Status, audience: View
       const html = operator
         ? (data.monitors.length || all ? String(<OperatorRows monitors={data.monitors} canEdit={audience === "editor"} floor={data.minCheckIntervalSeconds ?? 60} />) : "")
         : String(<PublicRows monitors={data.monitors} />);
-      return { html, ...(operator ? { monitors: data.monitors.map(({ history: _history, ...monitor }) => monitor), minCheckIntervalSeconds: data.minCheckIntervalSeconds } : {}) };
+      return { html, ...(operator ? { monitors: data.monitors.map(({ history: _history, historyRetryToken: _token, ...monitor }) => monitor) } : {}) };
     }
   }
 }
@@ -121,6 +121,12 @@ export function renderViewPartial(scope: ViewScope, data: Status, audience: View
 function PublicContent({ data }: { data: Status }) {
   return <><PageHeading name={data.pageName} /><PublicBanner data={data} />
     <div class="ledger"><PublicRows monitors={data.monitors} /></div><PublicIncidents data={data} /></>;
+}
+
+export function statusJson(data: Status) {
+  const monitors = data.monitors.map(({ historyRetryToken: _token, historyRevision: _revision, ...monitor }:
+    ViewMonitor & { historyRevision?: number }) => monitor);
+  return { ...data, monitors, monitor: monitors[0] ?? null };
 }
 
 export function renderViewSnapshot(data: Status, audience: ViewAudience, emailConfigured: boolean) {
@@ -346,9 +352,9 @@ function liveSnapshots(path, read, authorize) {
   const historyAttemptCount = id => historyAttempts.get(id)?.count ?? 0;
   function historyRows() {
     const rows = new Map([...document.querySelectorAll('[data-history-retry]')]
-      .map(node => [node.dataset.historyRetry, node.dataset.historyRevision]));
+      .map(node => [node.dataset.historyRetry, node.dataset.historyToken]));
     for (const [id, attempt] of historyAttempts)
-      if (!rows.has(id) || rows.get(id) !== attempt.revision) historyAttempts.delete(id);
+      if (!rows.has(id) || rows.get(id) !== attempt.token) historyAttempts.delete(id);
     return [...rows].filter(([id]) => historyAttemptCount(id) < ${historyRetryAttempts})
       .sort(([a], [b]) => historyAttemptCount(a) - historyAttemptCount(b)).slice(0, 32);
   }
@@ -361,7 +367,7 @@ function liveSnapshots(path, read, authorize) {
         if (!ready || stopped || document.hidden) return;
         if (!running) {
           const rows = historyRows();
-          for (const [id, revision] of rows) historyAttempts.set(id, { revision, count: historyAttemptCount(id) + 1 });
+          for (const [id, token] of rows) historyAttempts.set(id, { token, count: historyAttemptCount(id) + 1 });
           if (rows.length) enqueue({ revision: minimumRevision, scopes: rows.map(([id]) => 'monitor/' + id), history: true });
         }
         scheduleHistory();

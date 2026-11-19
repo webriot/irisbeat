@@ -379,9 +379,15 @@ module.exports = async function test({ mf, options, application, cachedSQLite, r
     const row = id => '/api/status/partials/monitor/' + id;
     const old = await readAt(json, publishedAt);
     assert.equal(old.monitors[0].history, null);
+    for (const record of [old.monitor, ...old.monitors]) {
+      assert.equal(Object.hasOwn(record, 'historyRetryToken'), false);
+      assert.equal(Object.hasOwn(record, 'historyRevision'), false);
+    }
     assert.match((await readAt(json, publishedAt, accept)).html, /Bars unavailable/);
     assert.match((await readAt(ledger, publishedAt)).html, /Bars unavailable/);
-    assert.match((await readAt(row(first.id), publishedAt)).html, /Bars unavailable/);
+    const pendingRow = await readAt(row(first.id), publishedAt);
+    assert.match(pendingRow.html, /Bars unavailable/);
+    assert.match(pendingRow.html, /data-history-token="[a-f0-9-]{36}"/);
     assert.equal((await readAt('/test-history-queries', publishedAt)).length, 1, 'warm unresolved reads respect the retry deadline');
     await at('/api/operator/monitors/' + first.id, publishedAt + 1500, 'PATCH', { published: false });
     // This later receipt is deliberately backdated into the old day.

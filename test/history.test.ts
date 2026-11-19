@@ -548,3 +548,32 @@ it('shares scoped history rendering with negotiated snapshots and keeps mutation
   }
   expect(await queriedIds()).toEqual([[published.id], [hidden.id]]);
 });
+
+it('uses opaque retry tokens without exposing private observation counts after republication', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(today);
+  const monitor = await create({ name: 'Heartbeat visibility', kind: 'heartbeat', url: undefined, failureThreshold: undefined });
+  const configuration = '/api/operator/monitors/' + monitor.id;
+  const partial = '/api/status/partials/monitor/' + monitor.id;
+  const token = async () => (await (await request(partial)).json<{ html: string }>()).html
+    .match(/data-history-token="([^"]+)"/)?.[1];
+  const receipt = () => mutate('/heartbeat/' + monitor.id, 'POST');
+  expect((await receipt()).status).toBe(204);
+  const before = await token();
+  expect(before).toMatch(/^[0-9a-f-]{36}$/);
+  expect(await token()).toBe(before);
+  expect((await status()).monitor).not.toHaveProperty('historyRevision');
+
+  expect((await mutate(configuration, 'PATCH', { published: false })).status).toBe(200);
+  expect(await token()).toBeUndefined();
+  expect((await receipt()).status).toBe(204);
+  expect((await receipt()).status).toBe(204);
+  expect((await mutate(configuration, 'PATCH', { published: true })).status).toBe(200);
+  const after = await token();
+  expect(after).toMatch(/^[0-9a-f-]{36}$/);
+  expect(after).not.toBe(before);
+  expect(await token()).toBe(after);
+  const publicStatus = await status();
+  expect(publicStatus.monitor).not.toHaveProperty('historyRevision');
+  expect(publicStatus.monitors[0]).not.toHaveProperty('historyRetryToken');
+  expect(publicStatus.monitor).not.toHaveProperty('historyRetryToken');
+});
