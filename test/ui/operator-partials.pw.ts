@@ -2,14 +2,16 @@
 import { expect, test, type WebSocketRoute } from '@playwright/test';
 import { monitorAction } from './actions';
 
-test('one section read applies a Monitor deletion and acknowledges its live hint while keeping a draft', async ({ page, request }) => {
-  const headers = { Authorization: 'Bearer ui-test-secret', Accept: 'application/vnd.irisbeat.view+json' };
+test('one section read applies a Monitor deletion and acknowledges its live hint while keeping a draft', async ({ page, request, baseURL }) => {
+  const origin = baseURL!.replace('127.0.0.1', 'localhost');
+  const operator = origin + '/api/operator';
+  const headers = { Authorization: 'Bearer ui-partials-editor', Accept: 'application/vnd.irisbeat.view+json' };
   const draftMonitor = 'Batched draft ' + Date.now();
   const deletedMonitor = 'Batched deletion ' + Date.now();
   const ids: string[] = [];
   try {
     for (const name of [draftMonitor, deletedMonitor]) {
-      const created = await request.post('/api/operator/monitors', {
+      const created = await request.post(operator + '/monitors', {
         headers: { Authorization: headers.Authorization }, data: { name, kind: 'heartbeat', published: false },
       });
       expect(created.status()).toBe(201);
@@ -29,8 +31,8 @@ test('one section read applies a Monitor deletion and acknowledges its live hint
     page.on('response', response => {
       if (response.request().method() === 'GET' && new URL(response.url()).pathname === '/api/operator') snapshots++;
     });
-    await page.goto('/operator');
-    await page.getByLabel('Installation secret').fill('ui-test-secret');
+    await page.goto(origin + '/operator');
+    await page.getByLabel('Access token').fill('ui-partials-editor');
     await page.getByRole('button', { name: 'Sign in' }).click();
     await expect.poll(() => snapshots).toBe(2);
     await monitorAction(page, 'Edit ' + draftMonitor);
@@ -62,6 +64,6 @@ test('one section read applies a Monitor deletion and acknowledges its live hint
     expect(reads.map(url => url.pathname)).toEqual(['/api/operator/partials']);
     expect(reads[0].searchParams.getAll('scope')).toEqual(['monitors', 'incidents']);
   } finally {
-    for (const id of ids) await request.delete('/api/operator/monitors/' + id, { headers });
+    for (const id of ids) await request.delete(operator + '/monitors/' + id, { headers });
   }
 });
