@@ -6,8 +6,19 @@
   "workers_dev": false,
   "preview_urls": false,
   "queues": {
-    "consumers": [{ "queue": "irisbeat-notifications", "max_retries": 0 }],
+    "consumers": [{
+      "queue": "irisbeat-notifications",
+      "max_retries": 10,
+    }],
+    "producers": [
+      { "binding": "NOTIFICATION_DLQ", "queue": "irisbeat-notifications-dead-letter" },
+      { "binding": "NOTIFICATION_HANDOFF", "queue": "irisbeat-notifications" },
+    ],
   },
+  "durable_objects": {
+    "bindings": [{ "name": "NOTIFICATION_RECOVERY", "class_name": "NotificationRecovery" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["NotificationRecovery"] }],
   "services": [
     { "binding": "NOTIFICATION_DELIVERY", "service": "irisbeat", "entrypoint": "NotificationDelivery" },
   ],
