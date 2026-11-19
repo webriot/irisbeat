@@ -418,6 +418,18 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const publishDue = pending && this.statusPublicationAt(pending) <= now;
     if (previous && !publishDue) return previous;
     const input = !publishDue && baseline ? this.baselinePublicationInput(baseline) : this.capturePublicationInput(state, revision, now);
+    const enriched = await this.attachPublicationHistory(input, previous, now);
+    // Only save the inputs captured for this revision. A later commit or publication wins the race.
+    const current = this.loadPublishedStatus();
+    if (current !== previous || (publishDue || !baseline) && revision !== this.viewClock().public) {
+      if (this.pendingStatus()) this.publicationRetryAt = Date.now() + 1_000;
+      return current;
+    }
+    this.publicationRetryAt = 0;
+    return this.savePublication(enriched, previous, publishDue ? pending : undefined);
+  }
+
+  private async attachPublicationHistory(input: PublicationInput, previous: PublishedStatus | undefined, now: number): Promise<PublicationInput> {
     const fallback = new Map<string, AvailabilityHistory | null>();
     const resolved = new Map<string, AvailabilityHistory | null>();
     if (previous && historyStart(previous.at) === historyStart(input.at)) {
@@ -434,14 +446,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       resolved.set(id, history);
       input.history.get(id)!.retryAt = now + availabilityRetryAfter;
     }
-    // Only save the inputs captured for this revision. A later commit or publication wins the race.
-    const current = this.loadPublishedStatus();
-    if (current !== previous || (publishDue || !baseline) && revision !== this.viewClock().public) {
-      if (this.pendingStatus()) this.publicationRetryAt = Date.now() + 1_000;
-      return current;
-    }
-    this.publicationRetryAt = 0;
-    return this.savePublication({ ...input, data: attachAvailability(input.data, resolved) }, previous, publishDue ? pending : undefined);
+    return { ...input, data: attachAvailability(input.data, resolved) };
   }
 
   private async retryPublishedHistory(published: PublishedStatus, resource: StatusResource, now: number) {
