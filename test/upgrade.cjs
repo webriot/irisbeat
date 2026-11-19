@@ -310,7 +310,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
       const { history: oldHistory, ...oldMonitor } = beforeUpgrade.monitor;
       const { history: newHistory, ...newMonitor } = after.monitor;
       assert.equal(oldHistory.percentage, 50);
-      assert.deepEqual(newMonitor, { ...oldMonitor, effectiveIntervalSeconds: 60 });
+      assert.deepEqual(newMonitor, { ...oldMonitor, effectiveIntervalSeconds: oldMonitor.intervalSeconds });
       assert.deepEqual(after.destinations, beforeUpgrade.destinations);
       assert.deepEqual(after.monitor.destinationIds, [webhookId]);
       assert.deepEqual(after.incidents, beforeUpgrade.incidents);
