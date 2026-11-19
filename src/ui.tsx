@@ -345,7 +345,7 @@ function fragment(html) {
   template.innerHTML = html;
   return template.content;
 }
-function liveSnapshots(path, read, authorize) {
+function liveSnapshots(path, read, authorize, viewPermission) {
   let running, queued, ackSocket;
   let socket, retry, handshake, renewal, polling, historyTimer, stopped = false, ready = false, delay = 1000;
   let minimumRevision = 0;
@@ -414,11 +414,11 @@ function liveSnapshots(path, read, authorize) {
       }
     }
   }
-  async function authenticate(current, type) {
+  async function authenticate(current, type, permission) {
     try {
       const ticket = await authorize();
       if (stopped || current !== socket || current.readyState !== WebSocket.OPEN) return;
-      current.send(JSON.stringify({ type, ticket }));
+      current.send(JSON.stringify({ type, ticket, permission }));
     } catch { if (current === socket) current.close(); }
   }
   function connect() {
@@ -428,15 +428,20 @@ function liveSnapshots(path, read, authorize) {
       const url = new URL(path, location.href);
       url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const current = socket = new WebSocket(url);
+      let renewingPermission;
       handshake = setTimeout(() => current.close(), 10000);
-      function connected() {
-        clearTimeout(handshake); minimumRevision = 0; ready = true; pollingMode(); sync();
+      function connected(continuous) {
+        clearTimeout(handshake); renewingPermission = undefined;
+        if (!continuous) {
+          minimumRevision = 0; ready = true; pollingMode(); sync();
+        }
         if (authorize) {
           clearTimeout(renewal);
           renewal = setTimeout(() => {
             if (stopped || current !== socket) return;
             handshake = setTimeout(() => current.close(), 10000);
-            authenticate(current, 'renew');
+            renewingPermission = viewPermission();
+            authenticate(current, 'renew', renewingPermission);
           }, 240000);
         }
       }
@@ -447,6 +452,9 @@ function liveSnapshots(path, read, authorize) {
       current.onmessage = event => {
         if (current !== socket) return;
         if (authorize && event.data === 'authorized') { connected(); return; }
+        if (renewingPermission && event.data === 'renewed') {
+          connected(renewingPermission === viewPermission()); return;
+        }
         if (!ready) return;
         let hint;
         try { hint = JSON.parse(event.data); } catch { current.close(); return; }
