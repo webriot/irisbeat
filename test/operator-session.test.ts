@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { afterEach, expect, it, vi } from 'vitest';
 import { createOperatorSession, type OperatorSessionCallbacks, type LiveSnapshots } from '../src/operator-session';
+import { mergeScopes } from '../src/view-changes';
 
 const snapshot = (pageName = 'Irisbeat') => ({
   partials: [{ scope: 'page', data: { pageName } }], hosted: false, permission: 'editor',
@@ -22,7 +23,7 @@ function setup() {
     writing: vi.fn(() => vi.fn()), previewed: vi.fn(), previewFailed: vi.fn(),
   };
   const live: LiveSnapshots = vi.fn(() => ({ sync: vi.fn(), stop: vi.fn() }));
-  const session = createOperatorSession(live, callbacks);
+  const session = createOperatorSession(live, mergeScopes, callbacks);
   return { session, callbacks, responses, requests, live };
 }
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
