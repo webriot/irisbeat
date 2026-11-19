@@ -504,8 +504,14 @@ override can read the prepared partials through `readPublishedStatus(scope,
 hint.revision)`. The saved projection supports those reads after eviction.
 Reader and editor hints still follow their committed revisions immediately.
 
-With no public subscribers, the first GET after the boundary advances
-publication and invokes the same hook. Before the first delayed change, the
+With no public subscribers, the first GET after the boundary renders the latest
+elapsed publication and invokes the same hook. At rollover, the
+MonitoringContext retains the elapsed window's public inputs, revision, and
+scopes before a newer write can affect them. When several windows elapse
+without a render, publication uses the latest eligible inputs and carries
+forward the affected scopes. Maintenance expiry and UTC history rollover take
+effect in the windows containing their expiry time and midnight, respectively,
+even if discovered later. Before the first delayed change, the
 MonitoringContext saves the prior public inputs so even a first-ever GET within
 the window sees the pre-change Status. Entering immediate mode discards the
 old delayed publication and pending hints. Returning to delayed mode starts
@@ -528,16 +534,26 @@ and [Durable Object alarms](https://developers.cloudflare.com/durable-objects/ap
 
 #### Analytics Engine handoff for #89
 
-Attach Analytics Engine availability while assembling the public publication,
-before rendering and persisting its partials. Capture the affected Monitor IDs,
-their history revisions and the UTC history range before awaiting the provider.
+`sealStatusWindow(clock, at)` captures the committed public Monitor fields,
+Incident inputs, history day and observation fence for an elapsed window.
+`advanceStatusPublication(at)` consumes those inputs after `read(at)` applies
+any due expiry and UTC rollover. `projectStatusBaseline(baseline)` assembles
+availability from the same retained inputs for both elapsed windows and the
+first-read baseline. `publishStatus(data, revision, scopes)` renders and saves
+that projection and invokes `onStatusPublished(hint)`, while newer pending
+changes keep their own window. The HTTP-facing `statusPublicationRevision()`
+and `readPublishedStatus(resource, minimum)` retain their signatures.
+
+Attach Analytics Engine availability when assembling the retained projection
+and the initial live projection if no retained inputs exist. The SQLite
+`queryHistory(id, start, end, throughId)` hook still accepts an observation
+fence. Capture each Monitor's history revision with the inputs before
+awaiting the provider.
 Recheck those inputs and the publication revision before saving so a late
 query cannot publish newer visibility or roll back a newer publication. The
-first-read baseline needs the same history fence so an observation committed
-during the window cannot appear early. The observation write belongs after
-the Check transaction commits. Provider reads belong on publication and
-history reads, while Check commits, alerts, and Operator authorization can
-proceed independently.
+observation write belongs after the Check transaction commits. Provider reads
+belong on publication and history reads, while Check commits, alerts, and
+Operator authorization can proceed independently.
 
 For the combined candidate, expose a durable render generation alongside the
 published revision from `statusPublicationRevision()` and return both from

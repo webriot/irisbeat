@@ -30,8 +30,11 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     const bindings = publicationFixture
       ? `import { createHostedWorker, MonitoringContext as EngineContext, NotificationDelivery } from ${source};
         export { NotificationDelivery };
+        const wallNow = Date.now;
         export class MonitoringContext extends EngineContext {
+          testClock(at) { Date.now = at === null ? wallNow : () => at; }
           testAlarmAt() { return this.ctx.storage.getAlarm(); }
+          testDelayedAlarm() { this.alarm(); }
           testPublished() { return this.ctx.storage.kv.get("test-publication") ?? null; }
           onStatusPublished(hint) {
             const partials = hint.scopes.map(scope => [scope, JSON.parse(this.readPublishedStatus(scope, hint.revision).body)]);
@@ -58,8 +61,17 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
         ${publicationFixture ? `if (url.pathname === '/test-status-alarm') {
           return Response.json(await env.MONITORING.getByName('personal').testAlarmAt());
         }
+        if (url.pathname === '/test-status-delayed-alarm') {
+          await env.MONITORING.getByName('personal').testDelayedAlarm();
+          return new Response(null, { status: 204 });
+        }
         if (url.pathname === '/test-status-published') {
           return Response.json(await env.MONITORING.getByName('personal').testPublished());
+        }
+        if (url.pathname === '/test-status-clock') {
+          const at = url.searchParams.get('at');
+          await env.MONITORING.getByName('personal').testClock(at === null ? null : Number(at));
+          return new Response(null, { status: 204 });
         }` : ''}
         const testAt = request.headers.get('x-test-at');
         const now = Date.now;

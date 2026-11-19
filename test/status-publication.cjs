@@ -158,6 +158,26 @@ module.exports = async function test({ mf, options, application, request, tick, 
   await close;
   await eventually(async () => assert.equal(await alarmAt(), null));
 
+  // Let one window elapse without a request or a subscriber to publish it.
+  await until(boundary(Date.now()) + 30);
+  const idleRevision = (await readPage(0)).revision;
+  const idleEnd = boundary(Date.now());
+  await update('Last edit in the elapsed window');
+  await until(idleEnd + 30);
+  await update('First edit in the open window');
+  assert.equal(await alarmAt(), null);
+  assert.deepEqual(await readPage(idleRevision + 1), {
+    revision: idleRevision + 1, html: '<h1>Last edit in the elapsed window</h1>',
+  });
+  assert.equal((await request(page + '?revision=' + (idleRevision + 2))).status, 409);
+  assert.equal((await status()).pageName, 'Last edit in the elapsed window');
+  await mf.unsafeEvictDurableObject('irisbeat', 'MonitoringContext', { name: 'personal', webSockets: 'hibernate' });
+  assert.equal((await status()).pageName, 'Last edit in the elapsed window', 'warm edge');
+  await mf.purgeCache();
+  assert.equal((await browserSnapshot()).pageName, 'Last edit in the elapsed window', 'cold negotiated snapshot');
+  await until(boundary(idleEnd) + 30);
+  assert.equal((await status()).pageName, 'First edit in the open window');
+
   // Resolve two trusted contexts on one host and use the same resource URL at its edge.
   const tenant = (id, path, init = {}) => mf.dispatchFetch('https://tenants.example' + path, {
     ...init, headers: { 'x-test-tenant': id, 'x-context-id': 'wrong-context', ...init.headers },
@@ -212,5 +232,95 @@ module.exports = async function test({ mf, options, application, request, tick, 
   assert.equal((await tick(Date.now() + 60_000)).status, 200);
   await eventually(() => assert.equal(deliveries.length, 2));
   assert.equal((await (await request('/api/operator')).json()).monitors.at(-1).state, 'down');
+
+  await boot({ STATUS_RENDER_INTERVAL_SECONDS: '60' });
+  const midnight = Date.UTC(2030, 0, 2);
+  const clock = async at => assert.equal((await request('/test-status-clock' + (at === undefined ? '' : '?at=' + at))).status, 204);
+  await clock(midnight - 180_000);
+  try {
+    const ids = [];
+    for (const [name, endsAt] of [
+      ['Early expiry', midnight - 110_000], ['Second expiry', midnight - 45_000], ['Late expiry', midnight + 35_000],
+    ]) {
+      const created = await request('/api/operator/monitors', 'POST', { name, kind: 'heartbeat' });
+      assert.equal(created.status, 201);
+      const id = (await created.json()).monitors.at(-1).id;
+      ids.push(id);
+      assert.equal((await request('/api/operator/monitors/' + id + '/maintenance', 'PUT', { endsAt })).status, 200);
+    }
+    await clock(midnight - 120_000);
+    const maintained = await status();
+    assert.deepEqual(maintained.monitors.map(monitor => monitor.state), ['maintenance', 'maintenance', 'maintenance']);
+    assert.equal(await alarmAt(), null);
+    const maintainedRevision = (await readPage(0)).revision;
+    await clock(midnight + 40_000);
+    const between = await status();
+    assert.deepEqual(between.monitors.map(monitor => monitor.state), ['unknown', 'unknown', 'maintenance'],
+      'the first late GET publishes elapsed expiries and retains Maintenance from the still-open window');
+    assert.equal(between.monitor.history.days.at(-1).date, '2030-01-01');
+    const expiryPublication = await hostedPublication();
+    assert.deepEqual(expiryPublication.hint, {
+      type: 'changed', scopes: ['banner', 'monitor/' + ids[0], 'monitor/' + ids[1]], revision: maintainedRevision + 2,
+    });
+    await mf.purgeCache();
+    assert.match((await browserSnapshot()).html, /2030-01-01 UTC/);
+    await clock(midnight + 60_000);
+    const rolled = await status();
+    assert.deepEqual(rolled.monitors.map(monitor => monitor.state), ['unknown', 'unknown', 'unknown']);
+    assert.equal(rolled.monitor.history.days.at(-1).date, '2030-01-02');
+    const nextDay = midnight + 86_400_000;
+    await clock(nextDay + 116_000);
+    assert.equal((await status()).monitor.history.days.at(-1).date, '2030-01-03',
+      'the first GET after an elapsed UTC rollover uses the effective midnight');
+
+    const prior = await hostedPublication();
+    const lateUpgrade = await mf.dispatchFetch(origin + '/api/status/events/v2', { headers: { Upgrade: 'websocket', Origin: origin } });
+    assert.equal(lateUpgrade.status, 101);
+    const lateSocket = lateUpgrade.webSocket;
+    lateSocket.accept();
+    const notices = [];
+    lateSocket.addEventListener('message', event => notices.push(JSON.parse(event.data)));
+    const runDelayedAlarm = async () => assert.equal((await request('/test-status-delayed-alarm')).status, 204);
+    await clock(nextDay + 125_000);
+    await update('Elapsed before delayed alarm');
+    await clock(nextDay + 181_000);
+    assert.equal((await request('/api/operator/monitors/' + ids[0], 'PATCH', { intervalSeconds: 120 })).status, 200);
+    assert.equal((await request('/api/operator/monitors', 'POST', { name: 'Private after boundary', kind: 'heartbeat', published: false })).status, 201);
+    assert.equal((await request('/heartbeat/' + ids[0], 'POST')).status, 204);
+    assert.equal((await request('/api/operator/monitors/' + ids[1], 'PATCH', { published: false })).status, 200);
+    assert.deepEqual(await hostedPublication(), prior, 'writes and observations do not render');
+    assert.equal(await alarmAt(), nextDay + 180_000, 'later writes retain the alarm deadline');
+    const [, eligible] = await Promise.all([runDelayedAlarm(), status()]);
+    assert.equal(eligible.pageName, 'Elapsed before delayed alarm');
+    assert.deepEqual(eligible.monitors.map(monitor => monitor.id), ids);
+    assert.equal(eligible.monitor.lastSeen, null);
+    assert.deepEqual(await readPage(prior.hint.revision + 1), {
+      revision: prior.hint.revision + 1, html: '<h1>Elapsed before delayed alarm</h1>',
+    });
+    await eventually(() => assert.deepEqual(notices, [
+      { type: 'changed', revision: prior.hint.revision + 1, scopes: ['page'] },
+    ]));
+    lateSocket.send('ack');
+    await clock(nextDay + 240_000);
+    await mf.purgeCache();
+    await Promise.all([runDelayedAlarm(), runDelayedAlarm(), browserSnapshot()]);
+    await eventually(() => assert.deepEqual(notices, [
+      { type: 'changed', revision: prior.hint.revision + 1, scopes: ['page'] },
+      { type: 'changed', revision: prior.hint.revision + 3, scopes: ['banner', 'monitors', 'incidents'] },
+    ]));
+    const latest = await status();
+    assert.deepEqual(latest.monitors.map(monitor => monitor.id), [ids[0], ids[2]]);
+    assert.equal(latest.monitor.lastSeen, nextDay + 181_000);
+    const lateClose = new Promise(resolve => lateSocket.addEventListener('close', resolve, { once: true }));
+    lateSocket.close(1000);
+    await lateClose;
+    const laterDay = nextDay + 3 * 86_400_000;
+    await clock(laterDay + 10_000);
+    assert.equal((await status()).monitor.history.days.at(-1).date, '2030-01-05');
+    await clock(laterDay + 60_000);
+    assert.equal((await status()).monitor.history.days.at(-1).date, '2030-01-06');
+  } finally {
+    await clock();
+  }
   console.log('PASS: Worker upgrade, configurable publication, regional misses, hibernation, unsubscribe, alerts, and tenant isolation');
 };
