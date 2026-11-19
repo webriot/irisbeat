@@ -98,7 +98,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
           return new Response(null, { status: 204 });
         }` : ''}
         const scheduledAt = url.pathname === '/test-tick' ? url.searchParams.get('at') : null;
-        const testAt = request.headers.get('x-test-at') ?? scheduledAt;
+        const testAt = request.headers.get('x-test-at') ?? ${statusPublication ? 'null' : 'scheduledAt'};
         const now = Date.now;
         if (testAt) Date.now = () => Number(testAt);
         try {
