@@ -182,7 +182,7 @@ function Operator({ hosted }: { hosted: boolean }) {
       <Paused paused={false} />
       <div id="workspace">
         <div id="new-monitor-panel"></div>
-      <table aria-label="Monitors"><colgroup><col class="monitor-column" /><col class="state-column" /><col class="publication-column" /><col class="actions-column" /></colgroup><thead><tr><th scope="col">Monitor</th><th scope="col">State</th><th scope="col">Publication</th><th scope="col">Actions</th></tr></thead><tbody id="monitor-rows"></tbody></table>
+      <table aria-label="Monitors"><colgroup><col class="monitor-column" /><col class="state-column" /><col class="schedule-column" /><col class="publication-column" /><col class="actions-column" /></colgroup><thead><tr><th scope="col">Monitor</th><th scope="col">State</th><th scope="col">Schedule</th><th scope="col">Publication</th><th scope="col">Actions</th></tr></thead><tbody id="monitor-rows"></tbody></table>
       <dialog id="maintenance-dialog" aria-labelledby="maintenance-heading"><form id="maintenance" hidden aria-labelledby="maintenance-heading">
         <h2 id="maintenance-heading">Maintenance</h2>
         <label for="maintenance-end">End time</label><input id="maintenance-end" type="datetime-local" required />
@@ -217,7 +217,7 @@ function Operator({ hosted }: { hosted: boolean }) {
           <fieldset id="destination-selection" hidden><legend tabindex={-1}>Notification destinations</legend>
             <div id="destination-choices"></div><p id="no-destination-choices">No destinations</p>
           </fieldset>
-          <p id="monitor-deleted" role="status" hidden>This Monitor was deleted. Copy your draft or cancel.</p><button id="save-monitor">Save Monitor</button><button id="cancel-edit" type="button">Cancel</button>
+          <p id="monitor-deleted" role="status" hidden>This Monitor was deleted. Copy your draft or cancel.</p><button id="save-monitor">Save Monitor</button><button id="resume-schedule" hidden>Save and Resume</button><button id="cancel-edit" type="button">Cancel</button>
         </form>
       <section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2><div id="incidents"></div></section>
       </div>
@@ -622,7 +622,8 @@ h2 { margin: 0; font-size: 16px; font-weight: 650; }
 .ledger-row[data-state="maintenance"] .status, .status[data-state="maintenance"], .ledger-row[data-state="paused"] .status, .status[data-state="paused"] { color: var(--info); }
 table { width: 100%; table-layout: fixed; border-spacing: 0; margin-top: 20px; }
 .monitor-column { width: auto; }
-.state-column, .publication-column { width: 19%; }
+.state-column, .schedule-column { width: 17%; }
+.publication-column { width: 15%; }
 .actions-column { width: 226px; }
 th, td { padding: 12px 16px; text-align: left; }
 th { font-size: 12px; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--line); }
@@ -824,6 +825,13 @@ function updateDeleted() {
   byId('maintenance-deleted').hidden = !maintenanceMissing;
   byId('save-maintenance').disabled = maintenanceMissing;
   byId('end-maintenance').disabled = maintenanceMissing;
+}
+
+function scheduleDuration(seconds) {
+  for (const [factor, unit] of [[86400, 'd'], [3600, 'h'], [60, 'min']]) {
+    if (seconds % factor === 0) return (seconds / factor) + ' ' + unit;
+  }
+  return seconds + ' s';
 }
 
 function focusActions(id) { (document.getElementById('actions-' + id)?.querySelector('button') || byId('new-monitor')).focus(); }

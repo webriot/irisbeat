@@ -6,10 +6,13 @@ let mode = 'available';
 let historyReads = 0;
 let queued: NotificationQueueJob[] = [];
 let queueUnavailable = false;
+let checkFloor: string | undefined;
+let useWallClock = false;
 export class MonitoringContext extends EngineContext {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, {
       ...env,
+      get MIN_CHECK_INTERVAL_SECONDS() { return checkFloor; },
       NOTIFICATION_QUEUE: {
         async sendBatch(messages) {
           if (queueUnavailable) throw new Error("substituted private Queue error");
@@ -26,11 +29,21 @@ export class MonitoringContext extends EngineContext {
     if (mode === 'failed') throw new Error('substituted series query failure');
     return super.queryHistory(id, start, end, throughId);
   }
+
+  protected outboundStartTime(scheduledAt: number) {
+    // Most suites advance a synthetic cron clock and control the request clock separately.
+    return useWallClock ? super.outboundStartTime(scheduledAt) : scheduledAt;
+  }
 }
 export default {
   ...worker,
   async fetch(request: Request, env: Env) {
     const url = new URL(request.url);
+    if (url.pathname === '/__test-check-floor' && request.method === 'PUT') {
+      checkFloor = url.searchParams.get('seconds') ?? undefined;
+      useWallClock = url.searchParams.has('wall-clock');
+      return new Response(null, { status: 204 });
+    }
     if (url.pathname === '/__test-notification-queue') {
       if (request.method === 'DELETE') {
         queued = [];

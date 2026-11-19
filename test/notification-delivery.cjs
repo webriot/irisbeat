@@ -57,6 +57,7 @@ async function deliveryBundles(source = './src', hasRecovery = true) {
     export class MonitoringContext extends EngineContext {
       restartForTest() { this.ctx.abort('Local Queue restart drill'); }
       setTestTime(at, uuid) { testTime = at; testUuid = uuid; }
+      outboundStartTime(scheduledAt) { return scheduledAt; }
     }
     function policy(revision) {
       return { paused: Number(revision) % 2 === 1, policyRevision: Number(revision) };

@@ -8,7 +8,7 @@ type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 type OperatorSnapshot = { partials: OperatorPartial[]; permission: 'reader' | 'editor'; hosted: boolean };
 type MutationAck = Pick<ViewHint, 'revision' | 'scopes'>;
 export type SchedulePreview = { explanation: string; timezone: string; occurrences: number[] };
-export type ScheduleInput = { cron: string; timezone: string; graceSeconds?: number | null };
+export type ScheduleInput = { cron: string; timezone: string; graceSeconds?: number | null; outbound?: true };
 export type LiveSnapshots = (
   path: string,
   read: (current: () => boolean, hint?: ViewHint) => Promise<boolean | void>,
