@@ -140,9 +140,15 @@ test('a save superseding a pending Retry leaves Retry usable after that read set
   await page.locator('#settings-button').click();
   let hold = false;
   let release!: () => void;
+  await page.route('**/api/operator/partials/page?revision=1', route => route.fulfill({
+    json: { revision: 1, permission: 'editor', html: '<h1>Saved</h1>', pageName: 'Saved' },
+  }));
   await page.route('**/api/operator', async route => {
-    if (route.request().method() === 'PUT') return fulfillView(route, { json: { ...data, pageName: 'Saved' } });
-    if (hold) await new Promise<void>(resolve => { release = resolve; });
+    if (route.request().method() === 'PUT') return route.fulfill({ json: { revision: 1, scopes: ['page'] } });
+    if (hold) {
+      hold = false;
+      await new Promise<void>(resolve => { release = resolve; });
+    }
     return route.fulfill({ status: 503, json: { error: 'Unavailable' } });
   });
   await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));

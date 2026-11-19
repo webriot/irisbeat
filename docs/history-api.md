@@ -19,7 +19,9 @@ history: {
     maintenance: number;
   }>;
   percentage: number | null; // 0–100, unrounded; null means no denominator
-} | null; // missing/failed series query
+  stale?: true; // last successful query while a refresh is needed
+  pending?: true; // recent or deferred observations may be absent from the totals
+} | null; // unavailable with no usable cached result
 ```
 
 Exported types are `HistoryDay` and `AvailabilityHistory`. The range is today
@@ -27,8 +29,9 @@ plus the previous 89 UTC calendar days. Both endpoints and the ledger share this
 range. Public filtering happens before series reads, so private/deleted Monitors
 never acquire public bars. Hosted readers receive the operator view with unchanged
 secret filtering and no editing controls. The UI formats a counted percentage to
-two decimals; null percentage displays “No observations”, null history displays
-“Bars unavailable”. Each strip has one keyboard entry point with arrow-key navigation and touch
+two decimals. An empty denominator displays “No observations”. Unavailable
+history displays “Bars unavailable”. A stale result keeps the bars and shows
+“Availability history is stale”. Each strip has one keyboard entry point with arrow-key navigation and touch
 selection. Both views label the range “past 90 days”. Selected days show compact
 successful/failed counts and Maintenance counts when present; unobserved days
 remain “No observations”. Historical dates stay explicit in UTC. “Exact time
@@ -52,36 +55,84 @@ saving changes. Operators receive all retained Incidents, including older and
 deleted-Monitor names, with a Deleted Monitor marker; missing recovery remains
 ongoing after deletion. No page-wide percentage is added.
 
-## Storage and failure boundary
+## Writes, reads and cutover
 
-The #8 observation writer is unchanged in meaning: attempt-start timestamps,
-any-overlap Maintenance classification, actual receipts/silence evaluations, no
-synthetic scheduler results or pre-upgrade backfill. A separate protected
-`queryHistory(id, start, end)` performs bounded-range daily SQL aggregation;
-returning null or throwing only makes that Monitor's series unavailable. It does
-not suppress current state or Incident reads. The test-only Worker subclass
-substitutes this query through a test request endpoint; that endpoint and fixture
-are absent from the distributed engine and production Worker.
+The MonitoringContext stores every eligible observation in a SQLite outbox in
+the same transaction as the latest result, detector state and any Calendar
+cursor advancement. The transaction also arms the shared Durable Object alarm.
+Scheduled dispatch, Heartbeat receipt handling and the alarm use the same
+bounded drain once those writes are durable. Scheduled dispatch shares the
+[250-point invocation limit](https://developers.cloudflare.com/analytics/analytics-engine/limits/)
+across its contexts and Monitors. Each alarm invocation drains up to 250
+points and schedules a subsequent wakeup before handing off the batch.
+The outbox contains only pending points and drops entries that age out of
+the displayed window.
 
-Indexes cover `(monitorId, at)`, global observation age, and Incident ordering.
-Each executed observation deletes at most 1,000 observation rows strictly before
-the current 90-day UTC range, using the later of execution/server time so delayed
-completion cannot move the cutoff backward. Cleanup never deletes current/future
-days or any Incident. Idle contexts may retain expired observations until later
-execution; these rows are excluded from queries. Old backlogs drain over subsequent
-observations. Retention is deliberately limited to observations outside the
-specified display range; operators' Incident archive remains unbounded, as
-required. There is no older raw-observation API or configurable retention policy.
+Irisbeat removes a point from the outbox when `writeDataPoint()` returns
+without throwing. At that point the binding has accepted the point for
+asynchronous processing. The call returns no ingestion receipt, so durable
+ingestion and query visibility remain unconfirmed. A synchronous error keeps
+the point queued. If execution stops after the binding accepts a point but
+before the outbox deletion commits, a retry can submit a duplicate and affect
+the aggregate totals. See [Cloudflare's Analytics Engine binding example](https://developers.cloudflare.com/workers/examples/analytics-engine/).
 
-## Pause #11 and distribution #12
+The dataset contains these Irisbeat fields.
 
-Pause prevents calls to the shared observation writer while retaining
-Heartbeat freshness. No row means no bar count or percentage denominator; do not
-record a failure, Maintenance, or synthetic paused observation. Resume retains
-existing observations. [Hosted pause contract](hosted-contract.md#pause-and-resume)
-describes the additive adapter metadata. There are no subscription policies or pause controls.
-Preserve the #8 any-overlap classification before the history writer.
+| Column | Value |
+| --- | --- |
+| `index1` | Opaque Durable Object ID. Stable for the context in its namespace. |
+| `blob1` | Opaque Monitor ID. |
+| `blob2` | `success`, `failure`, or `maintenance`. |
+| `double1` | Actual observation time in Unix milliseconds. |
 
-Regenerate the local candidate artifact after integrating this change. The package
-includes this handoff and remains AGPL-3.0-only. No registry publication, deployment,
-or live sends are needed for verification.
+HTTP and TCP use attempt start. Watchdog Heartbeats use the receipt or silence
+evaluation time. Calendar Heartbeats use the completed window deadline even if
+dispatch was delayed. Queries filter on that timestamp and group by its UTC day.
+Each outcome count sums Analytics Engine's `_sample_interval`. Maintenance
+contributes to its own count and is excluded from availability. Paused contexts
+record no new observations. Previously committed points can still drain.
+Cloudflare controls retention and asynchronous ingestion.
+See [Workers Analytics Engine SQL and sampling](https://developers.cloudflare.com/analytics/analytics-engine/sql-api/).
+
+Operator and immediate reads use only visible, active Monitor IDs from the current context. Successful
+daily aggregates are cached in the context for 60 seconds and refreshed on a
+new observation or UTC day change. While observations are queued or in the
+two-minute window following handoff, successful aggregates remain eligible for
+refresh after 15 seconds. Aggregates are eligible for a fresh read at the end
+of the window even if a read ran shortly before it. Query errors use the latest
+usable scoped cache, including after Durable Object eviction. A current result
+from an overlapping successful read stays fresh. Without cached data a failed
+read yields unavailable history. Before any new observation, a configured
+Monitor has an empty series. History may lag current status while an observation
+is being ingested or the cached totals age out. Connected, visible pages retry
+only affected rows, every 30 seconds, up to four attempts per observation while
+a row stays
+pending, stale, or unavailable. Status, detection, Incidents,
+and notification handoff commit independently of query availability.
+
+The first activation with both the write binding and query configuration drops
+the previous SQLite raw observations table and indexes. Retained SQLite Status renders and their series are invalidated. Readiness reports
+whether an observation can be read back. Transient SQL failures do not delay
+activation or monitoring. There is no backfill. Monitor configuration, latest results,
+detection progress, Maintenance and Incidents are preserved. Rolling the code back
+cannot restore the retired rows.
+
+## Integration
+
+Operator reads use `MonitoringContext.status(operator, secrets)` and
+`MonitoringContext.readView(scope, audience)`. Mutation responses carry cached
+history, empty bars, or unavailable history without waiting for a query.
+Delayed Status reads query the published Monitor IDs and the UTC range captured
+for that publication. The window end is an exclusive cutoff on Analytics Engine's
+built-in logging `timestamp`. A queued observation handed off at or after that
+cutoff belongs to a later publication. The handoff schedules a scoped update
+for affected published Monitors when it crosses a window boundary. The bars still
+count the observation on the UTC day of its actual timestamp. Points already
+logged before the cutoff can appear on retry after ingestion. Renders preserve
+`stale` and `pending` flags. History-only recovery
+advances the render generation independently of the public revision and updates
+the cache keys for the Status page, JSON, negotiated snapshot, ledger and row.
+
+See [installation and readiness](install.md#availability-history) for self-hosted
+configuration and [the trusted query interface](hosted-contract.md#availability-history)
+for managed deployments.

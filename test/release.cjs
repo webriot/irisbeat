@@ -6,6 +6,7 @@ const { createHash } = require('node:crypto');
 const { version } = require('../package.json');
 const probe = `src/release-untracked-probe-${process.pid}.txt`;
 writeFileSync(probe, 'untracked local content must never ship');
+const callerUmask = process.umask(0o022);
 try {
   execFileSync('npm', ['run', 'release:prepare'], { stdio: 'inherit' });
   const manifest = JSON.parse(readFileSync('dist/release.json'));
@@ -30,7 +31,11 @@ try {
   assert.ok(!engine.includes('package/test/'), 'consumer fixtures stay out of engine');
   assert.ok(!engine.includes(probe.slice(4)), 'untracked local source content stays out of the engine');
   const hashes = { ...manifest.sha256 };
+  process.umask(0o077);
   execFileSync('npm', ['run', 'release:prepare'], { stdio: 'pipe' });
-  assert.deepEqual(JSON.parse(readFileSync('dist/release.json')).sha256, hashes, 'same committed revision packs reproducibly');
+  assert.deepEqual(JSON.parse(readFileSync('dist/release.json')).sha256, hashes, 'same commit packs reproducibly across file-creation masks');
   console.log('PASS reproducible versioned source/engine artifacts, integrity, deployable source and fixture exclusion');
-} finally { rmSync(probe, { force: true }); }
+} finally {
+  process.umask(callerUmask);
+  rmSync(probe, { force: true });
+}

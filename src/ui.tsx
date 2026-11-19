@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /** @jsxRuntime automatic */
 /** @jsxImportSource hono/jsx */
-import type { Status } from "./index";
+import type { MonitoringContext, Status } from "./index";
 import { createOperatorSession } from "./operator-session";
 import { createMonitorEditor } from "./monitor-editor";
 import type { Child } from "hono/jsx";
 import { raw } from "hono/html";
 import { createStatusLedger, monitorActions } from "./status-ledger";
+import { historyRetryAttempts, historyRetryInterval } from "./availability-history";
 
 import { mergeScopes, type ViewAudience, type ViewScope } from "./view-changes";
 
 const statusLedger = createStatusLedger();
-type ViewMonitor = Status["monitors"][number];
+export type StatusProjection = ReturnType<MonitoringContext["project"]>;
+type ViewMonitor = StatusProjection["monitors"][number];
 
 function PublicBanner({ data }: { data: Status }) {
   const label = statusLedger.banner(data);
@@ -66,7 +68,7 @@ function OperatorRows({ monitors, canEdit, floor }: { monitors: ViewMonitor[]; c
           </button>)}
       </div></td>
     </tr>
-    <tr data-key={`${monitor.id}:history`}><td colSpan={5} id={`history-${monitor.id}`} aria-label={`${monitor.name} availability`}>{raw(statusLedger.history(monitor.history, monitor.id))}</td></tr>
+    <tr data-key={`${monitor.id}:history`}><td colSpan={5} id={`history-${monitor.id}`} aria-label={`${monitor.name} availability`}>{raw(statusLedger.history(monitor.history, monitor.id, monitor.historyRetryToken))}</td></tr>
   </>)}</>;
 }
 
@@ -74,7 +76,7 @@ function PublicRow({ monitor }: { monitor: ViewMonitor }) {
   const heading = `monitor-name-${monitor.id}`;
   return <article data-key={monitor.id} aria-labelledby={heading}>
     <div class="ledger-row" data-state={monitor.state}><h2 id={heading}>{monitor.name}</h2><span class="status">{statusLedger.stateLabel[monitor.state]}</span></div>
-    {raw(statusLedger.history(monitor.history, monitor.id))}
+    {raw(statusLedger.history(monitor.history, monitor.id, monitor.historyRetryToken))}
   </article>;
 }
 
@@ -99,7 +101,7 @@ function DestinationRows({ destinations, emailConfigured }: { destinations: NonN
   })}</>;
 }
 
-export function renderViewPartial(scope: ViewScope, data: Status, audience: ViewAudience, emailConfigured: boolean) {
+export function renderViewPartial(scope: ViewScope, data: StatusProjection, audience: ViewAudience, emailConfigured: boolean) {
   const operator = audience !== "public";
   switch (scope) {
     case "page": return { html: String(<PageHeading name={data.pageName} />), ...(operator ? { pageName: data.pageName } : {}) };
@@ -112,17 +114,23 @@ export function renderViewPartial(scope: ViewScope, data: Status, audience: View
       const html = operator
         ? (data.monitors.length || all ? String(<OperatorRows monitors={data.monitors} canEdit={audience === "editor"} floor={data.minCheckIntervalSeconds ?? 60} />) : "")
         : String(<PublicRows monitors={data.monitors} />);
-      return { html, ...(operator ? { monitors: data.monitors.map(({ history: _history, ...monitor }) => monitor), minCheckIntervalSeconds: data.minCheckIntervalSeconds } : {}) };
+      return { html, ...(operator ? { monitors: data.monitors.map(({ history: _history, historyRetryToken: _token, ...monitor }) => monitor), minCheckIntervalSeconds: data.minCheckIntervalSeconds } : {}) };
     }
   }
 }
 
-function PublicContent({ data }: { data: Status }) {
+function PublicContent({ data }: { data: StatusProjection }) {
   return <><PageHeading name={data.pageName} /><PublicBanner data={data} />
     <div class="ledger"><PublicRows monitors={data.monitors} /></div><PublicIncidents data={data} /></>;
 }
 
-export function renderViewSnapshot(data: Status, audience: ViewAudience, emailConfigured: boolean) {
+export function statusJson(data: StatusProjection) {
+  const monitors = data.monitors.map(({ historyRetryToken: _token, historyRevision: _revision, ...monitor }:
+    ViewMonitor & { historyRevision?: number }) => monitor);
+  return { ...data, monitors, monitor: monitors[0] ?? null };
+}
+
+export function renderViewSnapshot(data: StatusProjection, audience: ViewAudience, emailConfigured: boolean) {
   if (audience === "public") return { pageName: data.pageName, html: String(<PublicContent data={data} />) };
   const scopes: ViewScope[] = ["page", "banner", "monitors", "incidents", "destinations"];
   return { partials: scopes.map(scope => ({ scope, data: renderViewPartial(scope, data, audience, emailConfigured) })) };
@@ -139,13 +147,13 @@ function Document({ title, operator = false, children }: { title: string; operat
       <a href="/operator" aria-current={operator ? "page" : undefined}>Operator</a>
     </nav></header>
     <main><div class="page-clock"><time id="page-clock"></time></div><div id="stale" hidden><span>Updates unavailable</span><button id="retry" type="button">Retry</button></div>{children}<span id="sync-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></span>{!operator && <span id="updates-mode" role="status">Polling</span>}</main>
-    <footer><a href="https://github.com/webriot/irisbeat/releases/download/v0.3.0/irisbeat-0.3.0-source.tar.gz">Source (AGPL-3.0-only)</a>
+    <footer><a href="https://github.com/webriot/irisbeat/releases/download/v0.4.0/irisbeat-0.4.0-source.tar.gz">Source (AGPL-3.0-only)</a>
       <label class="theme-control">Theme <select id="theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
     </footer>
   </body></html>;
 }
 
-export function statusPage(status: Status) {
+export function statusPage(status: StatusProjection) {
   return "<!doctype html>" + <Document title={status.pageName}><div id="public-status"><PublicContent data={status} /></div></Document>;
 }
 
@@ -339,19 +347,47 @@ function fragment(html) {
 }
 function liveSnapshots(path, read, authorize) {
   let running, queued, ackSocket;
-  let socket, retry, handshake, renewal, polling, stopped = false, ready = false, delay = 1000;
+  let socket, retry, handshake, renewal, polling, historyTimer, stopped = false, ready = false, delay = 1000;
+  let minimumRevision = 0;
+  const historyAttempts = new Map();
+  const historyAttemptCount = id => historyAttempts.get(id)?.count ?? 0;
+  function historyRows() {
+    const rows = new Map([...document.querySelectorAll('[data-history-retry]')]
+      .map(node => [node.dataset.historyRetry, node.dataset.historyToken]));
+    for (const [id, attempt] of historyAttempts)
+      if (!rows.has(id) || rows.get(id) !== attempt.token) historyAttempts.delete(id);
+    return [...rows].filter(([id]) => historyAttemptCount(id) < ${historyRetryAttempts})
+      .sort(([a], [b]) => historyAttemptCount(a) - historyAttemptCount(b)).slice(0, 32);
+  }
+  function scheduleHistory() {
+    if (!ready || stopped || document.hidden) {
+      clearTimeout(historyTimer); historyTimer = undefined;
+    } else if (!historyTimer && historyRows().length) {
+      historyTimer = setTimeout(() => {
+        historyTimer = undefined;
+        if (!ready || stopped || document.hidden) return;
+        if (!running) {
+          const rows = historyRows();
+          for (const [id, token] of rows) historyAttempts.set(id, { token, count: historyAttemptCount(id) + 1 });
+          if (rows.length) enqueue({ revision: minimumRevision, scopes: rows.map(([id]) => 'monitor/' + id), history: true });
+        }
+        scheduleHistory();
+      }, ${historyRetryInterval});
+    }
+  }
   function pollingMode() {
     const mode = document.getElementById('updates-mode');
     if (mode) mode.hidden = ready;
     if (ready || document.hidden || stopped) { clearInterval(polling); polling = undefined; }
     else if (!polling) polling = setInterval(sync, 60000);
+    scheduleHistory();
   }
   function sync(hint) { enqueue(hint || { full: true }); }
   async function enqueue(request) {
     if (stopped) return;
     if (running) {
       const previous = queued || running;
-      queued = request.full || previous.full ? { full: true } : {
+      queued = previous.history ? request : request.full || previous.full ? { full: true } : {
         revision: Math.max(previous.revision, request.revision),
         scopes: mergeScopes(previous.scopes, request.scopes),
       };
@@ -359,14 +395,15 @@ function liveSnapshots(path, read, authorize) {
     }
     running = request;
     const source = socket;
-    if (!authorize) snapshotPending(true);
+    if (!authorize && !request.history) snapshotPending(true);
     try {
       const success = await read(() => !stopped && !queued && (request.full || source === socket), request.full ? undefined : request);
       if (success === false) socket?.close();
       else if (ready) delay = 1000;
     } finally {
       running = undefined;
-      if (!authorize) snapshotPending(false);
+      if (!authorize && !request.history) snapshotPending(false);
+      scheduleHistory();
       if (queued && !stopped) {
         const next = queued;
         queued = undefined;
@@ -393,7 +430,7 @@ function liveSnapshots(path, read, authorize) {
       const current = socket = new WebSocket(url);
       handshake = setTimeout(() => current.close(), 10000);
       function connected() {
-        clearTimeout(handshake); ready = true; pollingMode(); sync();
+        clearTimeout(handshake); minimumRevision = 0; ready = true; pollingMode(); sync();
         if (authorize) {
           clearTimeout(renewal);
           renewal = setTimeout(() => {
@@ -418,6 +455,7 @@ function liveSnapshots(path, read, authorize) {
             !hint.scopes.every(scope => typeof scope === 'string' && /^(page|banner|monitors|incidents|destinations|monitor\\/[A-Za-z0-9_-]{1,80})$/.test(scope))) {
           current.close(); return;
         }
+        minimumRevision = Math.max(minimumRevision, hint.revision);
         ackSocket = current; enqueue(hint);
       };
       current.onerror = () => current.close();
@@ -436,6 +474,7 @@ function liveSnapshots(path, read, authorize) {
   function visible() { pollingMode(); if (!document.hidden) sync(); }
   function suspend() {
     stopped = true; ready = false; queued = undefined; clearTimeout(retry); clearTimeout(handshake); clearTimeout(renewal); clearInterval(polling); polling = undefined;
+    clearTimeout(historyTimer); historyTimer = undefined;
     const previous = socket; socket = undefined; ackSocket = undefined; previous?.close();
   }
   function resume() { if (stopped) { stopped = false; pollingMode(); connect(); } }
@@ -577,9 +616,10 @@ document.addEventListener('DOMContentLoaded', () => {
           reconcile(document.getElementById('public-status'), fragment(data.html));
           document.title = data.pageName;
         }
-        initializeDisplay(hint?.scopes); snapshotFailure(false);
+        initializeDisplay(hint?.scopes);
+        if (!hint?.history) snapshotFailure(false);
       } catch {
-        if (current()) { snapshotFailure(true); return false; }
+        if (!hint?.history && current()) { snapshotFailure(true); return false; }
       } finally { clearTimeout(timeout); if (hint) controller.abort(); }
     });
     document.getElementById('retry').addEventListener('click', () => updates.sync());
@@ -839,7 +879,6 @@ function renderDestinations(next, monitors, markup) {
 
 let hosted = false;
 let monitorIds = new Set();
-let monitorFloor = 60;
 function updateDeleted() {
   monitorEditor.update(monitorIds);
   const maintenanceMissing = !maintenanceForm.hidden && !monitorIds.has(maintenanceForm.dataset.monitorId);
@@ -877,6 +916,7 @@ function clearSession() {
   updateDeleted();
   message.textContent = ''; byId('secret').value = ''; byId('secret').focus();
 }
+let monitorFloor = 60;
 function bindMonitorActions(group, monitor) {
   const path = '/api/operator/monitors/' + encodeURIComponent(monitor.id);
   const actions = {

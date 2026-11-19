@@ -62,6 +62,10 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
           module + ' belongs exclusively to the delivery bundle');
       }
     }
+    assert.deepEqual(producerConfig.analytics_engine_datasets.map(({ binding, dataset }) => ({ binding, dataset })),
+      [{ binding: 'AVAILABILITY_HISTORY', dataset: 'irisbeat_availability' }]);
+    assert.ok(producerConfig.secrets.required.includes('AVAILABILITY_API_TOKEN'));
+    assert.equal(producerConfig.keep_vars, true);
     const [queueProducer] = producerConfig.queues.producers;
     const [queueConsumer] = consumerConfig.queues.consumers;
     const deliveryProducers = Object.fromEntries(consumerConfig.queues.producers.map(({ binding, queue }) => [binding, queue]));
@@ -84,8 +88,13 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     assert.ok(consumerConfig.migrations.some(migration => migration.new_sqlite_classes?.includes(recovery.class_name)));
     const delivery = readFileSync(join(temporary, deliveryName + '-build', 'notification-delivery.js'), 'utf8');
     const script = (await build({ stdin: { contents: `
-      import worker from './src/index.ts';
-      export { MonitoringContext, NotificationDelivery } from './src/index.ts';
+      import worker, { MonitoringContext as EngineContext } from './src/index.ts';
+      export { NotificationDelivery } from './src/index.ts';
+      import { availabilityFixture } from ${JSON.stringify(join(project, 'test/availability-fixture.ts'))};
+      const analytics = availabilityFixture();
+      export class MonitoringContext extends EngineContext {
+        constructor(ctx, env) { super(ctx, { ...env, ...analytics.bindings }); }
+      }
       let now = ${Date.UTC(2026, 10, 14)};
       Date.now = () => now;
       export default {
@@ -113,7 +122,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     const secret = randomBytes(32).toString('hex');
     mf = new Miniflare(convertV4MiniflareOptions({ unsafeLocalExplorer: true, workers: [
       { name: monitoringName, modules: true, script, compatibilityDate: '2026-11-13',
-        bindings: { INSTALLATION_SECRET: secret, ...producerConfig.vars },
+        bindings: { INSTALLATION_SECRET: secret, STATUS_RENDER_INTERVAL_SECONDS: "0", ...producerConfig.vars },
         serviceBindings: { [emailService.binding]: serviceTarget(emailService) },
         durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } },
         queueProducers: { [queueProducer.binding]: queueProducer.queue },
@@ -171,7 +180,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     assert.equal((await request(heartbeat, 'POST')).status, 204);
     const html = await (await request('/', 'GET', undefined, '')).text();
     assert.ok(html.includes('Personal acceptance'));
-    assert.ok(html.includes('irisbeat-0.3.0-source.tar.gz'), 'network users can obtain Corresponding Source after publication');
+    assert.ok(html.includes(`/releases/download/v${version}/irisbeat-${version}-source.tar.gz`), 'network users can obtain Corresponding Source after publication');
     new (require('node:vm').Script)(await (await request('/operator.js')).text());
     for (const publicBody of [html, JSON.stringify(await status('/api/status'))]) {
       for (const privateValue of [secret, 'http-target.example', 'controlled.example', 'webhook.example']) assert.ok(!publicBody.includes(privateValue));

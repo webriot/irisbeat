@@ -1,6 +1,6 @@
 {
   "name": "irisbeat",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "license": "AGPL-3.0-only",
@@ -13,6 +13,7 @@
     "build:delivery": "wrangler deploy --dry-run --config wrangler.delivery.jsonc",
     "test:delivery": "node test/notification-delivery.cjs",
     "test:delivery:upgrade": "node test/notification-delivery.cjs --upgrade",
+    "test:status:publication": "node test/upgrade.cjs --status-publication",
     "pack:engine": "mkdir -p dist && npm pack --pack-destination dist",
     "test:consumer": "node test/consumer.cjs",
     "deploy": "wrangler deploy",
@@ -60,6 +61,9 @@
   ],
   "cloudflare": {
     "bindings": {
+      "AVAILABILITY_API_TOKEN": {
+        "description": "Cloudflare API token with Account Analytics Read access scoped to this account. Required for availability history."
+      },
       "INSTALLATION_SECRET": {
         "description": "Generate a unique random installation secret (for example, `openssl rand -hex 32`). It protects operator administration and personal Heartbeats. Keep it private."
       }

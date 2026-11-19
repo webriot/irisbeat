@@ -8,7 +8,7 @@ or production deployment. Final release/distribution remains pending under #12; 
 ## Consumption
 
 Run `npm ci`, `npm run check`, then `npm run test:consumer`. This produces
-`dist/irisbeat-0.3.0.tgz` and `dist/SHA256SUMS`. The test packs twice and compares
+`dist/irisbeat-0.4.0.tgz` and `dist/SHA256SUMS`. The test packs twice and compares
 SHA-256, resolves the exact local version in `test/consumer/package.json`, verifies
 lockfile SHA-512 integrity, installs with offline `npm ci`, typechecks the installed
 package and runs both package exports as separate Workers in local workerd,
@@ -74,6 +74,46 @@ existing configuration or prevent edits/checking. Hosted callers must create via
 so they cannot bypass the allowance. Page-only `PUT /api/operator` still works.
 The personal default export retains its complete existing interface and unlimited
 creation with the installation secret.
+
+## Availability history
+
+Bind `AVAILABILITY_HISTORY` as an Analytics Engine dataset on the Worker that
+hosts `MonitoringContext`. Configure the self-hosted SQL inputs or supply
+`AVAILABILITY_QUERY` as a trusted service binding on that Worker. The query service
+and the write binding use the same Analytics Engine account and dataset. The
+service binding takes precedence over the direct credentials when supplied.
+
+Import `AvailabilityQueryService`, `AvailabilityQuery`, and `AvailabilityRow`
+from `irisbeat`. The engine calls
+`queryAvailability(query: AvailabilityQuery): Promise<AvailabilityRow[]>`.
+The request carries an opaque `tenantKey` (the context's Durable Object ID),
+a batch of 1–50 authorized `monitorIds`, and `start` and `end` in Unix
+milliseconds. The service always filters by the tenant key and the listed IDs.
+Filter on the actual observation timestamp and include `start`, excluding
+`end`. Group by Monitor and UTC day. Return one
+`{ monitorId, date, successes, failures, maintenance }` per observed day, with
+`date` as `YYYY-MM-DD` and each count weighted by `_sample_interval`. Return
+an empty array when no rows match and reject on read failure.
+
+Delayed Status requests include `loggedBefore`, an exclusive cutoff in Unix
+seconds for Analytics Engine's built-in `timestamp` column, which records when
+the Worker logged the point. Apply `timestamp < toDateTime(loggedBefore, 'UTC')`
+alongside the actual observation range before grouping. Use the same cutoff for
+retries of a retained publication, including after a visibility change. Points
+logged exactly at the cutoff are eligible for a subsequent publication. A
+point logged before the cutoff can appear in the same publication when it
+becomes queryable. When the request includes `observation: { at, outcome }`,
+apply both exact filters for the installation readiness probe. Operator,
+immediate Status and readiness queries omit `loggedBefore`.
+
+Keep this service private to trusted Worker
+callers. The caller supplies identity after authorizing the public or Operator
+read, and the service never accepts scopes from browser headers or URLs.
+
+The field layout and cutover are in the
+[availability history handoff](history-api.md). The readiness endpoint is
+editor-only. Existing status payloads keep the 90-day history shape with an
+optional `stale: true` on previously successful aggregates.
 
 ## Heartbeat credentials
 
@@ -363,7 +403,8 @@ drafts. A gone or invisible row returns empty HTML, as does an unknown row.
 An inaccessible section returns 404. A successful response has a revision at
 least as high as the requested minimum (409 if unavailable). The default
 minimum is zero. Each partial uses the current request's trusted tenant and
-permissions. All partials are uncached in this release.
+permissions. Operator partials bypass shared caches. Public partials use the
+published Status revision and a regional edge cache.
 
 After processing a notice and its reads, send exactly `ack`. Each socket holds
 one pending hint and a coalesced successor covering the union of queued scopes
@@ -475,8 +516,10 @@ inferring hidden activity from revision gaps. A revision is meaningful within
 its trusted context and audience. It is independent of hosted policy revision.
 
 `MonitoringContext.publishViewChanges(hints)` is the synchronous post-commit
-publication point. Each entry is a `ViewHint` containing the committed revision
-and affected resources for its audience. `readView(scope, audience)` returns
+hook for committed changes. Each entry is a `ViewHint` containing the committed
+revision and affected resources for its audience. In delayed mode, hosted
+overrides forward public hints from `onStatusPublished(hint)`. In immediate
+mode they can forward them from `publishViewChanges`. `readView(scope, audience)` returns
 projection input and its committed revision together. Hono owns the HTML
 rendering. The availability provider is consulted only for ledger or row reads.
 The internal Operator configuration, Maintenance, and destination RPCs return the editor revision and affected
@@ -489,13 +532,71 @@ when its WebSocket is disconnected. A failed partial refresh triggers a full
 read. Legacy clients retain the existing JSON reads and mutation responses
 without the media type.
 
-For delayed public publication ([#88](https://github.com/Webriot/irisbeat/issues/88)),
-the publisher can retain the public hint while forwarding reader and editor
-hints immediately. Coalesce the public resource set and retain its highest
-revision. Publish rendered resources at least as new as that revision before
-releasing the public hint. Use the resolved tenant and resource for cache
-identity and the requested revision as a lower bound. A cold edge can use
-`readView` and Hono to fill a resource directly from committed data.
+Public publication coalesces revisions and scopes in a durable pending record.
+`STATUS_RENDER_INTERVAL_SECONDS` defaults to 60. Positive values through 86,400
+set a UTC-aligned window. An explicit `"0"` opts into immediate public
+rendering. Use the same binding in the HTTP Worker and the MonitoringContext
+Worker when they are configured separately. Invalid values fall back to 60
+seconds and log `invalid_status_render_interval`.
+
+With public subscribers, the subscription alarm wakes at the next publication
+boundary. The Hono render functions prepare the affected partials and the
+MonitoringContext saves the public projection. The synchronous protected
+`onStatusPublished(hint)` hook then receives the coalesced public hint. Call
+`super.onStatusPublished(hint)` to retain built-in WebSocket delivery. An
+override can read the prepared partials through `readPublishedStatus(scope,
+hint.revision)`. The saved projection supports those reads after eviction.
+Reader and editor hints still follow their committed revisions immediately.
+
+With no public subscribers, the first GET after the boundary renders the latest
+elapsed publication and invokes the same hook. At rollover, the
+MonitoringContext retains the elapsed window's public inputs, revision, and
+scopes before a newer write can affect them. When several windows elapse
+without a render, publication uses the latest eligible inputs and carries
+forward the affected scopes. Maintenance expiry and UTC history rollover take
+effect in the windows containing their expiry time and midnight, respectively,
+even if discovered later. Before the first delayed change, the
+MonitoringContext saves the prior public inputs so even a first-ever GET within
+the window sees the pre-change Status. Entering immediate mode discards the
+old delayed publication and pending hints. Returning to delayed mode starts
+from the current state. An unpublish can take the same window to appear on
+anonymous Status. Operator authorization, Check commits, and alert handoff
+stay independent of the public window.
+
+Cloudflare's Cache API stores anonymous documents, snapshots, and partials
+regionally. The MonitoringContext resolves the eligible publication revision
+before the HTTP Worker looks up a cache entry. The key includes the trusted
+Durable Object ID, resource, publication revision, and render generation, so ordinary GETs catch up
+even when an edge clock differs from the publication clock or a client missed a
+hint. A hinted revision is a lower bound on the same URL. An edge miss renders
+the published projection and an unavailable minimum returns 409. Static assets
+and the generic Operator shell use content-based keys. Client-facing responses
+retain `Cache-Control: no-store`. Hosted deployments can bind
+`IRISBEAT_VERSION` using Wrangler version metadata to isolate Status entries by
+deployed Worker version. See [Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/)
+and [Durable Object alarms](https://developers.cloudflare.com/durable-objects/api/alarms/).
+
+#### Availability in a public publication
+
+The MonitoringContext seals an elapsed window before a later change can alter
+its Monitor set, Incidents, observation revisions or UTC history range. A later
+open window retains its own pending changes. Maintenance expiry and UTC rollover
+use their effective time when discovered after idle periods. The MonitoringContext queries before
+rendering, persisting the projection, and sending the public hint. An observation
+committed later stays outside that series even if its observation timestamp is
+in the published range. Check commits, notification handoff and Operator
+authorization proceed independently of the query.
+
+`statusPublicationRevision(resource?, minimum?)` resolves the eligible revision
+and render generation before an edge lookup. `readPublishedStatus(resource,
+minimum)` reads the prepared render with the same version fields. A scoped
+retry GET can revalidate a stale, pending or unavailable row even on a warm
+edge. The MonitoringContext records a per-row retry deadline. An ordinary GET
+after that deadline can revalidate the unresolved rows it reads even after the
+browser finishes its four retries. Successful changes persist the corrected
+series and advance the render generation together. All anonymous representations
+use the resulting generation. The public hint revision and the publication
+window still control when new Monitor state and visibility become public.
 
 ### Upgrade from unscoped subscriptions
 

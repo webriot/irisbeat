@@ -33,7 +33,8 @@ export function configurationScopes(previous: Monitor | undefined, current: Moni
   const publication = current.published !== previous.published;
   const rowChanged = (["name", "published", "url", "hostname", "port", "scheduleMode", "cron", "timezone",
     "intervalSeconds", "timeoutSeconds", "failureThreshold", "recoveryThreshold", "silenceSeconds",
-    "recoverySpacingSeconds", "graceSeconds"] as const).some(key => previous[key] !== current[key]);
+    "recoverySpacingSeconds", "graceSeconds"] as const).some(key => previous[key] !== current[key]) ||
+    (previous.outboundCalendarFloor?.compatible === false) !== (current.outboundCalendarFloor?.compatible === false);
   const previousIds = previous.notificationSelections?.map(selection => selection.destinationId) ?? [];
   const currentIds = current.notificationSelections?.map(selection => selection.destinationId) ?? [];
   const selectionsChanged = previousIds.length !== currentIds.length || previousIds.some((id, index) => id !== currentIds[index]);

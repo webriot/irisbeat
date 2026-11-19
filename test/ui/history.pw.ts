@@ -223,3 +223,139 @@ test('today stays compact and becomes an explicit historical UTC date after midn
   await expect(page.locator('.history-counts')).toHaveText('Mar 31, 2026 UTC · No observations');
   await expect(page.locator('.history [tabindex="0"]')).toHaveAttribute('data-date', '2026-03-31');
 });
+
+for (const { path, unavailable } of [{ path: '/', unavailable: false }, { path: '/operator', unavailable: true }]) {
+  test(`${path} recovers only the affected history row while connected`, async ({ page, request }) => {
+    const headers = { Authorization: 'Bearer ui-test-secret' };
+    const healthy = await (await request.post('/api/operator/monitors', { headers, data: { name: 'Stable row', kind: 'heartbeat' } })).json();
+    const monitor = (await (await request.post('/api/operator/monitors', { headers, data: { name: 'Recovering history', kind: 'heartbeat' } })).json()).monitors.at(-1);
+    const id = monitor.id;
+    const api = path === '/' ? 'status' : 'operator';
+    const escaped = api === 'status' ? '[data-key="' + id + '"]' : '[data-key="' + id + ':history"]';
+    let fullReads = 0;
+    let connections = 0;
+    let scopedReads = 0;
+    try {
+      await request.post('/heartbeat/' + id, { headers });
+      await request.post('/heartbeat/' + healthy.monitors.at(-1).id, { headers });
+      await page.clock.install();
+      await page.routeWebSocket('**/api/' + api + '/events/v2', socket => {
+        connections++;
+        if (api === 'operator') socket.onMessage(() => socket.send('authorized'));
+      });
+      await page.route('**/api/' + api, async route => {
+        fullReads++;
+        const response = await route.fetch({ headers: { ...route.request().headers(), accept: 'application/json' } });
+        const data = await response.json();
+        for (const row of data.monitors) {
+          if (row.history) delete row.history.pending;
+          if (row.id === id) row.history = unavailable ? null : {
+            percentage: null, pending: true, days: row.history.days.map((day: { date: string }) => ({
+              ...day, state: 'empty', successes: 0, failures: 0, maintenance: 0,
+            })),
+          };
+        }
+        await fulfillView(route, { response, json: data });
+      });
+      await page.route('**/api/' + api + '/partials/**', async route => {
+        const url = new URL(route.request().url());
+        expect(url.pathname).toBe('/api/' + api + '/partials/monitor/' + id);
+        scopedReads++;
+        if (scopedReads === 1) { await route.fulfill({ status: 503 }); return; }
+        const response = await route.fetch();
+        const data = await response.json();
+        if (scopedReads < 4) {
+          data.html = data.html.replace('100.00%', 'No observations');
+        } else {
+          data.html = data.html.replace(/ data-history-retry="[^"]*"/g, '');
+        }
+        await route.fulfill({ response, json: data });
+      });
+      await page.goto(path);
+      if (unavailable) {
+        await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
+        await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+      }
+      await expect.poll(() => fullReads).toBe(unavailable ? 2 : 1);
+      await expect(page.getByText('Polling', { exact: true })).toBeHidden();
+      const row = page.locator(escaped);
+      await expect(row.locator(unavailable ? '.history-unavailable' : '.percentage')).toHaveText(unavailable ? 'Bars unavailable' : 'No observations');
+      await page.clock.fastForward(30_000);
+      await expect.poll(() => scopedReads).toBe(1);
+      await expect(page.getByText('Updates unavailable', { exact: true })).toBeHidden();
+      await page.clock.fastForward(30_000);
+      await expect.poll(() => scopedReads).toBe(2);
+      await expect(row.locator('.percentage')).toHaveText('No observations');
+      await page.clock.fastForward(30_000);
+      await expect.poll(() => scopedReads).toBe(3);
+      await expect(row.locator('.percentage')).toHaveText('No observations');
+      await page.clock.fastForward(30_000);
+      await expect(row.getByText('100.00%', { exact: true })).toBeVisible();
+      await page.clock.fastForward(90_000);
+      expect(scopedReads).toBe(4);
+      expect(fullReads).toBe(unavailable ? 2 : 1);
+      expect(connections).toBe(1);
+    } finally {
+      await page.close();
+      for (const removeId of [id, healthy.monitors.at(-1).id]) {
+        await request.delete('/api/operator/monitors/' + removeId, { headers });
+      }
+    }
+  });
+}
+
+test('a new observation receives its own connected history retry budget', async ({ page, request }) => {
+  const headers = { Authorization: 'Bearer ui-test-secret' };
+  const created = await request.post('/api/operator/monitors', { headers, data: { name: 'Delayed history', kind: 'heartbeat' } });
+  const { id } = (await created.json()).monitors.at(-1);
+  const row = page.locator('[data-key="' + id + '"]');
+  let reads = 0;
+  let snapshots = 0;
+  let ingested = false;
+  try {
+    expect((await request.post('/heartbeat/' + id, { headers })).status()).toBe(204);
+    await page.clock.install();
+    await page.route('**/api/status', async route => {
+      snapshots++;
+      const response = await route.fetch();
+      const data = await response.json();
+      data.html = data.html.replace('data-key="' + id + '"', 'data-key="' + id + '" data-test-snapshot-ready');
+      await route.fulfill({ response, json: data });
+    });
+    await page.route('**/api/status/partials/monitor/' + id + '?*', async route => {
+      const response = await route.fetch();
+      const data = await response.json();
+      data.html = data.html.replace('class="availability"', 'class="availability" data-test-history-read="' + ++reads + '"');
+      if (!ingested) data.html = data.html.replace('100.00%', 'No observations');
+      await route.fulfill({ response, json: data });
+    });
+    await page.goto('/');
+    await expect(page.getByText('Polling', { exact: true })).toBeHidden();
+    await expect(row).toHaveAttribute('data-test-snapshot-ready', '');
+    await expect(row.locator('[data-history-retry]')).toBeVisible();
+    const read = (count: number) => row.locator('[data-test-history-read="' + count + '"]');
+    for (const count of [1, 2, 3, 4]) {
+      await page.clock.fastForward(30_000);
+      await expect(read(count)).toBeVisible();
+    }
+    await page.clock.fastForward(60_000);
+    expect(reads).toBe(4);
+
+    expect((await request.post('/heartbeat/' + id, { headers })).status()).toBe(204);
+    await expect(read(5)).toBeVisible();
+    for (const count of [6, 7, 8]) {
+      await page.clock.fastForward(30_000);
+      await expect(read(count).locator('.percentage')).toHaveText('No observations');
+    }
+    ingested = true;
+    await page.clock.fastForward(30_000);
+    await expect(read(9).locator('.percentage')).toHaveText('100.00%');
+    await expect(row.locator('[data-history-retry]')).toBeVisible();
+    await page.clock.fastForward(60_000);
+    expect(reads).toBe(9);
+    expect(snapshots).toBe(1);
+  } finally {
+    await page.close();
+    await request.delete('/api/operator/monitors/' + id, { headers });
+  }
+});
