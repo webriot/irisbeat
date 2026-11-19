@@ -194,20 +194,27 @@ restoring such a version.
 On an existing Queue installation, keep the Worker names, source Queue and
 service binding. Configure the handoff producer on the existing source Queue,
 the dead-letter Queue and the Recovery migration before upgrading the delivery
-Worker. Deploy the monitoring Worker first to make the trusted `resolveAlert`
-RPC available, then deploy the consumer. Existing Monitor selections stay in
-place and the new consumer handles Incident jobs from the previous producer.
-If your current consumer predates Maintenance rendering, deploy a
-Maintenance-aware consumer before enabling Maintenance producers.
+Worker. Keep source Queue delivery paused while changing versions:
 
-To roll back, let pending result and diagnostic writes settle before restoring
-a delivery Worker that lacks Recovery. Before restoring a consumer that cannot
-render Maintenance events, stop emitting them and drain queued and in-flight
-Maintenance jobs. Keep compatible monitoring and delivery Workers in place while
-bookkeeping messages can still reach the source Queue. Before restoring a monitoring Worker that lacks `resolveAlert`, switch to a
-consumer compatible with that older monitoring Worker. Verify both deployed
-versions, bindings and stored data compatibility before restoring either version.
-[Cloudflare rollback limits](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/).
+1. Run `npx wrangler queues pause-delivery "$IRISBEAT_QUEUE_NAME"` and let any
+   in-flight batches finish before deploying either Worker.
+2. Deploy the monitoring Worker to make the trusted `resolveAlert` RPC available.
+   Deploy the compatible delivery Worker and verify the active revisions and
+   bindings. The new consumer can handle Incident jobs from the previous producer.
+3. Run `npx wrangler queues resume-delivery "$IRISBEAT_QUEUE_NAME"` once both
+   compatible revisions are active.
+
+Monitoring can keep enqueueing during the pause, including new Maintenance jobs.
+Queued jobs remain subject to Cloudflare message retention and Irisbeat's one-hour
+submission limit. Existing Monitor selections stay in place.
+[Cloudflare Queue delivery controls](https://developers.cloudflare.com/queues/configuration/pause-purge/)
+
+For rollback, use a compatible Worker pair that supports the stored data and
+the jobs still in the source Queue, including delayed retries. Its delivery
+Worker must also support any pending Recovery reports, diagnostics and
+bookkeeping handoffs. Use the same pause, in-flight drain, deploy, verify and
+resume sequence. If a previous pair lacks that compatibility, keep the compatible
+pair in place and deploy a forward fix. [Cloudflare rollback limits](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/)
 
 When upgrading from the confirmation-only build, existing inboxes retain consent and
 Monitor selections. The engine provisions withdrawal credentials from
