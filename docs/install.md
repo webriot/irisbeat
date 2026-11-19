@@ -518,9 +518,10 @@ configuration.
 ### Issue #89 candidate evidence
 
 The disposable drill ran on November 19, 2026 for
-[#89](https://github.com/Webriot/irisbeat/issues/89). The exact candidate source
-was `245569c301b03b4323630a1c551c74fa0e1f97d3` (version `0.3.0`, hosted
-contract 1). Its prepared artifacts had these SHA-256 checksums:
+[#89](https://github.com/Webriot/irisbeat/issues/89). The first drill used
+unpublished candidate source `245569c301b03b4323630a1c551c74fa0e1f97d3`
+with build metadata `0.3.0` and hosted contract 1. The archives for that
+revision had these SHA-256 checksums:
 
 | Artifact | SHA-256 |
 | --- | --- |
@@ -587,10 +588,28 @@ contract 1). Its prepared artifacts had these SHA-256 checksums:
   dataset binding and history survived. The deployed API token was still
   bound as `secret_text` and SQL verified three successful observations in
   the same dataset, with zero observations carrying an extra revision value.
+- **0.4.0 exact-source follow-up.** The Worker ran source
+  `de9c8e6b7c1062c4760007778c9e4cf70a0a4647` (version
+  `1ef1aefb-6cf9-4190-9913-d968c0b857af`). At 06:43:50 UTC an anonymous
+  WebSocket supplied minimum revision 2. The first request for the newly
+  created Monitor's partial returned HTTP 200 at revision 2 in ORD and
+  rendered 100% availability from Analytics Engine. The preceding reads
+  used the document and Status JSON resources, so the Monitor partial
+  had a separate regional cache key. Readiness returned HTTP 200 and
+  both views linked to the 0.4.0 Source archive. The local predecessor
+  regression verified the saved webhook and selection across cutover and
+  delivered the recovery alert through the Queue.
 - **Deploy to Cloudflare.** Dashboard sign-in was required and the
   authentication prompt was declined. The authenticated button build,
   binding and secret provisioning, and routine dashboard rebuild remain
   open acceptance items. The fresh CLI install verifies a separate path.
+
+The 0.4.0 follow-up archives had these SHA-256 checksums:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `irisbeat-0.4.0-source.tar.gz` | `41bab8f60913bd63bc87ec170744aa608bca23685bed0bb08406a99e5938294a` |
+| `irisbeat-0.4.0.tgz` | `66f5b3c5f5a6bbddd06840a158811ef5951fc6486f85dffed0a43e2a3ed377c9` |
 
 ## Publication gate and Corresponding Source
 
