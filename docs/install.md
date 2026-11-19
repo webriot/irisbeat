@@ -613,7 +613,13 @@ The 0.4.0 follow-up archives had these SHA-256 checksums:
 | Artifact | SHA-256 |
 | --- | --- |
 | `irisbeat-0.4.0-source.tar.gz` | `41bab8f60913bd63bc87ec170744aa608bca23685bed0bb08406a99e5938294a` |
-| `irisbeat-0.4.0.tgz` | `66f5b3c5f5a6bbddd06840a158811ef5951fc6486f85dffed0a43e2a3ed377c9` |
+| `irisbeat-0.4.0.tgz` | `5878b90b08ef68053daf64f152cd1c6752cbe5aadff4f1ef97137a2521ce13b6` |
+
+At `de9c8e6`, the initial packaging shell used `umask 077`. Its engine
+checksum was `66f5b3c5f5a6bbddd06840a158811ef5951fc6486f85dffed0a43e2a3ed377c9`.
+The table records a reproduction with `umask 022`. The source archive used
+for the live drill had the same checksum in both runs. Release preparation now
+uses a fixed mask when extracting and packing the engine.
 
 ## Publication gate and Corresponding Source
 
@@ -621,8 +627,10 @@ Release maintainers first review the PR and full implementation, complete local
 release verification and the candidate runtime acceptance above, then merge the
 reviewed source to main. Keep #12 open and its publication acceptance incomplete.
 Choose a version that has no tag or release in the repository. Before preparing
-the release, set that version in `package.json`, `package-lock.json`, and the
-Status and Operator Source links in `src/ui.tsx`. Regenerate the versioned
+the release, set that version in `package.json`, `package-lock.json`,
+`NOTICE`, the tarball dependency in `test/consumer/package.json`, and the
+Status and Operator Source links in `src/ui.tsx`. Update the current-release
+examples in README, this guide, and the hosted contract. Regenerate the versioned
 artifacts from the **final** clean release revision and repeat
 `npm run release:verify` on that revision.
 

@@ -16,10 +16,14 @@ writeFileSync('dist/' + source, gzipSync(execFileSync('git', ['archive', '--form
 mkdirSync('.tmp', { recursive: true });
 const temporary = mkdtempSync(join(process.cwd(), '.tmp/release-'));
 let packed;
+const callerUmask = process.umask(0o022);
 try {
   execFileSync('tar', ['-xzf', join(process.cwd(), 'dist', source), '-C', temporary]);
   packed = JSON.parse(execFileSync('npm', ['pack', '--json', '--ignore-scripts', '--pack-destination', join(process.cwd(), 'dist')], { cwd: join(temporary, `irisbeat-${version}`), encoding: 'utf8' }))[0];
-} finally { rmSync(temporary, { recursive: true, force: true }); }
+} finally {
+  process.umask(callerUmask);
+  rmSync(temporary, { recursive: true, force: true });
+}
 const sha256 = {};
 for (const file of [source, packed.filename]) {
   sha256[file] = createHash('sha256').update(readFileSync('dist/' + file)).digest('hex');
