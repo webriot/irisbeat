@@ -127,6 +127,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   private readonly renderInterval = statusRenderInterval(this.env.STATUS_RENDER_INTERVAL_SECONDS);
   private publishedStatus?: PublishedStatus;
   private publicationRetryAt = 0;
+  private subscriptionAlarmCheck?: Promise<void>;
 
   constructor(ctx: DurableObjectState, env: E) {
     super(ctx, env);
@@ -251,6 +252,22 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   private scheduleSubscriptionAlarm() {
+    if (!this.subscriptionAlarmCheck) {
+      this.subscriptionAlarmCheck = this.reconcileSubscriptionAlarm(this.ctx.storage.getAlarm());
+      this.ctx.waitUntil(this.subscriptionAlarmCheck);
+    }
+    return this.subscriptionAlarmCheck;
+  }
+
+  private async reconcileSubscriptionAlarm(currentAlarm: Promise<number | null>) {
+    const { storage } = this.ctx;
+    let scheduledAt: number | null;
+    try {
+      scheduledAt = await currentAlarm;
+    } finally {
+      this.subscriptionAlarmCheck = undefined;
+    }
+    // Calls sharing the read use the latest state. Compare and issue the write in the same turn.
     const now = Date.now();
     const stored = this.ctx.storage.kv.get<StoredContext | LegacyContext>("context");
     const monitors = stored && "monitors" in stored ? stored.monitors : stored?.monitor ? [stored.monitor] : [];
@@ -263,7 +280,9 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const boundary = observed.length ? Math.min((day + 1) * DAY,
       ...observed.flatMap(monitor => monitor.maintenance ? [monitor.maintenance.endsAt] : [])) : Infinity;
     const at = Math.min(boundary, publication, this.availability.flushAt ?? Infinity, ...operators.map(state => state.expiresAt));
-    this.ctx.waitUntil(Number.isFinite(at) ? this.ctx.storage.setAlarm(at) : this.ctx.storage.deleteAlarm());
+    const next = Number.isFinite(at) ? at : null;
+    if (next === scheduledAt) return;
+    return next === null ? storage.deleteAlarm() : storage.setAlarm(next);
   }
 
   async alarm() {
@@ -272,12 +291,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if ((this.availability.flushAt ?? Infinity) <= now) {
       // Persist the next wakeup before handing off any points from this alarm.
       this.availability.delayFlush(now);
-      this.scheduleSubscriptionAlarm();
+      await this.scheduleSubscriptionAlarm();
       await this.drainAvailability(availabilityWriteLimit);
     }
     if (this.liveSockets("public").length && this.eligiblePublicationAt() <= now)
       await this.advanceStatusPublication(this.read(now), now);
-    this.scheduleSubscriptionAlarm();
+    await this.scheduleSubscriptionAlarm();
   }
 
   private async drainAvailability(limit: number) {
@@ -1054,7 +1073,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       if (monitor.kind !== "heartbeat" && monitor.scheduleMode === "calendar") await calendarPolicy;
       await this.checkMonitor(monitor.id, at);
     })]);
-    if (this.availability.flushAt !== undefined) this.scheduleSubscriptionAlarm();
+    if (this.availability.flushAt !== undefined) await this.scheduleSubscriptionAlarm();
     await this.drainAvailability(Math.min(writeLimit, availabilityWriteLimit));
   }
 
