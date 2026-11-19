@@ -102,7 +102,7 @@ async function directQuery(env: AvailabilityEnv, query: AvailabilityQuery) {
     FORMAT JSON`;
   const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${config.account}/analytics_engine/sql`, {
     method: "POST", body: sql, headers: { Authorization: "Bearer " + config.token, "Content-Type": "text/plain" },
-    redirect: "error", signal: AbortSignal.timeout(timeout),
+    redirect: "manual", signal: AbortSignal.timeout(timeout),
   });
   if (!response.ok) throw new Error("Analytics Engine SQL request failed");
   return (await response.json<{ data: unknown }>()).data;

@@ -270,6 +270,7 @@ it('queries only published Monitor IDs, reuses their aggregates, and shares no p
   vi.mocked(fetch).mockImplementation(async (input, init) => {
     expect(String(input)).toBe('https://api.cloudflare.com/client/v4/accounts/' + 'a'.repeat(32) + '/analytics_engine/sql');
     expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer test-analytics-token');
+    expect(init?.redirect).toBe('manual');
     const sql = String(init?.body);
     sqlCalls.push(sql);
     expect(sql).toMatch(/index1 = '[a-f0-9]{64}'/);
