@@ -37,19 +37,22 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
           super(ctx, { ...env, ...bindings });
         }
       }` : 'export { EngineContext as MonitoringContext };'}
-    export default { async fetch(request, env, ctx) {
-      const url = new URL(request.url);
-      const testAt = request.headers.get('x-test-at') || url.searchParams.get('at');
-      const now = Date.now;
-      if (testAt) Date.now = () => Number(testAt);
-      try {
-        if (url.pathname === '/test-tick') {
-          await app.scheduled({ scheduledTime: Number(testAt) }, env, ctx);
-          return new Response('checked');
-        }
-        return await app.fetch(request, env, ctx);
-      } finally { Date.now = now; }
-    } };`;
+    export default {
+      async fetch(request, env, ctx) {
+        const url = new URL(request.url);
+        const scheduledAt = url.pathname === '/test-tick' ? url.searchParams.get('at') : null;
+        const testAt = request.headers.get('x-test-at') ?? scheduledAt;
+        const now = Date.now;
+        if (testAt !== null) Date.now = () => Number(testAt);
+        try {
+          if (scheduledAt !== null) {
+            await app.scheduled({ scheduledTime: Number(scheduledAt) }, env, ctx);
+            return new Response('checked');
+          }
+          return await app.fetch(request, env, ctx);
+        } finally { Date.now = now; }
+      },
+    };`;
   const socketTarget = {
     name: 'substitute-tcp-target',
     setup(builder) {
@@ -228,7 +231,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
       const { history: oldHistory, ...oldMonitor } = beforeUpgrade.monitor;
       const { history: newHistory, ...newMonitor } = after.monitor;
       assert.equal(oldHistory.percentage, 50);
-      assert.deepEqual(newMonitor, oldMonitor);
+      assert.deepEqual(newMonitor, { ...oldMonitor, effectiveIntervalSeconds: oldMonitor.intervalSeconds });
       assert.deepEqual(after.incidents, beforeUpgrade.incidents);
       assert.deepEqual(after.monitors[1].maintenance, beforeUpgrade.monitors[1].maintenance);
       assert.equal(after.monitors[1].published, false);
