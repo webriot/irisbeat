@@ -49,6 +49,7 @@ export type Monitor = MonitorConfiguration & Timing & {
   successes: number;
   nextDue: number;
   lastOutboundCheckAt?: number;
+  lastOutboundStartedAt?: number;
   outboundCalendarFloor?: { seconds: number; compatible: boolean };
   createdAt: number;
   lastSeen: number | null;

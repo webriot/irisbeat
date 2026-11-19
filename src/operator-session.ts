@@ -4,7 +4,7 @@ import type { Status } from './index';
 type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 type OperatorResponse = Status | { secret: string };
 export type SchedulePreview = { explanation: string; timezone: string; occurrences: number[] };
-export type ScheduleInput = { cron: string; timezone: string; graceSeconds?: number | null };
+export type ScheduleInput = { cron: string; timezone: string; graceSeconds?: number | null; outbound?: true };
 export type LiveSnapshots = (
   path: string,
   read: (current: () => boolean) => Promise<boolean | void>,

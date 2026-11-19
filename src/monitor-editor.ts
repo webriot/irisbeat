@@ -4,7 +4,7 @@ import type { Monitor } from './monitor-configuration';
 import type { createOperatorSession, SchedulePreview } from './operator-session';
 
 type EditorSession = Pick<ReturnType<typeof createOperatorSession>, 'preview' | 'cancelPreview' | 'run'>;
-type EditableMonitor = Pick<Monitor, 'id' | 'name' | 'kind'> & Partial<Omit<Monitor, 'id' | 'name' | 'kind'>> & { destinationIds?: string[] };
+type EditableMonitor = Pick<Monitor, 'id' | 'name' | 'kind'> & Partial<Omit<Monitor, 'id' | 'name' | 'kind'>> & { destinationIds?: string[]; scheduleSuspended?: boolean };
 
 // Describe only the DOM members used here, without mixing browser globals into Worker types.
 type EditorControl = {
@@ -47,6 +47,8 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
   let editingId: string | null = null;
   let minimumCheckInterval = timingDefaults.intervalSeconds;
   let savedInterval: number | undefined;
+  let savedCalendar: { cron: string; timezone: string } | undefined;
+  let scheduleSuspended = false;
   let newIntervalDefault = timingDefaults.intervalSeconds;
   let monitorIds = new Set<string>();
   let destinations: NotificationDestination[] = [];
@@ -68,14 +70,20 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
     outboundIntervalMinimum() {
       return controls.get('kind').value === 'heartbeat' ? timingDefaults.intervalSeconds : minimumCheckInterval;
     },
+    calendarUnchanged() {
+      return savedCalendar !== undefined && controls.get('scheduleMode').value === 'calendar' &&
+        savedCalendar.cron === controls.get('cron').value && savedCalendar.timezone === controls.get('timezone').value;
+    },
     preview() {
+      controls.get('resume-schedule').hidden = true;
       controls.get('cron').setCustomValidity('');
       controls.get('schedule-explanation').textContent = '';
       controls.get('schedule-occurrences').replaceChildren();
       const cron = controls.get('cron').value;
       const timezone = controls.get('timezone').value;
+      const heartbeat = controls.get('kind').value === 'heartbeat';
       session.preview(controls.get('scheduleMode').value !== 'calendar' ? null : () => ({
-        cron, timezone, ...(controls.get('kind').value === 'heartbeat' ? { graceSeconds: duration.validate(controls.get('graceSeconds')) } : {}),
+        cron, timezone, ...(heartbeat ? { graceSeconds: duration.validate(controls.get('graceSeconds')) } : { outbound: true }),
       }));
     },
   };
@@ -142,6 +150,9 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
       newIntervalDefault = controls.outboundIntervalMinimum();
       controls.get('cron').value = monitor?.cron || '0 9 * * *';
       controls.get('timezone').value = monitor?.timezone || 'UTC';
+      savedCalendar = monitor?.kind !== 'heartbeat' && monitor?.scheduleMode === 'calendar'
+        ? { cron: controls.get('cron').value, timezone: controls.get('timezone').value } : undefined;
+      scheduleSuspended = monitor?.scheduleSuspended === true;
       controls.get('cron').setCustomValidity('');
       for (const [field, value] of Object.entries(timingDefaults) as [TimingField, number][]) {
         const input = controls.get(field);
@@ -156,9 +167,13 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
       form.hidden = false; monitorEditor.update(); controls.preview();
       controls.get('name').focus();
     },
-    setMinimumCheckInterval(seconds: number) {
+    setSchedulePolicy(seconds: number, suspended: boolean) {
+      const changed = minimumCheckInterval !== seconds || scheduleSuspended !== suspended;
       minimumCheckInterval = seconds;
-      if (!form.hidden) duration.updateIntervalBounds();
+      scheduleSuspended = suspended;
+      if (form.hidden) return;
+      duration.updateIntervalBounds();
+      if (changed && controls.get('scheduleMode').value === 'calendar' && controls.get('kind').value !== 'heartbeat') controls.preview();
     },
     close() {
       session.cancelPreview(); controls.get('cron').setCustomValidity('');
@@ -239,8 +254,10 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
       const missing = editingId !== null && !monitorIds.has(editingId);
       controls.get('monitor-deleted').hidden = !missing;
       controls.get('save-monitor').disabled = missing;
+      controls.get('resume-schedule').disabled = missing;
     },
     previewed(data: SchedulePreview) {
+      controls.get('resume-schedule').hidden = !scheduleSuspended || !controls.calendarUnchanged();
       controls.get('schedule-explanation').textContent = data.explanation;
       const format = new Intl.DateTimeFormat(undefined, { timeZone: data.timezone, dateStyle: 'medium', timeStyle: 'long' });
       controls.get('schedule-occurrences').replaceChildren(...data.occurrences.map(at => {
@@ -254,7 +271,7 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
     },
     previewFailed(error: string) {
       controls.get('schedule-explanation').textContent = error;
-      controls.get('cron').setCustomValidity(error);
+      if (!controls.calendarUnchanged()) controls.get('cron').setCustomValidity(error);
     },
   };
   for (const input of form.querySelectorAll('[data-duration]')) {
@@ -284,8 +301,11 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
     const body: Record<string, string | number | boolean | null | Record<string, boolean>> = { name: controls.get('name').value, kind: controls.get('kind').value, published: controls.get('published').checked };
     if (body.kind === 'tcp') { body.hostname = controls.get('hostname').value; body.port = Number(controls.get('port').value); }
     else if (body.kind === 'http') body.url = controls.get('url').value;
-    body.scheduleMode = controls.get('scheduleMode').value;
-    if (body.scheduleMode === 'calendar') { body.cron = controls.get('cron').value; body.timezone = controls.get('timezone').value; }
+    const resume = (event as Event & { submitter?: EditorControl }).submitter?.id === 'resume-schedule';
+    if (resume || !controls.calendarUnchanged()) {
+      body.scheduleMode = controls.get('scheduleMode').value;
+      if (body.scheduleMode === 'calendar') { body.cron = controls.get('cron').value; body.timezone = controls.get('timezone').value; }
+    }
     for (const field of controls.fields()) {
       const input = controls.get(field);
       body[field] = durations.has(input) ? duration.validate(input) : Number(input.value);

@@ -22,7 +22,25 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     mkdirSync(dirname(destination), { recursive: true });
     writeFileSync(destination, execFileSync('git', ['show', `${base}:${source}`]));
   }
-  const wrapper = index => `import app from ${JSON.stringify(index)}; export {MonitoringContext${index.startsWith(project) ? ', NotificationDelivery' : ''}} from ${JSON.stringify(index)}; export default { async fetch(request, env, ctx) { const url = new URL(request.url); if(url.pathname === '/test-tick') { await app.scheduled({scheduledTime:Number(url.searchParams.get('at'))}, env, ctx); return new Response('checked'); } const testAt = request.headers.get('x-test-at'); const now = Date.now; if (testAt) Date.now = () => Number(testAt); try { return await app.fetch(request, env, ctx); } finally { Date.now = now; } } };`;
+  const wrapper = index => `
+    import app from ${JSON.stringify(index)};
+    export {MonitoringContext${index.startsWith(project) ? ', NotificationDelivery' : ''}} from ${JSON.stringify(index)};
+    export default {
+      async fetch(request, env, ctx) {
+        const url = new URL(request.url);
+        const scheduledAt = url.pathname === '/test-tick' ? url.searchParams.get('at') : null;
+        const testAt = request.headers.get('x-test-at') ?? scheduledAt;
+        const now = Date.now;
+        if (testAt !== null) Date.now = () => Number(testAt);
+        try {
+          if (scheduledAt !== null) {
+            await app.scheduled({ scheduledTime: Number(scheduledAt) }, env, ctx);
+            return new Response('checked');
+          }
+          return await app.fetch(request, env, ctx);
+        } finally { Date.now = now; }
+      },
+    };`;
   const socketTarget = {
     name: 'substitute-tcp-target',
     setup(builder) {

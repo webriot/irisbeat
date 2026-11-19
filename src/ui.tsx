@@ -118,7 +118,7 @@ function Operator({ hosted }: { hosted: boolean }) {
           <fieldset id="destination-selection" hidden><legend tabindex={-1}>Notification destinations</legend>
             <div id="destination-choices"></div><p id="no-destination-choices">No destinations</p>
           </fieldset>
-          <p id="monitor-deleted" role="status" hidden>This Monitor was deleted. Copy your draft or cancel.</p><button id="save-monitor">Save Monitor</button><button id="cancel-edit" type="button">Cancel</button>
+          <p id="monitor-deleted" role="status" hidden>This Monitor was deleted. Copy your draft or cancel.</p><button id="save-monitor">Save Monitor</button><button id="resume-schedule" hidden>Save and Resume</button><button id="cancel-edit" type="button">Cancel</button>
         </form>
       <section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2><div id="incidents"></div></section>
       </div>
@@ -472,7 +472,6 @@ table { width: 100%; table-layout: fixed; border-spacing: 0; margin-top: 20px; }
 .monitor-column { width: auto; }
 .state-column, .schedule-column { width: 17%; }
 .publication-column { width: 15%; }
-.schedule-detail { display: block; color: var(--muted); font-size: .875rem; }
 .actions-column { width: 226px; }
 th, td { padding: 12px 16px; text-align: left; }
 th { font-size: 12px; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--line); }
@@ -771,11 +770,12 @@ function render(data, savedField) {
     savedPageName = data.pageName;
   }
   monitorIds = new Set(data.monitors.map(monitor => monitor.id));
-  monitorEditor.setMinimumCheckInterval(data.minCheckIntervalSeconds ?? 60);
+  const editedMonitor = data.monitors.find(monitor => monitor.id === monitorEditor.id);
+  monitorEditor.setSchedulePolicy(data.minCheckIntervalSeconds ?? 60, editedMonitor?.scheduleSuspended === true);
   emailConfigured = canEdit && data.emailConfigured === true;
   addEmail.hidden = !emailConfigured;
   renderDestinations(canEdit ? data.destinations ?? [] : [], canEdit ? data.monitors : []);
-  monitorEditor.refreshDestinations(destinations, data.monitors.find(monitor => monitor.id === monitorEditor.id)?.destinationIds);
+  monitorEditor.refreshDestinations(destinations, editedMonitor?.destinationIds);
   updateDeleted();
   if (monitorEditor.id && !monitorIds.has(monitorEditor.id) && form.parentElement !== byId('new-monitor-panel')) {
     byId('new-monitor-panel').append(form);
@@ -787,11 +787,9 @@ function render(data, savedField) {
     const state = document.createElement('td'); state.textContent = statusLedger.stateLabel[monitor.state];
     state.className = 'status'; state.dataset.state = monitor.state;
     const schedule = document.createElement('td');
-    const detail = document.createElement('span'); detail.className = 'schedule-detail';
     if (monitor.scheduleSuspended) {
-      schedule.textContent = 'Suspended';
       const suspensionFloor = monitor.scheduleSuspensionFloorSeconds;
-      detail.textContent = scheduleDuration(suspensionFloor) + ' minimum' + (suspensionFloor === data.minCheckIntervalSeconds ? '' : ' at suspension');
+      schedule.textContent = 'Suspended (' + scheduleDuration(suspensionFloor) + ' minimum' + (suspensionFloor === data.minCheckIntervalSeconds ? '' : ' at suspension') + ')';
     } else if (monitor.scheduleMode === 'calendar') {
       schedule.textContent = 'Calendar';
     } else if (monitor.kind === 'heartbeat') {
@@ -799,9 +797,8 @@ function render(data, savedField) {
     } else {
       const effective = monitor.effectiveIntervalSeconds ?? monitor.intervalSeconds;
       schedule.textContent = 'Every ' + scheduleDuration(effective);
-      if (monitor.intervalSeconds !== effective) detail.textContent = 'Saved ' + scheduleDuration(monitor.intervalSeconds);
+      if (monitor.intervalSeconds !== effective) schedule.textContent += ' (saved ' + scheduleDuration(monitor.intervalSeconds) + ')';
     }
-    if (detail.textContent) schedule.append(detail);
     const publication = document.createElement('td'); publication.textContent = monitor.published ? 'Published' : 'Private';
     row.append(name, state, schedule, publication);
     const actions = document.createElement('td');

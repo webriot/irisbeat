@@ -379,7 +379,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       if ("graceSeconds" in value && (typeof value.graceSeconds !== "number" || !Number.isInteger(value.graceSeconds) || value.graceSeconds < 1 || value.graceSeconds > 86400 || !await parsed.acceptsGraceAsync(value.graceSeconds, after)))
         throw new Error("Grace must be 1–86400 whole seconds and shorter than every occurrence gap");
       const floor = minimumCheckIntervalSeconds(this.env.MIN_CHECK_INTERVAL_SECONDS);
-      if (!("graceSeconds" in value) && !await parsed.acceptsMinimumGap(floor, after))
+      if (value.outbound === true && !await parsed.acceptsMinimumGap(floor, after))
         throw new Error(`Calendar occurrences must be at least ${floor} seconds apart`);
       return { cron: parsed.cron, timezone: parsed.timezone, explanation: parsed.explanation, occurrences: parsed.next(after, 3) };
     } catch (error) {
@@ -668,6 +668,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     })]);
   }
 
+  protected outboundStartTime(_scheduledAt: number) {
+    return Date.now();
+  }
+
   private async checkMonitor(id: string, at: number) {
     const state = this.read(at);
     const attempt = state.monitors.find(monitor => monitor.id === id);
@@ -700,10 +704,21 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
       return;
     }
+    const nextDue = calendarMode ? calendar(attempt.cron, attempt.timezone).next(at)[0] : at + attempt.intervalSeconds * 1000;
+    // Cron timestamps anchor observations and recurrence. The target sees wall-clock starts.
+    const startedAt = this.outboundStartTime(at);
+    if (startedAt < (attempt.lastOutboundStartedAt ?? -Infinity) + floor) {
+      if (calendarMode) {
+        attempt.nextDue = nextDue;
+        this.ctx.storage.kv.put("context", state);
+      }
+      return;
+    }
     const observation = { maintenance: !!attempt.maintenance, paused: false };
     this.checking.set(id, observation);
     attempt.lastOutboundCheckAt = at;
-    attempt.nextDue = calendarMode ? calendar(attempt.cron, attempt.timezone).next(at)[0] : at + attempt.intervalSeconds * 1000;
+    attempt.lastOutboundStartedAt = startedAt;
+    attempt.nextDue = nextDue;
     this.ctx.storage.kv.put("context", state);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), attempt.timeoutSeconds * 1000);

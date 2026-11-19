@@ -6,6 +6,7 @@ let mode = 'available';
 let queued: NotificationQueueJob[] = [];
 let queueUnavailable = false;
 let checkFloor: string | undefined;
+let useWallClock = false;
 export class MonitoringContext extends EngineContext {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, {
@@ -26,6 +27,11 @@ export class MonitoringContext extends EngineContext {
     if (mode === 'failed') throw new Error('substituted series query failure');
     return super.queryHistory(id, start, end);
   }
+
+  protected outboundStartTime(scheduledAt: number) {
+    // Most suites advance a synthetic cron clock and control the request clock separately.
+    return useWallClock ? super.outboundStartTime(scheduledAt) : scheduledAt;
+  }
 }
 export default {
   ...worker,
@@ -33,6 +39,7 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === '/__test-check-floor' && request.method === 'PUT') {
       checkFloor = url.searchParams.get('seconds') ?? undefined;
+      useWallClock = url.searchParams.has('wall-clock');
       return new Response(null, { status: 204 });
     }
     if (url.pathname === '/__test-notification-queue') {

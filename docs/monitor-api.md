@@ -83,12 +83,16 @@ settings](install.md#outbound-check-floor) describe its bounds and failure behav
   saved Calendar is suspended. When true, `scheduleSuspensionFloorSeconds`
   gives the floor that caused suspension. New or explicitly submitted outbound
   Calendars must have every occurrence at least the floor apart, including
-  timezone offset transitions. The schedule-preview endpoint applies this rule
-  to outbound schedules and validates Heartbeat grace when `graceSeconds` is supplied.
-- Saving a compatible schedule resumes a suspended Calendar. Calendar saves
-  resume at the next future occurrence and preserve observations and Incidents.
+  timezone offset transitions. Send `outbound: true` to apply the floor in the
+  schedule-preview endpoint. Calendar Heartbeat previews can omit
+  `graceSeconds` or supply it to validate the grace window.
+- Omit `scheduleMode`, `cron` and `timezone` from unrelated edits to keep a
+  Calendar suspended. Explicitly saving a compatible schedule resumes at the
+  next future occurrence and preserves observations and Incidents.
   When a delayed outbound Calendar dispatch would put a following occurrence
   inside the floor, the scheduler skips that occurrence and returns to the Calendar.
+  The scheduler enforces the floor using actual start times and retains scheduled
+  timestamps for observations.
 
 These fields belong to the Operator projection. Public availability and
 Incidents still reflect observations. Heartbeat retains its existing fields,

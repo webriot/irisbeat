@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import worker, { type Status } from '../src/index';
+import worker, { createHostedWorker, type Status } from '../src/index';
 import { setupNetwork } from '@msw/cloudflare';
 import { http, HttpResponse } from 'msw';
 import { env, exports } from 'cloudflare:workers';
@@ -27,7 +27,12 @@ const collection = '/api/operator/monitors';
 const target = { name: 'Website', url: 'https://target.example/health' };
 const create = (settings = {}) => request(collection, 'POST', { ...target, ...settings });
 const read = async (): Promise<Status> => (await request('/api/operator')).json();
-const floor = (seconds?: string) => request('/__test-check-floor' + (seconds === undefined ? '' : '?seconds=' + encodeURIComponent(seconds)), 'PUT');
+const floor = (seconds?: string, wallClock = false) => {
+  const query = new URLSearchParams();
+  if (seconds !== undefined) query.set('seconds', seconds);
+  if (wallClock) query.set('wall-clock', '');
+  return request('/__test-check-floor?' + query, 'PUT');
+};
 const tick = (minutes: number) => worker.scheduled(createScheduledController({ scheduledTime: start + minutes * 60_000 }), env);
 
 it('rejects invalid installation settings at both Worker entry points', async () => {
@@ -57,27 +62,68 @@ it('rejects explicit outbound Intervals below the floor and defaults new Monitor
 });
 
 it('enforces a changed Interval floor from the last dispatch and restores the saved interval after eviction', async () => {
-  vi.spyOn(Date, 'now').mockReturnValue(start);
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+  await floor(undefined, true);
   network.use(http.get(target.url, () => new HttpResponse(null, { status: 204 })));
   expect((await create({ intervalSeconds: 60 })).status).toBe(201);
+  clock.mockReturnValue(start + 50_000);
   await tick(0);
   const observed = (await read()).monitor!.lastResult;
   expect(observed).toEqual({ at: start, outcome: 'success' });
 
-  await floor('180');
+  await floor('180', true);
   await evictDurableObject(env.MONITORING.getByName('personal'));
+  clock.mockReturnValue(start + 60_000);
   await tick(1);
+  clock.mockReturnValue(start + 120_000);
   await tick(2);
+  clock.mockReturnValue(start + 180_000);
+  await tick(3);
   const raised = await read();
   expect(raised.monitor).toMatchObject({ intervalSeconds: 60, effectiveIntervalSeconds: 180, lastResult: observed });
   expect(raised.incidents).toEqual([]);
-  await tick(3);
-  expect((await read()).monitor!.lastResult).toEqual({ at: start + 180_000, outcome: 'success' });
-
-  await floor();
-  await evictDurableObject(env.MONITORING.getByName('personal'));
+  clock.mockReturnValue(start + 240_000);
   await tick(4);
-  expect((await read()).monitor).toMatchObject({ intervalSeconds: 60, effectiveIntervalSeconds: 60, lastResult: { at: start + 240_000, outcome: 'success' } });
+  expect((await read()).monitor!.lastResult).toEqual({ at: start + 240_000, outcome: 'success' });
+
+  await floor(undefined, true);
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  clock.mockReturnValue(start + 300_000);
+  await tick(5);
+  expect((await read()).monitor).toMatchObject({ intervalSeconds: 60, effectiveIntervalSeconds: 60, lastResult: { at: start + 300_000, outcome: 'success' } });
+});
+
+it.each([
+  ['Interval', { intervalSeconds: 120 }],
+  ['Calendar', { scheduleMode: 'calendar', cron: '*/2 * * * *' }],
+])('enforces the actual start of a delayed %s Check across eviction', async (mode, schedule) => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(start - 60_000);
+  await floor('120', true);
+  const starts: number[] = [];
+  network.use(http.get(target.url, () => {
+    starts.push(Date.now());
+    return new HttpResponse(null, { status: 204 });
+  }));
+  expect((await create(schedule)).status).toBe(201);
+  clock.mockReturnValue(start + 50_000);
+  if (mode === 'Calendar') {
+    const hosted = createHostedWorker({ contractVersion: '1', resolve: () => null, contexts: () => ['personal'] });
+    await hosted.scheduled(createScheduledController({ scheduledTime: start }), env);
+  } else {
+    await tick(0);
+  }
+  expect((await read()).monitor!.lastResult).toEqual({ at: start, outcome: 'success' });
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+
+  clock.mockReturnValue(start + 120_000);
+  if (mode === 'Calendar') await env.MONITORING.getByName('personal').check(start + 120_000);
+  else await tick(2);
+  expect(starts).toEqual([start + 50_000]);
+  expect((await read()).monitor!.lastResult).toEqual({ at: start, outcome: 'success' });
+  clock.mockReturnValue(start + 240_000);
+  await tick(4);
+  expect(starts).toEqual([start + 50_000, start + 240_000]);
+  expect((await read()).monitor!.lastResult).toEqual({ at: start + 240_000, outcome: 'success' });
 });
 
 it('rejects Calendar gaps shortened by timezone transitions and accepts gaps equal to the floor', async () => {
@@ -86,17 +132,29 @@ it('rejects Calendar gaps shortened by timezone transitions and accepts gaps equ
   const schedule = { scheduleMode: 'calendar', cron: '0 9 * * *' };
   const timezone = 'America/New_York';
   expect((await create({ ...schedule, timezone })).status).toBe(400);
-  const preview = await request('/api/operator/schedule-preview', 'POST', { cron: schedule.cron, timezone });
+  const preview = await request('/api/operator/schedule-preview', 'POST', { cron: schedule.cron, timezone, outbound: true });
   expect(preview.status).toBe(400);
   expect((await preview.json() as { error: string }).error).toContain('86400');
   expect((await create(schedule)).status).toBe(201);
   const { monitor } = await read();
   expect((await request(collection + '/' + monitor!.id, 'PATCH', { timezone })).status).toBe(400);
   expect((await read()).monitor).toMatchObject({ timezone: 'UTC', scheduleSuspended: false });
-  expect((await request('/api/operator/schedule-preview', 'POST', { cron: '* * * * *', graceSeconds: 30 })).status).toBe(200);
 });
 
-it('suspends an existing Calendar without adding observations or changing an open Incident', async () => {
+it('keeps Calendar Heartbeat previews compatible whether or not clients include grace', async () => {
+  await floor('180');
+  const cron = '* * * * *';
+  const preview = (options = {}) => request('/api/operator/schedule-preview', 'POST', { cron, after: start, ...options });
+  const omitted = await preview();
+  expect(omitted.status).toBe(200);
+  const explicit = await preview({ graceSeconds: 30 });
+  expect(explicit.status).toBe(200);
+  expect(await explicit.json()).toEqual(await omitted.json());
+  expect((await preview({ graceSeconds: 60 })).status).toBe(400);
+  expect((await preview({ outbound: true })).status).toBe(400);
+});
+
+it.each(['180', '60'])('keeps a Calendar suspended at a %s second floor until an explicit compatible save', async currentFloor => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
   network.use(http.get(target.url, () => new HttpResponse(null, { status: 503 })));
   expect((await create({ scheduleMode: 'calendar', cron: '* * * * *', failureThreshold: 1, recoveryThreshold: 1 })).status).toBe(201);
@@ -114,13 +172,15 @@ it('suspends an existing Calendar without adding observations or changing an ope
   expect(suspended.incidents).toEqual(observed.incidents);
 
   const path = collection + '/' + observed.monitor!.id;
-  await floor();
-  expect((await read()).monitor).toMatchObject({ scheduleSuspended: true, scheduleSuspensionFloorSeconds: 180 });
-  await floor('180');
-  expect((await request(path, 'PATCH', { published: false })).status).toBe(200);
   expect((await request(path, 'PATCH', { cron: '* * * * *' })).status).toBe(400);
+  await floor(currentFloor);
+  const destination = await request('/api/operator/destinations', 'POST', { url: 'https://hooks.example/calendar' });
+  const id = (await destination.json<Status>()).destinations![0].id;
+  expect((await request(path, 'PATCH', { name: 'Renamed', destinationChanges: { [id]: true } })).status).toBe(200);
+  expect((await read()).monitor).toMatchObject({ name: 'Renamed', destinationIds: [id], cron: '* * * * *', scheduleSuspended: true, scheduleSuspensionFloorSeconds: 180 });
   clock.mockReturnValue(start + 11 * 60_000);
-  expect((await request(path, 'PATCH', { cron: '*/3 * * * *' })).status).toBe(200);
+  const cron = currentFloor === '180' ? '*/3 * * * *' : '* * * * *';
+  expect((await request(path, 'PATCH', { scheduleMode: 'calendar', cron, timezone: 'UTC' })).status).toBe(200);
   expect((await read()).monitor).toMatchObject({ scheduleSuspended: false, state: 'down', lastResult: observed.monitor!.lastResult });
   network.use(http.get(target.url, () => new HttpResponse(null, { status: 204 })));
   await tick(11);
