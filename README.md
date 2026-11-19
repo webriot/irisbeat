@@ -6,7 +6,7 @@ The application supports multiple personal HTTP(S), TCP and Heartbeat Monitors, 
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/webriot/irisbeat)
 
-See [installation, operation and release acceptance](docs/install.md). This candidate is unpublished; the button uses main and becomes release-ready only after reviewed publication and a real install drill. The exact-source CLI path supports candidate verification.
+See [installation, operation and release acceptance](docs/install.md). The button uses main. Use the exact-source CLI path to install a specific release.
 
 ## Local development
 
@@ -110,11 +110,11 @@ result. See [installation](docs/install.md) and [hosted integration](docs/hosted
 
 The harness follows Cloudflare's [Vitest setup](https://developers.cloudflare.com/workers/testing/vitest-integration/write-your-first-test/), [request mocking](https://developers.cloudflare.com/workers/testing/vitest-integration/mock-outbound-requests/) and [test APIs](https://developers.cloudflare.com/workers/testing/vitest-integration/test-apis/). `npm run check` regenerates binding/runtime types from `wrangler.jsonc` and checks TypeScript; generated declarations are ignored. `npm run build` bundles locally with `wrangler deploy --dry-run` and does not deploy.
 
-The configuration declares a monitoring Worker with a one-minute cron, a SQLite Durable Object migration and the required `INSTALLATION_SECRET` name. A separate configuration declares the Queue consumer and Recovery migration. Actual deployments, secret values and account infrastructure belong outside this repository. The Deploy to Cloudflare flow declares its installation-secret prompt and deployment command. Versioned source and engine artifacts with integrity/exact revision metadata are prepared by `npm run release:prepare`; `npm run release:verify` assembles all local acceptance checks. This release candidate has not been published or live-deployed; local checks do not establish live installation acceptance. See [the parent-owned publication and deployment gates](docs/install.md).
+The configuration declares a monitoring Worker with a one-minute cron, a SQLite Durable Object migration and the required `INSTALLATION_SECRET` name. A separate configuration declares the Queue consumer and Recovery migration. Actual deployments, secret values and account infrastructure belong outside this repository. The Deploy to Cloudflare flow declares its installation-secret prompt and deployment command. Versioned source and engine artifacts with integrity/exact revision metadata are prepared by `npm run release:prepare`; `npm run release:verify` assembles all local acceptance checks. See [publication and deployment checks](docs/install.md).
 
 ## Repository boundary
 
-The public application owns the monitoring engine and hosted extension interfaces. Private hosted consumers integrate versioned public releases rather than duplicate the engine. [Hosted contract 1](docs/hosted-contract.md) documents trusted context/permission/allowance resolution, tenant Heartbeat issuance and rotation, and Queue-based Incident and Maintenance notifications. `npm run test:consumer` prepares a reproducible local `irisbeat@0.2.2` tarball and verifies a separately installed, integrity-pinned consumer in workerd. Context pause/resume is included, with durable trusted policy revisions. Final publication and live deployment acceptance remain parent-owned under #12.
+The public application owns the monitoring engine and hosted extension interfaces. Private hosted consumers integrate versioned public releases rather than duplicate the engine. [Hosted contract 1](docs/hosted-contract.md) documents trusted context/permission/allowance resolution, tenant Heartbeat issuance and rotation, and Queue-based Incident and Maintenance notifications. `npm run test:consumer` prepares a reproducible local `irisbeat@0.3.0` tarball and verifies a separately installed, integrity-pinned consumer in workerd. Context pause/resume is included, with durable trusted policy revisions.
 
 Hosted consumers own account integration, organization roles, entitlements, subscription provisioning, monitor allowances, sender and domain provisioning, custom hostnames and hosted deployment. The public application remains independently self-hostable. Infrastructure and secrets belong outside this repository.
 
