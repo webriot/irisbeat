@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { fulfillView } from './view-response';
 import { expect, test, type WebSocketRoute } from '@playwright/test';
 
 const snapshot = { pageName: 'Private session', destinations: [{ id: 'hook', channel: 'webhook', url: 'https://private.example/hook' }], monitors: [{ id: 'private', name: 'Private Monitor', kind: 'http', url: 'https://private.example', state: 'up', published: false }], incidents: [] };
@@ -10,7 +11,7 @@ async function login(page: import('@playwright/test').Page) {
 test('renews on the same socket, reauthorizes snapshots and clears private state on denied renewal', async ({ page }) => {
   let live!: WebSocketRoute; let connections = 0; let tickets = 0; let denied = false; let reads = 0;
   const frames: string[] = [];
-  await page.route('**/api/operator', route => { reads++; return route.fulfill({ json: snapshot }); });
+  await page.route('**/api/operator', route => { reads++; return fulfillView(route, { json: snapshot }); });
   await page.route('**/api/operator/events/ticket', route => {
     expect(route.request().method()).toBe('POST');
     expect(route.request().headers().authorization).toBe('Bearer ui-test-secret');
@@ -45,7 +46,7 @@ test('renews on the same socket, reauthorizes snapshots and clears private state
 test('coalesces operator notices, reconnects with resync and polls only while disconnected and visible', async ({ page }) => {
   let live!: WebSocketRoute; let connections = 0; let reads = 0; let hold = false; let release: (() => void) | undefined;
   let data = { ...snapshot };
-  await page.route('**/api/operator', route => { reads++; return route.fulfill({ json: data }); });
+  await page.route('**/api/operator', route => { reads++; return fulfillView(route, { json: data }); });
   let partialReads = 0;
   await page.route('**/api/operator/partials/page?*', async route => {
     partialReads++;
@@ -72,7 +73,7 @@ for (const boundary of ['ticket', 'partial', 'renewal']) {
   test('sign-out rejects a delayed ' + boundary + ' response and stops renewal/reconnection', async ({ page }) => {
     let live!: WebSocketRoute; let connections = 0; let tickets = 0; let release: (() => void) | undefined; let held = false;
     const frames: string[] = [];
-    await page.route('**/api/operator', route => route.fulfill({ json: snapshot }));
+    await page.route('**/api/operator', route => fulfillView(route, { json: snapshot }));
     await page.route('**/api/operator/partials/page?*', async route => {
       if (held) await new Promise<void>(resolve => { release = resolve; });
       await route.fulfill({ json: { revision: 1, permission: 'editor', pageName: 'Late private page', html: '<h1>Late private page</h1>' } });
@@ -113,7 +114,7 @@ test('failed sockets retain visible polling, stale feedback and clear UI on snap
     Object.defineProperty(document, 'hidden', { configurable: true, value: false });
   });
   let status = 200; let reads = 0;
-  await page.route('**/api/operator', route => { reads++; return route.fulfill({ status, json: snapshot }); });
+  await page.route('**/api/operator', route => { reads++; return fulfillView(route, { status, json: snapshot }); });
   await page.clock.install(); await login(page); await expect(page.locator('#editor')).toBeVisible(); status = 503;
   await page.clock.runFor(60001); await expect(page.locator('#stale')).toBeVisible();
   await expect(page.getByText('Private Monitor', { exact: true })).toBeVisible();

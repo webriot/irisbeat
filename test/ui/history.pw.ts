@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { fulfillView } from './view-response';
 import { expect, test } from '@playwright/test';
 import { monitorAction } from './actions';
 
@@ -24,7 +25,8 @@ for (const settings of [
     for (const path of ['/', '/operator']) {
       test(`${path} localizes instants and inspects UTC history`, async ({ page, request }) => {
         const data = snapshot();
-        await page.route('**/api/operator', route => route.fulfill({ json: data }));
+        await page.routeWebSocket(path === '/' ? '**/api/status/events/v2' : '**/api/operator/events/v2', socket => socket.close());
+        await page.route('**/api/operator', route => fulfillView(route, { json: data }));
         if (path === '/') await page.route('**/*', async route => {
           if (new URL(route.request().url()).pathname === '/') {
             const response = await request.post('/__ui/status', { data: { ...data, monitors: data.monitors.slice(0, 1) } });
@@ -80,7 +82,7 @@ for (const settings of [
           await expect(page.getByLabel('End time (' + settings.timezoneId + ')', { exact: true })).toBeVisible();
           await page.locator('#maintenance-end').fill('2026-11-17T12:00');
           const write = page.waitForRequest(req => req.url().endsWith('/web/maintenance') && req.method() === 'PUT');
-          await page.route('**/web/maintenance', route => route.fulfill({ json: data }));
+          await page.route('**/web/maintenance', route => fulfillView(route, { json: data }));
           await page.locator('#save-maintenance').click();
           const expected = settings.timezoneId === 'America/Los_Angeles' ? '2026-11-17T20:00:00Z' : settings.timezoneId === 'Europe/Berlin' ? '2026-11-17T11:00:00Z' : '2026-11-17T06:15:00Z';
           expect((await write).postDataJSON()).toEqual({ endsAt: Date.parse(expected) });
@@ -93,7 +95,7 @@ for (const settings of [
 test('touch selects a day without adding tab stops', async ({ browser }) => {
   const context = await browser.newContext({ hasTouch: true, viewport: { width: 390, height: 844 } });
   const page = await context.newPage();
-  await page.route('**/api/operator', route => route.fulfill({ json: snapshot() }));
+  await page.route('**/api/operator', route => fulfillView(route, { json: snapshot() }));
   await page.goto('/operator');
   await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -109,7 +111,7 @@ test('empty, unavailable, and result states stay distinct through refresh and re
   const history = data.monitors[0].history!;
   history.percentage = null;
   history.days.forEach(day => Object.assign(day, { state: 'empty', successes: 0, failures: 0, maintenance: 0 }));
-  await page.route('**/api/operator', route => route.fulfill({ json: data }));
+  await page.route('**/api/operator', route => fulfillView(route, { json: data }));
   await page.goto('/operator');
   await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -164,13 +166,14 @@ test('fall daylight-saving repeated hours retain distinct exact instants', async
 test('Maintenance preserves an unchanged fold instant and rejects gap or ambiguous edits', async ({ browser }) => {
   const context = await browser.newContext({ timezoneId: 'America/Los_Angeles' });
   const page = await context.newPage();
+  await page.routeWebSocket('**/api/operator/events/v2', socket => socket.close());
   const data = snapshot();
   Object.assign(data.monitors[0], { maintenance: { endsAt: Date.parse('2027-11-07T09:30:25Z') } });
   const writes: unknown[] = [];
-  await page.route('**/api/operator', route => route.fulfill({ json: data }));
+  await page.route('**/api/operator', route => fulfillView(route, { json: data }));
   await page.route('**/web/maintenance', route => {
     writes.push(route.request().postDataJSON());
-    return route.fulfill({ json: data });
+    return fulfillView(route, { json: data });
   });
   await page.goto('/operator');
   await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
@@ -211,7 +214,7 @@ for (const path of ['/', '/operator']) {
 
 test('today stays compact and becomes an explicit historical UTC date after midnight', async ({ page }) => {
   await page.clock.install({ time: new Date('2026-03-31T23:59:00Z') });
-  await page.route('**/api/operator', route => route.fulfill({ json: snapshot() }));
+  await page.route('**/api/operator', route => fulfillView(route, { json: snapshot() }));
   await page.goto('/operator');
   await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();

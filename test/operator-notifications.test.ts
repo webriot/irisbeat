@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import worker, { createHostedWorker, type Status } from '../src/index';
 import { env } from 'cloudflare:workers';
-import { createScheduledController, evictDurableObject, runDurableObjectAlarm, reset } from 'cloudflare:test';
+import { createScheduledController, evictDurableObject, runDurableObjectAlarm, runInDurableObject, reset } from 'cloudflare:test';
 import { afterEach, expect, it, vi } from 'vitest';
 const origin = 'https://irisbeat.example';
 const sockets: WebSocket[] = [];
@@ -215,4 +215,30 @@ it('does not postpone a due public boundary when private requests reschedule aut
   await request('/api/operator/webhook', 'PUT', { url: 'https://private.example/boundary' });
   await runDurableObjectAlarm(env.MONITORING.getByName('personal'));
   await settle(); expect(messages).toEqual(['changed', 'changed', 'changed']);
+});
+
+it('keeps the due UTC rollover when the Operator disconnects and Status stays subscribed', async () => {
+  const midnight = Date.parse('2030-11-17T00:00Z');
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(midnight - 1000);
+  await request('/api/operator/monitors', 'POST', { name: 'Public rollover', kind: 'heartbeat' });
+  const response = await worker.fetch(new Request(origin + '/api/status/events/v2', { headers: { Upgrade: 'websocket', Origin: origin } }), env);
+  const publicSocket = response.webSocket!;
+  publicSocket.accept();
+  sockets.push(publicSocket);
+  const hints: unknown[] = [];
+  publicSocket.addEventListener('message', event => { hints.push(JSON.parse(String(event.data))); });
+  const operator = await subscribe();
+  operator.socket.send(JSON.stringify({ type: 'auth', ticket: (await ticket()).ticket }));
+  await settle();
+  expect(operator.messages).toEqual(['authorized']);
+
+  clock.mockReturnValue(midnight + 1);
+  const closed = closes(operator.socket);
+  operator.socket.close();
+  await closed;
+  const context = env.MONITORING.getByName('personal');
+  expect(await runInDurableObject(context, (_instance, state) => state.storage.getAlarm())).toBe(midnight);
+  await runDurableObjectAlarm(context);
+  await settle();
+  expect(hints).toEqual([{ type: 'changed', revision: 2, scopes: ['monitors', 'incidents', 'banner'] }]);
 });

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, renderViewPartial, styleSheet, themeScript } from "./ui";
+import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, renderViewPartial, renderViewSnapshot, styleSheet, themeScript } from "./ui";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
 import { MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
@@ -106,6 +106,7 @@ type PublishedStatus = {
   renders: Map<StatusResource, StatusRender>;
 };
 type PublishedStatusMeta = Pick<Status, "paused" | "pageName"> & { revision: number };
+type MutationAck = Pick<ViewHint, "revision" | "scopes">;
 type ViewClock = Record<ViewAudience, number> & { day?: number };
 type Ticket = { origin: string; contextId: string; permission: "reader" | "editor"; expiresAt: number; leaseEndsAt: number };
 
@@ -245,7 +246,8 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const observed = operators.some(state => state.authenticated) ? monitors
       : hasPublicSubscribers ? monitors.filter(monitor => monitor.published) : [];
     const publication = hasPublicSubscribers ? this.statusPublicationAt() : Infinity;
-    const boundary = observed.length ? Math.min((Math.floor(now / DAY) + 1) * DAY,
+    const day = this.viewClock().day ?? Math.floor(now / DAY);
+    const boundary = observed.length ? Math.min((day + 1) * DAY,
       ...observed.flatMap(monitor => monitor.maintenance ? [monitor.maintenance.endsAt] : [])) : Infinity;
     const at = Math.min(boundary, publication, ...operators.map(state => state.expiresAt));
     this.ctx.waitUntil(Number.isFinite(at) ? this.ctx.storage.setAlarm(at) : this.ctx.storage.deleteAlarm());
@@ -313,7 +315,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (!this.renderInterval) {
       const revision = this.viewClock().public;
       if (revision < minimum) return null;
-      const scope = resource === "/" || resource === "/api/status" ? undefined : resource;
+      const scope = resource === "/" || (resource === "/api/status" || resource === "snapshot") ? undefined : resource;
       return { revision, ...renderStatus(resource, this.project(state, false, false, at, scope), revision), cacheable: false };
     }
     const prior = this.loadPublishedStatus();
@@ -335,7 +337,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   // The write and revisions share one transaction. Only committed hints leave the DO.
   private commitViewChanges(write: () => ViewChanges, day?: number) {
-    const hints = this.ctx.storage.transactionSync(() => {
+    const { hints, revision } = this.ctx.storage.transactionSync(() => {
       const changes = write();
       const clock = this.viewClock();
       const hints: Partial<Record<ViewAudience, ViewHint>> = {};
@@ -350,13 +352,19 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         this.ctx.storage.kv.put("status-pending", { since, scopes } satisfies PendingStatus);
       }
       if (day !== undefined) clock.day = day;
+      else clock.day ??= Math.floor(Date.now() / DAY);
       if (day !== undefined || Object.keys(hints).length) this.ctx.storage.kv.put("view-clock", clock);
-      return hints;
+      return { hints, revision: clock.editor };
     });
     if (Object.keys(hints).length) {
       this.scheduleSubscriptionAlarm();
       this.publishViewChanges(hints);
     }
+    return { revision, scopes: hints.editor?.scopes ?? [] };
+  }
+
+  private unchangedView(scope: ViewScope): MutationAck {
+    return { revision: this.viewClock().editor, scopes: [scope] };
   }
 
   protected publishViewChanges(hints: Partial<Record<ViewAudience, ViewHint>>) {
@@ -508,12 +516,11 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   private monitorConfigurations = new MonitorConfigurations({
     read: () => this.read(),
     commit: (state: StoredContext, previousName: string, previous?: Monitor, current?: Monitor) => {
-      this.commitViewChanges(() => {
+      return this.commitViewChanges(() => {
         if (current && previous && current.scheduleRevision !== previous.scheduleRevision) this.resetCalendarEvidence(current);
         this.ctx.storage.kv.put("context", state);
         return configurationScopes(previous, current, state.pageName !== previousName);
       });
-      return true as const;
     },
   });
 
@@ -543,7 +550,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const existing = destinations.find(destination => destination.id === destinationId);
     if (destinationId && !existing) return null;
     if (address?.channel === "webhook" && existing?.channel === "webhook" && existing.url === address.url ||
-        address?.channel === "email" && existing?.channel === "email" && existing.address === address.address) return true as const;
+        address?.channel === "email" && existing?.channel === "email" && existing.address === address.address) return this.unchangedView("destinations");
     const replacement = address && {
       id: crypto.randomUUID(), ...(address.channel === "email" ? { ...address, confirmed: false } : address),
     };
@@ -574,12 +581,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         }
       }
     }
-    this.commitViewChanges(() => {
+    const ack = this.commitViewChanges(() => {
       this.ctx.storage.kv.put("context", state);
       return replacement || existing ? { editor: editorScopes } : {};
     });
     if (job) await this.enqueueConfirmation(job);
-    return true as const;
+    return ack;
   }
 
   async resendConfirmation(id: string, origin: string) {
@@ -591,7 +598,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (!job) return "cooldown" as const;
     this.ctx.storage.kv.put("context", state);
     await this.enqueueConfirmation(job);
-    return true as const;
+    return this.unchangedView("destinations");
   }
 
   private prepareConfirmation(state: StoredContext, destination: Extract<NotificationDestination, { channel: "email" }>, origin: string) {
@@ -700,9 +707,9 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         value.endsAt <= at || value.endsAt > 8_640_000_000_000_000)) return undefined;
     const previous = monitor.maintenance;
     const next = end ? null : { startedAt: at, endsAt: (value as { endsAt: number }).endsAt };
-    if (previous?.endsAt === next?.endsAt) return true as const;
+    if (previous?.endsAt === next?.endsAt) return this.unchangedView(`monitor/${id}`);
     const order = this.nextNotificationOrder(state);
-    this.commitViewChanges(() => {
+    const ack = this.commitViewChanges(() => {
       if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
         // Retain elapsed overlap when an operator cuts a window short or replaces it.
         this.ctx.storage.sql.exec("UPDATE calendar_maintenance SET endsAt = MIN(endsAt, ?) WHERE monitorId = ? AND endsAt > ?", at, id, at);
@@ -731,7 +738,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         });
       }
     }
-    return true as const;
+    return ack;
   }
 
   private clearCalendarEvidence(id: string) {
@@ -750,13 +757,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const state = this.read();
     const monitor = state.monitors.find(monitor => monitor.id === id);
     if (!monitor) return null;
-    this.commitViewChanges(() => {
+    return this.commitViewChanges(() => {
       this.clearCalendarEvidence(id);
       state.monitors = state.monitors.filter(monitor => monitor.id !== id);
       this.ctx.storage.kv.put("context", state);
       return configurationScopes(monitor, undefined, false);
     });
-    return true as const;
   }
 
   // Keep overlap evidence with the running attempt even after a window is replaced or ends.
@@ -1365,12 +1371,26 @@ async function configuredConfirmationOrigin<E extends EngineEnv>(c: Context<Http
   }
 }
 
-async function operatorResponse<E extends EngineEnv>(c: Context<HttpEnv<E>>, result: Status | true | null, status = 200) {
+const viewMediaType = "application/vnd.irisbeat.view+json";
+
+async function operatorSnapshot<E extends EngineEnv>(c: Context<HttpEnv<E>>, status = 200) {
   const resolved = c.get("resolved");
-  if (result === true) result = await c.get("context").status(true, c.get("permission") === "editor");
-  const emailConfigured = result && c.get("permission") === "editor" && await confirmationOrigin(c);
-  return Response.json(result && { ...result, ...(emailConfigured ? { emailConfigured: true } : {}),
+  const permission = c.get("permission")!;
+  const result = await c.get("context").status(true, permission === "editor");
+  const emailConfigured = permission === "editor" && !!await confirmationOrigin(c);
+  if (c.req.header("Accept") === viewMediaType) {
+    return Response.json({ ...renderViewSnapshot(result, permission, emailConfigured), hosted: !!resolved, permission }, { status });
+  }
+  return Response.json({ ...result, ...(emailConfigured ? { emailConfigured: true } : {}),
     ...(resolved ? { hosted: true, permission: resolved.permission } : {}) }, { status });
+}
+
+function operatorMutationResponse<E extends EngineEnv>(c: Context<HttpEnv<E>>, ack: MutationAck, status = 200, refresh?: ViewScope) {
+  if (c.req.header("Accept") === viewMediaType) {
+    const scopes = refresh ? mergeScopes(ack.scopes, [refresh]) : ack.scopes;
+    return Response.json({ ...ack, scopes }, { status });
+  }
+  return operatorSnapshot(c, status);
 }
 
 async function readBoundedBody(request: Request) {
@@ -1453,7 +1473,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     const interval = statusRenderInterval(c.env.STATUS_RENDER_INTERVAL_SECONDS);
     // An entry from a prior window cannot satisfy an ordinary request after publication.
     const until = interval ? statusWindowEnd(Date.now(), interval) : 0;
-    const key = interval ? edgeKey(c, c.req.path, `${c.env.IRISBEAT_VERSION?.id ?? "source"}:${interval}:${until}`) : null;
+    const key = interval ? edgeKey(c, resource, `${c.env.IRISBEAT_VERSION?.id ?? "source"}:${interval}:${until}`) : null;
     if (key) {
       const cached = await readEdge(key);
       if (cached && Date.now() < until && Number(cached.headers.get("X-Irisbeat-Revision")) >= minimum)
@@ -1465,7 +1485,8 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     return renderResponse(render);
   };
   app.get("/", getOnly, (c: Context<HttpEnv<E>>) => publicRender(c, "/"));
-  app.get("/api/status", getOnly, (c: Context<HttpEnv<E>>) => publicRender(c, "/api/status"));
+  app.get("/api/status", getOnly, (c: Context<HttpEnv<E>>) =>
+    publicRender(c, c.req.header("Accept") === viewMediaType ? "snapshot" : "/api/status"));
   const asset = (render: StatusRender): MiddlewareHandler<HttpEnv<E>> => async c => {
     const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(render.body));
     const version = Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, "0")).join("");
@@ -1586,7 +1607,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     app.get(path, async (c: Context<HttpEnv<E>>) => {
       if (c.req.method !== "GET")
         return methodNotAllowed(path === "/api/operator/monitors" || path === destinationsPath ? "GET, POST" : "GET, PUT");
-      return operatorResponse(c, await c.get("context").status(true, c.get("permission") === "editor"));
+      return operatorSnapshot(c);
     });
   }
   app.post(rotationPath, async (c: Context<HttpEnv<E>>) => {
@@ -1595,11 +1616,11 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   });
   app.delete(maintenancePath, async (c: Context<HttpEnv<E>>) => {
     const result = await c.get("context").maintenance(monitorId(c), null, true);
-    return result ? operatorResponse(c, result) : Response.json({ error: "Monitor not found" }, { status: 404 });
+    return result ? operatorMutationResponse(c, result) : Response.json({ error: "Monitor not found" }, { status: 404 });
   });
   app.delete(monitorPath, async (c: Context<HttpEnv<E>>) => {
     const result = await c.get("context").remove(monitorId(c));
-    return result ? operatorResponse(c, result) : Response.json({ error: "Monitor not found" }, { status: 404 });
+    return result ? operatorMutationResponse(c, result) : Response.json({ error: "Monitor not found" }, { status: 404 });
   });
   app.put("/api/operator/webhook", readBody, async (c: Context<HttpEnv<E>>) => {
     const value = c.get("value");
@@ -1608,12 +1629,12 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     if (destination === undefined) return Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
     return destinationResponse(c, await c.get("context").configureDestination(null, destination ? { channel: "webhook", url: destination } : null, true));
   });
-  function destinationResponse(c: Context<HttpEnv<E>>, result: true | null | "duplicate" | "unconfigured" | "cooldown" | "paused", status = 200) {
+  function destinationResponse(c: Context<HttpEnv<E>>, result: MutationAck | null | "duplicate" | "unconfigured" | "cooldown" | "paused", status = 200) {
     if (result === "unconfigured") return Response.json({ error: "Email sending is unavailable" }, { status: 503 });
     if (result === "duplicate") return Response.json({ error: "This inbox is already a destination" }, { status: 409 });
     if (result === "paused") return Response.json({ error: "Confirmation is paused" }, { status: 409 });
     if (result === "cooldown") return Response.json({ error: "Wait five minutes between confirmations for this inbox" }, { status: 429 });
-    return result ? operatorResponse(c, result, status) : Response.json({ error: "Destination not found" }, { status: 404 });
+    return result ? operatorMutationResponse(c, result, status) : Response.json({ error: "Destination not found" }, { status: 404 });
   }
   const saveDestination = async (c: Context<HttpEnv<E>>) => {
     const value = c.get("value");
@@ -1648,7 +1669,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   app.put(maintenancePath, readBody, async (c: Context<HttpEnv<E>>) => {
     const result = await c.get("context").maintenance(monitorId(c), c.get("value"));
     if (result === undefined) return Response.json({ error: "Enter a future end time in epoch milliseconds" }, { status: 400 });
-    return result ? operatorResponse(c, result) : Response.json({ error: "Monitor not found" }, { status: 404 });
+    return result ? operatorMutationResponse(c, result) : Response.json({ error: "Monitor not found" }, { status: 404 });
   });
   app.post(previewPath, readBody, async (c: Context<HttpEnv<E>>) => {
     const result = await c.get("context").previewSchedule(c.get("value"));
@@ -1657,14 +1678,14 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   app.patch(monitorPath, readBody, async (c: Context<HttpEnv<E>>) => {
     const result = await c.get("context").edit(monitorId(c), c.get("value"));
     if (result === undefined) return Response.json({ error: "Enter valid Monitor settings and an HTTP(S)/TCP target or Heartbeat settings; type cannot change" }, { status: 400 });
-    return result ? operatorResponse(c, result) : Response.json({ error: "Monitor not found" }, { status: 404 });
+    return result ? operatorMutationResponse(c, result, 200, `monitor/${monitorId(c)}`) : Response.json({ error: "Monitor not found" }, { status: 404 });
   });
   app.post("/api/operator/monitors", readBody, async (c: Context<HttpEnv<E>>) => {
     const value = c.get("value");
     const result = await c.get("context").create(value, c.get("resolved")?.monitorLimit);
     if (result === undefined)
       return Response.json({ error: "Enter a Monitor name and HTTP(S)/TCP target or Heartbeat settings" }, { status: 400 });
-    return result ? operatorResponse(c, result, 201) : Response.json({ error: "Monitor allowance reached" }, { status: 409 });
+    return result ? operatorMutationResponse(c, result, 201) : Response.json({ error: "Monitor allowance reached" }, { status: 409 });
   });
   app.put("/api/operator", readBody, async (c: Context<HttpEnv<E>>) => {
     const value = c.get("value");
@@ -1673,12 +1694,13 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
       const pageName = value.pageName;
       if (typeof pageName !== "string" || !pageName.trim() || pageName.length > 120)
         return Response.json({ error: "Enter a page name" }, { status: 400 });
-      return operatorResponse(c, await context.configure({ pageName: pageName.trim() }) ?? null);
+      const ack = (await context.configure({ pageName: pageName.trim() }))!;
+      return operatorMutationResponse(c, ack, 200, "page");
     }
     if (c.get("resolved")) return Response.json({ error: "Use the Monitor collection" }, { status: 400 });
     const result = await context.configure(value, c.get("selectedMonitorId"));
     if (result === undefined) return Response.json({ error: "Enter a page name, Monitor name and HTTP(S)/TCP target or Heartbeat settings; type cannot change" }, { status: 400 });
-    return result ? operatorResponse(c, result) : Response.json({ error: "Monitor changed; reload before saving" }, { status: 409 });
+    return result ? operatorMutationResponse(c, result) : Response.json({ error: "Monitor changed; reload before saving" }, { status: 409 });
   });
   for (const path of operatorPaths) app.all(path, () => methodNotAllowed(
     (path === rotationPath || path === previewPath) ? "POST" : path === maintenancePath ? "PUT, DELETE" : path === monitorPath ? "PATCH, DELETE" : path === destinationPath ? "PUT, DELETE" : (path === "/api/operator/monitors" || path === destinationsPath) ? "GET, POST" : "GET, PUT",

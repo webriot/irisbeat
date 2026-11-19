@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { AvailabilityHistory, Status } from './index';
 
-// Self-contained: the same implementation runs in the Worker and the classic browser script.
+// Markup and labels shared by the Worker renderers.
 export function createStatusLedger() {
   const stateLabel = {
     unknown: 'Awaiting check', up: 'Operational', down: 'Unavailable',
@@ -74,20 +74,6 @@ export function createStatusLedger() {
       return [status, result.reason && reasons[result.reason]].filter(Boolean).join(' · ');
     },
     banner: markup.banner,
-    row(monitor: Status["monitors"][number]) {
-      const id = markup.escape(monitor.id);
-      return '<article data-key="' + id + '" aria-labelledby="monitor-name-' + id + '"><div class="ledger-row" data-state="' +
-        markup.escape(monitor.state) + '"><h2 id="monitor-name-' + id + '">' + markup.escape(monitor.name) +
-        '</h2><span class="status">' + stateLabel[monitor.state] + '</span></div>' + ledger.history(monitor.history, monitor.id) + '</article>';
-    },
-    render(data: Status) {
-      const banner = markup.banner(data);
-      return '<h1>' + markup.escape(data.pageName) + '</h1><section class="banner" data-state="' +
-        (banner === 'All services operational' ? 'up' : banner === 'Services unavailable' ? 'down' : 'unknown') +
-        '" aria-label="Current status"><h2>' + banner + '</h2></section><div class="ledger">' +
-        data.monitors.map(ledger.row).join('') + '</div><section id="public-incidents"' + (data.monitors.length ? '' : ' hidden') +
-        ' aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>' + ledger.incidents(data) + '</section>';
-    },
   };
   return ledger;
 }
