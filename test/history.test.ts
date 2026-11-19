@@ -44,7 +44,7 @@ it('renders exactly 90 UTC days and counts only in-range observations across mid
   expect(html).toContain('2026-11-13 UTC: Failed checks');
 });
 
-it('distinguishes empty, Maintenance-only and mixed counted days without inventing a denominator', async () => {
+it('calculates availability from successes and failures and excludes Maintenance', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(today - 2 * day);
   const monitor = await create();
   let html = await (await request('/')).text();
@@ -146,7 +146,7 @@ it.each(['missing', 'failed'])('keeps rendered current state and Incidents when 
   expect(operator.incidents).toHaveLength(2);
 });
 
-it('assigns any-overlap Maintenance to attempt-start UTC day and excludes skipped dispatches', async () => {
+it('uses a check’s start date when it overlaps Maintenance and skips unrun checks', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(today - 1_000);
   const monitor = await create();
   const path = '/api/operator/monitors/' + monitor.id + '/maintenance';
@@ -520,7 +520,7 @@ it('marks aggregates pending during ingestion and refreshes them without another
   expect(html).not.toContain('data-history-retry');
 });
 
-it('shares scoped history rendering with negotiated snapshots and keeps mutation acknowledgments query-free', async () => {
+it('renders the same history in snapshots and row responses without querying on save', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(today);
   const published = await create({ name: 'Public row' });
   const hidden = await create({ name: 'Private row', published: false });

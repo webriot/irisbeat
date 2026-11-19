@@ -109,7 +109,7 @@ it('filters credentials for readers and confines heartbeat credentials to their 
 it('rejects unsupported contract versions before serving requests', () => {
   expect(() => createHostedWorker({ contractVersion: '2', resolve: () => null, contexts: () => [] })).toThrow('Unsupported Irisbeat contract version');
 });
-it('exposes hosted capabilities for the existing operator ledger without exposing credentials in assets', async () => {
+it('reports hosted editor and reader access and labels the hosted sign-in field', async () => {
   expect(await (await request('a.example', '/api/operator')).json()).toMatchObject({ hosted: true, permission: 'editor' });
   expect(await (await request('a.example', '/api/operator', 'GET', undefined, 'reader')).json()).toMatchObject({ hosted: true, permission: 'reader' });
   expect(await (await request('a.example', '/operator')).text()).toContain('Access token');

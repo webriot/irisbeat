@@ -1,8 +1,8 @@
-# Maintenance handoff
+# Maintenance
 
-Implements [#8](https://github.com/webriot/irisbeat/issues/8) under
-[spec #1](https://github.com/webriot/irisbeat/issues/1). Product policy lives in those
-issues; this document describes integration points.
+Use a Maintenance window to mark planned downtime on a Monitor. Irisbeat
+continues evaluating checks and excludes Maintenance from availability and
+Incident detection.
 
 ## Controls and status
 
@@ -14,7 +14,7 @@ issues; this document describes integration points.
   expiry/end is harmless and does not reset subsequent detector progress.
 - Both require installation Bearer authorization, use the existing bounded JSON
   reader for PUT, return full operator status, and return 404 for deleted/unknown IDs.
-  HTTP, TCP and Heartbeat share these routes. Future scheduling is outside #8.
+  HTTP, TCP and Heartbeat share these routes. Windows start immediately.
 - Monitor status adds `maintenance: { startedAt, endsAt } | null` and overrides the
   displayed `state` with `maintenance` while effective. The stored detector state
   and Incident identity remain intact. `lastResult.outcome` adds `maintenance`.
@@ -29,9 +29,10 @@ excluded from the window. It requires no cron execution or alarm to become visib
 Expiry/early end reset outbound counts and Heartbeat recovery count/spacing without
 changing due times, last-seen, last result, availability, or Incidents. Delayed
 Watchdog silence observations use their scheduled timestamp to determine whether
-they fall inside a naturally expired window. Missing executions create no results. Heartbeat receipts during Maintenance refresh last-seen
-and record Maintenance, including closely spaced receipts; they never recover an
-Incident. Subsequent recovery requires the Monitor's normal post-window rule.
+they fall inside a naturally expired window. During Maintenance, Interval
+Heartbeat receipts refresh last-seen and record Maintenance, including closely
+spaced receipts. Recovery follows the Monitor's usual rules after the window.
+Calendar Heartbeats [exclude entire overlapping receipt windows](heartbeat-api.md#calendar-heartbeats).
 
 ## Availability history
 
@@ -42,27 +43,17 @@ Entering or ending Maintenance and skipped executions create no observations.
 Maintenance is recorded as its own outcome and excluded from the
 success/failure denominator. See the [availability history contract](history-api.md).
 
-## Hosted #10 and pause #11
+## Hosted permissions and pause
 
-`maintenance(id, value, end?)` commits before awaiting Queue acceptance. The route uses hosted editor authorization and hides reader controls.
-Retain adapter context resolution, operator metadata, allowance enforcement and
-heartbeat credential rotation. Suppression returns from shared `record` before
-Incident mutation or Incident Queue handoff. Installed-consumer tests cover Queue
-handoff for HTTP, TCP and Heartbeat.
-A webhook submitted before declaration cannot be recalled. See the
-[hosted notification contract](hosted-contract.md#incident-notifications) for
-Queue setup and upgrade behavior.
-
-#11 makes pause override Maintenance for checking/recording/display and retains
-unexpired windows for resume. See the [hosted pause contract](hosted-contract.md#pause-and-resume). Do not infer subscriptions or hosted identity from
-Maintenance.
+Hosted editors can set or end Maintenance. Readers can see active windows.
+A paused context takes precedence over Maintenance and retains any unexpired
+window for resume. See the [hosted pause contract](hosted-contract.md#pause-and-resume).
 
 ## Maintenance notifications
 
-[Issue #74](https://github.com/Webriot/irisbeat/issues/74) uses the same Queue
-handoff and trusted destination eligibility as Incident notifications. The
-channel-independent `MaintenanceNotificationEvent` is part of `NotificationEvent`.
-It carries the Monitor name, original event time (`at`), and the window's
+Maintenance uses the same [delivery queue and destination checks](hosted-contract.md#incident-notifications)
+as Incident notifications. `MaintenanceNotificationEvent` is part of
+`NotificationEvent`. It carries the Monitor name, original event time (`at`), and the window's
 `startedAt` and scheduled `endsAt`, all timestamps in epoch milliseconds.
 
 | Event kind | Additional detail |
@@ -78,7 +69,6 @@ the same selection and pause checks used for Incident jobs.
 
 ## In-flight attempts
 
-The [owner confirmed any overlap is Maintenance](https://github.com/webriot/irisbeat/issues/8#issuecomment-6867542753).
 An HTTP/TCP attempt starting inside a window, or still pending when a window is
 declared, records `maintenance` even if the window expires, ends early, or is
 replaced before completion. The running attempt retains its own overlap flag;
@@ -92,6 +82,4 @@ success/failure availability denominator. An attempt starting exactly at `endsAt
 has no overlap with that expired window and counts normally unless another window
 intersects it. Open Incidents remain frozen for overlap results; only wholly
 post-window results satisfy normal thresholds. No result is created for a skipped
-execution. Installed-consumer tests exercise notification suppression when windows
-are replaced or ended entirely during a pending attempt and when a successful
-attempt spans replacement or expiry of an open Incident's window.
+execution.

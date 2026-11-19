@@ -1,44 +1,91 @@
-# Heartbeat integration
+# Heartbeat Monitors
 
-Implements [#6](https://github.com/webriot/irisbeat/issues/6) under [spec #1](https://github.com/webriot/irisbeat/issues/1). The Status ledger choice is recorded on [#2](https://github.com/webriot/irisbeat/issues/2#issuecomment-6865093219).
+A Heartbeat Monitor checks whether a job or service sends receipts on time.
+Choose **Interval** to detect silence or **Calendar** to expect one receipt
+after each scheduled time.
 
-`POST /api/operator/monitors` creates a Heartbeat with `kind: "heartbeat"`, a Monitor name, optional publication and timing. New IDs are opaque and never reused; use `PATCH /api/operator/monitors/:id` for edits. `PUT /api/operator` with page/Monitor fields remains a compatibility route for the first active Monitor; page-only saves stay independent. `intervalSeconds` is the expected producer cadence (default 60); `silenceSeconds` defaults to 180; `recoveryThreshold` defaults to two receipts; `recoverySpacingSeconds` defaults to 60. Owner-confirmed seconds bounds are integers 60–86,400 and receipt count 1–100. Monitor kind is fixed after creation; see the [owner decision](https://github.com/webriot/irisbeat/issues/6#issuecomment-6866440729). Expectation describes producer cadence; the scheduled evaluation compares elapsed silence with `silenceSeconds`. These settings are independent. Omitted edits preserve values; kind is immutable. No hosted policy or configurable rule engine is introduced.
+## Configure a Heartbeat
 
-`POST /heartbeat/:id` requires `Authorization: Bearer <installation secret>`. A known Heartbeat returns 204. Wrong/missing authorization returns 401; authenticated unknown/deleted IDs and HTTP/TCP Monitors return 404 without changing freshness on any Monitor. Authenticated unsupported methods return 405 with `Allow: POST`. Bodies, content type and content length are ignored; ingress never reads the body. Published Monitors expose kind and last-seen time through creation-ordered `monitors[]` (with the first visible Monitor aliased as `monitor`); anonymous responses omit private/deleted Monitors, their Incidents, target URLs and secrets. Operator responses include timing.
+In the Operator view, select **New Monitor**, choose **Heartbeat**, set its
+schedule, and save. Via the [Monitor API](monitor-api.md), create it with
+`POST /api/operator/monitors` and a body containing `name` and
+`kind: "heartbeat"`. Use `PATCH /api/operator/monitors/:id` to edit timing or
+publication. Omitted fields keep their saved values.
 
-Creation time anchors initial silence. Receipts update `lastSeen` independently of qualifying recovery observations. Scheduled silence evaluation opens an Incident at evaluation time, clears recovery progress and records failure; skipped cron dispatches invent no results. A first recovery receipt anchors spacing; duplicates and intermediate receipts refresh freshness without moving that anchor or advancing the count. Later qualifying receipts use current timing. Edits neither evaluate silence nor close an Incident. Existing Incident IDs and timestamps survive edits and object eviction.
+### Interval mode
 
-## Sibling seams
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `intervalSeconds` | 60 | How often the producer is expected to check in |
+| `silenceSeconds` | 180 | How long a Monitor may go without a receipt before Irisbeat opens an Incident |
+| `recoveryThreshold` | 2 | How many qualifying receipts resolve an Incident |
+| `recoverySpacingSeconds` | 60 | Minimum time between qualifying recovery receipts |
 
-Integration #2/#3/#4/#7 is merged at `1e73abc32bd6e927ee7f3b052faa7a761a466673`. Both HTTP attempts and heartbeat observations use the asynchronous per-Monitor `record` path, which commits detection before delivering that Monitor's opening/recovery webhook. Repeated silence and duplicate receipts do not emit transitions. Private Monitors continue silence evaluation, receipt handling and alerts. Deleting a Monitor retains named operator Incidents, emits no recovery and rejects future receipts; HTTP late results remain discarded before detection/delivery.
+The seconds fields accept integers from 60 to 86,400. The recovery count accepts
+1 to 100. Creation time starts the initial silence countdown. The scheduled
+evaluation checks elapsed time against `silenceSeconds`. An accepted receipt
+updates last-seen time. Receipts closer together than the recovery spacing
+refresh last-seen without advancing the recovery count or restarting the spacing
+timer. A later silence evaluation clears recovery progress. Edits apply to later
+receipts and evaluations.
 
-Each Monitor persists `kind`, `createdAt`, `lastSeen`, `recoveryReceiptAt`, `silenceSeconds` and `recoverySpacingSeconds` with its detector state. Pre-heartbeat HTTP collection entries default to `kind: "http"`; legacy single-Monitor conversion preserves its original ID (including `website`), timing, freshness, spacing anchor, counts, Incidents and saved context webhook. New configuration appends to the creation-order array; edits and publication never reorder it. This inherits the collection's forward-update requirement: the old single-Monitor bundle cannot read collection storage. Restore a pre-upgrade backup for a downgrade.
+## Send a receipt
 
-TCP #5 / PR #19 now merges integration `3b524d867c6d77625fb00ad0fe02722cb128a49e` (merged #6) into TCP `f7a19c714664be3bf0ae6132829b97698d45b04a`, preserving both histories. `Target` is HTTP/TCP/Heartbeat. The DO validates and applies ID-specific patches together against the current Monitor, avoiding stale partial-target races. Legacy saves select the first ID before reading the body, return 409 for a stale identity and 400 for a changed kind. Page-only saves remain independent. All kinds have immutable kind, creation order, per-ID Incidents, publication-independent monitoring/alerts and retained deletion history. HTTP/TCP attempts retain starting snapshots and late-deletion discard. TCP retains nonblocking handled cleanup and bracketed IPv6 at the socket boundary.
+In a self-hosted installation, reopen **Edit** to find the Monitor's check-in
+path. When your job completes, send an HTTPS request with the authorization header shown below.
 
-Kind-specific responses expose heartbeat `intervalSeconds`, `silenceSeconds`, `recoveryThreshold`, `recoverySpacingSeconds` and `lastSeen`; no outbound target, timeout or failure threshold. HTTP/TCP expose their own targets and four outbound timing controls. Requests containing another kind’s target or timing fields reject atomically with 400. The UI offers all three kinds and locks kind while editing.
+```http
+POST /heartbeat/<monitor-id>
+Authorization: Bearer <installation secret>
+```
 
-Combined verification: 67 runtime tests pass, including every inherited heartbeat/TCP regression and new three-kind lifecycle, cross-kind atomic rejection and timing serialization cases. `npm run check`, `npm run build`, upgrade script syntax and served operator script syntax pass. Six actual-bundle upgrades pass: foundation `6fb95cc`, timing `0a9a0e8`, webhook `e0bfa2b`, collection `1e73abc`, single-TCP `8186447 tcp` and single-Heartbeat `106fbc4 --heartbeat`. These assert only Worker responses and substituted external behavior over persisted runtime state.
+The body is ignored. A successful receipt returns HTTP 204. Missing or incorrect
+authorization returns 401. With valid authorization, an unknown, deleted, or
+non-Heartbeat Monitor returns 404. Store the installation secret in your job's
+secret configuration and send it in the authorization header.
 
-Prior-head [TCP review at f7a19c7](https://github.com/webriot/irisbeat/pull/19#pullrequestreview-5898982920) reports advisory approval, Standards/Spec pass and zero findings/unresolved threads. Its native/upgrade evidence was not rerun for that delta. The combined head awaits fresh independent review; prior approval is not approval of this merge.
-
-Hosted secret rotation, Maintenance and pause remain [#10](https://github.com/webriot/irisbeat/issues/10), [#8](https://github.com/webriot/irisbeat/issues/8) and [#11](https://github.com/webriot/irisbeat/issues/11). No deployment or browser automation was performed.
-
+Hosted Heartbeats use a Monitor-specific, rotatable credential and
+`POST /heartbeat`. See the [hosted credential reference](hosted-contract.md#heartbeat-credentials).
 
 ## Calendar Heartbeats
 
-Issue [#42](https://github.com/Webriot/irisbeat/issues/42) adds Heartbeat `scheduleMode: "calendar"`, numeric five-field `cron`, named `timezone` (default UTC), `graceSeconds` (integer 1–86,400, default 30), and `recoveryThreshold` (1–100, default two). Calendar reuses HTTP's accepted grammar, OR/wildcard day rules, spring-gap skip and first repeated wall-time policy. Grace must be strictly shorter than the smallest future occurrence gap, including timezone transitions. Validation checks a full Gregorian cycle without enumerating every minute of dense schedules. Invalid saves reject atomically. Interval-only expectation, silence and spacing fields are rejected in Calendar mode; grace is rejected in Interval mode. Operator projections expose grace and recovery count for Calendar, retaining the existing Interval projection otherwise. Public responses expose neither schedule nor credentials.
+Use `scheduleMode: "calendar"`, a five-field `cron` expression, and a named
+`timezone` (default UTC). Calendar Heartbeats use the
+[same cron and daylight saving rules as outbound schedules](monitor-api.md#http-and-tcp-calendar-schedules).
+Set `graceSeconds` from 1 to 86,400 (default 30). Grace must be shorter than
+every gap between occurrences, including gaps shortened by timezone changes.
+Set `recoveryThreshold` from 1 to 100 (default 2). Interval expectation, silence,
+and recovery spacing fields apply only in Interval mode.
 
-Authoritative preview and save validation run in the existing SQLite Durable Object, including collection creation. The HTTP Worker forwards the input. The validator retains the full 400 × 366-day horizon, scans daily offsets and locates changed minutes; it checks cron gaps over valid wall-time ranges rather than expanding dense transition days. It yields every 512 horizon days so receipts and ordinary edits can proceed. Saves re-read and reparse current state after yielding before committing; unchanged cron/timezone/grace skips the scan.
+Each occurrence has a receipt window from the scheduled time through the
+inclusive grace deadline. One authenticated receipt satisfies the window.
+Early, late, and duplicate receipts update last-seen but do not satisfy
+another window or advance recovery. The next scheduled evaluation after the
+window closes records availability at the deadline. One missed occurrence opens
+an Incident. The configured number of consecutive successful occurrences
+resolves it.
 
-`node test/calendar-cost.cjs [revision]` measures representative dense New York and Lord Howe schedules. It reports Node active CPU separately from local workerd wall time, total timezone conversions and conversions between yields. Runtime tests cap these cases at 200,000 conversions and the Lord Howe yielding case at 600 conversions per batch. These are regression bounds, not production CPU guarantees. Cloudflare documents [10 ms CPU for Free Worker HTTP requests](https://developers.cloudflare.com/workers/platform/limits/#cpu-time) and [30 seconds default active CPU per SQLite DO request](https://developers.cloudflare.com/durable-objects/platform/limits/#sqlite-backed-durable-objects-general-limits), available on Free and Paid. Yielding allows interleaving; it does not reduce total billed CPU or reset a request's CPU budget. Self-hosting does not require an increased CPU limit for these measured cases; live limit enforcement has not been tested.
+A delayed evaluation processes up to 128 expired windows per Monitor in time
+order. The next evaluation resumes where it left off, including after restart.
+Older missed windows still affect Incidents. Availability records only
+observations in the displayed 90 UTC days.
 
-Each occurrence owns `[scheduledAt, scheduledAt + graceSeconds * 1000]`. One authenticated receipt in that window persists evidence; subsequent duplicates do not advance recovery. All accepted receipts immediately update last-seen, including early/late receipts and receipts while paused. Bodies remain unread. Personal ingress still uses the installation Bearer secret; hosted ingress still uses the Monitor credential, with immediate rotation and tenant isolation. Rotation preserves already accepted evidence.
+Any overlap with [Maintenance](maintenance-api.md) excludes the whole window,
+including when Maintenance starts at its deadline. Maintenance ending exactly
+at the scheduled time does not overlap. Maintenance between windows resets
+recovery at the time it occurred.
 
-Scheduled dispatch finalizes only when its timestamp is strictly after the inclusive deadline. Each expired occurrence is evaluated chronologically at its deadline, regardless of later receipts already recorded. A miss opens after one occurrence; consecutive successful occurrences recover according to the configured threshold. Receipt spacing is unused. Evidence consumption, availability observation, detector/Incident changes and the next-occurrence cursor commit in one synchronous storage transaction before best-effort delivery. A dispatch processes at most 128 occurrences per Monitor; later scheduled invocations resume the remaining backlog, including after object recreation. Concurrent dispatch cannot process an occurrence twice. Delivery retains the existing best-effort crash gap; no outbox or retry contract is added.
+Creation, a change to the schedule or grace period, and hosted resume start at
+the next future occurrence. They clear pending receipts and recovery progress
+while keeping the Monitor ID, last result, last-seen time, and Incidents.
+Ordinary edits preserve pending receipts. Credential rotation preserves already
+accepted receipts. Hosted pause skips observations while allowing receipts to
+update last-seen. Unexpired Maintenance carries through resume.
 
-Availability observations are inserted only for today and the preceding 89 UTC days. Older outcomes still advance detection and retain their original Incident deadlines. Maintenance stores actual intervals durably: replacement or early end truncates the old interval rather than erasing it or retaining a cancelled future portion. Any overlap exempts the whole receipt window; end exactly at occurrence start is outside, while start exactly at its inclusive deadline overlaps. Maintenance between windows resets progress chronologically. Expiry cannot erase detector progress needed to finalize earlier windows. A later non-overlapping Maintenance declaration cannot suppress those older transitions.
+## History and alerts
 
-Creation, schedule/grace changes and hosted resume anchor at the next future occurrence, reset counts and pending evidence, and retain identity, last result, last-seen and Incidents. Repeated identical saves and ordinary name/publication/threshold edits preserve pending evidence and progress. Pause records no observations; paused receipts refresh freshness only. Resume carries forward any unexpired Maintenance. Deletion clears pending evidence, rejects future receipts and retains named operator Incidents without fabricated recovery.
-
-Evidence: `test/calendar-heartbeat.test.ts` exercises Worker HTTP/scheduled seams with real SQLite storage, exact deadlines, restart batches, century-scale downtime bounds, old deadlines/90-day retention, DST, schedule/grace isolation, durable Maintenance and hosted pause. `test/ui/calendar.pw.ts` covers configuration, preview, grace units/overlap errors and returning to Interval. `test/consumer.cjs` installs the packed engine and verifies hosted credentials, rotation, ignored bodies, restart evidence, permissions/privacy, retained Incidents and both transition delivery paths. The Heartbeat branch of `test/upgrade.cjs` migrates an actual legacy bundle and enables Calendar on its retained identity.
+Private Monitors continue to accept receipts, evaluate their schedule, and send
+alerts to selected destinations. Deleting a Monitor stops receipt processing and
+retains its Incidents in the Operator view. Public responses for published
+Monitors include last-seen time and omit timing settings and credentials.
+Incident notifications use the [notification queue](hosted-contract.md#incident-notifications).

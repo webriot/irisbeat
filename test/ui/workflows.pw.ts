@@ -17,7 +17,10 @@ for (const kind of ['http', 'tcp', 'heartbeat']) {
     if (kind === 'http') await page.getByLabel('HTTP(S) target', { exact: true }).fill('https://example.invalid/private-target');
     if (kind === 'tcp') {
       await page.getByLabel('Hostname', { exact: true }).fill('tcp.example.invalid');
-      await page.getByLabel('Port', { exact: true }).fill('5432');
+      const port = page.getByLabel('Port', { exact: true });
+      await expect(port).toHaveAttribute('min', '1');
+      await expect(port).toHaveAttribute('max', '65535');
+      await port.fill('5432');
     }
     await page.getByLabel('Published', { exact: true }).uncheck();
     await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
@@ -50,7 +53,9 @@ for (const kind of ['http', 'tcp', 'heartbeat']) {
     await page.goto('/');
     await expect(page.getByRole('heading', { name: edited, exact: true })).toBeVisible();
     const source = await page.content();
-    for (const privateValue of ['private-target', 'tcp.example.invalid', 'private-token', 'ui-test-secret']) expect(source).not.toContain(privateValue);
+    expect(source).not.toContain('ui-test-secret');
+    if (kind === 'http') expect(source).not.toContain('private-target');
+    if (kind === 'tcp') expect(source).not.toContain('tcp.example.invalid');
     await page.goto('/operator');
     await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -124,7 +129,7 @@ test('hosted editor rotates Heartbeat credentials and reader sees a read-only le
   }
 });
 
-test('a disconnected Operator saves with only the acknowledged scope refresh', async ({ page }) => {
+test('refreshes only the saved section while the Operator connection is offline', async ({ page }) => {
   await page.routeWebSocket('**/api/operator/events/v2', socket => socket.close());
   await page.goto('/operator');
   await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');

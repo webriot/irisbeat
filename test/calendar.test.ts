@@ -18,7 +18,7 @@ const read = async () => (await request('/api/operator')).json() as Promise<impo
 const create = (settings = {}) => request('/api/operator/monitors', 'POST', { name: 'Calendar', url: 'https://target.example/', scheduleMode: 'calendar', cron: '*/5 * * * *', ...settings });
 const tick = (at: number) => worker.scheduled(createScheduledController({ scheduledTime: at, cron: '* * * * *' }), env);
 
-it('previews authoritative named-zone occurrences, skipping gaps and using only the first repeated wall time', async () => {
+it('previews schedule times across daylight saving changes in a named timezone', async () => {
   const spring = await preview('30 2 * * *', 'America/New_York');
   expect(spring.status).toBe(200);
   expect(await spring.json()).toMatchObject({ occurrences: [Date.parse('2026-03-09T06:30:00Z'), Date.parse('2026-03-10T06:30:00Z'), Date.parse('2026-03-11T06:30:00Z')] });
@@ -306,7 +306,7 @@ it('preserves the latest Calendar schedule, due time and detector progress durin
   expect((await read()).incidents).toMatchObject([{ openedAt: Date.UTC(2026, 10, 17, 11), closedAt: null }]);
 });
 
-it('does not seed a changed schedule with a late starting-configuration result', async () => {
+it('excludes a late result from the new schedule’s consecutive counts', async () => {
   const start = Date.UTC(2026, 10, 16);
   const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
   await create({ cron: '* * * * *' });

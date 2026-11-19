@@ -163,7 +163,7 @@ it('re-resolves hosted reader/editor access for each ticket and keeps context, o
   expect((await fetch('a.example', row)).status).toBe(401);
   const closed = closes(socket); socket.send(JSON.stringify({ type: 'renew', ticket: 'denied' })); expect(await closed).toBe(1008);
 });
-it('does not carry editor-only pending activity into a renewed reader scope', async () => {
+it('drops pending editor-only updates when a connection renews as a reader', async () => {
   let permission: 'editor' | 'reader' = 'editor';
   const hosted = createHostedWorker({ contractVersion: '1', resolve: () => ({ id: 'personal', permission, monitorLimit: 10 }), contexts: () => [] });
   const issue = async () => await (await hosted.fetch(new Request(origin + '/api/operator/events/ticket', { method: 'POST' }), env)).json() as { ticket: string };

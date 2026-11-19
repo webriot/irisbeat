@@ -59,7 +59,6 @@ test.describe('touch actions', () => {
       const group = page.getByRole('group', { name: 'Actions Touch Monitor', exact: true });
       await expect(group.getByRole('button')).toHaveCount(4);
       for (const label of ['Edit', 'Unpublish', 'Maintenance', 'Delete']) await expect(group.getByText(label, { exact: true })).toBeVisible();
-      await page.screenshot({ path: '.tmp/ledger-touch.png', fullPage: true });
       const labels = await group.locator('.action-label').evaluateAll(labels => labels.map(label => { const rect = label.getBoundingClientRect(); return { left: rect.left, right: rect.right, height: rect.height }; }));
       for (const label of labels) expect(label.height).toBeLessThanOrEqual(18);
       for (let i = 1; i < labels.length; i++) expect(labels[i].left).toBeGreaterThanOrEqual(labels[i - 1].right);

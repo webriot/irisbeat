@@ -22,7 +22,7 @@ async function subscribe() {
   return { socket, messages };
 }
 const settle = () => new Promise(resolve => setTimeout(resolve, 30));
-it('routes Hono upgrades to hibernating public subscriptions and coalesces until acknowledged', async () => {
+it('groups public WebSocket updates while waiting for an acknowledgment', async () => {
   const { socket, messages } = await subscribe();
   await request('/api/operator', 'PUT', { pageName: 'First' });
   await settle();
@@ -113,7 +113,7 @@ it('bounds connections and rejects unsolicited or oversized application messages
   const response = await worker.fetch(new Request('https://irisbeat.example/api/status/events/v2', { headers: { Upgrade: 'websocket', Origin: 'https://irisbeat.example' } }), env);
   expect(response.status).toBe(503);
 });
-it('announces public time boundaries after hibernation without private activity', async () => {
+it('updates public time-sensitive rows after the Durable Object wakes', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2030-11-16T10:00Z'));
   const { socket, messages } = await subscribe();
   const created = await (await request('/api/operator/monitors', 'POST', { name: 'Public', kind: 'heartbeat' })).json() as import('../src/index').Status;
