@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, renderViewPartial, renderViewSnapshot, statusPage, styleSheet, themeScript } from "./ui";
+import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, renderViewPartial, renderViewSnapshot, statusJson, statusPage, styleSheet, themeScript } from "./ui";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
 import { MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
@@ -805,6 +805,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       if (inRange) {
         monitor.historyRevision = (monitor.historyRevision ?? 0) + 1;
         monitor.historyChangedAt = now;
+        monitor.historyRetryToken = crypto.randomUUID();
         this.availability.enqueue(monitor.id, observation);
       }
       if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
@@ -1098,7 +1099,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const visible = withHistory || withIncidents || scope === "destinations"
       ? state.monitors.filter(monitor => (operator || monitor.published) && (row === null || monitor.id === row)) : [];
     const monitors = visible.map(monitor => ({
-      id: monitor.id, name: monitor.name, kind: monitor.kind, history: null as AvailabilityHistory | null, historyRevision: monitor.historyRevision,
+      id: monitor.id, name: monitor.name, kind: monitor.kind, history: null as AvailabilityHistory | null, historyRetryToken: monitor.historyRetryToken,
       ...(monitor.kind === "heartbeat" ? { lastSeen: monitor.lastSeen } : {}), state: state.paused ? "paused" as const : monitor.maintenance ? "maintenance" as const : monitor.state, maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult,
       ...(secrets ? { destinationIds: (monitor.notificationSelections ?? []).map(selection => selection.destinationId) } : {}),
       ...(operator ? {
@@ -1318,7 +1319,7 @@ async function operatorSnapshot<E extends EngineEnv>(c: Context<HttpEnv<E>>, sta
   if (c.req.header("Accept") === viewMediaType) {
     return Response.json({ ...renderViewSnapshot(result, permission, emailConfigured), hosted: !!resolved, permission }, { status });
   }
-  return Response.json({ ...result, ...(emailConfigured ? { emailConfigured: true } : {}),
+  return Response.json({ ...statusJson(result), ...(emailConfigured ? { emailConfigured: true } : {}),
     ...(resolved ? { hosted: true, permission: resolved.permission } : {}) }, { status });
 }
 
@@ -1417,7 +1418,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   app.get("/api/operator/events/v2", getOnly, subscribe);
   app.get("/api/status", getOnly, async (c: Context<HttpEnv<E>>) => {
     const data = await c.get("context").status();
-    return c.json(c.req.header("Accept") === viewMediaType ? renderViewSnapshot(data, "public", false) : data);
+    return c.json(c.req.header("Accept") === viewMediaType ? renderViewSnapshot(data, "public", false) : statusJson(data));
   });
 
   for (const action of ["confirm", "unsubscribe"] as const) {
