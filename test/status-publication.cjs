@@ -399,8 +399,10 @@ module.exports = async function test({ mf, options, application, cachedSQLite, r
     const afterRetries = publishedAt + 150_000;
     const repaired = await readAt(json, afterRetries);
     assert.equal(repaired.monitors[0].id, first.id, 'the unpublished Monitor stays visible until its next publication');
-    assert.equal(repaired.monitors[0].history.days.at(-2).successes, 1, 'the published fence excludes the later backdated observation');
-    for (const monitor of repaired.monitors.slice(1)) assert.equal(monitor.history.days.at(-2).successes, 1);
+    const publishedDay = new Date(day).toISOString().slice(0, 10);
+    assert.equal(repaired.monitors[0].history.days.at(-1).date, publishedDay);
+    assert.equal(repaired.monitors[0].history.days.at(-1).successes, 1, 'the published fence excludes the later backdated observation');
+    for (const monitor of repaired.monitors.slice(1)) assert.equal(monitor.history.days.at(-1).successes, 1);
     assert.deepEqual((await readAt('/test-history-queries', afterRetries)).map(query => query.monitorIds).at(-1), [second.id, third.id]);
     for (const html of [(await readAt(json, afterRetries, accept)).html, (await readAt(ledger, afterRetries)).html]) {
       assert.match(html, /100.00%/);
