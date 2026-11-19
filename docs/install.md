@@ -267,9 +267,11 @@ dataset name and retain that name in the installation's Wrangler configuration.
 Use letters, digits and underscores for the dataset name, starting with a letter
 or underscore.
 
-Routine deploys retain the Worker secret and dashboard variables
-(`keep_vars` is enabled). Keep the write binding in the configuration used for
-each deploy. For a deployed Worker, `npx wrangler secret put
+For routine deploys, keep `keep_vars` enabled to retain dashboard variables
+such as `AVAILABILITY_ACCOUNT_ID` and `AVAILABILITY_DATASET`. Leave the stored
+Worker secret in place and keep the write binding in the configuration used
+for each deploy. Confirm the deployed bindings and readiness afterward.
+For a deployed Worker, `npx wrangler secret put
 AVAILABILITY_API_TOKEN --name "$IRISBEAT_WORKER_NAME"` prompts privately for a
 replacement token. Managed deployments can supply the
 [trusted query service](hosted-contract.md#availability-history) instead.
@@ -489,13 +491,16 @@ configuration.
    Fetch each hinted partial with `?revision=<revision>`, confirm its revision,
    then send `ack`. Read a different public representation to cover a cache
    miss. Confirm an ordinary read without the hint catches up.
-5. To exercise query failure on the disposable Worker, redeploy the same
-   archive with `AVAILABILITY_DATASET` pointing to an unused valid dataset
-   name while the write binding retains its original dataset. Verify readiness
-   rejects the mismatch. Trigger a new Incident and confirm the Check, current
-   state, scoped hint and alert delivery while history is stale or unavailable.
-   Restore the variable and redeploy. Confirm readiness, repaired history and
-   the same Monitor and Incident IDs. The local publication suite checks
+5. Treat a missing account variable, missing credential or mismatched dataset
+   as incomplete setup. Confirm the deployed binding and variables and use a
+   fresh observation to check readiness after correcting them. For an
+   intentional SQL outage, use a separate diagnostic build on the disposable
+   Worker with the write binding and SQL origin intact and a deliberately
+   invalid synthetic bearer compiled into the SQL request. Verify
+   `query_unavailable` before triggering an Incident. Confirm the Check,
+   current state and alert delivery while history is stale or unavailable.
+   Redeploy the exact candidate and confirm readiness, repaired history and
+   retained Monitor and Incident identities. The local publication suite checks
    same-version warm-cache recovery under a long window and across eviction.
 6. Run the [Deploy to Cloudflare](#deploy-to-cloudflare) flow on the exact
    candidate source in a disposable repository connected to the account.
@@ -509,6 +514,72 @@ configuration.
    fixture, repository connection, private files and scoped token after the
    two installation paths are verified. Analytics Engine applies its managed
    retention to drill points.
+
+### Issue #89 candidate evidence
+
+The disposable drill ran on November 19, 2026 for
+[#89](https://github.com/Webriot/irisbeat/issues/89). The exact candidate source
+was `245569c301b03b4323630a1c551c74fa0e1f97d3` (version `0.3.0`, hosted
+contract 1). Its prepared artifacts had these SHA-256 checksums:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `irisbeat-0.3.0-source.tar.gz` | `e87b5ef8d9d681e913b82753942931483605b14442acbaf1a30dd54b1a855a14` |
+| `irisbeat-0.3.0.tgz` | `952ec8a7f2456049f0781d1be348c9e0e9d8ebf8381d8e75128bbde64f7cff27` |
+
+- **Local predecessor.** The workerd upgrade test ran directly from tagged
+  `v0.3.0` (`4f9442a0e660907b02c00c942e05ed4e43abab3c`) to the exact
+  candidate. Incomplete Analytics Engine setup returned HTTP 503
+  `configuration_missing` and preserved SQLite history for the old bundle.
+  With both paths configured, only the availability series reset. Monitor
+  state, partial recovery, Incidents, private publication and Maintenance
+  survived, and the next Check recovered the same Incident and populated
+  the new history.
+- **Live predecessor.** The direct cutover from tagged `v0.3.0` (Worker version
+  `84915377-a20f-4d5a-a5ac-1bbf9b74a324`) went to intermediate source
+  `0238526f5cebd15d646c7ce169b7c35594604434` (Worker version
+  `f2f85f4d-1d03-4a03-94d2-305ac0c6fd52`, source archive SHA-256
+  `736e535e4e94a1717562ce16b66601081a5b46fe1a6d4a707a13b5ffec71a3bc`).
+  Snapshots at 06:04:07 and 06:05:06 UTC showed history totals going from
+  `[3, 2, 1]` to `[0, 0, 0]` and readiness reporting
+  `observation_pending` before the first new observation. Monitor identifiers
+  and settings, latest results, Maintenance, the Incident, and webhook
+  settings and selections survived.
+- **Redirect diagnostic.** Worker version
+  `88b73baf-11d6-4745-b2c2-9c898a87f80e` was a diagnostic build used
+  after the intermediate cutover. Its same-dataset SQL readback confirmed
+  one success and one Maintenance observation. At 06:11:00 UTC readiness
+  was true, the same Incident recovered, the recovery alert was accepted,
+  and availability showed 100%. A scoped WebSocket page hint at revision 2
+  was followed by HTTP 200 for a cold resource in ORD and an updated
+  ordinary GET.
+- **SQL failure and exact-source recovery.** Routine Wrangler changes to the
+  read dataset or secret did not reproduce the intended live fault. A separate
+  diagnostic build compiled a deliberately invalid synthetic bearer into the
+  SQL request to the same origin. At 06:17:01 UTC readiness reported
+  `query_unavailable` and history was unavailable in Status and Operator.
+  A scheduled HTTP Check still recorded failure, set the Monitor to down,
+  opened an Incident and produced an accepted webhook alert. The later
+  exact candidate deployment over the upgraded installation (Worker version
+  `efd8bf14-6404-449f-9bbf-7650116331e4`) retained the Monitor and Incident
+  and restored fresh SQL history. At 06:23:13 UTC readiness returned HTTP 200
+  and displayed availability was 0%, reflecting the failed Check. The read
+  and write datasets matched and the API token binding type was `secret_text`.
+  The exact build also published page and Monitor resources at scoped
+  revision 8 in ORD. Ordinary GET caught up, a future minimum revision
+  returned HTTP 409, and the private Monitor stayed out of public responses.
+- **Fresh CLI install.** Exact-source Worker version
+  `f5a6d151-e5b9-4cc8-938a-df2601828dea` returned HTTP 503
+  `observation_pending` with cron registered. At 06:26:35 UTC the first
+  real scheduled Check had succeeded, readiness returned HTTP 200, and
+  availability showed 100% in ORD. The 06:26:41 UTC recheck after a routine
+  redeploy without a secrets file (Worker version
+  `09484123-78a5-4ae2-86e2-e69e6a5bbf44`) confirmed that stored credentials,
+  dataset binding and history survived.
+- **Deploy to Cloudflare.** Dashboard sign-in was required and the
+  authentication prompt was declined. The authenticated button build,
+  binding and secret provisioning, and routine dashboard rebuild remain
+  open acceptance items. The fresh CLI install verifies a separate path.
 
 ## Publication gate and Corresponding Source
 
