@@ -99,6 +99,7 @@ type PublishedStatus = PublicationInput & { generation: number; renders: Map<Sta
 type StatusBaseline = PublishedStatusMeta & {
   monitors: (ReturnType<typeof publicMonitor> & { historyFence?: HistoryFence })[];
   at: number;
+  publication?: { dueAt: number; scopes: ViewScope[] };
 };
 type MutationAck = Pick<ViewHint, "revision" | "scopes">;
 type ViewClock = Record<ViewAudience, number> & { day?: number };
@@ -254,7 +255,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const hasPublicSubscribers = this.liveSockets("public").length > 0;
     const observed = operators.some(state => state.authenticated) ? monitors
       : hasPublicSubscribers ? monitors.filter(monitor => monitor.published) : [];
-    const publication = hasPublicSubscribers ? Math.max(this.statusPublicationAt(), this.publicationRetryAt) : Infinity;
+    const publication = hasPublicSubscribers ? Math.max(this.eligiblePublicationAt(), this.publicationRetryAt) : Infinity;
     const day = this.viewClock().day ?? Math.floor(now / DAY);
     const boundary = observed.length ? Math.min((day + 1) * DAY,
       ...observed.flatMap(monitor => monitor.maintenance ? [monitor.maintenance.endsAt] : [])) : Infinity;
@@ -271,7 +272,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       this.scheduleSubscriptionAlarm();
       await this.drainAvailability(availabilityWriteLimit);
     }
-    if (this.liveSockets("public").length && this.statusPublicationAt() <= now)
+    if (this.liveSockets("public").length && this.eligiblePublicationAt() <= now)
       await this.advanceStatusPublication(this.read(now), now);
     this.scheduleSubscriptionAlarm();
   }
@@ -305,12 +306,16 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return pending ? statusWindowEnd(pending.since, this.renderInterval) : Infinity;
   }
 
-  // Keep the inputs to the first publication before a write can change them.
-  private captureStatusBaseline(revision: number, at: number) {
+  private eligiblePublicationAt() {
+    return this.statusBaseline()?.publication?.dueAt ?? this.statusPublicationAt();
+  }
+
+  private captureStatusBaseline(revision: number, at: number, publication?: StatusBaseline["publication"]) {
     const stored = this.ctx.storage.kv.get<StoredContext>("context");
     const paused = !!stored?.paused;
     const monitors = stored?.monitors?.filter(monitor => monitor.published)
       .map(monitor => ({ ...publicMonitor(monitor, paused), historyFence: this.historyFence(monitor) })) ?? [];
+    this.ctx.storage.sql.exec("DELETE FROM status_publication WHERE kind = 'baseline-incident'");
     if (monitors.length) this.ctx.storage.sql.exec(
       `INSERT INTO status_publication (kind, position, data)
        SELECT 'baseline-incident', ROW_NUMBER() OVER (ORDER BY openedAt DESC, id), json_object('id', id, 'monitorId', monitorId,
@@ -319,8 +324,22 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
        AND monitorId IN (SELECT value FROM json_each(?))`,
       historyStart(at) + 90 * DAY, historyStart(at), JSON.stringify(monitors.map(monitor => monitor.id)),
     );
-    const baseline: StatusBaseline = { revision, at, monitors, pageName: stored?.pageName ?? "Irisbeat", paused };
+    const baseline: StatusBaseline = { revision, at, monitors, pageName: stored?.pageName ?? "Irisbeat", paused, publication };
     this.ctx.storage.kv.put("status-baseline", baseline);
+  }
+
+  // Fence the elapsed window before any later transaction can change its public inputs.
+  private sealStatusWindow(clock: ViewClock, at: number) {
+    const pending = this.pendingStatus();
+    if (!pending) return;
+    const end = this.statusPublicationAt(pending);
+    if (end > at) return;
+    const prior = this.statusBaseline()?.publication;
+    this.captureStatusBaseline(clock.public, (clock.day ?? Math.floor(pending.since / DAY)) * DAY, {
+      dueAt: prior?.dueAt ?? end,
+      scopes: mergeScopes(prior?.scopes ?? [], pending.scopes),
+    });
+    this.ctx.storage.kv.delete("status-pending");
   }
 
   private statusBaseline() {
@@ -361,11 +380,11 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       JSON.stringify({ ...monitor, historyFence }));
   }
 
-  private savePublication(input: PublicationInput, previous: PublishedStatus | undefined, pending?: PendingStatus) {
+  private savePublication(input: PublicationInput, previous: PublishedStatus | undefined, scopes: ViewScope[] = []) {
     const { revision, at, data, history } = input;
     const generation = (previous?.generation ?? 0) + 1;
     const renders = new Map<StatusResource, StatusRender>();
-    for (const scope of pending?.scopes ?? []) renders.set(scope, renderStatus(scope, data, revision));
+    for (const scope of scopes) renders.set(scope, renderStatus(scope, data, revision));
     this.ctx.storage.transactionSync(() => {
       const { pageName, paused, monitors, incidents } = data;
       this.ctx.storage.sql.exec("DELETE FROM status_publication");
@@ -374,13 +393,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         "INSERT INTO status_publication VALUES ('incident', ?, ?)", position, JSON.stringify(incident),
       ));
       this.ctx.storage.kv.put("status-published", { revision, generation, at, pageName, paused });
-      if (pending) this.ctx.storage.kv.delete("status-pending");
       this.ctx.storage.kv.delete("status-baseline");
     });
     const published = this.publishedStatus = { ...input, generation, renders };
-    if (pending) {
+    if (scopes.length) {
       try {
-        this.onStatusPublished({ type: "changed", scopes: pending.scopes, revision });
+        this.onStatusPublished({ type: "changed", scopes, revision });
       } catch {
         console.error(JSON.stringify({ event: "status_publication_hook_failed", revision }));
       }
@@ -411,22 +429,27 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   private async advanceStatusPublication(state: StoredContext, now: number) {
-    const previous = this.loadPublishedStatus();
-    const pending = this.pendingStatus();
-    const baseline = this.statusBaseline();
     const revision = this.viewClock().public;
-    const publishDue = pending && this.statusPublicationAt(pending) <= now;
-    if (previous && !publishDue) return previous;
-    const input = !publishDue && baseline ? this.baselinePublicationInput(baseline) : this.capturePublicationInput(state, revision, now);
+    if (this.statusPublicationAt() <= now) {
+      this.ctx.storage.transactionSync(() => this.sealStatusWindow(this.viewClock(), now));
+    }
+    const previous = this.loadPublishedStatus();
+    const baseline = this.statusBaseline();
+    if (previous && !baseline?.publication) return previous;
+    const input = baseline ? this.baselinePublicationInput(baseline) : this.capturePublicationInput(state, revision, now);
     const enriched = await this.attachPublicationHistory(input, previous, now);
-    // Only save the inputs captured for this revision. A later commit or publication wins the race.
+
     const current = this.loadPublishedStatus();
-    if (current !== previous || (publishDue || !baseline) && revision !== this.viewClock().public) {
-      if (this.pendingStatus()) this.publicationRetryAt = Date.now() + 1_000;
+    const retained = this.statusBaseline();
+    // A later sealed window can supersede this one. An open window cannot change its inputs.
+    if ((current && current.revision >= input.revision) ||
+        retained?.revision !== baseline?.revision || retained?.publication?.dueAt !== baseline?.publication?.dueAt ||
+        (!baseline && this.viewClock().public !== revision)) {
+      if (this.eligiblePublicationAt() <= now) this.publicationRetryAt = Date.now() + 1_000;
       return current;
     }
     this.publicationRetryAt = 0;
-    return this.savePublication(enriched, previous, publishDue ? pending : undefined);
+    return this.savePublication(enriched, current, baseline?.publication?.scopes);
   }
 
   private async attachPublicationHistory(input: PublicationInput, previous: PublishedStatus | undefined, now: number): Promise<PublicationInput> {
@@ -490,9 +513,9 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (!this.renderInterval) return { revision: this.viewClock().public, generation: 0, cacheSeconds: 0 };
     const now = Date.now();
     const state = this.read(now);
-    const pending = this.pendingStatus();
+    const due = this.eligiblePublicationAt() <= now;
     let published = await this.advanceStatusPublication(state, now);
-    if (pending && this.statusPublicationAt(pending) <= now) this.scheduleSubscriptionAlarm();
+    if (due) this.scheduleSubscriptionAlarm();
     if (!published) published = await this.advanceStatusPublication(this.read(now), now);
     if (published && published.revision >= minimum) await this.retryPublishedHistory(published, resource, now);
     const eligible = this.loadPublishedStatus();
@@ -523,11 +546,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   // The write and revisions share one transaction. Only committed hints leave the DO.
-  private commitViewChanges(write: () => ViewChanges, day?: number) {
+  private commitViewChanges(write: () => ViewChanges, day?: number, at = Date.now()) {
     const { hints, revision } = this.ctx.storage.transactionSync(() => {
       const clock = this.viewClock();
+      this.sealStatusWindow(clock, at);
       if (this.renderInterval && !this.ctx.storage.kv.get("status-published") && !this.statusBaseline())
-        this.captureStatusBaseline(clock.public, (clock.day ?? Math.floor(Date.now() / DAY)) * DAY);
+        this.captureStatusBaseline(clock.public, (clock.day ?? Math.floor(at / DAY)) * DAY);
       const changes = write();
       const hints: Partial<Record<ViewAudience, ViewHint>> = {};
       for (const audience of ["public", "reader", "editor"] as const) {
@@ -536,12 +560,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
       if (hints.public && this.renderInterval) {
         const pending = this.pendingStatus();
-        const since = pending?.since ?? Date.now();
+        const since = pending?.since ?? at;
         const scopes = mergeScopes(pending?.scopes ?? [], hints.public.scopes);
         this.ctx.storage.kv.put("status-pending", { since, scopes } satisfies PendingStatus);
       }
       if (day !== undefined) clock.day = day;
-      else clock.day ??= Math.floor(Date.now() / DAY);
+      else clock.day ??= Math.floor(at / DAY);
       if (day !== undefined || Object.keys(hints).length) this.ctx.storage.kv.put("view-clock", clock);
       if (Object.keys(hints).length) this.scheduleSubscriptionAlarm();
       return { hints, revision: clock.editor };
@@ -578,37 +602,58 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const stored = this.ctx.storage.kv.get<StoredContext | LegacyContext>("context");
     if (!stored) return { pageName: "Irisbeat", monitors: [] };
     if ("monitors" in stored) {
+      const now = Date.now();
+      const expireThrough = Math.max(at, now);
       stored.monitors = stored.monitors.map(monitor => { monitor.kind ??= "http"; return { ...timingDefaults, scheduleMode: "interval", ...monitor, createdAt: monitor.createdAt ?? 0, lastSeen: monitor.lastSeen ?? null, recoveryReceiptAt: monitor.recoveryReceiptAt ?? null }; });
-      let changed = this.migrateWebhook(stored);
-      const expired: { monitor: Monitor; window: MaintenanceWindow; order: number }[] = [];
-      for (const monitor of stored.monitors) {
+      const migrated = this.migrateWebhook(stored);
+      const expired = stored.monitors.flatMap(monitor => {
         const window = monitor.maintenance;
-        if (window && at >= window.endsAt) {
-          this.endMaintenance(monitor);
-          changed = true;
-          expired.push({ monitor, window, order: this.nextNotificationOrder(stored) });
-        }
+        return window && expireThrough >= window.endsAt ? [{ monitor, window, order: 0 }] : [];
+      });
+      const day = Math.floor(now / DAY);
+      const savedDay = this.viewClock().day;
+      if (!migrated && !expired.length && savedDay !== undefined && savedDay >= day) return stored;
+      const previousDay = savedDay ?? Math.min(day, ...expired.map(({ window }) => Math.floor(window.endsAt / DAY)));
+      const windows = new Map<number, { at: number; day?: number; expired: typeof expired }>();
+      const groupAt = (effectiveAt: number) => {
+        const end = this.renderInterval ? statusWindowEnd(effectiveAt, this.renderInterval) : 0;
+        let group = windows.get(end);
+        if (!group) windows.set(end, group = { at: effectiveAt, expired: [] });
+        group.at = Math.min(group.at, effectiveAt);
+        return group;
+      };
+      for (const event of expired) groupAt(Math.min(event.window.endsAt, now)).expired.push(event);
+      if (previousDay < day) {
+        // Skipped days coalesce, but today's open window must preserve yesterday's eligible history.
+        if (this.renderInterval && previousDay < day - 1 && now < statusWindowEnd(day * DAY, this.renderInterval)
+          && stored.monitors.some(monitor => monitor.published))
+          groupAt((day - 1) * DAY).day = day - 1;
+        groupAt(day * DAY).day = day;
+      } else if (savedDay === undefined) {
+        groupAt(now).day = day;
       }
-      const day = Math.floor(Date.now() / DAY);
-      const previousDay = this.viewClock().day;
-      const dayChanged = previousDay === undefined || previousDay < day;
-      if (changed || dayChanged) this.commitViewChanges(() => {
-        for (const { monitor, window } of expired) {
+      if (migrated && !windows.size) groupAt(now);
+      for (const [, group] of [...windows].sort(([a], [b]) => a - b)) this.commitViewChanges(() => {
+        // Persist each window before its successor can seal those inputs.
+        for (const event of group.expired) {
+          const { monitor, window } = event;
+          this.endMaintenance(monitor);
+          event.order = this.nextNotificationOrder(stored);
           if (monitor.kind !== "heartbeat" || monitor.scheduleMode === "calendar") continue;
           // Watchdog silence uses scheduled time, even when a wall-clock read expires the window first.
           this.ctx.storage.sql.exec("DELETE FROM calendar_maintenance WHERE monitorId = ? AND endsAt <= ?", monitor.id, historyStart(at));
           this.ctx.storage.sql.exec("INSERT INTO calendar_maintenance (monitorId, startedAt, endsAt) VALUES (?, ?, ?)", monitor.id, window.startedAt, window.endsAt);
         }
-        if (changed) this.ctx.storage.kv.put("context", stored);
+        if (migrated || group.expired.length) this.ctx.storage.kv.put("context", stored);
         const scopes = (monitors: Monitor[], expiredMonitors: Monitor[]): ViewScope[] => {
-          if (previousDay !== undefined && dayChanged && monitors.length) return ["monitors", "incidents", "banner"];
+          if (group.day !== undefined && group.day > previousDay && monitors.length) return ["monitors", "incidents", "banner"];
           return expiredMonitors.length ? ["banner", ...expiredMonitors.map(monitor => `monitor/${monitor.id}` as const)] : [];
         };
-        const expiredMonitors = expired.map(({ monitor }) => monitor);
+        const expiredMonitors = group.expired.map(({ monitor }) => monitor);
         const operator = scopes(stored.monitors, expiredMonitors).filter(scope => scope !== "banner");
         return { public: scopes(stored.monitors.filter(monitor => monitor.published), expiredMonitors.filter(monitor => monitor.published)),
           reader: operator, editor: operator };
-      }, dayChanged ? day : undefined);
+      }, group.day, group.at);
       for (const { monitor, window, order } of expired) {
         if (stored.paused || expiry.suppress || !monitor.notificationSelections?.length) continue;
         const send = this.enqueueNotifications(monitor, stored.pauseGeneration ?? 0, {

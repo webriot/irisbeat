@@ -541,8 +541,14 @@ override can read the prepared partials through `readPublishedStatus(scope,
 hint.revision)`. The saved projection supports those reads after eviction.
 Reader and editor hints still follow their committed revisions immediately.
 
-With no public subscribers, the first GET after the boundary advances
-publication and invokes the same hook. Before the first delayed change, the
+With no public subscribers, the first GET after the boundary renders the latest
+elapsed publication and invokes the same hook. At rollover, the
+MonitoringContext retains the elapsed window's public inputs, revision, and
+scopes before a newer write can affect them. When several windows elapse
+without a render, publication uses the latest eligible inputs and carries
+forward the affected scopes. Maintenance expiry and UTC history rollover take
+effect in the windows containing their expiry time and midnight, respectively,
+even if discovered later. Before the first delayed change, the
 MonitoringContext saves the prior public inputs so even a first-ever GET within
 the window sees the pre-change Status. Entering immediate mode discards the
 old delayed publication and pending hints. Returning to delayed mode starts
@@ -565,8 +571,10 @@ and [Durable Object alarms](https://developers.cloudflare.com/durable-objects/ap
 
 #### Availability in a public publication
 
-Each delayed publication uses the published Monitor set, its captured observation
-revisions, and its UTC history range. The MonitoringContext queries before
+The MonitoringContext seals an elapsed window before a later change can alter
+its Monitor set, Incidents, observation revisions or UTC history range. A later
+open window retains its own pending changes. Maintenance expiry and UTC rollover
+use their effective time when discovered after idle periods. The MonitoringContext queries before
 rendering, persisting the projection, and sending the public hint. An observation
 committed later stays outside that series even if its observation timestamp is
 in the published range. Check commits, notification handoff and Operator
