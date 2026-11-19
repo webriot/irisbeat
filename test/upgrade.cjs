@@ -164,7 +164,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     if (statusPublication) {
       const test = require('./status-publication.cjs');
       const application = await bundle(join(project, 'src/index.ts'));
-      await test({ mf, options, application, request, tick, deliveries });
+      await test({ mf, options, application, request, tick, deliveries, fresh: options => new Miniflare(options) });
       return;
     }
     if (liveViews) {
@@ -282,7 +282,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
       const { history: oldHistory, ...oldMonitor } = beforeUpgrade.monitor;
       const { history: newHistory, ...newMonitor } = after.monitor;
       assert.equal(oldHistory.percentage, 50);
-      assert.deepEqual(newMonitor, oldMonitor);
+      assert.deepEqual(newMonitor, { ...oldMonitor, effectiveIntervalSeconds: 60 });
       assert.deepEqual(after.incidents, beforeUpgrade.incidents);
       assert.deepEqual(after.monitors[1].maintenance, beforeUpgrade.monitors[1].maintenance);
       assert.equal(after.monitors[1].published, false);

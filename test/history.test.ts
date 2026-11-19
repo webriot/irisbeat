@@ -374,7 +374,7 @@ it('submits a committed Calendar Heartbeat after restart without replaying its o
   clock.mockReturnValue(deadline + 10_001);
   expect(await runDurableObjectAlarm(context)).toBe(true);
   await tick(deadline + 10_001);
-  expect(await points()).toEqual([expect.objectContaining({ blobs: [monitor.id, 'failure'], doubles: [deadline] })]);
+  expect(await points()).toEqual([expect.objectContaining({ blobs: [monitor.id, 'failure'], doubles: [deadline, 1] })]);
 });
 
 it('bounds a dispatch across Monitors and drains overflow after eviction without delaying detection', async () => {

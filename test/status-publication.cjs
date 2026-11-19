@@ -20,7 +20,7 @@ async function eventually(assertion, deadline = Date.now() + 3_000) {
   }
 }
 
-module.exports = async function test({ mf, options, application, request, tick, deliveries }) {
+module.exports = async function test({ mf, options, application, request, tick, deliveries, fresh }) {
   const update = name => request('/api/operator', 'PUT', { pageName: name });
   const status = async () => (await request('/api/status')).json();
   const browserSnapshot = async () => (await mf.dispatchFetch(origin + '/api/status', {
@@ -213,39 +213,63 @@ module.exports = async function test({ mf, options, application, request, tick, 
   await eventually(() => assert.equal(deliveries.length, 2));
   assert.equal((await (await request('/api/operator')).json()).monitors.at(-1).state, 'down');
   // Warm long-window cache entries must recover through a scoped retry and an ordinary GET.
-  await mf.setOptions(options(application, 'history-state', true, undefined, { STATUS_RENDER_INTERVAL_SECONDS: '86400' }));
-  const day = Date.now() - Date.now() % 86_400_000;
-  const readAt = (path, at) => request(path, 'GET', undefined, at).then(response => response.json());
-  const heartbeat = name => request('/api/operator/monitors', 'POST', { name, kind: 'heartbeat' }, day + 1000).then(response => response.json());
-  const first = (await heartbeat('First history')).monitor;
-  const second = (await heartbeat('Second history')).monitors[1];
-  for (const monitor of [first, second]) {
-    assert.equal((await request('/heartbeat/' + monitor.id, 'POST', undefined, day + 2000)).status, 204);
-  }
-  const operatorWithHistory = await readAt('/api/operator', day + 2000);
-  assert.equal(operatorWithHistory.monitors[0].history?.percentage, 100);
-  assert.equal(operatorWithHistory.monitors[1].history?.percentage, 100);
-  const mode = value => request('/test-history-mode?mode=' + value);
-  await mode('failed');
-  const publishedAt = day + 86_400_000 + 1000;
-  const firstRow = '/api/status/partials/monitor/' + first.id;
-  const old = await readAt('/api/status', publishedAt);
-  assert.equal(old.monitors[0].history, null);
-  assert.match((await readAt(firstRow, publishedAt)).html, /Bars unavailable/);
-  assert.equal((await readAt('/test-history-queries', publishedAt)).length, 2, 'warm unresolved reads respect the retry deadline');
-  await request('/api/operator/monitors/' + first.id, 'PATCH', { published: false }, publishedAt + 1500);
-  // This later receipt is deliberately backdated into the old day.
-  await request('/heartbeat/' + first.id, 'POST', undefined, day + 3000);
-  await mf.unsafeEvictDurableObject('irisbeat', 'MonitoringContext', { name: 'personal', webSockets: 'hibernate' });
-  await mode('ingested');
-  const retryAt = publishedAt + 30_000;
-  assert.match((await readAt(firstRow, retryAt)).html, /100.00%/);
-  const repaired = await readAt('/api/status', retryAt);
-  assert.equal(repaired.monitors[0].id, first.id, 'the unpublished Monitor stays visible until its next publication');
-  assert.equal(repaired.monitors[0].history.days.at(-2).successes, 1, 'the published fence excludes the later backdated observation');
-  assert.equal(repaired.monitors[1].history.days.at(-2).successes, 1);
-  assert.deepEqual((await readAt('/test-history-queries', retryAt)).map(query => query.monitorIds), [[first.id], [second.id]]);
-  assert.match((await readAt('/api/status/partials/monitors', retryAt)).html, /100.00%/);
+  const history = fresh(options(application, 'history-state', false, undefined, { STATUS_RENDER_INTERVAL_SECONDS: '86400' }));
+  try {
+    const day = Date.now() - Date.now() % 86_400_000;
+    const at = (path, time, method = 'GET', body, accept) => history.dispatchFetch(origin + path, {
+      method, headers: { authorization: 'Bearer upgrade-test-secret', 'content-type': 'application/json',
+        'x-test-at': String(time), ...(accept ? { Accept: accept } : {}) },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    const readAt = (path, time, accept) => at(path, time, 'GET', undefined, accept).then(response => response.json());
+    const heartbeat = async name => {
+      const response = await at('/api/operator/monitors', day + 1000, 'POST', { name, kind: 'heartbeat' });
+      assert.equal(response.status, 201);
+      const monitor = (await response.json()).monitors.at(-1);
+      assert.equal((await at('/heartbeat/' + monitor.id, day + 2000, 'POST')).status, 204);
+      return monitor;
+    };
+    const first = await heartbeat('First history');
+    const second = await heartbeat('Second history');
+    const third = await heartbeat('Third history');
+    const mode = value => at('/test-history-mode?mode=' + value, day);
+    await mode('failed');
+    const publishedAt = day + 86_400_000 + 1000;
+    const json = '/api/status';
+    const accept = 'application/vnd.irisbeat.view+json';
+    const ledger = '/api/status/partials/monitors';
+    const row = id => '/api/status/partials/monitor/' + id;
+    const old = await readAt(json, publishedAt);
+    assert.equal(old.monitors[0].history, null);
+    assert.match((await readAt(json, publishedAt, accept)).html, /Bars unavailable/);
+    assert.match((await readAt(ledger, publishedAt)).html, /Bars unavailable/);
+    assert.match((await readAt(row(first.id), publishedAt)).html, /Bars unavailable/);
+    assert.equal((await readAt('/test-history-queries', publishedAt)).length, 1, 'warm unresolved reads respect the retry deadline');
+    await at('/api/operator/monitors/' + first.id, publishedAt + 1500, 'PATCH', { published: false });
+    // This later receipt is deliberately backdated into the old day.
+    assert.equal((await at('/heartbeat/' + first.id, day + 3000, 'POST')).status, 204);
+    await history.unsafeEvictDurableObject('irisbeat', 'MonitoringContext', { name: 'personal', webSockets: 'hibernate' });
+    await mode('ingested');
+    const retryAt = publishedAt + 30_000;
+    assert.match((await readAt(row(first.id), retryAt)).html, /100.00%/);
+    assert.deepEqual((await readAt('/test-history-queries', retryAt)).map(query => query.monitorIds), [[first.id]]);
+    await mode('failed');
+    for (const offset of [30_000, 60_000, 90_000, 120_000]) {
+      assert.match((await readAt(row(third.id), publishedAt + offset)).html, /Bars unavailable/);
+    }
+    await mode('ingested');
+    const afterRetries = publishedAt + 150_000;
+    const repaired = await readAt(json, afterRetries);
+    assert.equal(repaired.monitors[0].id, first.id, 'the unpublished Monitor stays visible until its next publication');
+    assert.equal(repaired.monitors[0].history.days.at(-2).successes, 1, 'the published fence excludes the later backdated observation');
+    for (const monitor of repaired.monitors.slice(1)) assert.equal(monitor.history.days.at(-2).successes, 1);
+    assert.deepEqual((await readAt('/test-history-queries', afterRetries)).map(query => query.monitorIds).at(-1), [second.id, third.id]);
+    for (const html of [(await readAt(json, afterRetries, accept)).html, (await readAt(ledger, afterRetries)).html]) {
+      assert.match(html, /100.00%/);
+      assert.doesNotMatch(html, /Bars unavailable/);
+    }
+    assert.ok(await history.purgeCache() > 0, 'warm recovery repopulates the public cache under a new generation');
+  } finally { await history.dispose(); }
 
   console.log('PASS: Worker upgrade, configurable publication, regional misses, hibernation, unsubscribe, alerts, and tenant isolation');
 };

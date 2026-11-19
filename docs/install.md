@@ -371,6 +371,8 @@ npx playwright install chromium
 npm run test:ui
 node test/upgrade.cjs --notifications
 node test/upgrade.cjs --analytics
+node test/upgrade.cjs --live-views
+npm run test:status:publication
 npm run test:delivery:upgrade
 ```
 
@@ -447,6 +449,66 @@ channels or arbitrary public sites. Use default one-minute intervals, thresholds
 Bound the live drill to 30 minutes after cron activation (allow up to 15 minutes
 for new cron propagation). If targets/cron fail to initialize, stop and investigate;
 do not widen destinations or call dry-run/local evidence a live pass.
+
+## Analytics Engine install and upgrade drill
+
+Use one disposable v0.3.0 installation and a separate fresh installation. Keep
+the exact candidate revision, artifact hashes, Worker version IDs, and UTC
+timestamps with the evidence. Use a separate Analytics Engine dataset per
+disposable install and keep dataset identifiers in the private deployment
+configuration.
+
+1. Run the local release and predecessor checks from the candidate checkout.
+   Create the candidate archive with `npm run release:prepare`, verify
+   `SHA256SUMS`, and extract it outside the checkout. Keep the v0.3.0 control
+   Worker name, `MONITORING` binding, class, migration list and both Queue names
+   when applying the installation substitutions to the candidate. Confirm the
+   account and Worker identity before any upload.
+2. Capture the v0.3.0 anonymous and authenticated snapshots before upgrading.
+   Use a published Monitor with an open Incident and partial recovery progress,
+   a private Monitor in Maintenance, a Monitor with a successful scheduled
+   Check, and a selected webhook pointing to the controlled sink. Record their
+   IDs, timestamps, history totals and accepted alert submission. Complete the
+   upgrade before silence can reset the seeded recovery progress.
+3. Configure `AVAILABILITY_HISTORY` in the candidate's Wrangler config and
+   `AVAILABILITY_DATASET` to the same dataset name. Set the account ID, and
+   supply the scoped token and installation secret through the private
+   Wrangler secret file described above. Deploy the exact candidate with those
+   local substitutions. In the deployed Worker version, confirm the write
+   binding's dataset, the read dataset variable, and the token binding type.
+   Record the first candidate snapshots before sending new receipts or letting
+   the seeded Monitors Check. Compare identity, configuration, publication,
+   Maintenance, latest results, Incidents and alert selections. Expect empty
+   bars and readiness `observation_pending` before the first eligible result.
+4. Send the next correctly spaced authenticated receipt. Confirm recovery of
+   the same Incident and acceptance of the recovery alert. Poll editor
+   readiness until it returns 200 after ingestion. Verify the new result in both
+   views, the private Monitor's absence from public responses, and anonymous
+   401 for operator configuration. Connect a same-origin WebSocket to
+   `/api/status/events/v2`, make a public change and wait for its window.
+   Fetch each hinted partial with `?revision=<revision>`, confirm its revision,
+   then send `ack`. Read a different public representation to cover a cache
+   miss. Confirm an ordinary read without the hint catches up.
+5. To exercise query failure on the disposable Worker, redeploy the same
+   archive with `AVAILABILITY_DATASET` pointing to an unused valid dataset
+   name while the write binding retains its original dataset. Verify readiness
+   rejects the mismatch. Trigger a new Incident and confirm the Check, current
+   state, scoped hint and alert delivery while history is stale or unavailable.
+   Restore the variable and redeploy. Confirm readiness, repaired history and
+   the same Monitor and Incident IDs. The local publication suite checks
+   same-version warm-cache recovery under a long window and across eviction.
+6. Run the [Deploy to Cloudflare](#deploy-to-cloudflare) flow on the exact
+   candidate source in a disposable repository connected to the account.
+   Record whether the button created the declared write binding and prompted
+   for the secret. If needed, use the dashboard fallback. Set the account ID
+   and SQL dataset, record a Check and verify readiness. Rebuild routinely
+   without re-entering the secret and verify the deployed binding and variables,
+   readiness and retained history again. Recheck the supported webhook setup
+   independently using the two-Worker CLI path.
+7. Capture only sanitized evidence. Remove the disposable Workers, Queues,
+   fixture, repository connection, private files and scoped token after the
+   two installation paths are verified. Analytics Engine applies its managed
+   retention to drill points.
 
 ## Publication gate and Corresponding Source
 
