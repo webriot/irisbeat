@@ -12,13 +12,13 @@ const request = (path: string, method = 'GET', body?: unknown) => worker.fetch(n
 const read = async (operator = true) => (await request(operator ? '/api/operator' : '/api/status')).json() as Promise<Status>;
 const settle = () => new Promise(resolve => setTimeout(resolve, 30));
 async function subscribe(audience: 'public' | 'operator') {
-  const response = await worker.fetch(new Request(origin + '/api/' + (audience === 'public' ? 'status' : 'operator') + '/events', {
+  const response = await worker.fetch(new Request(origin + '/api/' + (audience === 'public' ? 'status' : 'operator') + '/events/v2', {
     headers: { Upgrade: 'websocket', Origin: origin },
   }), env);
   expect(response.status).toBe(101);
   const socket = response.webSocket!; socket.accept(); sockets.push(socket);
   const messages: unknown[] = [];
-  socket.addEventListener('message', event => { messages.push(event.data); });
+  socket.addEventListener('message', event => { messages.push(event.data === 'authorized' ? 'authorized' : JSON.parse(String(event.data)).type); });
   if (audience === 'operator') {
     const grant = await (await request('/api/operator/events/ticket', 'POST')).json() as { ticket: string };
     socket.send(JSON.stringify({ type: 'auth', ticket: grant.ticket }));

@@ -329,11 +329,11 @@ it("presents the selected Status ledger with separate operator Settings", async 
   await tick(0);
   const page = await (await request("/")).text();
   expect(page).toContain("All services operational");
-  expect(page).toMatch(/<article[^>]*aria-labelledby="monitor-name"/);
+  expect(page).toMatch(/<article[^>]*aria-labelledby="monitor-name-[^"]+"/);
   expect(page.indexOf("All services operational")).toBeLessThan(
-    page.indexOf('id="monitor-name"'),
+    page.indexOf('id="monitor-name-'),
   );
-  expect(page.indexOf('id="monitor-name"')).toBeLessThan(
+  expect(page.indexOf('id="monitor-name-')).toBeLessThan(
     page.indexOf('id="incident-heading"'),
   );
   expect(page).not.toContain("90 UTC-day");
@@ -548,12 +548,18 @@ it("serves collection controls with separate Monitor and page settings forms", a
   for (const control of ['id="new-monitor"', 'id="published"', 'id="cancel-edit"', 'id="page-configuration"', 'id="monitor-rows"']) {
     expect(html).toContain(control);
   }
-  const script = await (await request("/operator.js")).text();
-  expect(script).toContain("Publish");
-  expect(script).toContain("Unpublish");
-  expect(script).toContain("Delete");
-  expect(script).toContain("/api/operator/monitors");
-  expect(script).not.toContain("localStorage");
+  const created = await (await operatorRequest("/api/operator/monitors", "POST", {
+    name: "Collection control", kind: "heartbeat",
+  })).json<import("../src/index").Status>();
+  const id = created.monitor!.id;
+  const path = "/api/operator/partials/monitor/" + id;
+  const publicRow = await (await operatorRequest(path)).json<{ html: string }>();
+  expect(publicRow.html).toContain('aria-label="Unpublish Collection control"');
+  expect(publicRow.html).toContain('aria-label="Delete Collection control"');
+  await operatorRequest("/api/operator/monitors/" + id, "PATCH", { published: false });
+  const privateRow = await (await operatorRequest(path)).json<{ html: string }>();
+  expect(privateRow.html).toContain('aria-label="Publish Collection control"');
+  expect((await (await request("/operator.js")).text())).not.toContain("localStorage");
 });
 
 it("retains named Incidents independently when one unavailable Monitor recovers and the other is deleted", async () => {

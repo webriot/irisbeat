@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { fulfillView } from './view-response';
 import { expect, test } from '@playwright/test';
 
 for (const path of ['/', '/operator']) {
@@ -16,7 +17,7 @@ for (const path of ['/', '/operator']) {
     await page.route(api, async route => {
       reads++;
       if (hold) await new Promise<void>(resolve => { release = resolve; });
-      await route.fulfill(failure ? { status: 503, json: { error: 'Unavailable' } } : { json: { pageName: 'Recovered', monitors: [], incidents: [], webhookUrl: null } });
+      await fulfillView(route, failure ? { status: 503, json: { error: 'Unavailable' } } : { json: { pageName: 'Recovered', monitors: [], incidents: [], webhookUrl: null } });
     });
     await page.goto(path);
     if (path === '/operator') {
@@ -73,7 +74,7 @@ for (const path of ['/', '/operator']) {
     let reads = 0;
     await page.route(path === '/' ? '**/api/status' : '**/api/operator', route => {
       reads++;
-      return route.fulfill(failure ? { status: 503, json: { error: 'Unavailable' } } : { json: data });
+      return fulfillView(route, failure ? { status: 503, json: { error: 'Unavailable' } } : { json: data });
     });
     await page.goto(path);
     if (path === '/operator') {
@@ -105,7 +106,7 @@ test('operator writes keep a failed-read indicator and denied Retry ends the Ope
   await page.addInitScript(() => { Object.defineProperty(window, 'WebSocket', { value: class { constructor() { throw new Error('offline'); } } }); });
   let status = 200;
   const data = { pageName: 'Saved', webhookUrl: null, monitors: [], incidents: [] };
-  await page.route('**/api/operator', route => route.fulfill({ status: route.request().method() === 'PUT' ? 200 : status, json: data }));
+  await page.route('**/api/operator', route => fulfillView(route, { status: route.request().method() === 'PUT' ? 200 : status, json: data }));
   await page.goto('/operator');
   await page.locator('#secret').fill('ui-test-secret');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -132,7 +133,7 @@ test('operator writes keep a failed-read indicator and denied Retry ends the Ope
 test('a save superseding a pending Retry leaves Retry usable after that read settles', async ({ page }) => {
   await page.addInitScript(() => { Object.defineProperty(window, 'WebSocket', { value: class { constructor() { throw new Error('offline'); } } }); });
   const data = { pageName: 'Original', webhookUrl: null, monitors: [], incidents: [] };
-  await page.route('**/api/operator', route => route.fulfill({ json: data }));
+  await page.route('**/api/operator', route => fulfillView(route, { json: data }));
   await page.goto('/operator');
   await page.locator('#secret').fill('ui-test-secret');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -140,7 +141,7 @@ test('a save superseding a pending Retry leaves Retry usable after that read set
   let hold = false;
   let release!: () => void;
   await page.route('**/api/operator', async route => {
-    if (route.request().method() === 'PUT') return route.fulfill({ json: { ...data, pageName: 'Saved' } });
+    if (route.request().method() === 'PUT') return fulfillView(route, { json: { ...data, pageName: 'Saved' } });
     if (hold) await new Promise<void>(resolve => { release = resolve; });
     return route.fulfill({ status: 503, json: { error: 'Unavailable' } });
   });

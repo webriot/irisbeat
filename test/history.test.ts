@@ -233,3 +233,23 @@ it('keeps percentages per Monitor and uses down for failure with Maintenance', a
   const html = await (await request('/')).text();
   expect(html.match(/class="percentage"/g)).toHaveLength(2);
 });
+
+it('acknowledges a bundled page-name write and renders its refresh without querying Monitor history', async () => {
+  await create();
+  await create({ name: 'Another Monitor' });
+  await request('/__test-history');
+  const response = await request('/api/operator', {
+    method: 'PUT', headers: { authorization, 'Content-Type': 'application/json', Accept: 'application/vnd.irisbeat.view+json' },
+    body: JSON.stringify({ pageName: 'Renamed page' }),
+  });
+  expect(response.status).toBe(200);
+  const { revision, scopes } = await response.json() as { revision: number; scopes: string[] };
+  expect(scopes).toEqual(['page']);
+  const partial = await request('/api/operator/partials/page?revision=' + revision, { headers: { authorization } });
+  expect(await partial.json()).toMatchObject({ pageName: 'Renamed page', revision });
+  expect(await (await request('/__test-history?reads')).json()).toBe(0);
+
+  const legacy = await mutate('/api/operator', 'PUT', { pageName: 'Legacy page' });
+  expect(await legacy.json()).toMatchObject({ pageName: 'Legacy page', monitors: [{ history: { days: expect.any(Array) } }, { history: { days: expect.any(Array) } }] });
+  expect(await (await request('/__test-history?reads')).json()).toBe(2);
+});

@@ -123,3 +123,23 @@ test('hosted editor rotates Heartbeat credentials and reader sees a read-only le
     }
   }
 });
+
+test('a disconnected Operator saves with only the acknowledged scope refresh', async ({ page }) => {
+  await page.routeWebSocket('**/api/operator/events/v2', socket => socket.close());
+  await page.goto('/operator');
+  await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+
+  const requests: string[] = [];
+  page.on('request', request => {
+    const url = new URL(request.url());
+    if (request.method() === 'GET' && url.pathname.startsWith('/api/operator')) requests.push(url.pathname);
+  });
+  const name = page.getByLabel('Page name');
+  await name.fill('  Disconnected save  ');
+  await page.getByRole('button', { name: 'Save page', exact: true }).click();
+  await expect(name).toHaveValue('Disconnected save');
+  await expect(page.locator('#message')).toHaveText('Saved');
+  expect(requests).toEqual(['/api/operator/partials/page']);
+});

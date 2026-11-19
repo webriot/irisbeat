@@ -3,6 +3,7 @@ import worker, { MonitoringContext as EngineContext, type NotificationQueueJob }
 
 // Test-only series fault injection; production exports no control endpoint.
 let mode = 'available';
+let historyReads = 0;
 let queued: NotificationQueueJob[] = [];
 let queueUnavailable = false;
 let checkFloor: string | undefined;
@@ -23,6 +24,7 @@ export class MonitoringContext extends EngineContext {
   }
 
   protected queryHistory(id: string, start: number, end: number) {
+    historyReads++;
     if (mode === 'missing') return null;
     if (mode === 'failed') throw new Error('substituted series query failure');
     return super.queryHistory(id, start, end);
@@ -51,7 +53,9 @@ export default {
       return Response.json(queued);
     }
     if (url.pathname === '/__test-history') {
-      mode = new URL(request.url).searchParams.get('mode') ?? 'available';
+      if (request.method === 'GET' && url.searchParams.has('reads')) return Response.json(historyReads);
+      historyReads = 0;
+      mode = url.searchParams.get('mode') ?? 'available';
       return new Response(null, { status: 204 });
     }
     return worker.fetch(request, env);

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import worker, { createHostedWorker, type Status } from '../src/index';
 import { env } from 'cloudflare:workers';
-import { createScheduledController, evictDurableObject, runDurableObjectAlarm, reset } from 'cloudflare:test';
+import { createScheduledController, evictDurableObject, runDurableObjectAlarm, runInDurableObject, reset } from 'cloudflare:test';
 import { afterEach, expect, it, vi } from 'vitest';
 const origin = 'https://irisbeat.example';
 const sockets: WebSocket[] = [];
@@ -18,10 +18,10 @@ async function ticket() {
   return await response.json() as { ticket: string; expiresAt: number };
 }
 async function subscribe() {
-  const response = await worker.fetch(new Request(origin + '/api/operator/events', { headers: { Upgrade: 'websocket', Origin: origin } }), env);
+  const response = await worker.fetch(new Request(origin + '/api/operator/events/v2', { headers: { Upgrade: 'websocket', Origin: origin } }), env);
   expect(response.status).toBe(101);
   const socket = response.webSocket!; socket.accept(); sockets.push(socket);
-  const messages: unknown[] = []; socket.addEventListener('message', event => { messages.push(event.data); });
+  const messages: unknown[] = []; socket.addEventListener('message', event => { messages.push(event.data === 'authorized' ? 'authorized' : JSON.parse(String(event.data)).type); });
   return { socket, messages };
 }
 it('authenticates only through the first message, then sends private invalidations without data', async () => {
@@ -61,9 +61,9 @@ it('atomically consumes tickets once, rejects wrong first messages and expired t
 it('enforces the five-minute lease before notifications and on the shared alarm, preserving public silence', async () => {
   const at = Date.parse('2030-11-16T10:00Z');
   const clock = vi.spyOn(Date, 'now').mockReturnValue(at);
-  const publicResponse = await worker.fetch(new Request(origin + '/api/status/events', { headers: { Upgrade: 'websocket', Origin: origin } }), env);
+  const publicResponse = await worker.fetch(new Request(origin + '/api/status/events/v2', { headers: { Upgrade: 'websocket', Origin: origin } }), env);
   const publicSocket = publicResponse.webSocket!; publicSocket.accept(); sockets.push(publicSocket);
-  const publicMessages: unknown[] = []; publicSocket.addEventListener('message', event => { publicMessages.push(event.data); });
+  const publicMessages: unknown[] = []; publicSocket.addEventListener('message', event => { publicMessages.push(event.data === 'authorized' ? 'authorized' : JSON.parse(String(event.data)).type); });
   const a = await subscribe(), b = await subscribe();
   a.socket.send(JSON.stringify({ type: 'auth', ticket: (await ticket()).ticket }));
   b.socket.send(JSON.stringify({ type: 'auth', ticket: (await ticket()).ticket }));
@@ -101,7 +101,7 @@ it('bounds unauthenticated connections and closes them on timeout without privat
   const at = Date.parse('2030-11-16T10:00Z'); const clock = vi.spyOn(Date, 'now').mockReturnValue(at);
   const opened = [];
   for (let i = 0; i < 16; i++) opened.push(await subscribe());
-  const response = await worker.fetch(new Request(origin + '/api/operator/events', { headers: { Upgrade: 'websocket', Origin: origin } }), env);
+  const response = await worker.fetch(new Request(origin + '/api/operator/events/v2', { headers: { Upgrade: 'websocket', Origin: origin } }), env);
   expect(response.status).toBe(503);
   const closed = opened.map(({ socket }) => closes(socket));
   await evictDurableObject(env.MONITORING.getByName('personal'));
@@ -116,12 +116,12 @@ it('requires HTTP authorization and validates upgrade Origin, transport and cred
     expect((await worker.fetch(new Request(origin + '/api/operator/events/ticket', { method }), env)).status).toBe(401);
   }
   for (const [url, headers, status] of [
-    [origin + '/api/operator/events', { Origin: 'https://evil.example', Upgrade: 'websocket' }, 403],
-    [origin + '/api/operator/events', { Upgrade: 'websocket' }, 403],
-    ['http://irisbeat.example/api/operator/events', { Origin: 'http://irisbeat.example', Upgrade: 'websocket' }, 403],
-    [origin + '/api/operator/events?ticket=secret', { Origin: origin, Upgrade: 'websocket' }, 400],
-    [origin + '/api/operator/events', { Origin: origin, Upgrade: 'websocket', 'Sec-WebSocket-Protocol': 'secret' }, 400],
-    [origin + '/api/operator/events', { Origin: origin }, 426],
+    [origin + '/api/operator/events/v2', { Origin: 'https://evil.example', Upgrade: 'websocket' }, 403],
+    [origin + '/api/operator/events/v2', { Upgrade: 'websocket' }, 403],
+    ['http://irisbeat.example/api/operator/events/v2', { Origin: 'http://irisbeat.example', Upgrade: 'websocket' }, 403],
+    [origin + '/api/operator/events/v2?ticket=secret', { Origin: origin, Upgrade: 'websocket' }, 400],
+    [origin + '/api/operator/events/v2', { Origin: origin, Upgrade: 'websocket', 'Sec-WebSocket-Protocol': 'secret' }, 400],
+    [origin + '/api/operator/events/v2', { Origin: origin }, 426],
   ] as const) expect((await worker.fetch(new Request(url, { headers }), env)).status).toBe(status);
 });
 it('re-resolves hosted reader/editor access for each ticket and keeps context, origin and snapshot permissions isolated', async () => {
@@ -130,25 +130,37 @@ it('re-resolves hosted reader/editor access for each ticket and keeps context, o
   const fetch = (host: string, path: string, method = 'GET', body?: unknown) => hosted.fetch(new Request('https://' + host + path, { method, headers: { Origin: 'https://' + host, Upgrade: 'websocket', 'content-type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}) }), env);
   const grant = await (await fetch('a.example', '/api/operator/events/ticket', 'POST')).json() as { ticket: string };
   for (const host of ['b.example', 'alias.example']) {
-    const response = await fetch(host, '/api/operator/events');
+    const response = await fetch(host, '/api/operator/events/v2');
     const socket = response.webSocket!; socket.accept(); sockets.push(socket); const closed = closes(socket);
     socket.send(JSON.stringify({ type: 'auth', ticket: grant.ticket })); expect(await closed).toBe(1008);
   }
   permission = 'reader';
   const readerTicket = await fetch('a.example', '/api/operator/events/ticket', 'POST'); expect(readerTicket.status).toBe(200);
-  const response = await fetch('a.example', '/api/operator/events'); const socket = response.webSocket!; socket.accept(); sockets.push(socket);
-  const messages: unknown[] = []; socket.addEventListener('message', event => { messages.push(event.data); });
+  const response = await fetch('a.example', '/api/operator/events/v2'); const socket = response.webSocket!; socket.accept(); sockets.push(socket);
+  const messages: unknown[] = []; socket.addEventListener('message', event => { messages.push(event.data === 'authorized' ? 'authorized' : JSON.parse(String(event.data)).type); });
   socket.send(JSON.stringify({ type: 'auth', ticket: ((await readerTicket.json()) as { ticket: string }).ticket })); await settle();
   expect(messages).toEqual(['authorized']);
   expect((await fetch('a.example', '/api/operator/monitors', 'POST', { name: 'Denied', kind: 'heartbeat' })).status).toBe(403);
   permission = 'editor';
+  const tenantMonitor = await (await fetch('a.example', '/api/operator/monitors', 'POST', { name: 'Tenant private', kind: 'heartbeat', published: false })).json() as Status;
+  const row = '/api/operator/partials/monitor/' + tenantMonitor.monitor!.id;
   await fetch('a.example', '/api/operator/webhook', 'PUT', { url: 'https://private.example/hook' });
   await fetch('b.example', '/api/operator/monitors', 'POST', { name: 'Other private', kind: 'heartbeat', published: false });
+  expect(await (await fetch('a.example', '/api/operator/partials/destinations')).text()).toContain('https://private.example/hook');
   permission = 'reader';
+  await settle();
+  expect(messages).toEqual(['authorized', 'changed']);
   expect(await (await fetch('a.example', '/api/operator')).json()).not.toHaveProperty('webhookUrl');
+  expect((await fetch('a.example', '/api/operator/partials/destinations')).status).toBe(404);
+  expect(await (await fetch('a.example', row)).json()).toMatchObject({
+    permission: 'reader', revision: 1, html: expect.stringContaining('Tenant private'),
+    monitors: [{ id: tenantMonitor.monitor!.id }],
+  });
+  expect(await (await fetch('b.example', row)).json()).toEqual({ permission: 'reader', revision: 1, html: '', monitors: [], minCheckIntervalSeconds: 60 });
   permission = null;
   expect((await fetch('a.example', '/api/operator/events/ticket', 'POST')).status).toBe(401);
   expect((await fetch('a.example', '/api/operator')).status).toBe(401);
+  expect((await fetch('a.example', row)).status).toBe(401);
   const closed = closes(socket); socket.send(JSON.stringify({ type: 'renew', ticket: 'denied' })); expect(await closed).toBe(1008);
 });
 it('does not carry editor-only pending activity into a renewed reader scope', async () => {
@@ -170,9 +182,9 @@ it('does not carry editor-only pending activity into a renewed reader scope', as
 it('notifies private results, history, Incidents, Maintenance expiry and hosted pause while public stays silent', async () => {
   const at = Date.parse('2030-11-16T10:00Z'); const clock = vi.spyOn(Date, 'now').mockReturnValue(at);
   const { socket, messages } = await subscribe(); socket.send(JSON.stringify({ type: 'auth', ticket: (await ticket()).ticket })); await settle();
-  const publicResponse = await worker.fetch(new Request(origin + '/api/status/events', { headers: { Upgrade: 'websocket', Origin: origin } }), env);
+  const publicResponse = await worker.fetch(new Request(origin + '/api/status/events/v2', { headers: { Upgrade: 'websocket', Origin: origin } }), env);
   const publicSocket = publicResponse.webSocket!; publicSocket.accept(); sockets.push(publicSocket);
-  const publicMessages: unknown[] = []; publicSocket.addEventListener('message', event => { publicMessages.push(event.data); });
+  const publicMessages: unknown[] = []; publicSocket.addEventListener('message', event => { publicMessages.push(event.data === 'authorized' ? 'authorized' : JSON.parse(String(event.data)).type); });
   const saved = await (await request('/api/operator/monitors', 'POST', { name: 'Private heartbeat', kind: 'heartbeat', published: false })).json() as Status;
   const path = '/api/operator/monitors/' + saved.monitor!.id;
   let notices = 1;
@@ -192,9 +204,9 @@ it('notifies private results, history, Incidents, Maintenance expiry and hosted 
 });
 it('does not postpone a due public boundary when private requests reschedule authorization alarms', async () => {
   const at = Date.parse('2030-11-16T10:00Z'); const clock = vi.spyOn(Date, 'now').mockReturnValue(at);
-  const response = await worker.fetch(new Request(origin + '/api/status/events', { headers: { Upgrade: 'websocket', Origin: origin } }), env);
+  const response = await worker.fetch(new Request(origin + '/api/status/events/v2', { headers: { Upgrade: 'websocket', Origin: origin } }), env);
   const socket = response.webSocket!; socket.accept(); sockets.push(socket);
-  const messages: unknown[] = []; socket.addEventListener('message', event => { messages.push(event.data); });
+  const messages: unknown[] = []; socket.addEventListener('message', event => { messages.push(event.data === 'authorized' ? 'authorized' : JSON.parse(String(event.data)).type); });
   const saved = await (await request('/api/operator/monitors', 'POST', { name: 'Public time boundary', kind: 'heartbeat' })).json() as Status;
   await settle(); socket.send('ack'); await settle();
   await request('/api/operator/monitors/' + saved.monitor!.id + '/maintenance', 'PUT', { endsAt: at + 60_000 });
@@ -203,4 +215,30 @@ it('does not postpone a due public boundary when private requests reschedule aut
   await request('/api/operator/webhook', 'PUT', { url: 'https://private.example/boundary' });
   await runDurableObjectAlarm(env.MONITORING.getByName('personal'));
   await settle(); expect(messages).toEqual(['changed', 'changed', 'changed']);
+});
+
+it('keeps the due UTC rollover when the Operator disconnects and Status stays subscribed', async () => {
+  const midnight = Date.parse('2030-11-17T00:00Z');
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(midnight - 1000);
+  await request('/api/operator/monitors', 'POST', { name: 'Public rollover', kind: 'heartbeat' });
+  const response = await worker.fetch(new Request(origin + '/api/status/events/v2', { headers: { Upgrade: 'websocket', Origin: origin } }), env);
+  const publicSocket = response.webSocket!;
+  publicSocket.accept();
+  sockets.push(publicSocket);
+  const hints: unknown[] = [];
+  publicSocket.addEventListener('message', event => { hints.push(JSON.parse(String(event.data))); });
+  const operator = await subscribe();
+  operator.socket.send(JSON.stringify({ type: 'auth', ticket: (await ticket()).ticket }));
+  await settle();
+  expect(operator.messages).toEqual(['authorized']);
+
+  clock.mockReturnValue(midnight + 1);
+  const closed = closes(operator.socket);
+  operator.socket.close();
+  await closed;
+  const context = env.MONITORING.getByName('personal');
+  expect(await runInDurableObject(context, (_instance, state) => state.storage.getAlarm())).toBe(midnight);
+  await runDurableObjectAlarm(context);
+  await settle();
+  expect(hints).toEqual([{ type: 'changed', revision: 2, scopes: ['monitors', 'incidents', 'banner'] }]);
 });

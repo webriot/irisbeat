@@ -22,7 +22,7 @@ test('duration units save whole seconds and preserve repeating fractions on unit
   await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
   const response = await saved;
   expect(response.status()).toBe(201);
-  const monitor = (await response.json()).monitors.at(-1);
+  const monitor = (await (await request.get('/api/operator', { headers })).json()).monitors.find((item: { name: string }) => item.name === 'Duration HTTP');
   try {
     expect(monitor).toMatchObject({ kind: 'http', intervalSeconds: 66, timeoutSeconds: 1, failureThreshold: 2, recoveryThreshold: 2 });
     await page.reload();
@@ -34,7 +34,8 @@ test('duration units save whole seconds and preserve repeating fractions on unit
     await page.getByLabel('Timeout unit', { exact: true }).selectOption('days');
     const edited = page.waitForResponse(response => response.request().method() === 'PATCH');
     await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
-    const current = (await (await edited).json()).monitors.find((item: { id: string }) => item.id === monitor.id);
+    expect((await edited).status()).toBe(200);
+    const current = (await (await request.get('/api/operator', { headers })).json()).monitors.find((item: { id: string }) => item.id === monitor.id);
     expect(current).toEqual(monitor);
   } finally {
     await request.delete('/api/operator/monitors/' + monitor.id, { headers });
@@ -47,7 +48,7 @@ for (const kind of ['http', 'tcp', 'heartbeat']) {
     const target = kind === 'http' ? { url: 'https://example.invalid' } : kind === 'tcp' ? { hostname: 'example.invalid', port: 443 } : {};
     const response = await request.post('/api/operator/monitors', { headers, data: { name, kind, ...target, published: false } });
     expect(response.status()).toBe(201);
-    const original = (await response.json()).monitors.at(-1);
+    const original = (await response.json()).monitors.find((item: { name: string }) => item.name === name);
     try {
       await page.setViewportSize({ width: 390, height: 900 });
       await page.goto('/operator');
@@ -76,7 +77,8 @@ for (const kind of ['http', 'tcp', 'heartbeat']) {
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
       const saved = page.waitForResponse(response => response.request().method() === 'PATCH');
       await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
-      const edited = (await (await saved).json()).monitors.find((item: { id: string }) => item.id === original.id);
+      expect((await saved).status()).toBe(200);
+      const edited = (await (await request.get('/api/operator', { headers })).json()).monitors.find((item: { id: string }) => item.id === original.id);
       expect(edited).toMatchObject({ ...original, intervalSeconds: 90, recoveryThreshold: 3, ...(kind === 'heartbeat' ? { silenceSeconds: 86400, recoverySpacingSeconds: 90 } : { timeoutSeconds: 30, effectiveIntervalSeconds: 90 }) });
       await monitorAction(page, 'Edit ' + name);
       await expect(page.getByLabel(interval, { exact: true })).toHaveValue('90');
@@ -138,9 +140,10 @@ test('duration validation rejects subsecond and out-of-range values without savi
     expect(saves).toBe(0);
   }
   await timeout.fill('1');
-  const saved = page.waitForResponse(response => response.request().method() === 'POST');
+  const saved = page.waitForResponse(response => response.request().method() === 'POST' && response.url().endsWith('/api/operator/monitors'));
   await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
-  const monitor = (await (await saved).json()).monitors.at(-1);
+  expect((await saved).status()).toBe(201);
+  const monitor = (await (await request.get('/api/operator', { headers })).json()).monitors.find((item: { name: string }) => item.name === 'Invalid duration');
   try {
     expect(monitor).toMatchObject({ intervalSeconds: 86400, timeoutSeconds: 60 });
     const rejected = await request.patch('/api/operator/monitors/' + monitor.id, {
