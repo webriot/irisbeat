@@ -440,8 +440,9 @@ channels or arbitrary public sites. Use default one-minute intervals, thresholds
    persists. Local suites cover exact timing/UTC boundaries; live evidence covers
    actual Cloudflare socket/cron/secret/resource behavior.
 6. Stop producers, remove the drill webhook in Settings, and delete only drill Monitors.
-   Verify both disposable Worker names, both Queues and the account. Delete the
-   delivery Worker first, then the monitoring Worker using
+   Verify both disposable Worker names, both Queues and the account. Detach the
+   delivery Worker using `npx wrangler queues consumer remove "$IRISBEAT_QUEUE_NAME" "$IRISBEAT_DELIVERY_WORKER_NAME"`.
+   Delete the delivery Worker, then the monitoring Worker using
    `npx wrangler delete <worker-name>`. Delete both disposable Queues with
    `npx wrangler queues delete <queue-name>`. Worker deletion destroys its
    associated DO data. Confirm removal, then remove any separate controlled
@@ -603,6 +604,9 @@ revision had these SHA-256 checksums:
   authentication prompt was declined. The authenticated button build,
   binding and secret provisioning, and routine dashboard rebuild remain
   open acceptance items. The fresh CLI install verifies a separate path.
+- **Cleanup.** The five disposable CLI Workers and four Queues were removed
+  and their absence was verified. Analytics Engine retains the drill points
+  under its managed retention.
 
 The 0.4.0 follow-up archives had these SHA-256 checksums:
 
