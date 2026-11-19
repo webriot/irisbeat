@@ -60,6 +60,9 @@
   ],
   "cloudflare": {
     "bindings": {
+      "AVAILABILITY_API_TOKEN": {
+        "description": "Cloudflare API token with Account Analytics Read access scoped to this account. Required for availability history."
+      },
       "INSTALLATION_SECRET": {
         "description": "Generate a unique random installation secret (for example, `openssl rand -hex 32`). It protects operator administration and personal Heartbeats. Keep it private."
       }

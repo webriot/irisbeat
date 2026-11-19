@@ -35,7 +35,7 @@ export function createStatusLedger() {
       if (!history) return '<p class="history-unavailable">Bars unavailable</p>';
       return '<div class="availability"><div class="history-head"><span>past 90 days</span><span class="percentage" aria-label="Availability">' +
         (history.percentage === null ? 'No observations' : history.percentage.toFixed(2) + '%') +
-        '</span></div><ol class="history" data-monitor="' + encodeURIComponent(id) + '" aria-label="90 UTC days of availability">' +
+        '</span></div>' + (history.stale ? '<p class="history-unavailable" role="status">Availability history is stale</p>' : '') + '<ol class="history" data-monitor="' + encodeURIComponent(id) + '" aria-label="90 UTC days of availability">' +
         history.days.map((day, index) => {
           const label = ({ empty: 'No observations', up: 'Successful checks', down: 'Failed checks', degraded: 'Mixed results', maintenance: 'Maintenance' })[day.state] +
             '; ' + day.successes + ' successes, ' + day.failures + ' failures, ' + day.maintenance + ' Maintenance';

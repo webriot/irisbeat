@@ -197,26 +197,7 @@ it('retains operator Incidents after observation rollover without removing newer
   expect((await status()).incidents).toEqual([]);
   expect((await status(true)).incidents).toEqual([{ ...original, closedAt: today - 99 * day }]);
   expect((await status()).monitor!.history).toMatchObject({ percentage: 100, days: expect.arrayContaining([expect.objectContaining({ date: '2026-11-13', successes: 1 })]) });
-  // Rewinding the query window makes bounded retention observable without storage inspection.
-  clock.mockReturnValue(today - 100 * day);
-  expect((await status(true)).monitor!.history!.percentage).toBeNull();
 });
-
-it('bounds observation cleanup per execution while preserving the unfinished UTC day', async () => {
-  const clock = vi.spyOn(Date, 'now').mockReturnValue(today - 100 * day);
-  const monitor = await create({ kind: 'heartbeat', url: undefined, failureThreshold: undefined });
-  const receipt = () => request('/heartbeat/' + monitor.id, { method: 'POST', headers: { authorization } });
-  for (let index = 0; index < 1001; index++) expect((await receipt()).status).toBe(204);
-  clock.mockReturnValue(today + 1_000);
-  await receipt(); // Deletes at most 1,000 expired observations.
-  clock.mockReturnValue(today - 100 * day);
-  expect((await status()).monitor!.history!.days.at(-1)?.successes).toBe(1);
-  clock.mockReturnValue(today + 2_000);
-  await receipt();
-  expect((await status()).monitor!.history!.days.at(-1)?.successes).toBe(2);
-  clock.mockReturnValue(today - 100 * day);
-  expect((await status()).monitor!.history!.percentage).toBeNull();
-}, 30_000); // The retention boundary requires 1,001 sequential HTTP receipts on shared CI runners.
 
 it('keeps percentages per Monitor and uses down for failure with Maintenance', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(today);
@@ -232,4 +213,139 @@ it('keeps percentages per Monitor and uses down for failure with Maintenance', a
   expect(data).not.toHaveProperty('percentage');
   const html = await (await request('/')).text();
   expect(html.match(/class="percentage"/g)).toHaveLength(2);
+});
+
+it('reports setup readiness only after an actual observation can be read back', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(today);
+  const path = '/api/operator/history/readiness';
+  expect((await request(path)).status).toBe(401);
+  await request('/__test-history?mode=unconfigured');
+  const missing = await mutate(path, 'GET');
+  expect(missing.status).toBe(503);
+  expect(await missing.json()).toEqual({ ready: false, reason: 'configuration_missing' });
+  await request('/__test-history?mode=available');
+  expect(await (await mutate(path, 'GET')).json()).toEqual({ ready: false, reason: 'observation_pending' });
+  await create();
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await request('/__test-history?mode=write-failed');
+  await tick(today);
+  expect(await (await mutate(path, 'GET')).json()).toEqual({ ready: false, reason: 'observation_unconfirmed' });
+  await request('/__test-history?mode=available');
+  await tick(today + 60_000);
+  expect(await (await mutate(path, 'GET')).json()).toEqual({ ready: true });
+});
+
+it('keeps the last successful bars after query failure and Durable Object eviction', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
+  await create();
+  const target = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await tick(today);
+  const cached = (await status()).monitor!.history!;
+  expect(cached.percentage).toBe(100);
+  await request('/__test-history?mode=failed');
+  clock.mockReturnValue(today + 60_000);
+  target.mockResolvedValue(new Response(null, { status: 503 }));
+  await tick(today + 60_000);
+  await evictDurableObject(env.MONITORING.getByName('personal'));
+  expect((await status()).monitor).toMatchObject({ state: 'down', history: { ...cached, stale: true } });
+  expect(await (await request('/')).text()).toContain('Availability history is stale');
+  expect((await status()).incidents).toHaveLength(1);
+});
+
+it('queries only published Monitor IDs, reuses their aggregates, and shares no private or deleted bars', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(today);
+  const published = await create();
+  const hidden = await create({ published: false });
+  const deleted = await create();
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await tick(today);
+  const { points } = await (await request('/__test-history')).json<{ points: AnalyticsEngineDataPoint[] }>();
+  expect(points.find(point => point.blobs?.[0] === published.id)).toEqual({
+    indexes: [expect.stringMatching(/^[a-f0-9]{64}$/)], blobs: [published.id, 'success'], doubles: [today],
+  });
+  await mutate('/api/operator/monitors/' + deleted.id, 'DELETE');
+  await request('/__test-history?mode=direct'); // Keep existing points, disable the managed reader temporarily.
+  vi.spyOn(Date, 'now').mockReturnValue(today + 60_000);
+  const sqlCalls: string[] = [];
+  vi.mocked(fetch).mockImplementation(async (input, init) => {
+    expect(String(input)).toBe('https://api.cloudflare.com/client/v4/accounts/' + 'a'.repeat(32) + '/analytics_engine/sql');
+    expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer test-analytics-token');
+    const sql = String(init?.body);
+    sqlCalls.push(sql);
+    expect(sql).toMatch(/index1 = '[a-f0-9]{64}'/);
+    expect(sql).toContain("toDateTime(double1 / 1000, 'UTC')");
+    expect(sql).toContain("SUM(IF(blob2 = 'success', _sample_interval, 0))");
+    expect(sql).toContain('double1 >= ' + (today - 89 * day) + ' AND double1 < ' + (today + day));
+    expect(sql).toContain("blob1 IN ('" + published.id + "')");
+    expect(sql).not.toContain(hidden.id);
+    expect(sql).not.toContain(deleted.id);
+    return Response.json({ data: [
+      { monitorId: published.id, date: '2026-11-12', successes: '3', failures: '2', maintenance: '12' },
+    ] });
+  });
+  const publicStatus = await status();
+  expect(publicStatus.monitors.map(monitor => monitor.id)).toEqual([published.id]);
+  expect(publicStatus.monitor!.history).toMatchObject({ percentage: 60, days: expect.arrayContaining([
+    { date: '2026-11-12', state: 'degraded', successes: 3, failures: 2, maintenance: 12 },
+  ]) });
+  expect((await status()).monitor!.history).toEqual(publicStatus.monitor!.history);
+  expect(sqlCalls).toHaveLength(1);
+});
+
+it('enqueues the Incident while the history reader is unavailable', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
+  const monitor = await create();
+  await mutate('/api/operator/destinations', 'POST', { url: 'https://hooks.example/history' });
+  const operator = await status(true);
+  await mutate('/api/operator/monitors/' + monitor.id, 'PATCH', { destinationIds: [operator.destinations![0].id] });
+  await request('/__test-notification-queue', { method: 'DELETE' });
+  await request('/__test-history?mode=failed');
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 503 }));
+  clock.mockReturnValue(today + 60_000);
+  await tick(today + 60_000);
+  const { queries } = await (await request('/__test-history')).json<{ queries: unknown[] }>();
+  expect(queries).toHaveLength(0);
+  expect(await (await request('/__test-notification-queue')).json()).toMatchObject([{ event: { kind: 'incident.opened' } }]);
+  expect((await status()).monitor).toMatchObject({ state: 'down', history: null });
+  await request('/__test-notification-queue', { method: 'DELETE' });
+});
+
+it('queries history for only the requested authorized ledger rows and never for mutations', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(today);
+  const first = await create({ name: 'First' });
+  const second = await create({ name: 'Second' });
+  const hidden = await create({ name: 'Private', published: false });
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await tick(today);
+
+  const update = await mutate('/api/operator/monitors/' + first.id, 'PATCH', { name: 'Renamed' });
+  expect(update.status).toBe(200);
+  expect(await update.json()).toMatchObject({ monitor: { id: first.id, name: 'Renamed', state: 'up' } });
+  const publicPartials = '/api/status/partials/';
+  const operatorPartials = '/api/operator/partials/';
+  const queriedIds = async () => (await (await request('/__test-history')).json<{ queries: { monitorIds: string[] }[] }>())
+    .queries.map(query => query.monitorIds);
+  for (const scope of ['page', 'banner', 'incidents', 'monitor/' + hidden.id]) {
+    expect((await request(publicPartials + scope)).status).toBe(200);
+  }
+  expect((await mutate(operatorPartials + 'destinations', 'GET')).status).toBe(200);
+  expect((await request(publicPartials + 'monitors?revision=999')).status).toBe(409);
+  expect(await queriedIds()).toEqual([]);
+
+  const row = await (await request(publicPartials + 'monitor/' + first.id)).json<{ revision: number; html: string }>();
+  expect(row.revision).toBeGreaterThan(0);
+  expect(row.html).toContain('100.00%');
+  expect(row.html).toContain('Renamed');
+  expect(await queriedIds()).toEqual([[first.id]]);
+  const ledger = await (await request(publicPartials + 'monitors')).json<{ revision: number; html: string }>();
+  expect(ledger.revision).toBe(row.revision);
+  expect(ledger.html).toContain('Second');
+  expect(ledger.html).not.toContain('Private');
+  expect(await queriedIds()).toEqual([[first.id], [second.id]]);
+  const privateRow = await (await mutate(operatorPartials + 'monitor/' + hidden.id, 'GET')).json<{ html: string }>();
+  expect(privateRow.html).toContain('Private');
+  expect(privateRow.html).toContain('100.00%');
+  const saved = await mutate('/api/operator', 'PUT', { pageName: 'Renamed status page' });
+  expect(await saved.json()).toMatchObject({ pageName: 'Renamed status page', monitor: { history: { percentage: 100 } } });
+  expect(await queriedIds()).toEqual([[first.id], [second.id], [hidden.id]]);
 });

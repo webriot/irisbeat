@@ -17,7 +17,8 @@ prompt (`openssl rand -hex 32` generates one locally). Keep it in a password man
 The empty `.dev.vars.example` declares the prompt; never accept an empty value.
 Keep the default build command `npm run build` (local bundle validation) and deploy
 command `npm run deploy` (actual upload). The Wrangler configuration supplies the
-SQLite `MonitoringContext` binding/migration, one-minute cron and workers.dev URL.
+SQLite `MonitoringContext` binding/migration, Analytics Engine write binding,
+one-minute cron and workers.dev URL.
 No external database, identity service, custom hostname, email or billing integration
 is required. Cloudflare account limits and charges apply, including DO usage.
 
@@ -26,7 +27,9 @@ including `cloudflare.bindings` descriptions and secret example files. Account
 permissions, repository authorization and the actual build form still require a
 real install drill. The button deploys the monitoring Worker only. For a complete
 webhook installation, use the per-install Queue and delivery Worker setup below.
-Do not put a credential in Wrangler vars or a repository.
+Provide `AVAILABILITY_API_TOKEN` at the secret prompt, then complete
+[availability history setup](#availability-history). Do not put a credential
+in Wrangler vars or a repository.
 
 ## Exact-source CLI installation
 
@@ -99,12 +102,16 @@ NODE
 
 Open that file locally and save the `INSTALLATION_SECRET` value in your password
 manager; you need it to sign in and configure producers. Keep it out of terminal
-recordings, source control and shell command arguments. For a fresh installation,
-deploy the monitoring Worker and secret together. After that succeeds, deploy the consumer so its
+recordings, source control and shell command arguments. Add the
+`AVAILABILITY_API_TOKEN` to the same protected JSON file with a local editor.
+Set `AVAILABILITY_ACCOUNT_ID` to the selected Cloudflare account's 32-character ID.
+See [availability history setup](#availability-history) for the required token
+permissions and dataset. For a fresh installation, deploy the monitoring Worker
+and both secrets together. After that succeeds, deploy the consumer so its
 service binding can resolve the monitoring Worker.
 
 ```sh
-npm run deploy -- --name "$IRISBEAT_WORKER_NAME" --secrets-file "$IRISBEAT_SECRET_FILE" &&
+npm run deploy -- --name "$IRISBEAT_WORKER_NAME" --secrets-file "$IRISBEAT_SECRET_FILE" --var "AVAILABILITY_ACCOUNT_ID:$AVAILABILITY_ACCOUNT_ID" &&
   npm run deploy -- --config wrangler.delivery.jsonc --name "$IRISBEAT_DELIVERY_WORKER_NAME"
 ```
 
@@ -218,6 +225,56 @@ Monitor selections. The engine provisions withdrawal credentials from
 `NOTIFICATION_PUBLIC_ORIGIN` for self-hosted alerts and from the trusted
 [context origin](hosted-contract.md#trusted-adapter) for hosted alerts.
 
+## Availability history
+
+The monitoring Worker needs an Analytics Engine dataset and a server-side SQL
+credential. Create a custom API token with **Account → Account Analytics →
+Read**, scoped to the account that runs this Worker. Store it as the
+`AVAILABILITY_API_TOKEN` Worker secret. Set `AVAILABILITY_ACCOUNT_ID` to the
+same account ID as a Worker variable. The default dataset is
+`irisbeat_availability`, declared as the `AVAILABILITY_HISTORY` write binding
+in `wrangler.jsonc`. The dataset is created on the first write. If the Deploy
+button leaves out the binding, add an Analytics Engine binding under the
+monitoring Worker's **Settings → Bindings** with that exact binding and dataset.
+If you use a different dataset, set `AVAILABILITY_DATASET` to match the binding's
+dataset name and retain that name in the installation's Wrangler configuration.
+Use letters, digits and underscores for the dataset name, starting with a letter
+or underscore.
+
+Routine deploys retain the Worker secret and dashboard variables
+(`keep_vars` is enabled). Keep the write binding in the configuration used for
+each deploy. For a deployed Worker, `npx wrangler secret put
+AVAILABILITY_API_TOKEN --name "$IRISBEAT_WORKER_NAME"` prompts privately for a
+replacement token. Managed deployments can supply the
+[trusted query service](hosted-contract.md#availability-history) instead.
+
+Create an active Monitor and let it record an observation. Verify
+`GET /api/operator/history/readiness` with the installation Bearer secret.
+HTTP 200 with `{ "ready": true }` confirms the query can read the Monitor's
+actual observation from the write dataset. HTTP 503 returns a reason:
+
+| Reason | Meaning |
+| --- | --- |
+| `configuration_missing` | Write binding or SQL configuration is missing or invalid. |
+| `observation_pending` | Wait for an eligible Monitor observation since cutover. |
+| `observation_unconfirmed` | The query did not find that observation. Allow for ingestion lag and check that the dataset matches. |
+| `query_unavailable` | Check token scope, dataset and SQL service availability. The dataset can be unavailable before its first write is ingested. |
+
+Open Status and Operator to verify the bars. The app continues serving current
+Monitor status and Incidents and delivering alerts if a history query fails.
+The history bars show a stale message if a cached series survives, or
+“Bars unavailable” if it does not. Workers Logs expose sanitized
+`history_write_failed` and `history_query_failed` events.
+
+An upgrade from SQLite history discards only the raw availability series.
+Keep the existing Durable Object namespace so configuration, last results,
+detection progress, Maintenance and Incidents survive. Bars fill from new
+observations after the upgrade. The local cutover check is
+`node test/upgrade.cjs --analytics`. Wrangler discards Analytics Engine writes
+in ordinary local development. The local automated suite uses a test query
+service or substitutes the SQL API. Verify the actual binding and token on the
+installed Worker.
+
 ## Optional email confirmation
 
 - In Cloudflare, onboard a sending domain and choose a sender address on that domain.
@@ -286,6 +343,7 @@ Run the rendered workflows and both predecessor transitions from the same checko
 npx playwright install chromium
 npm run test:ui
 node test/upgrade.cjs --notifications
+node test/upgrade.cjs --analytics
 npm run test:delivery:upgrade
 ```
 

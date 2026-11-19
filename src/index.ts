@@ -8,9 +8,11 @@ import { parseEmailAddress, type AlertDestination, type ConfirmationIdentity, ty
 import type { NotificationDeliveryIdentity, SubmissionReport } from "./notification-outcomes";
 import { configurationScopes, mergeScopes, monitorScopes, sharedScopes, type ViewAudience, type ViewChanges, type ViewHint, type ViewScope } from "./view-changes";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import { Availability, DAY, historyStart, type AvailabilityEnv, type AvailabilityHistory } from "./availability-history";
+export type { AvailabilityHistory, AvailabilityQuery, AvailabilityQueryService, AvailabilityRow, HistoryDay } from "./availability-history";
 
 export const CONTRACT_VERSION = "1" as const;
-export interface EngineEnv {
+export interface EngineEnv extends AvailabilityEnv {
   MONITORING: DurableObjectNamespace<MonitoringContext>;
   INSTALLATION_SECRET?: string;
   NOTIFICATION_PUBLIC_ORIGIN?: string;
@@ -57,19 +59,8 @@ export type {
   NotificationQueueJob,
 } from "./notification-jobs";
 export type { MaintenanceWindow } from "./monitor-configuration";
-const DAY = 86_400_000;
-const historyStart = (at: number) => Math.floor(at / DAY) * DAY - 89 * DAY;
-export type HistoryDay = {
-  date: string;
-  state: "up" | "down" | "degraded" | "maintenance" | "empty";
-  successes: number;
-  failures: number;
-  maintenance: number;
-};
-export type AvailabilityHistory = { days: HistoryDay[]; percentage: number | null };
-type DailyCounts = { day: number; successes: number; failures: number; maintenance: number };
 export type { ViewAudience, ViewHint, ViewScope } from "./view-changes";
-export type Status = ReturnType<MonitoringContext["status"]>;
+export type Status = ReturnType<MonitoringContext["project"]>;
 const CONFIRMATION_COOLDOWN = 5 * 60_000;
 type ConfirmationInvitation = { id: string; token: string; origin: string; expiresAt: number; submitted?: boolean };
 type StoredContext = {
@@ -120,9 +111,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS incidents (
       id TEXT PRIMARY KEY, monitorId TEXT NOT NULL, openedAt INTEGER NOT NULL, closedAt INTEGER
     )`);
-    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS observations (
-      id INTEGER PRIMARY KEY, monitorId TEXT NOT NULL, at INTEGER NOT NULL, outcome TEXT NOT NULL
-    )`);
+    ctx.storage.sql.exec("DROP TABLE IF EXISTS observations");
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS subscription_tickets (
       token TEXT PRIMARY KEY, scope TEXT NOT NULL, expiresAt INTEGER NOT NULL
     )`);
@@ -133,8 +122,6 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       id INTEGER PRIMARY KEY, monitorId TEXT NOT NULL, startedAt INTEGER NOT NULL, endsAt INTEGER NOT NULL
     )`);
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS calendar_maintenance_monitor ON calendar_maintenance (monitorId, endsAt)");
-    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS observations_monitor_at ON observations (monitorId, at)");
-    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS observations_at ON observations (at)");
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS incidents_opened ON incidents (openedAt DESC, id)");
     if (!ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(incidents)").toArray().some(column => column.name === "monitorName")) {
       ctx.storage.sql.exec("ALTER TABLE incidents ADD COLUMN monitorName TEXT");
@@ -655,6 +642,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (!monitor) return null;
     this.commitViewChanges(() => {
       this.clearCalendarEvidence(id);
+      this.availability.remove(id);
       state.monitors = state.monitors.filter(monitor => monitor.id !== id);
       this.ctx.storage.kv.put("context", state);
       return configurationScopes(monitor, undefined, false);
@@ -772,20 +760,16 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     let transition: "opened" | "recovered" | undefined;
     let transitionedIncident: Pick<Incident, "id" | "openedAt"> | undefined;
     let order: number | undefined;
+    const observation = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" } as const;
+    const inRange = at >= historyStart(Math.max(at, Date.now()));
     this.commitViewChanges(() => {
       const previousState = monitor.state;
-      monitor.lastResult = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" };
+      monitor.lastResult = observation;
+      if (inRange) monitor.historyRevision = (monitor.historyRevision ?? 0) + 1;
       if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
         this.ctx.storage.sql.exec("DELETE FROM calendar_receipts WHERE monitorId = ? AND occurrence < ?", monitor.id, monitor.nextDue);
         this.ctx.storage.sql.exec("DELETE FROM calendar_maintenance WHERE monitorId = ? AND endsAt <= ?", monitor.id, at);
       }
-      if (monitor.kind !== "heartbeat" || monitor.scheduleMode !== "calendar" || at >= historyStart(Math.max(at, Date.now())))
-        this.ctx.storage.sql.exec("INSERT INTO observations (monitorId, at, outcome) VALUES (?, ?, ?)", monitor.id, at, monitor.lastResult.outcome);
-      // Bounded cleanup keeps the entire current UTC day and never touches Incidents.
-      this.ctx.storage.sql.exec(
-        "DELETE FROM observations WHERE id IN (SELECT id FROM observations WHERE at < ? ORDER BY at LIMIT 1000)",
-        historyStart(Math.max(at, Date.now())),
-      );
       if (maintenance) {
         this.ctx.storage.kv.put("context", current);
         return monitorScopes(monitor, `monitor/${monitor.id}`);
@@ -830,6 +814,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       if (transition || previousState !== monitor.state) scopes.push("banner");
       return monitorScopes(monitor, ...scopes);
     });
+    if (inRange) this.availability.write(monitor.id, observation);
     if (!transition || !transitionedIncident) return;
     if (monitor.notificationSelections?.length) {
       await this.enqueueNotifications(monitor, pauseGeneration, {
@@ -1005,36 +990,19 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return monitor ? this.heartbeat(monitor.id, at) : false;
   }
 
-  // Separate series reads so their failure never hides current state or Incidents.
-  protected queryHistory(id: string, start: number, end: number): DailyCounts[] | null {
-    return this.ctx.storage.sql.exec<DailyCounts>(
-      `SELECT CAST(at / ${DAY} AS INTEGER) AS day,
-        SUM(outcome = 'success') AS successes, SUM(outcome = 'failure') AS failures,
-        SUM(outcome = 'maintenance') AS maintenance
-       FROM observations WHERE monitorId = ? AND at >= ? AND at < ? GROUP BY day`,
-      id, start, end,
-    ).toArray();
+  private availability = new Availability(this.env, this.ctx);
+
+  availabilityReadiness() {
+    return this.availability.readiness(this.read().monitors, Date.now());
   }
 
-  private history(id: string, start: number): AvailabilityHistory | null {
-    try {
-      const rows = this.queryHistory(id, start, start + 90 * DAY);
-      if (!rows) return null;
-      const counts = new Map(rows.map(row => [row.day, row]));
-      const days: HistoryDay[] = Array.from({ length: 90 }, (_, index) => {
-        const at = start + index * DAY;
-        const { successes = 0, failures = 0, maintenance = 0 } = counts.get(at / DAY) ?? {};
-        return { date: new Date(at).toISOString().slice(0, 10),
-          state: successes && failures ? "degraded" : successes ? "up" : failures ? "down" : maintenance ? "maintenance" : "empty",
-          successes, failures, maintenance };
-      });
-      const successes = days.reduce((total, day) => total + day.successes, 0);
-      const failures = days.reduce((total, day) => total + day.failures, 0);
-      return { days, percentage: successes + failures ? successes / (successes + failures) * 100 : null };
-    } catch {
-      console.error(JSON.stringify({ event: "history_query_failed" }));
-      return null;
-    }
+  private readAvailability(state: StoredContext, projection: Status, at: number) {
+    const selected = new Set(projection.monitors.map(monitor => monitor.id));
+    const monitors = state.monitors.filter(monitor => selected.has(monitor.id));
+    return this.availability.read(monitors, at, () => {
+      const state = this.ctx.storage.kv.get<StoredContext>("context");
+      return new Map(state?.monitors.map(monitor => [monitor.id, monitor.historyRevision]));
+    });
   }
 
   provisionEmailWithdrawals(origin: string) {
@@ -1051,26 +1019,40 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   firstMonitorId() { return this.read().monitors[0]?.id ?? null; }
 
-  status(operator = false, secrets = operator) {
-    const at = Date.now();
-    return this.project(this.read(at), operator, secrets, at);
-  }
-
-  readView(scope: ViewScope, audience: ViewAudience) {
+  snapshot(operator = false, secrets = operator) {
     const at = Date.now();
     const state = this.read(at);
-    return { revision: this.viewClock()[audience], data: this.project(state, audience !== "public", audience === "editor", at, scope) };
+    const data = this.project(state, operator, secrets, at);
+    return attachAvailability(data, this.availability.cached(state.monitors.filter(monitor => operator || monitor.published), at));
+  }
+
+  async status(operator = false, secrets = operator): Promise<Status> {
+    const at = Date.now();
+    const state = this.read(at);
+    const data = this.project(state, operator, secrets, at);
+    return attachAvailability(data, await this.readAvailability(state, data, at));
+  }
+
+  async readView(scope: ViewScope, audience: ViewAudience, minimum = 0) {
+    const at = Date.now();
+    const state = this.read(at);
+    const revision = this.viewClock()[audience];
+    const operator = audience !== "public";
+    const data = this.project(state, operator, audience === "editor", at, scope);
+    if (revision < minimum || !includesLedger(scope) || !data.monitors.length) return { revision, data };
+    const history = await this.readAvailability(state, data, at);
+    return { revision, data: attachAvailability(data, history) };
   }
 
   private project(state: StoredContext, operator: boolean, secrets: boolean, at: number, scope?: ViewScope) {
     const start = historyStart(at);
     const row = scope?.startsWith("monitor/") ? scope.slice("monitor/".length) : null;
-    const withHistory = !scope || scope === "monitors" || row !== null;
+    const withHistory = !scope || includesLedger(scope);
     const withIncidents = !scope || scope === "incidents" || scope === "banner" && !operator;
     const visible = withHistory || withIncidents || scope === "destinations"
       ? state.monitors.filter(monitor => (operator || monitor.published) && (row === null || monitor.id === row)) : [];
     const monitors = visible.map(monitor => ({
-      id: monitor.id, name: monitor.name, kind: monitor.kind, history: withHistory ? this.history(monitor.id, start) : null,
+      id: monitor.id, name: monitor.name, kind: monitor.kind, history: null as AvailabilityHistory | null,
       ...(monitor.kind === "heartbeat" ? { lastSeen: monitor.lastSeen } : {}), state: state.paused ? "paused" as const : monitor.maintenance ? "maintenance" as const : monitor.state, maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult,
       ...(secrets ? { destinationIds: (monitor.notificationSelections ?? []).map(selection => selection.destinationId) } : {}),
       ...(operator ? {
@@ -1106,6 +1088,15 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         .toArray().filter(incident => operator || visible.some(monitor => monitor.id === incident.monitorId)) : [],
     };
   }
+}
+
+function includesLedger(scope: ViewScope) {
+  return scope === "monitors" || scope.startsWith("monitor/");
+}
+
+function attachAvailability(status: Status, history: Map<string, AvailabilityHistory | null>): Status {
+  const monitors = status.monitors.map(monitor => ({ ...monitor, history: history.get(monitor.id) ?? null }));
+  return { ...status, monitors, monitor: monitors[0] ?? null };
 }
 
 async function authorized(request: Request, secret: string | undefined) {
@@ -1268,7 +1259,7 @@ async function configuredConfirmationOrigin<E extends EngineEnv>(c: Context<Http
 
 async function operatorResponse<E extends EngineEnv>(c: Context<HttpEnv<E>>, result: Status | true | null, status = 200) {
   const resolved = c.get("resolved");
-  if (result === true) result = await c.get("context").status(true, c.get("permission") === "editor");
+  if (result === true) result = await c.get("context").snapshot(true, c.get("permission") === "editor");
   const emailConfigured = result && c.get("permission") === "editor" && await confirmationOrigin(c);
   return Response.json(result && { ...result, ...(emailConfigured ? { emailConfigured: true } : {}),
     ...(resolved ? { hosted: true, permission: resolved.permission } : {}) }, { status });
@@ -1388,10 +1379,11 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   const destinationsPath = "/api/operator/destinations";
   const destinationPath = destinationsPath + "/:id";
   const resendPath = destinationPath + "/confirmation";
+  const readinessPath = "/api/operator/history/readiness";
   const publicPartials = "/api/status/partials";
   const operatorPartials = "/api/operator/partials";
   const operatorPartialPaths = [operatorPartials + "/:section", operatorPartials + "/monitor/:id"];
-  const operatorPaths = [...operatorPartialPaths, ticketPath, previewPath, destinationsPath, destinationPath, resendPath, "/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
+  const operatorPaths = [readinessPath, ...operatorPartialPaths, ticketPath, previewPath, destinationsPath, destinationPath, resendPath, "/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
   for (const path of operatorPaths) app.use(path, async (c, next) => {
     const resolved = c.get("resolved");
     if (path === rotationPath && !resolved) return c.notFound();
@@ -1412,7 +1404,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     const minimum = c.req.query("revision") ?? "0";
     if (!/^\d+$/.test(minimum) || !Number.isSafeInteger(Number(minimum))) return c.text("Invalid revision", 400);
     const scope = resource as ViewScope;
-    const { revision, data } = await c.get("context").readView(scope, audience);
+    const { revision, data } = await c.get("context").readView(scope, audience, Number(minimum));
     if (revision < Number(minimum)) return c.text("Revision unavailable", 409);
     const emailConfigured = scope === "destinations" && !!await confirmationOrigin(c);
     return c.json({ revision, ...renderViewPartial(scope, data, audience, emailConfigured), ...(operator ? { permission: audience } : {}) });
@@ -1420,6 +1412,11 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   for (const path of [publicPartials + "/:section", publicPartials + "/monitor/:id", ...operatorPartialPaths]) {
     app.get(path, getOnly, partial);
   }
+  app.get(readinessPath, getOnly, async (c: Context<HttpEnv<E>>) => {
+    if (c.get("permission") !== "editor") return Response.json({ error: "Forbidden" }, { status: 403 });
+    const result = await c.get("context").availabilityReadiness();
+    return Response.json(result, { status: result.ready ? 200 : 503 });
+  });
   app.post(ticketPath, async c => {
     const url = new URL(c.req.url);
     if (!allowedSubscriptionOrigin(c.req.raw, false)) return new Response(null, { status: 403 });
@@ -1549,7 +1546,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     return result ? operatorResponse(c, result) : Response.json({ error: "Monitor changed; reload before saving" }, { status: 409 });
   });
   for (const path of operatorPaths) app.all(path, () => methodNotAllowed(
-    (path === rotationPath || path === previewPath) ? "POST" : path === maintenancePath ? "PUT, DELETE" : path === monitorPath ? "PATCH, DELETE" : path === destinationPath ? "PUT, DELETE" : (path === "/api/operator/monitors" || path === destinationsPath) ? "GET, POST" : "GET, PUT",
+    path === readinessPath ? "GET" : (path === rotationPath || path === previewPath) ? "POST" : path === maintenancePath ? "PUT, DELETE" : path === monitorPath ? "PATCH, DELETE" : path === destinationPath ? "PUT, DELETE" : (path === "/api/operator/monitors" || path === destinationsPath) ? "GET, POST" : "GET, PUT",
   ));
   return app;
 }
