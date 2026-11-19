@@ -7,6 +7,7 @@ async function renderOperatorFixture(page: Page, snapshot: object, monitorId: st
   expect(response.ok()).toBe(true);
   const json = await response.json();
   await page.route('**/api/operator', route => route.fulfill({ json }));
+  await page.route('**/api/operator/events/ticket', route => route.fulfill({ status: 503 }));
   await page.route('**/api/operator/monitors/' + monitorId, route => route.fulfill({ json }));
 }
 
