@@ -303,3 +303,41 @@ for (const { path, unavailable } of [{ path: '/', unavailable: false }, { path: 
     }
   });
 }
+
+test('a new observation receives its own connected history retry budget', async ({ page, request }) => {
+  const headers = { Authorization: 'Bearer ui-test-secret' };
+  const created = await request.post('/api/operator/monitors', { headers, data: { name: 'Delayed history', kind: 'heartbeat' } });
+  const { id } = (await created.json()).monitors.at(-1);
+  const row = page.locator('[data-key="' + id + '"]');
+  let reads = 0;
+  let ingested = false;
+  try {
+    expect((await request.post('/heartbeat/' + id, { headers })).status()).toBe(204);
+    await page.clock.install();
+    await page.route('**/api/status/partials/monitor/' + id + '?*', async route => {
+      const response = await route.fetch();
+      const data = await response.json();
+      data.html = data.html.replace('class="availability"', 'class="availability" data-test-history-read="' + ++reads + '"');
+      if (!ingested) data.html = data.html.replace('100.00%', 'No observations');
+      await route.fulfill({ response, json: data });
+    });
+    await page.goto('/');
+    await expect(page.getByText('Polling', { exact: true })).toBeHidden();
+    await expect(row.locator('[data-history-retry]')).toBeVisible();
+    for (const count of [1, 2, 3]) {
+      await page.clock.fastForward(30_000);
+      await expect(row.locator('[data-test-history-read="' + count + '"]')).toBeVisible();
+    }
+
+    expect((await request.post('/heartbeat/' + id, { headers })).status()).toBe(204);
+    await expect(row.locator('[data-test-history-read="4"]')).toBeVisible();
+    await page.clock.fastForward(30_000);
+    await expect(row.locator('[data-test-history-read="5"]')).toBeVisible();
+    ingested = true;
+    await page.clock.fastForward(30_000);
+    await expect(row.locator('[data-test-history-read="6"] .percentage')).toHaveText('100.00%');
+  } finally {
+    await page.close();
+    await request.delete('/api/operator/monitors/' + id, { headers });
+  }
+});

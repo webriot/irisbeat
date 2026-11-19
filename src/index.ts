@@ -1098,7 +1098,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const visible = withHistory || withIncidents || scope === "destinations"
       ? state.monitors.filter(monitor => (operator || monitor.published) && (row === null || monitor.id === row)) : [];
     const monitors = visible.map(monitor => ({
-      id: monitor.id, name: monitor.name, kind: monitor.kind, history: null as AvailabilityHistory | null,
+      id: monitor.id, name: monitor.name, kind: monitor.kind, history: null as AvailabilityHistory | null, historyRevision: monitor.historyRevision,
       ...(monitor.kind === "heartbeat" ? { lastSeen: monitor.lastSeen } : {}), state: state.paused ? "paused" as const : monitor.maintenance ? "maintenance" as const : monitor.state, maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult,
       ...(secrets ? { destinationIds: (monitor.notificationSelections ?? []).map(selection => selection.destinationId) } : {}),
       ...(operator ? {
