@@ -5,6 +5,7 @@ import { availabilityFixture } from './availability-fixture';
 // Test-only series fault injection; production exports no control endpoint.
 const analytics = availabilityFixture();
 let backend = 'managed';
+let interruptObservation = false;
 let queued: NotificationQueueJob[] = [];
 let queueUnavailable = false;
 export class MonitoringContext extends EngineContext {
@@ -25,6 +26,10 @@ export class MonitoringContext extends EngineContext {
     });
   }
 
+  protected override publishViewChanges(...args: Parameters<EngineContext['publishViewChanges']>) {
+    if (interruptObservation) throw new Error('Interrupted before Analytics Engine handoff');
+    super.publishViewChanges(...args);
+  }
 }
 export default {
   ...worker,
@@ -42,6 +47,7 @@ export default {
       if (!url.searchParams.has('mode')) return Response.json({ points: analytics.points, queries: analytics.queries });
       const mode = url.searchParams.get('mode')!;
       backend = mode === 'unconfigured' || mode === 'direct' ? mode : 'managed';
+      interruptObservation = mode === 'interrupt-observation';
       analytics.setMode(mode);
       return new Response(null, { status: 204 });
     }

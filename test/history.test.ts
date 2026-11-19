@@ -351,6 +351,32 @@ it('queries history for only the requested authorized ledger rows and never for 
 });
 
 
+it('submits a committed Calendar Heartbeat after restart without replaying its observation', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
+  const monitor = await create({ kind: 'heartbeat', scheduleMode: 'calendar', cron: '* * * * *',
+    timezone: 'UTC', graceSeconds: 30, url: undefined, failureThreshold: undefined });
+  const deadline = today + 90_000;
+  clock.mockReturnValue(deadline + 1);
+  await request('/__test-history?mode=interrupt-observation');
+  await expect(tick(deadline + 1)).rejects.toThrow('Interrupted before Analytics Engine handoff');
+  const points = async () => (await (await request('/__test-history')).json<{ points: AnalyticsEngineDataPoint[] }>()).points;
+  expect(await points()).toEqual([]);
+
+  const context = env.MONITORING.getByName('personal');
+  await evictDurableObject(context);
+  await request('/__test-history?mode=write-rejected');
+  expect((await status()).monitor).toMatchObject({ state: 'down', lastResult: { at: deadline } });
+  clock.mockReturnValue(deadline + 5_001);
+  expect(await runDurableObjectAlarm(context)).toBe(true);
+  expect(await points()).toEqual([]);
+  await evictDurableObject(context);
+  await request('/__test-history?mode=ingested');
+  clock.mockReturnValue(deadline + 10_001);
+  expect(await runDurableObjectAlarm(context)).toBe(true);
+  await tick(deadline + 10_001);
+  expect(await points()).toEqual([expect.objectContaining({ blobs: [monitor.id, 'failure'], doubles: [deadline] })]);
+});
+
 it('bounds a dispatch across Monitors and drains overflow after eviction without delaying detection', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
   const input = { kind: 'heartbeat', scheduleMode: 'calendar', cron: '* * * * *', timezone: 'UTC', graceSeconds: 30 };
@@ -408,6 +434,30 @@ it('keeps a successful first query when a newer observation commits while it is 
   expect((await status()).monitor).toMatchObject({ state: 'down', history: { percentage: 100, stale: true } });
 });
 
+it('returns the newer successful scoped series when an earlier query fails', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
+  const monitor = await create();
+  await create({ published: false });
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await tick(today);
+  const path = '/api/status/partials/monitor/' + monitor.id;
+  const read = async () => (await request(path)).json<{ html: string }>();
+  const queries = async () => (await (await request('/__test-history')).json<{ queries: { monitorIds: string[] }[] }>()).queries;
+  await request('/__test-history?mode=held-failure');
+  const earlier = read();
+  await vi.waitFor(async () => expect(await queries()).toHaveLength(1));
+  clock.mockReturnValue(today + 1_000);
+  await request('/__test-history?mode=ingested');
+  expect((await read()).html).toContain('100.00%');
+  await request('/__test-history?mode=release-failure');
+  const { html } = await earlier;
+  expect(html).toContain('100.00%');
+  expect(html).not.toContain('Availability history is stale');
+  clock.mockReturnValue(today + 16_000);
+  expect((await read()).html).toContain('100.00%');
+  expect((await queries()).map(query => query.monitorIds)).toEqual([[monitor.id], [monitor.id], [monitor.id]]);
+});
+
 it('marks aggregates pending during ingestion and refreshes them without another observation', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
   const monitor = await create();
@@ -415,13 +465,18 @@ it('marks aggregates pending during ingestion and refreshes them without another
   await tick(today);
   await request('/__test-history?mode=lagging');
   expect((await status()).monitor!.history).toMatchObject({ percentage: null, pending: true });
-  await request('/__test-history?mode=ingested');
   clock.mockReturnValue(today + 14_999);
   expect((await status()).monitor!.history?.percentage).toBeNull();
-  clock.mockReturnValue(today + 15_000);
-  expect((await status()).monitor!.history?.percentage).toBe(100);
-  clock.mockReturnValue(today + 60_000);
   const path = '/api/status/partials/monitor/' + monitor.id;
+  const read = async () => (await request(path)).json<{ html: string }>();
+  for (const offset of [30_000, 60_000, 90_000, 119_000]) {
+    clock.mockReturnValue(today + offset);
+    const { html } = await read();
+    expect(html).toContain('No observations');
+    expect(html).toContain('data-history-retry');
+  }
+  await request('/__test-history?mode=ingested');
+  clock.mockReturnValue(today + 120_000);
   const { html } = await (await request(path)).json<{ html: string }>();
   expect(html).toContain('100.00%');
   expect(html).not.toContain('data-history-retry');

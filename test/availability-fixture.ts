@@ -7,16 +7,20 @@ export function availabilityFixture(storage?: DurableObjectStorage) {
   const points = storage?.kv.get<AnalyticsEngineDataPoint[]>(key) ?? [];
   const queries: AvailabilityQuery[] = [];
   let mode = "available";
+  let holdFailure = false;
   return {
     points,
     queries,
     setMode(value: string) {
+      if (value === "held-failure") holdFailure = true;
+      if (value === "release-failure" || value === "available") holdFailure = false;
       mode = value;
       if (value === "available") { points.length = 0; queries.length = 0; }
     },
     bindings: {
       AVAILABILITY_HISTORY: {
         writeDataPoint(point?: AnalyticsEngineDataPoint) {
+          if (mode === "write-rejected") throw new Error("Substituted synchronous Analytics Engine write failure");
           if (point && mode !== "write-failed") {
             points.push(point);
             storage?.kv.put(key, points);
@@ -26,6 +30,10 @@ export function availabilityFixture(storage?: DurableObjectStorage) {
       AVAILABILITY_QUERY: {
         async queryAvailability(query: AvailabilityQuery): Promise<AvailabilityRow[]> {
           queries.push(query);
+          if (mode === "held-failure") {
+            while (holdFailure) await new Promise(resolve => setTimeout(resolve, 10));
+            throw new Error("Substituted delayed Analytics Engine query failure");
+          }
           if (mode === "lagging") return [];
           if (mode === "failed" || mode === "missing") throw new Error("Substituted Analytics Engine query failure");
           const rows = new Map<string, AvailabilityRow>();

@@ -41,6 +41,7 @@ type CachedSeries = {
   rows: AvailabilityRow[];
 };
 const flushKey = "availability-flush-at";
+const flushDelay = 5_000;
 const cacheKey = (id: string) => "availability:" + id;
 const batchSize = 50;
 // https://developers.cloudflare.com/analytics/analytics-engine/limits/
@@ -48,6 +49,10 @@ export const availabilityWriteLimit = 250;
 const timeout = 3_000;
 const freshFor = 60_000;
 const retryAfter = 15_000;
+export const historyRetryInterval = 30_000;
+export const historyRetryAttempts = 4;
+const historyRetryWindow = historyRetryInterval * historyRetryAttempts;
+const queriedAt = (cached: CachedSeries) => cached.queriedAt ?? cached.freshUntil - freshFor;
 const date = (at: number) => new Date(at).toISOString().slice(0, 10);
 
 function series(rows: AvailabilityRow[], start: number, stale = false, pending = false): AvailabilityHistory {
@@ -142,37 +147,39 @@ export class Availability {
       (typeof this.env.AVAILABILITY_QUERY?.queryAvailability === "function" || !!queryConfiguration(this.env));
   }
 
-  defer(monitorId: string, { at, outcome }: Observation) {
+  enqueue(monitorId: string, { at, outcome }: Observation) {
     this.ctx.storage.sql.exec("INSERT INTO availability_outbox (monitorId, at, outcome) VALUES (?, ?, ?)", monitorId, at, outcome);
-    if (this.flushAt === undefined) this.ctx.storage.kv.put(flushKey, Date.now() + 5_000);
+    if (this.flushAt === undefined) this.delayFlush(Date.now());
   }
 
   get flushAt() {
     return this.configured ? this.ctx.storage.kv.get<number>(flushKey) : undefined;
   }
 
-  flush(now: number) {
+  delayFlush(now: number) {
+    this.ctx.storage.kv.put(flushKey, now + flushDelay);
+  }
+
+  flush(now: number, limit: number) {
     const changed = new Set<string>();
     if (!this.configured) return changed;
     const sql = this.ctx.storage.sql;
     sql.exec("DELETE FROM availability_outbox WHERE at < ?", historyStart(now));
     const rows = sql.exec<Observation & { id: number; monitorId: string }>(
-      "SELECT id, monitorId, at, outcome FROM availability_outbox ORDER BY id LIMIT ?", availabilityWriteLimit,
+      "SELECT id, monitorId, at, outcome FROM availability_outbox ORDER BY id LIMIT ?", limit,
     ).toArray();
     for (const { id, monitorId, at, outcome } of rows) {
       if (!this.write(monitorId, { at, outcome })) break;
       sql.exec("DELETE FROM availability_outbox WHERE id = ?", id);
       changed.add(monitorId);
     }
-    if (sql.exec("SELECT 1 FROM availability_outbox LIMIT 1").toArray().length) {
-      this.ctx.storage.kv.put(flushKey, now + 5_000);
-    } else {
+    if (!sql.exec("SELECT 1 FROM availability_outbox LIMIT 1").toArray().length) {
       this.ctx.storage.kv.delete(flushKey);
     }
     return changed;
   }
 
-  write(monitorId: string, observation: Observation) {
+  private write(monitorId: string, observation: Observation) {
     try {
       if (!this.env.AVAILABILITY_HISTORY) throw new Error("Analytics Engine write binding missing");
       this.env.AVAILABILITY_HISTORY.writeDataPoint({
@@ -235,8 +242,12 @@ export class Availability {
   private cachedSeries(monitor: Monitor, now: number, start: number, configured: boolean) {
     if (!monitor.historyRevision) return configured ? series([], start) : null;
     const cached = this.ctx.storage.kv.get<CachedSeries>(cacheKey(monitor.id));
+    return this.cachedHistory(cached, monitor.historyRevision, now, start, configured);
+  }
+
+  private cachedHistory(cached: CachedSeries | undefined, revision: number | undefined, now: number, start: number, configured: boolean) {
     if (!cached || Math.abs(cached.start - start) >= 90 * DAY) return null;
-    const fresh = configured && cached.start === start && cached.revision === monitor.historyRevision && now < cached.freshUntil;
+    const fresh = configured && cached.start === start && cached.revision === revision && now < cached.freshUntil;
     return series(cached.rows, start, !fresh, cached.pending);
   }
 
@@ -267,20 +278,24 @@ export class Availability {
         for (const row of rows) rowsByMonitor.get(row.monitorId)!.push(row);
         const revisions = currentRevisions();
         for (const { id, historyRevision, historyChangedAt } of batch) {
+          if (!revisions.has(id)) { result.set(id, null); continue; }
           const revision = historyRevision!;
           const key = cacheKey(id);
           const previous = this.ctx.storage.kv.get<CachedSeries>(key);
-          const pending = now < (historyChangedAt ?? -Infinity) + freshFor ||
-            this.ctx.storage.sql.exec("SELECT 1 FROM availability_outbox WHERE monitorId = ? LIMIT 1", id).toArray().length > 0;
+          const pendingUntil = (historyChangedAt ?? -Infinity) + historyRetryWindow;
+          const queued = this.ctx.storage.sql.exec("SELECT 1 FROM availability_outbox WHERE monitorId = ? LIMIT 1", id).toArray().length > 0;
+          const pending = queued || now < pendingUntil;
+          const freshUntil = queued ? now + retryAfter
+            : pending ? Math.min(now + retryAfter, pendingUntil) : now + freshFor;
           let latest: CachedSeries = {
-            start, revision, queriedAt: now, freshUntil: now + (pending ? retryAfter : freshFor),
+            start, revision, queriedAt: now, freshUntil,
             rows: rowsByMonitor.get(id)!, pending,
           };
           // A raced query is still a useful fallback if no newer query has succeeded.
           if (previous && (previous.revision > revision ||
-              (previous.revision === revision && (previous.queriedAt ?? previous.freshUntil - freshFor) >= now))) {
+              (previous.revision === revision && queriedAt(previous) >= now))) {
             latest = previous;
-          } else if (revisions.has(id)) {
+          } else {
             this.ctx.storage.kv.put(key, latest);
           }
           const stale = latest.start !== start || latest.revision !== revisions.get(id) || now >= latest.freshUntil;
@@ -290,7 +305,12 @@ export class Availability {
       } catch {
         const revisions = currentRevisions();
         for (const { id, historyRevision } of batch) {
-          if (historyRevision === revisions.get(id)) this.nextAttempt.set(id, now + retryAfter);
+          const revision = revisions.get(id);
+          const latest = this.ctx.storage.kv.get<CachedSeries>(cacheKey(id));
+          result.set(id, revisions.has(id) ? this.cachedHistory(latest, revision, Date.now(), start, configured) : null);
+          if (historyRevision === revision && (!latest || latest.revision !== revision || queriedAt(latest) < now)) {
+            this.nextAttempt.set(id, Math.max(this.nextAttempt.get(id) ?? -Infinity, now + retryAfter));
+          }
         }
         console.error(JSON.stringify({ event: "history_query_failed" }));
       }
