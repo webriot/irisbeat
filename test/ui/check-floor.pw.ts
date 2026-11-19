@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import { monitorAction } from './actions';
+
+async function renderOperatorFixture(page: Page, snapshot: object, monitorId: string) {
+  const response = await page.request.post('/__ui/operator', { data: snapshot });
+  expect(response.ok()).toBe(true);
+  const json = await response.json();
+  await page.route('**/api/operator', route => route.fulfill({ json }));
+  await page.route('**/api/operator/monitors/' + monitorId, route => route.fulfill({ json }));
+}
 
 test('Schedule carries the floor and suspension while State shows the last observed result', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 820 });
@@ -14,8 +22,7 @@ test('Schedule carries the floor and suspension while State shows the last obser
       { ...base, id: 'heartbeat', name: 'Producer', kind: 'heartbeat', scheduleMode: 'interval', state: 'up', intervalSeconds: 60 },
     ],
   };
-  await page.route('**/api/operator', route => route.fulfill({ json: snapshot }));
-  await page.route('**/api/operator/monitors/interval', route => route.fulfill({ json: snapshot }));
+  await renderOperatorFixture(page, snapshot, 'interval');
   await page.goto('/operator');
   await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -56,8 +63,7 @@ for (const floor of [180, 60]) {
       pageName: 'Floor test', minCheckIntervalSeconds: floor, incidents: [], monitors: [monitor],
       destinations: [{ id: 'webhook', channel: 'webhook', url: 'https://hooks.example/alert' }],
     };
-    await page.route('**/api/operator', route => route.fulfill({ json: snapshot }));
-    await page.route('**/api/operator/monitors/calendar', route => route.fulfill({ json: snapshot }));
+    await renderOperatorFixture(page, snapshot, monitor.id);
     await page.route('**/api/operator/schedule-preview', route => {
       const { cron } = route.request().postDataJSON();
       return floor === 180 && cron === monitor.cron

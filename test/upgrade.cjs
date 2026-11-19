@@ -19,12 +19,16 @@ const base = (statusPublication ? 'c4fcfa3a2eeac1f8ee18cb962c499c3d81f2d59a' : l
 const tcp = process.argv[3] === 'tcp';
 const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
 (async () => {
-  const sources = execFileSync('git', ['ls-tree', '-r', '--name-only', base, 'src'], { encoding: 'utf8' }).trim().split('\n');
-  for (const source of sources) {
-    const destination = join(temporary, source.slice(4));
-    mkdirSync(dirname(destination), { recursive: true });
-    writeFileSync(destination, execFileSync('git', ['show', `${base}:${source}`]));
-  }
+  const extractSource = (revision, directory) => {
+    const sources = execFileSync('git', ['ls-tree', '-r', '--name-only', revision, 'src'], { encoding: 'utf8' }).trim().split('\n');
+    for (const source of sources) {
+      const destination = join(directory, source.slice(4));
+      mkdirSync(dirname(destination), { recursive: true });
+      writeFileSync(destination, execFileSync('git', ['show', `${revision}:${source}`]));
+    }
+    return join(directory, 'index.ts');
+  };
+  const predecessor = extractSource(base, temporary);
   const wrapper = index => {
     const source = JSON.stringify(index);
     const publicationFixture = statusPublication && index.startsWith(project);
@@ -156,7 +160,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
       }] : [])],
     });
   }
-  let mf = new Miniflare(options(await bundle(join(temporary,'index.ts'))));
+  let mf = new Miniflare(options(await bundle(predecessor)));
   const request = (path, method='GET', body, at) => mf.dispatchFetch('https://irisbeat.example'+path,{method,headers:{authorization:'Bearer upgrade-test-secret','content-type':'application/json',...(at === undefined ? {} : {'x-test-at':String(at)})},...(body?{body:JSON.stringify(body)}:{})});
   const tick = at => request('/test-tick?at='+at);
   const start = Date.UTC(2026,10,13);
@@ -164,7 +168,8 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     if (statusPublication) {
       const test = require('./status-publication.cjs');
       const application = await bundle(join(project, 'src/index.ts'));
-      await test({ mf, options, application, request, tick, deliveries, fresh: options => new Miniflare(options) });
+      const cachedSQLite = await bundle(extractSource('6acaa65552a4d93bd9c43136a51abd324cc1e346', join(temporary, 'cached-sqlite')));
+      await test({ mf, options, application, cachedSQLite, request, tick, deliveries, fresh: options => new Miniflare(options) });
       return;
     }
     if (liveViews) {
@@ -267,7 +272,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
       }, start + 60_000)).status, 200);
       const beforeUpgrade = await read(start + 60_000);
       const upgraded = await bundle(join(project, 'src/index.ts'));
-      const legacy = await bundle(join(temporary, 'index.ts'));
+      const legacy = await bundle(predecessor);
       for (const missing of ['no-write', 'no-query']) {
         await mf.setOptions(options(upgraded, 'state', false, undefined, { TEST_AVAILABILITY: missing }));
         const readiness = await request('/api/operator/history/readiness', 'GET', undefined, start + 60_000);
@@ -426,7 +431,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     assert.equal((await (await request('/api/operator')).json()).incidents[0].monitorName,'Legacy service');
     if (supportsWebhook) {
       await mf.dispose();
-      mf = new Miniflare(options(await bundle(join(temporary,'index.ts')), 'webhook-only'));
+      mf = new Miniflare(options(await bundle(predecessor), 'webhook-only'));
       assert.equal((await request('/api/operator/webhook','PUT',{url:destination})).status,200);
       await mf.setOptions(options(await bundle(join(project,'src/index.ts')), 'webhook-only'));
       const upgraded = await (await request('/api/operator')).json();

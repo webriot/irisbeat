@@ -20,7 +20,7 @@ async function eventually(assertion, deadline = Date.now() + 3_000) {
   }
 }
 
-module.exports = async function test({ mf, options, application, request, tick, deliveries, fresh }) {
+module.exports = async function test({ mf, options, application, cachedSQLite, request, tick, deliveries, fresh }) {
   const update = name => request('/api/operator', 'PUT', { pageName: name });
   const status = async () => (await request('/api/status')).json();
   const browserSnapshot = async () => (await mf.dispatchFetch(origin + '/api/status', {
@@ -212,6 +212,31 @@ module.exports = async function test({ mf, options, application, request, tick, 
   assert.equal((await tick(Date.now() + 60_000)).status, 200);
   await eventually(() => assert.equal(deliveries.length, 2));
   assert.equal((await (await request('/api/operator')).json()).monitors.at(-1).state, 'down');
+  // A predecessor can have SQLite history in an already-published projection.
+  const cached = fresh(options(cachedSQLite, 'cached-state', false, undefined, { STATUS_RENDER_INTERVAL_SECONDS: '60' }));
+  try {
+    const day = Date.now() - Date.now() % 86_400_000;
+    const send = (path, time, method = 'GET', body) => cached.dispatchFetch(origin + path, {
+      method, headers: { authorization: 'Bearer upgrade-test-secret', 'content-type': 'application/json', 'x-test-at': String(time) },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    const created = await send('/api/operator/monitors', day + 1000, 'POST', { name: 'SQLite history', kind: 'heartbeat' });
+    assert.equal(created.status, 201);
+    const { monitor } = await created.json();
+    assert.equal((await send('/heartbeat/' + monitor.id, day + 2000, 'POST')).status, 204);
+    const publishedAt = day + 61_000;
+    const read = () => send('/api/status', publishedAt + 1000).then(response => response.json());
+    const before = await read();
+    assert.equal(before.monitor.history.days.at(-1).successes, 1);
+    await send('/api/operator', publishedAt + 1000, 'PUT', { pageName: 'Pending rename' });
+    await cached.setOptions(options(application, 'cached-state', false, undefined, { STATUS_RENDER_INTERVAL_SECONDS: '60' }));
+    const after = await read();
+    assert.equal(after.pageName, before.pageName);
+    assert.equal(after.monitor.id, before.monitor.id);
+    assert.deepEqual(after.monitor.lastResult, before.monitor.lastResult);
+    assert.ok(after.monitor.history.days.every(day => day.state === 'empty'));
+  } finally { await cached.dispose(); }
+
   // Warm long-window cache entries must recover through a scoped retry and an ordinary GET.
   const history = fresh(options(application, 'history-state', false, undefined, { STATUS_RENDER_INTERVAL_SECONDS: '86400' }));
   try {

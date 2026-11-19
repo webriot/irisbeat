@@ -139,7 +139,7 @@ export class Availability {
 
   constructor(private env: AvailabilityEnv, private ctx: DurableObjectState) {
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS availability_outbox (
-      id INTEGER PRIMARY KEY, monitorId TEXT NOT NULL, at INTEGER NOT NULL, outcome TEXT NOT NULL
+      id INTEGER PRIMARY KEY, monitorId TEXT NOT NULL, at INTEGER NOT NULL, outcome TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0
     )`);
     if (!ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(availability_outbox)").toArray().some(column => column.name === "revision"))
       ctx.storage.sql.exec("ALTER TABLE availability_outbox ADD COLUMN revision INTEGER NOT NULL DEFAULT 0");

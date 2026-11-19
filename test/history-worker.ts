@@ -5,6 +5,7 @@ import { availabilityFixture } from './availability-fixture';
 // Test-only series fault injection; production exports no control endpoint.
 const analytics = availabilityFixture();
 let backend = 'managed';
+let readDataset: string | undefined;
 let interruptObservation = false;
 let queued: NotificationQueueJob[] = [];
 let queueUnavailable = false;
@@ -15,6 +16,7 @@ export class MonitoringContext extends EngineContext {
     super(ctx, {
       ...env,
       get MIN_CHECK_INTERVAL_SECONDS() { return checkFloor; },
+      get AVAILABILITY_DATASET() { return readDataset; },
       get AVAILABILITY_HISTORY() { return backend === 'unconfigured' ? undefined : analytics.bindings.AVAILABILITY_HISTORY; },
       get AVAILABILITY_QUERY() { return backend === 'managed' ? analytics.bindings.AVAILABILITY_QUERY : undefined; },
       get AVAILABILITY_ACCOUNT_ID() { return backend === 'direct' ? 'a'.repeat(32) : undefined; },
@@ -59,6 +61,7 @@ export default {
     if (url.pathname === '/__test-history') {
       if (!url.searchParams.has('mode')) return Response.json({ points: analytics.points, queries: analytics.queries });
       const mode = url.searchParams.get('mode')!;
+      readDataset = url.searchParams.get('dataset') ?? undefined;
       backend = mode === 'unconfigured' || mode === 'direct' ? mode : 'managed';
       interruptObservation = mode === 'interrupt-observation';
       analytics.setMode(mode);
