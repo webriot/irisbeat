@@ -568,6 +568,15 @@ contract 1). Its prepared artifacts had these SHA-256 checksums:
   The exact build also published page and Monitor resources at scoped
   revision 8 in ORD. Ordinary GET caught up, a future minimum revision
   returned HTTP 409, and the private Monitor stayed out of public responses.
+- **Direct live upgrade to the exact candidate.** A separate disposable
+  SQLite namespace went directly from tagged `v0.3.0` (Worker version
+  `8adedb76-e726-4c52-91de-eee768b6ea8c`) to exact source
+  `245569c301b03b4323630a1c551c74fa0e1f97d3` (Worker version
+  `bd455268-53ed-4382-bb3f-2f58845d8f15`). Snapshots at 06:29:43 and
+  06:31:20 UTC showed history totals changing from `[1, 1]` to `[0, 0]`.
+  Both Monitor IDs, settings and latest results survived, as did the
+  private Monitor's Maintenance. Readiness was `observation_pending`
+  before the first new observation.
 - **Fresh CLI install.** Exact-source Worker version
   `f5a6d151-e5b9-4cc8-938a-df2601828dea` returned HTTP 503
   `observation_pending` with cron registered. At 06:26:35 UTC the first
@@ -575,7 +584,9 @@ contract 1). Its prepared artifacts had these SHA-256 checksums:
   availability showed 100% in ORD. The 06:26:41 UTC recheck after a routine
   redeploy without a secrets file (Worker version
   `09484123-78a5-4ae2-86e2-e69e6a5bbf44`) confirmed that stored credentials,
-  dataset binding and history survived.
+  dataset binding and history survived. The deployed API token was still
+  bound as `secret_text` and SQL verified three successful observations in
+  the same dataset, with zero observations carrying an extra revision value.
 - **Deploy to Cloudflare.** Dashboard sign-in was required and the
   authentication prompt was declined. The authenticated button build,
   binding and secret provisioning, and routine dashboard rebuild remain
