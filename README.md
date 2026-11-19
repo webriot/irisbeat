@@ -118,7 +118,7 @@ The configuration declares a monitoring Worker with a one-minute cron, a SQLite 
 
 ## Repository boundary
 
-The public application owns the monitoring engine and hosted extension interfaces. Private hosted consumers integrate versioned public releases rather than duplicate the engine. [Hosted contract 1](docs/hosted-contract.md) documents trusted context/permission/allowance resolution, tenant Heartbeat issuance and rotation, and Queue-based Incident and Maintenance notifications. `npm run test:consumer` prepares a reproducible local `irisbeat@0.3.0` tarball and verifies a separately installed, integrity-pinned consumer in workerd. Context pause/resume is included, with durable trusted policy revisions.
+The public application owns the monitoring engine and hosted extension interfaces. Private hosted consumers integrate versioned public releases rather than duplicate the engine. [Hosted contract 1](docs/hosted-contract.md) documents trusted context/permission/allowance resolution, tenant Heartbeat issuance and rotation, and Queue-based Incident and Maintenance notifications. `npm run test:consumer` prepares a reproducible local `irisbeat@0.4.0` tarball and verifies a separately installed, integrity-pinned consumer in workerd. Context pause/resume is included, with durable trusted policy revisions.
 
 Hosted consumers own account integration, organization roles, entitlements, subscription provisioning, monitor allowances, sender and domain provisioning, custom hostnames and hosted deployment. The public application remains independently self-hostable. Infrastructure and secrets belong outside this repository.
 

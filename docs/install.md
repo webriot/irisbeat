@@ -51,7 +51,7 @@ State. Heartbeat scheduling continues to use its own timing rules.
 ## Exact-source CLI installation
 
 Requires Node >=22.12, npm, a Cloudflare account and its workers.dev subdomain.
-Download `irisbeat-0.3.0-source.tar.gz`, `release.json` and `SHA256SUMS` from the
+Download `irisbeat-0.4.0-source.tar.gz`, `release.json` and `SHA256SUMS` from the
 reviewed release, verifying that the manifest's full revision is the intended one.
 For an unpublished candidate, use the artifacts produced by `release:prepare`
 from its reviewed Git revision instead of a release download.
@@ -59,8 +59,8 @@ Download the engine tarball too if checking the entire checksum file.
 
 ```sh
 sha256sum --check SHA256SUMS
-tar -xzf irisbeat-0.3.0-source.tar.gz
-cd irisbeat-0.3.0
+tar -xzf irisbeat-0.4.0-source.tar.gz
+cd irisbeat-0.4.0
 npm ci
 npm run check
 npm run build
@@ -267,9 +267,11 @@ dataset name and retain that name in the installation's Wrangler configuration.
 Use letters, digits and underscores for the dataset name, starting with a letter
 or underscore.
 
-Routine deploys retain the Worker secret and dashboard variables
-(`keep_vars` is enabled). Keep the write binding in the configuration used for
-each deploy. For a deployed Worker, `npx wrangler secret put
+For routine deploys, keep `keep_vars` enabled to retain dashboard variables
+such as `AVAILABILITY_ACCOUNT_ID` and `AVAILABILITY_DATASET`. Leave the stored
+Worker secret in place and keep the write binding in the configuration used
+for each deploy. Confirm the deployed bindings and readiness afterward.
+For a deployed Worker, `npx wrangler secret put
 AVAILABILITY_API_TOKEN --name "$IRISBEAT_WORKER_NAME"` prompts privately for a
 replacement token. Managed deployments can supply the
 [trusted query service](hosted-contract.md#availability-history) instead.
@@ -382,8 +384,8 @@ These checks use local workerd, controlled time and synthetic recipients.
 
 | Artifact | Use |
 | --- | --- |
-| `irisbeat-0.3.0-source.tar.gz` | Exact committed source, lockfile, config, tests, build/install instructions, LICENSE and NOTICE |
-| `irisbeat-0.3.0.tgz` | TypeScript exports for both Workers, configuration references, integration docs, LICENSE and NOTICE |
+| `irisbeat-0.4.0-source.tar.gz` | Exact committed source, lockfile, config, tests, build/install instructions, LICENSE and NOTICE |
+| `irisbeat-0.4.0.tgz` | TypeScript exports for both Workers, configuration references, integration docs, LICENSE and NOTICE |
 | `release.json` | Full Git revision, version, contract 1, SHA-256 hashes and engine npm SHA-512 integrity |
 | `SHA256SUMS` | SHA-256 integrity for both archives and the manifest |
 
@@ -438,8 +440,9 @@ channels or arbitrary public sites. Use default one-minute intervals, thresholds
    persists. Local suites cover exact timing/UTC boundaries; live evidence covers
    actual Cloudflare socket/cron/secret/resource behavior.
 6. Stop producers, remove the drill webhook in Settings, and delete only drill Monitors.
-   Verify both disposable Worker names, both Queues and the account. Delete the
-   delivery Worker first, then the monitoring Worker using
+   Verify both disposable Worker names, both Queues and the account. Detach the
+   delivery Worker using `npx wrangler queues consumer remove "$IRISBEAT_QUEUE_NAME" "$IRISBEAT_DELIVERY_WORKER_NAME"`.
+   Delete the delivery Worker, then the monitoring Worker using
    `npx wrangler delete <worker-name>`. Delete both disposable Queues with
    `npx wrangler queues delete <queue-name>`. Worker deletion destroys its
    associated DO data. Confirm removal, then remove any separate controlled
@@ -450,25 +453,203 @@ Bound the live drill to 30 minutes after cron activation (allow up to 15 minutes
 for new cron propagation). If targets/cron fail to initialize, stop and investigate;
 do not widen destinations or call dry-run/local evidence a live pass.
 
+## Analytics Engine install and upgrade drill
+
+Use one disposable v0.3.0 installation and a separate fresh installation. Keep
+the exact candidate revision, artifact hashes, Worker version IDs, and UTC
+timestamps with the evidence. Use a separate Analytics Engine dataset per
+disposable install and keep dataset identifiers in the private deployment
+configuration.
+
+1. Run the local release and predecessor checks from the candidate checkout.
+   Create the candidate archive with `npm run release:prepare`, verify
+   `SHA256SUMS`, and extract it outside the checkout. Keep the v0.3.0 control
+   Worker name, `MONITORING` binding, class, migration list and both Queue names
+   when applying the installation substitutions to the candidate. Confirm the
+   account and Worker identity before any upload.
+2. Capture the v0.3.0 anonymous and authenticated snapshots before upgrading.
+   Use a published Monitor with an open Incident and partial recovery progress,
+   a private Monitor in Maintenance, a Monitor with a successful scheduled
+   Check, and a selected webhook pointing to the controlled sink. Record their
+   IDs, timestamps, history totals and accepted alert submission. Complete the
+   upgrade before silence can reset the seeded recovery progress.
+3. Configure `AVAILABILITY_HISTORY` in the candidate's Wrangler config and
+   `AVAILABILITY_DATASET` to the same dataset name. Set the account ID, and
+   supply the scoped token and installation secret through the private
+   Wrangler secret file described above. Deploy the exact candidate with those
+   local substitutions. In the deployed Worker version, confirm the write
+   binding's dataset, the read dataset variable, and the token binding type.
+   Record the first candidate snapshots before sending new receipts or letting
+   the seeded Monitors Check. Compare identity, configuration, publication,
+   Maintenance, latest results, Incidents and alert selections. Expect empty
+   bars and readiness `observation_pending` before the first eligible result.
+4. Send the next correctly spaced authenticated receipt. Confirm recovery of
+   the same Incident and acceptance of the recovery alert. Poll editor
+   readiness until it returns 200 after ingestion. Verify the new result in both
+   views, the private Monitor's absence from public responses, and anonymous
+   401 for operator configuration. Connect a same-origin WebSocket to
+   `/api/status/events/v2`, make a public change and wait for its window.
+   Fetch each hinted partial with `?revision=<revision>`, confirm its revision,
+   then send `ack`. Read a different public representation to cover a cache
+   miss. Confirm an ordinary read without the hint catches up.
+5. Treat a missing account variable, missing credential or mismatched dataset
+   as incomplete setup. Confirm the deployed binding and variables and use a
+   fresh observation to check readiness after correcting them. For an
+   intentional SQL outage, use a separate diagnostic build on the disposable
+   Worker with the write binding and SQL origin intact and a deliberately
+   invalid synthetic bearer compiled into the SQL request. Verify
+   `query_unavailable` before triggering an Incident. Confirm the Check,
+   current state and alert delivery while history is stale or unavailable.
+   Redeploy the exact candidate and confirm readiness, repaired history and
+   retained Monitor and Incident identities. The local publication suite checks
+   same-version warm-cache recovery under a long window and across eviction.
+6. Run the [Deploy to Cloudflare](#deploy-to-cloudflare) flow on the exact
+   candidate source in a disposable repository connected to the account.
+   Record whether the button created the declared write binding and prompted
+   for the secret. If needed, use the dashboard fallback. Set the account ID
+   and SQL dataset, record a Check and verify readiness. Rebuild routinely
+   without re-entering the secret and verify the deployed binding and variables,
+   readiness and retained history again. Recheck the supported webhook setup
+   independently using the two-Worker CLI path.
+7. Capture only sanitized evidence. Remove the disposable Workers, Queues,
+   fixture, repository connection, private files and scoped token after the
+   two installation paths are verified. Analytics Engine applies its managed
+   retention to drill points.
+
+### Issue #89 candidate evidence
+
+The disposable drill ran on November 19, 2026 for
+[#89](https://github.com/Webriot/irisbeat/issues/89). The first drill used
+unpublished candidate source `245569c301b03b4323630a1c551c74fa0e1f97d3`
+with build metadata `0.3.0` and hosted contract 1. The archives for that
+revision had these SHA-256 checksums:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `irisbeat-0.3.0-source.tar.gz` | `e87b5ef8d9d681e913b82753942931483605b14442acbaf1a30dd54b1a855a14` |
+| `irisbeat-0.3.0.tgz` | `952ec8a7f2456049f0781d1be348c9e0e9d8ebf8381d8e75128bbde64f7cff27` |
+
+- **Local predecessor.** The workerd upgrade test ran directly from tagged
+  `v0.3.0` (`4f9442a0e660907b02c00c942e05ed4e43abab3c`) to the exact
+  candidate. Incomplete Analytics Engine setup returned HTTP 503
+  `configuration_missing` and preserved SQLite history for the old bundle.
+  With both paths configured, only the availability series reset. Monitor
+  state, partial recovery, Incidents, private publication and Maintenance
+  survived, and the next Check recovered the same Incident and populated
+  the new history.
+- **Live predecessor.** The direct cutover from tagged `v0.3.0` (Worker version
+  `84915377-a20f-4d5a-a5ac-1bbf9b74a324`) went to intermediate source
+  `0238526f5cebd15d646c7ce169b7c35594604434` (Worker version
+  `f2f85f4d-1d03-4a03-94d2-305ac0c6fd52`, source archive SHA-256
+  `736e535e4e94a1717562ce16b66601081a5b46fe1a6d4a707a13b5ffec71a3bc`).
+  Snapshots at 06:04:07 and 06:05:06 UTC showed history totals going from
+  `[3, 2, 1]` to `[0, 0, 0]` and readiness reporting
+  `observation_pending` before the first new observation. Monitor identifiers
+  and settings, latest results, Maintenance, the Incident, and webhook
+  settings and selections survived.
+- **Redirect diagnostic.** Worker version
+  `88b73baf-11d6-4745-b2c2-9c898a87f80e` was a diagnostic build used
+  after the intermediate cutover. Its same-dataset SQL readback confirmed
+  one success and one Maintenance observation. At 06:11:00 UTC readiness
+  was true, the same Incident recovered, the recovery alert was accepted,
+  and availability showed 100%. A scoped WebSocket page hint at revision 2
+  was followed by HTTP 200 for a cold resource in ORD and an updated
+  ordinary GET.
+- **SQL failure and exact-source recovery.** Routine Wrangler changes to the
+  read dataset or secret did not reproduce the intended live fault. A separate
+  diagnostic build compiled a deliberately invalid synthetic bearer into the
+  SQL request to the same origin. At 06:17:01 UTC readiness reported
+  `query_unavailable` and history was unavailable in Status and Operator.
+  A scheduled HTTP Check still recorded failure, set the Monitor to down,
+  opened an Incident and produced an accepted webhook alert. The later
+  exact candidate deployment over the upgraded installation (Worker version
+  `efd8bf14-6404-449f-9bbf-7650116331e4`) retained the Monitor and Incident
+  and restored fresh SQL history. At 06:23:13 UTC readiness returned HTTP 200
+  and displayed availability was 0%, reflecting the failed Check. The read
+  and write datasets matched and the API token binding type was `secret_text`.
+  The exact build also published page and Monitor resources at scoped
+  revision 8 in ORD. Ordinary GET caught up, a future minimum revision
+  returned HTTP 409, and the private Monitor stayed out of public responses.
+- **Direct live upgrade to the exact candidate.** A separate disposable
+  SQLite namespace went directly from tagged `v0.3.0` (Worker version
+  `8adedb76-e726-4c52-91de-eee768b6ea8c`) to exact source
+  `245569c301b03b4323630a1c551c74fa0e1f97d3` (Worker version
+  `bd455268-53ed-4382-bb3f-2f58845d8f15`). Snapshots at 06:29:43 and
+  06:31:20 UTC showed history totals changing from `[1, 1]` to `[0, 0]`.
+  Both Monitor IDs, settings and latest results survived, as did the
+  private Monitor's Maintenance. Readiness was `observation_pending`
+  before the first new observation.
+- **Fresh CLI install.** Exact-source Worker version
+  `f5a6d151-e5b9-4cc8-938a-df2601828dea` returned HTTP 503
+  `observation_pending` with cron registered. At 06:26:35 UTC the first
+  real scheduled Check had succeeded, readiness returned HTTP 200, and
+  availability showed 100% in ORD. The 06:26:41 UTC recheck after a routine
+  redeploy without a secrets file (Worker version
+  `09484123-78a5-4ae2-86e2-e69e6a5bbf44`) confirmed that stored credentials,
+  dataset binding and history survived. The deployed API token was still
+  bound as `secret_text` and SQL verified three successful observations in
+  the same dataset, with zero observations carrying an extra revision value.
+- **0.4.0 exact-source follow-up.** The Worker ran source
+  `de9c8e6b7c1062c4760007778c9e4cf70a0a4647` (version
+  `1ef1aefb-6cf9-4190-9913-d968c0b857af`). At 06:43:50 UTC an anonymous
+  WebSocket supplied minimum revision 2. The first request for the newly
+  created Monitor's partial returned HTTP 200 at revision 2 in ORD and
+  rendered 100% availability from Analytics Engine. The preceding reads
+  used the document and Status JSON resources, so the Monitor partial
+  had a separate regional cache key. Readiness returned HTTP 200 and
+  both views linked to the 0.4.0 Source archive. The local predecessor
+  regression verified the saved webhook and selection across cutover and
+  delivered the recovery alert through the Queue.
+- **Deploy to Cloudflare.** Dashboard sign-in was required and the
+  authentication prompt was declined. The authenticated button build,
+  binding and secret provisioning, and routine dashboard rebuild remain
+  open acceptance items. The fresh CLI install verifies a separate path.
+- **Cleanup.** The five disposable CLI Workers and four Queues were removed
+  and their absence was verified. Analytics Engine retains the drill points
+  under its managed retention.
+
+The 0.4.0 follow-up archives had these SHA-256 checksums:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `irisbeat-0.4.0-source.tar.gz` | `41bab8f60913bd63bc87ec170744aa608bca23685bed0bb08406a99e5938294a` |
+| `irisbeat-0.4.0.tgz` | `5878b90b08ef68053daf64f152cd1c6752cbe5aadff4f1ef97137a2521ce13b6` |
+
+At `de9c8e6`, the initial packaging shell used `umask 077`. Its engine
+checksum was `66f5b3c5f5a6bbddd06840a158811ef5951fc6486f85dffed0a43e2a3ed377c9`.
+The table records a reproduction with `umask 022`. The source archive used
+for the live drill had the same checksum in both runs. Release preparation now
+uses a fixed mask when extracting and packing the engine.
+
 ## Publication gate and Corresponding Source
 
 Release maintainers first review the PR and full implementation, complete local
 release verification and the candidate runtime acceptance above, then merge the
 reviewed source to main. Keep #12 open and its publication acceptance incomplete.
-Regenerate artifacts from the **final** clean release revision and
-repeat `npm run release:verify`; integration candidate bytes do not represent a
-later merge commit. Set version/source links together for future releases.
+Choose a version that has no tag or release in the repository. Before preparing
+the release, set that version in `package.json`, `package-lock.json`,
+`NOTICE`, the tarball dependency in `test/consumer/package.json`, and the
+Status and Operator Source links in `src/ui.tsx`. Update the current-release
+examples in README, this guide, and the hosted contract. Regenerate the versioned
+artifacts from the **final** clean release revision and repeat
+`npm run release:verify` on that revision.
 
-Only after authorization, create tag `v0.3.0` on that exact revision and a draft
-GitHub release, attach all four artifacts, verify downloaded hashes, then publish.
-For example, after creating and pushing the reviewed tag:
+Once authorized, tag that exact revision with the unused version, create a draft
+GitHub release, and attach all four regenerated artifacts. Verify the downloaded
+hashes before publishing. Set `IRISBEAT_RELEASE_NOTES` to the reviewed notes
+file and run the following after pushing the tag.
 
 ```sh
-gh release create v0.3.0 --verify-tag --draft --title 'Irisbeat 0.3.0' --notes-file <reviewed-notes-file> dist/irisbeat-0.3.0.tgz dist/irisbeat-0.3.0-source.tar.gz dist/release.json dist/SHA256SUMS --repo Webriot/irisbeat
+IRISBEAT_RELEASE_VERSION="$(node -p 'require("./package.json").version')"
+gh release create "v$IRISBEAT_RELEASE_VERSION" --verify-tag --draft \
+  --title "Irisbeat $IRISBEAT_RELEASE_VERSION" --notes-file "$IRISBEAT_RELEASE_NOTES" \
+  "dist/irisbeat-$IRISBEAT_RELEASE_VERSION.tgz" \
+  "dist/irisbeat-$IRISBEAT_RELEASE_VERSION-source.tar.gz" \
+  dist/release.json dist/SHA256SUMS --repo Webriot/irisbeat
 ```
 
 Follow [GitHub release guidance](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository).
-Never replace published bytes for the same version; issue a new version instead.
+Publish changes under a new version and preserve existing release artifacts.
 The public/operator Source link targets that release's source archive. It remains
 pending until publication. Irisbeat's own code is AGPL-3.0-only, with LICENSE and
 NOTICE in both archives. Provide Corresponding Source to network users of your
