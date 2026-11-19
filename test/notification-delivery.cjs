@@ -9,9 +9,9 @@ const localRequire = createRequire(join(process.cwd(), 'node_modules/@cloudflare
 const { build } = localRequire('esbuild');
 const { Log, LogLevel, Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
 
-async function bundle(contents) {
+async function bundle(contents, resolveDir) {
   return (await build({
-    stdin: { contents, resolveDir: process.cwd(), loader: 'ts' },
+    stdin: { contents, resolveDir, loader: 'ts' },
     nodePaths: [join(process.cwd(), 'node_modules')],
     bundle: true, write: false, format: 'esm', platform: 'neutral',
     external: ['cloudflare:workers', 'cloudflare:sockets'],
@@ -19,9 +19,13 @@ async function bundle(contents) {
 }
 
 async function deliveryBundles(source = './src', hasRecovery = true) {
+  const installed = source === 'irisbeat';
+  const resolveDir = installed ? join(process.cwd(), 'test/consumer') : process.cwd();
+  const engineImport = JSON.stringify(installed ? 'irisbeat' : source + '/index.ts');
+  const deliveryImport = JSON.stringify(installed ? 'irisbeat/notification-delivery' : source + '/notification-delivery.ts');
   const monitoring = await bundle(`
-    import personal, { createHostedWorker, MonitoringContext as EngineContext } from ${JSON.stringify(source + '/index.ts')};
-    import { NotificationDelivery as EngineDelivery } from ${JSON.stringify(source + '/index.ts')};
+    import personal, { createHostedWorker, MonitoringContext as EngineContext } from ${engineImport};
+    import { NotificationDelivery as EngineDelivery } from ${engineImport};
     export class NotificationDelivery extends EngineDelivery {
       async resolveAlert(job) {
         const response = await this.env.GATE.fetch('https://test.example/resolve', {
@@ -63,10 +67,12 @@ async function deliveryBundles(source = './src', hasRecovery = true) {
         const url = new URL(request.url);
         const revision = url.searchParams.get('test-policy-revision');
         const token = request.headers.get('authorization');
+        const id = url.hostname === 'recipient.example' ? 'mixed-pause.example' : url.hostname;
         return {
-          id: url.hostname, monitorLimit: 10,
+          id, monitorLimit: 10,
           permission: token === 'Bearer test-installation-secret' ? 'editor' : token === 'Bearer reader' ? 'reader' : null,
-          notificationOrigin: url.hostname === 'no-email.example' ? undefined : url.origin,
+          notificationOrigin: id === 'mixed-pause.example' ? 'https://recipient.example'
+            : url.hostname === 'no-email.example' ? undefined : url.origin,
           ...(revision === null ? {} : policy(revision)),
         };
       },
@@ -100,9 +106,9 @@ async function deliveryBundles(source = './src', hasRecovery = true) {
         }
         return app.fetch(request, env);
       },
-    };`);
+    };`, resolveDir);
   const recovery = hasRecovery ? `
-    import { NotificationRecovery as Recovery } from ${JSON.stringify(source + '/notification-delivery.ts')};
+    import { NotificationRecovery as Recovery } from ${deliveryImport};
     export class NotificationRecovery extends Recovery {
       constructor(ctx, env) { super(ctx, faultBindings(env)); }
       async deliver(job, brokerAttempt, queuedAt) {
@@ -131,8 +137,8 @@ async function deliveryBundles(source = './src', hasRecovery = true) {
     }
   ` : '';
   const consumer = await bundle(`
-    import delivery from ${JSON.stringify(source + '/notification-delivery.ts')};
-    export { NotificationEmailCapability } from ${JSON.stringify(source + '/notification-delivery.ts')};
+    import delivery from ${deliveryImport};
+    export { NotificationEmailCapability } from ${deliveryImport};
     ${recovery}
     export default {
       async queue(batch, env, ctx) {
@@ -157,12 +163,13 @@ async function deliveryBundles(source = './src', hasRecovery = true) {
         })) }, env, ctx);
         await env.GATE.fetch('https://test.example/done', { method: 'POST', body: JSON.stringify(actions) });
       },
-    };`);
+    };`, resolveDir);
   return { monitoring, consumer, hasRecovery };
 }
 
-async function main(runFixture, emailEnabled = true, upgrade) {
-  const current = await deliveryBundles();
+async function main(runFixture, emailEnabled = true, upgrade, packageName) {
+  const current = await deliveryBundles(packageName);
+  if (packageName) console.log('Running both notification Workers from the installed engine exports');
   const batches = [], submissions = [], errors = [], actions = [], deadLetters = [];
   const controls = new Map();
   const providerStatuses = new Map();
@@ -1283,7 +1290,18 @@ async function main(runFixture, emailEnabled = true, upgrade) {
         const webhook = await dispatch(endpoint, { method: 'POST', headers, body: JSON.stringify({ url: 'https://hooks.example/still-available' }) });
         assert.equal(webhook.status, 201);
         assert.ok(!('emailConfigured' in await webhook.json()));
-      }, false);
+        const { monitor, destinations } = await (await dispatch('https://personal.example' + monitors, {
+          method: 'POST', headers, body: JSON.stringify({ name: 'Webhook-only Monitor', url: 'https://internal.example:8443/target-secret', failureThreshold: 1 }),
+        })).json();
+        assert.equal((await dispatch('https://personal.example' + monitors + '/' + monitor.id, {
+          method: 'PATCH', headers, body: JSON.stringify({ destinationIds: [destinations[0].id] }),
+        })).status, 200);
+        assert.equal((await dispatch('https://personal.example/test-tick?at=' + (Date.now() + 60_000), { headers })).status, 204);
+        await until(async () => {
+          const snapshot = await (await dispatch(endpoint, { headers })).json();
+          return snapshot.incidents.length === 1 && snapshot.destinations[0].latestSubmission?.status === 'accepted';
+        });
+      }, false, undefined, packageName);
       await setClock(consentHost, 0);
       console.log('PASS email confirmation: optional setup, hosted roles, consent, cooldown, expiry, cancellation and pause');
     }
@@ -1653,6 +1671,121 @@ async function main(runFixture, emailEnabled = true, upgrade) {
     assert.ok(!JSON.stringify(batches).includes(withdraw.hash.slice(1)));
     assert.ok(errors.every(error => !error.includes(address) && !error.includes(withdraw.hash.slice(1))));
     console.log('PASS email alerts: native capture, independent webhook acceptance, classified retries, duplicate suppression during report outage, withdrawal and cancellation');
+
+    const mixedHost = 'mixed-pause.example';
+    const mixedAddress = 'mixed-pause@example.net';
+    const mixedUrl = 'https://hooks.example/mixed-pause-secret';
+    const { destinations: [mixedInbox] } = await json(mixedHost, path, 'POST',
+      { channel: 'email', address: mixedAddress }, 201,
+      { 'X-Forwarded-Host': 'forged.example', 'X-Forwarded-Proto': 'http' });
+    const invite = await until(async () => (await capturedMail()).find(message => message.to.includes(mixedAddress)));
+    const consent = await confirmationLink(invite, mixedAddress);
+    assert.equal(consent.origin, 'https://recipient.example', 'the trusted origin wins over request and forwarded hosts');
+    const confirmAt = origin => mf.dispatchFetch(origin + consent.pathname, {
+      method: 'POST', body: new URLSearchParams({ token: consent.hash.slice(1) }),
+    });
+    assert.equal((await confirmAt('https://other-alerts.example')).status, 400);
+    assert.equal((await confirmAt('https://' + mixedHost)).status, 400, 'an alias to the same context cannot use the consent token');
+    assert.equal((await confirmAt(consent.origin)).status, 200);
+    const { destinations: [, mixedHook] } = await json(mixedHost, path, 'POST', { url: mixedUrl }, 201);
+    const { monitor: mixedMonitor } = await json(mixedHost, monitors, 'POST', { name: 'Mixed pause', kind: 'heartbeat' }, 201);
+    const mixedPath = monitors + '/' + mixedMonitor.id;
+    assert.deepEqual(mixedMonitor.destinationIds, []);
+    const both = [mixedInbox.id, mixedHook.id];
+    const mixedReader = { authorization: 'Bearer reader', 'X-Context-Id': mixedHost, 'X-Permission': 'editor' };
+    assert.equal((await request(mixedHost, mixedPath, 'PATCH', { destinationIds: both }, mixedReader)).status, 403);
+    assert.equal((await request(mixedHost, path + '/' + mixedInbox.id, 'DELETE', undefined, mixedReader)).status, 403);
+    assert.equal((await request(mixedHost, path + '/' + mixedHook.id, 'DELETE', undefined, mixedReader)).status, 403);
+    await json(mixedHost, mixedPath, 'PATCH', { destinationIds: both });
+    for (const [endpoint, headers] of [['/api/operator', mixedReader], ['/api/operator/destinations', mixedReader],
+      ['/api/status', { authorization: '' }], ['/', { authorization: '' }], ['/operator.js', { authorization: '' }]]) {
+      const response = await request(mixedHost, endpoint, 'GET', undefined, headers);
+      assert.equal(response.status, 200, endpoint);
+      const body = await response.text();
+      for (const secret of [mixedAddress, mixedUrl, mixedInbox.id, mixedHook.id, consent.hash.slice(1)]) {
+        assert.ok(!body.includes(secret), 'private notification data leaked through ' + endpoint);
+      }
+    }
+    const mixedTraffic = () => [emailCalls.filter(address => address === mixedAddress).length,
+      submissions.filter(submission => submission.url === mixedUrl).length];
+    const policy = async revision => (await json(mixedHost, '/api/operator?test-policy-revision=' + revision)).paused;
+    const maintain = async offset => {
+      wallTime += 1000;
+      await json(mixedHost, mixedPath + '/maintenance', 'PUT', { endsAt: wallTime + offset });
+    };
+    const baseline = mixedTraffic();
+    await holdTransition(mixedHost, async () => {
+      assert.equal(await policy(1), true);
+      const before = batches.length;
+      await maintain(620_000);
+      assert.equal(batches.length, before, 'paused Maintenance does not enqueue either channel');
+      assert.equal(await policy(2), false);
+    }, () => maintain(600_000));
+    assert.deepEqual(mixedTraffic(), baseline, 'queued email and webhook are canceled across pause and resume');
+    assert.equal((await alertMail(mixedAddress)).length, 0);
+    assert.deepEqual((await json(mixedHost, path)).destinations.map(destination => destination.latestSubmission?.status),
+      ['accepted', undefined], 'never-attempted alerts leave Settings results alone');
+
+    // Email accepts while only the webhook retries. Then both channels retry across pause.
+    providerStatuses.set(mixedUrl, 429);
+    let mixedJobs;
+    const controlMixedBatch = () => {
+      mixedJobs = batches.at(-1);
+      assert.deepEqual(mixedJobs.map(job => job.destinationId).sort(), [...both].sort());
+      for (const job of mixedJobs) controls.set(job.deliveryId, { attempts: 1 });
+    };
+    await holdTransition(mixedHost, controlMixedBatch, () => maintain(630_000));
+    assert.deepEqual((await json(mixedHost, path)).destinations.map(destination => destination.latestSubmission.status),
+      ['accepted', 'retrying']);
+    assert.equal((await alertMail(mixedAddress)).length, 1);
+    emailFaults.set(mixedAddress, 'E_INTERNAL_SERVER_ERROR');
+    await holdTransition(mixedHost, controlMixedBatch, () => maintain(640_000));
+    assert.deepEqual((await json(mixedHost, path)).destinations.map(destination => destination.latestSubmission.status),
+      ['retrying', 'retrying']);
+    assert.equal(await policy(3), true);
+    const beforeRetries = mixedTraffic();
+    for (const job of mixedJobs) await redeliver(producer, job);
+    assert.equal(await policy(4), false);
+    for (const job of mixedJobs) await redeliver(producer, job);
+    assert.deepEqual(mixedTraffic(), beforeRetries, 'neither channel can retry during or after pause');
+    assert.deepEqual((await json(mixedHost, path)).destinations.map(destination => destination.latestSubmission.status),
+      ['canceled', 'canceled']);
+
+    providerStatuses.set(mixedUrl, 204);
+    const beforeFresh = completedBatches;
+    await maintain(650_000);
+    await until(() => completedBatches > beforeFresh);
+    assert.deepEqual(mixedTraffic(), beforeRetries.map(count => count + 1));
+    const [emailOrigin] = batches.at(-1).filter(job => job.destinationId === mixedInbox.id);
+    const beforeLimits = mixedTraffic();
+    const beforeLetters = deadLetters.length;
+    for (const [reason, control] of [
+      ['expired', { timestamp: Date.now() - 3_600_000 }],
+      ['attempts_exhausted', { attempts: 11 }],
+    ]) {
+      const job = { ...emailOrigin, deliveryId: reason + ':' + mixedInbox.id };
+      controls.set(job.deliveryId, control);
+      await redeliver(producer, job);
+      await until(() => deadLetters.find(letter => letter.deliveryId === job.deliveryId && letter.reason === reason));
+    }
+    assert.deepEqual(mixedTraffic(), beforeLimits, 'expired and broker-exhausted email never invokes the binding');
+    const exhausted = { ...emailOrigin, deliveryId: 'email-provider-budget:' + mixedInbox.id };
+    for (let attempts = 1; attempts <= 10; attempts++) {
+      emailFaults.set(mixedAddress, 'E_INTERNAL_SERVER_ERROR');
+      controls.set(exhausted.deliveryId, { attempts });
+      await redeliver(producer, exhausted);
+      assert.deepEqual(actions.at(-1), attempts < 10
+        ? { id: exhausted.deliveryId, retry: { delaySeconds: 5 * 2 ** (attempts - 1) } }
+        : { id: exhausted.deliveryId, ack: true });
+    }
+    const exhaustedLetter = await until(() => deadLetters.find(letter => letter.deliveryId === exhausted.deliveryId));
+    assert.equal(exhaustedLetter.attempts, 10);
+    assert.equal(exhaustedLetter.reason, 'attempts_exhausted');
+    await redeliver(producer, exhausted);
+    assert.deepEqual(mixedTraffic(), [beforeLimits[0] + 10, beforeLimits[1]]);
+    assert.doesNotMatch(JSON.stringify(deadLetters.slice(beforeLetters)), /mixed-pause@example|mixed-pause-secret|Mixed pause/);
+    console.log('PASS mixed hosted delivery: trusted canonical origin, role and projection guards, independent retries in both directions, pause before and between attempts, and sanitized age/attempt exhaustion');
+
   } finally {
     await mf.dispose();
   }
@@ -1671,5 +1804,6 @@ async function testUpgrade() {
 }
 
 exports.withDelivery = main;
+exports.testInstalledDelivery = () => main(undefined, true, undefined, 'irisbeat');
 if (require.main === module) (process.argv.includes('--upgrade') ? testUpgrade() : main())
   .catch(error => { console.error(error); process.exitCode = 1; });

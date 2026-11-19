@@ -11,7 +11,10 @@ Run `npm ci`, `npm run check`, then `npm run test:consumer`. This produces
 `dist/irisbeat-0.2.2.tgz` and `dist/SHA256SUMS`. The test packs twice and compares
 SHA-256, resolves the exact local version in `test/consumer/package.json`, verifies
 lockfile SHA-512 integrity, installs with offline `npm ci`, typechecks the installed
-package and bundles its package import into a separate real workerd consumer.
+package and runs both package exports as separate Workers in local workerd,
+with real Queue delivery, trusted service RPC, and locally captured Email Sending.
+The package includes both Wrangler configurations as binding references. Hosted
+consumers supply their own Worker names, routes, account integration and Queue resources.
 The temporary consumer lockfile changes with the candidate artifact and is ignored.
 A released consumer must retain its exact version and integrity lock; release operations attach the final tarball/checksum and exact source to the release without silently replacing it.
 
@@ -24,7 +27,7 @@ the packaged page source also declares its JSX runtime for bundlers. Import `cre
 Pin the artifact version **and literal `contractVersion: '1'`**; unsupported
 versions throw during factory construction, before requests or scheduling run.
 `private: true` prevents accidental registry publication; versioned GitHub release tarballs are the supported distribution path.
-Hosted consumers own accounts, Stripe, hostname provisioning, and Email Service provisioning. The engine provides email consent and the delivery Worker submits confirmation mail.
+Hosted consumers own accounts, Stripe, hostname provisioning, and Email Service provisioning. The engine provides email consent and the delivery Worker submits confirmation and alert mail.
 
 ## Trusted adapter
 
@@ -166,8 +169,7 @@ enqueued because the binding is missing, the engine records the same enqueue
 failure as a rejected submission.
 See [Maintenance notifications](maintenance-api.md#maintenance-notifications)
 for the event vocabulary and timestamps. Installations with an existing Queue
-and Monitor selections must follow the [delivery-first upgrade and producer-first
-rollback order](install.md#upgrade-and-roll-back-notification-workers).
+and Monitor selections must follow the [version compatibility and rollout order](install.md#upgrade-and-roll-back-notification-workers).
 
 The engine no longer invokes `onIncidentTransition` in any configuration. The
 protected method and exported `IncidentTransition` type remain deprecated for
@@ -190,7 +192,7 @@ Follow the sender, Queue and service-binding configuration in
 [optional email confirmation](install.md#optional-email-confirmation).
 For hosted delivery wrappers, re-export `NotificationEmailCapability` from
 `irisbeat/notification-delivery`. Set `ResolvedContext.notificationOrigin`
-from trusted configuration. Resolve unauthenticated requests to
+from trusted configuration in both request and scheduled resolution. Resolve unauthenticated requests to
 `/notifications/confirm` and `/notifications/unsubscribe` at that origin to the same
 context. Recipient credentials remain in the link's fragment until the recipient submits the form
 and are excluded from status snapshots and Queue payloads.
