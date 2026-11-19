@@ -2,4 +2,5 @@
 export function withDelivery(run: (
   dispatch: (url: string, init: RequestInit) => Promise<Response>,
   confirmationLinkFor: (address: string) => Promise<string>,
+  unsubscribeLinkFor: (address: string) => Promise<string>,
 ) => Promise<void>): Promise<void>;

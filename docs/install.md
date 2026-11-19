@@ -184,17 +184,24 @@ compatibility before rollback. Never delete/recreate a production namespace to u
 
 On an existing Queue installation, keep the Worker names, source Queue and
 service binding. Configure the handoff producer on the existing source Queue,
-the dead-letter Queue and the Recovery migration before upgrading the delivery Worker. Deploy the delivery
-Worker first, then deploy the monitoring Worker. The updated consumer handles
-Incident jobs from the previous producer, so existing Monitor selections can
-stay in place. Its Recovery object can retain Settings reports until the
-upgraded monitoring Worker can accept them.
+the dead-letter Queue and the Recovery migration before upgrading the delivery
+Worker. Deploy the monitoring Worker first to make the trusted `resolveAlert`
+RPC available, then deploy the consumer. Existing Monitor selections stay in
+place and the new consumer handles Incident jobs from the previous producer.
+If your current consumer predates Maintenance rendering, deploy a
+Maintenance-aware consumer before enabling Maintenance producers.
 
-To roll back, restore the previous monitoring Worker first. Before restoring
-a delivery Worker that cannot handle Maintenance events or bookkeeping messages,
-drain queued and in-flight messages of those types and let pending result
-and diagnostic writes settle. Keep the updated delivery Worker in place if
-unsupported messages can still reach the source Queue.
+To roll back, let pending result and diagnostic writes settle before restoring
+a delivery Worker that lacks Recovery. Before restoring a consumer that cannot
+render Maintenance events, stop emitting them and drain queued and in-flight
+Maintenance jobs. Keep compatible monitoring and delivery Workers in place while
+bookkeeping messages can still reach the source Queue. Restore a monitoring Worker
+without `resolveAlert` after switching to a consumer that supports its RPC.
+
+When upgrading from the confirmation-only build, existing inboxes retain consent and
+Monitor selections. The engine provisions withdrawal credentials from
+`NOTIFICATION_PUBLIC_ORIGIN` for self-hosted alerts and from the trusted
+[context origin](hosted-contract.md#trusted-adapter) for hosted alerts.
 
 ## Optional email confirmation
 
@@ -205,12 +212,12 @@ unsupported messages can still reach the source Queue.
   separately for each monitoring context.
   [Cloudflare pricing](https://developers.cloudflare.com/email-service/platform/pricing/) and
   [send binding restrictions](https://developers.cloudflare.com/email-service/configuration/send-bindings/).
-- Before enabling confirmation mail, turn off **Enable email preview** for the
+- Before enabling email, turn off **Enable email preview** for the
   sending domain in Cloudflare under **Compute > Email Service > Email Sending >
-  [sending domain] > Settings**. Keep it off while sending confirmation mail.
+  [sending domain] > Settings**. Keep it off while sending Irisbeat mail.
   Cloudflare turns it on for new sending domains and retains previews for about
   seven days. Previews include the HTML, plain text and raw message, which expose
-  the live confirmation link. This prerequisite applies to self-hosted and hosted
+  live confirmation and unsubscribe links. This prerequisite applies to self-hosted and hosted
   deployments. [Domain settings](https://developers.cloudflare.com/email-service/configuration/domains/#email-preview)
   and [Activity log message previews](https://developers.cloudflare.com/email-service/observability/logs/#message-preview).
 - In your private delivery Worker configuration, add `send_email: [{ "name": "EMAIL" }]`
@@ -227,8 +234,13 @@ unsupported messages can still reach the source Queue.
   Resending replaces the previous link. The five-minute cooldown applies within
   the installation even if the inbox is removed and re-added.
 
+Each Incident and Maintenance email includes an unsubscribe link. The recipient
+opens the link and chooses **Unsubscribe**. This removes the inbox and its Monitor
+selections from the context and cancels unsubmitted alerts. Cloudflare owns any
+SMTP processing after acceptance.
+
 Cloudflare still processes recipient metadata for transport. Keep addresses and
-confirmation links out of Irisbeat logs and Queue diagnostics. The delivery Worker
+recipient links out of Irisbeat logs and Queue diagnostics. The delivery Worker
 reports sanitized submission results in Settings and records exhausted jobs in the dead-letter Queue.
 
 `npm run test:delivery` and the rendered Settings acceptance test read HTML, plain

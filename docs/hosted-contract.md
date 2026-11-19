@@ -37,10 +37,12 @@ The adapter supplies just:
   nonnegative safe integer. Invalid resolved contexts fail closed with 500.
   An optional `notificationOrigin` is a trusted canonical HTTPS origin for the
   context's recipient-facing pages. Leave it unset for a context without email.
-- `contexts(env)`: return stable context names or `{ id, paused?, policyRevision? }` descriptors for
-  this scheduled invocation. Identical duplicates are removed; conflicting pause
-  state/revision metadata for the same ID rejects the invocation before dispatch. The consumer owns context discovery and
-  batching; large fleets need bounded enumeration by the consumer.
+- `contexts(env)`: return stable context names or `{ id, paused?, policyRevision?, notificationOrigin? }`
+  descriptors for this scheduled invocation. For contexts with email, supply the
+  same trusted origin as in `resolve`. Identical duplicates are removed. Conflicting
+  pause metadata or origins for the same ID reject the invocation before dispatch.
+  The consumer owns context discovery and batching. Large fleets need bounded
+  enumeration by the consumer.
 
 The adapter must authenticate the actor and validate the actual tenant host using
 its trusted configuration. Never use a caller's tenant/role/allowance headers or
@@ -92,11 +94,10 @@ producer. Configure a second Queue in the same jurisdiction for the delivery
 Worker's `NOTIFICATION_DLQ` producer. Keep native dead-letter routing unset
 because it forwards the original job body. Use `irisbeat/notification-delivery`
 as the delivery Worker entrypoint and bind its exported SQLite Durable Object
-`NotificationRecovery`
-as `NOTIFICATION_RECOVERY`, with a SQLite class migration. Export
-`NotificationDelivery` from the hosted monitoring Worker and bind the delivery
-Worker's `NOTIFICATION_DELIVERY` service
-to that named entrypoint. It resolves a webhook only while the original context,
+`NotificationRecovery` as `NOTIFICATION_RECOVERY`, with a SQLite class migration.
+Export `NotificationDelivery` from the hosted monitoring Worker and bind the
+delivery Worker's `NOTIFICATION_DELIVERY` service to that named entrypoint.
+It resolves a webhook or confirmed inbox only while the original context,
 Monitor, destination and selection remain eligible. Keep the Queue and service
 binding under trusted deployment control. The same service RPC records submission
 results. Keep Workers Logs enabled on the delivery Worker and disable
@@ -116,7 +117,9 @@ HTTP, TCP and Heartbeat share post-commit Incident and Maintenance enqueueing. A
 event and delivery IDs, original event time and safe rendering data. Address
 changes replace the destination identity and clear prior selections. A failed
 enqueue logs `notification_enqueue_failed` and leaves the change committed.
-Queue acceptance starts durable delivery for webhooks and email confirmations.
+Queue acceptance starts durable delivery for webhooks, email confirmations and alert emails.
+The consumer calls the trusted `resolveAlert` RPC for webhook and email alerts.
+The monitoring Worker continues to support the earlier `resolveWebhook` RPC.
 The delivery Worker rechecks eligibility immediately before it reserves a
 submission in the delivery's SQLite Recovery object and calls the provider.
 Duplicate Queue copies share a ten-submission budget, even at the same broker
@@ -133,9 +136,10 @@ is unavailable on the final broker delivery, the consumer submits a delayed,
 bookkeeping-only message to the source Queue and acknowledges the original
 after that write succeeds. The handoff retains the original eligibility evidence
 and timestamps, omits Monitor names and addresses, and cannot submit to a provider.
-If Recovery and the Queue write both fail on the final delivery, the broker
-can discard the exhausted source. A durable provider reservation can consume a
-slot if the Worker crashes before making the request.
+If Recovery and the handoff write both fail on the final delivery, the broker
+can discard the exhausted source. Settings can retain its preceding result and
+the dead-letter Queue can receive no diagnostic for that job. A durable provider
+reservation can consume a slot if the Worker crashes before making the request.
 
 Editor snapshots expose the optional `destinations[].latestSubmission` with
 `status`, `at` (Unix milliseconds) and a safe `reason` for failures.
@@ -173,11 +177,11 @@ Monitor that should send.
 
 ## Email consent
 
-Before enabling hosted confirmation mail, turn off **Enable email preview** in
-the Cloudflare sending domain's settings and keep it off while sending confirmation
+Before enabling hosted email, turn off **Enable email preview** in
+the Cloudflare sending domain's settings and keep it off while sending Irisbeat
 mail. When enabled, the Activity log stores the HTML, plain text and raw message
-with the live confirmation link for about seven days. Cloudflare still processes
-recipient metadata for transport. Keep addresses and confirmation links out of
+with live confirmation or unsubscribe links for about seven days. Cloudflare still processes
+recipient metadata for transport. Keep addresses and recipient links out of
 Irisbeat logs and Queue diagnostics.
 [Cloudflare domain settings](https://developers.cloudflare.com/email-service/configuration/domains/#email-preview)
 and [Activity log message previews](https://developers.cloudflare.com/email-service/observability/logs/#message-preview).
@@ -187,8 +191,8 @@ Follow the sender, Queue and service-binding configuration in
 For hosted delivery wrappers, re-export `NotificationEmailCapability` from
 `irisbeat/notification-delivery`. Set `ResolvedContext.notificationOrigin`
 from trusted configuration. Resolve unauthenticated requests to
-`/notifications/confirm` at that origin to the same context. Confirmation
-credentials remain in the link's fragment until the recipient submits the form
+`/notifications/confirm` and `/notifications/unsubscribe` at that origin to the same
+context. Recipient credentials remain in the link's fragment until the recipient submits the form
 and are excluded from status snapshots and Queue payloads.
 
 Editors use the same destination create and replace routes with
@@ -202,6 +206,16 @@ explicit POST, is single-use, and expires 24 hours after the invitation is
 created. It does not change Monitor selections or replay Monitor events.
 A paused context can save pending inboxes. Resume requires an explicit resend
 and never releases a confirmation queued before pause.
+
+Alert mail includes the Monitor name, original event time and safe Incident or
+Maintenance details in HTML and plain text. The unsubscribe link remains valid at
+the origin where it was issued until the destination is removed or replaced.
+The recipient can withdraw while monitoring is paused. The explicit POST removes
+only that context's destination and its selections and invalidates queued alerts
+that have yet to be submitted. On upgrade from the confirmation-only build, the
+engine uses the trusted context origin to create missing withdrawal credentials
+before scheduled dispatch while preserving consent and Monitor selections.
+Cloudflare owns SMTP processing after provider acceptance.
 
 The Queue uses `NotificationQueueJob` for both regular Monitor jobs and jobs
 with `kind: "email.confirmation"`. The latter resolve the inbox and its link

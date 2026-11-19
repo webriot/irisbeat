@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 const assert = require('node:assert/strict');
 const { createRequire } = require('node:module');
+const { execFileSync } = require('node:child_process');
+const { mkdtempSync, rmSync } = require('node:fs');
+const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const localRequire = createRequire(join(process.cwd(), 'node_modules/@cloudflare/vitest-plugin/package.json'));
 const { build } = localRequire('esbuild');
@@ -9,22 +12,23 @@ const { Log, LogLevel, Miniflare, convertV4MiniflareOptions } = localRequire('mi
 async function bundle(contents) {
   return (await build({
     stdin: { contents, resolveDir: process.cwd(), loader: 'ts' },
+    nodePaths: [join(process.cwd(), 'node_modules')],
     bundle: true, write: false, format: 'esm', platform: 'neutral',
     external: ['cloudflare:workers', 'cloudflare:sockets'],
   })).outputFiles[0].text;
 }
 
-async function main(runFixture, emailEnabled = true) {
+async function deliveryBundles(source = './src', hasRecovery = true) {
   const monitoring = await bundle(`
-    import personal, { createHostedWorker, MonitoringContext as EngineContext } from './src/index.ts';
-    import { NotificationDelivery as EngineDelivery } from './src/index.ts';
+    import personal, { createHostedWorker, MonitoringContext as EngineContext } from ${JSON.stringify(source + '/index.ts')};
+    import { NotificationDelivery as EngineDelivery } from ${JSON.stringify(source + '/index.ts')};
     export class NotificationDelivery extends EngineDelivery {
-      async resolveWebhook(job) {
+      async resolveAlert(job) {
         const response = await this.env.GATE.fetch('https://test.example/resolve', {
           method: 'POST', body: JSON.stringify(job.deliveryId),
         });
         if (!response.ok) throw new Error('Injected eligibility outage');
-        return super.resolveWebhook(job);
+        return super.resolveAlert(job);
       }
       async markConfirmationSubmitted(job) {
         const response = await this.env.GATE.fetch('https://test.example/mark-confirmation', {
@@ -89,14 +93,16 @@ async function main(runFixture, emailEnabled = true) {
         }
         if (url.pathname === '/test-tick') {
           const revision = url.searchParams.get('test-policy-revision');
-          const testContext = revision === null ? url.hostname : { id: url.hostname, ...policy(revision) };
+          const testContext = url.hostname === 'legacy-tenant.example'
+            ? { id: url.hostname, notificationOrigin: 'https://legacy-tenant.example' }
+            : revision === null ? url.hostname : { id: url.hostname, ...policy(revision) };
           return app.scheduled({ scheduledTime: Number(url.searchParams.get('at')) }, { ...env, testContext }).then(() => new Response(null, { status: 204 }));
         }
         return app.fetch(request, env);
       },
     };`);
-  const consumer = await bundle(`
-    import delivery, { NotificationRecovery as Recovery } from './src/notification-delivery.ts';
+  const recovery = hasRecovery ? `
+    import { NotificationRecovery as Recovery } from ${JSON.stringify(source + '/notification-delivery.ts')};
     export class NotificationRecovery extends Recovery {
       constructor(ctx, env) { super(ctx, faultBindings(env)); }
       async deliver(job, brokerAttempt, queuedAt) {
@@ -123,7 +129,11 @@ async function main(runFixture, emailEnabled = true) {
         await env.NOTIFICATION_DLQ.send(letter);
       } } };
     }
-    export { NotificationEmailCapability } from './src/notification-delivery.ts';
+  ` : '';
+  const consumer = await bundle(`
+    import delivery from ${JSON.stringify(source + '/notification-delivery.ts')};
+    export { NotificationEmailCapability } from ${JSON.stringify(source + '/notification-delivery.ts')};
+    ${recovery}
     export default {
       async queue(batch, env, ctx) {
         if (batch.queue === 'dead-letters') {
@@ -148,7 +158,11 @@ async function main(runFixture, emailEnabled = true) {
         await env.GATE.fetch('https://test.example/done', { method: 'POST', body: JSON.stringify(actions) });
       },
     };`);
+  return { monitoring, consumer, hasRecovery };
+}
 
+async function main(runFixture, emailEnabled = true, upgrade) {
+  const current = await deliveryBundles();
   const batches = [], submissions = [], errors = [], actions = [], deadLetters = [];
   const controls = new Map();
   const providerStatuses = new Map();
@@ -242,7 +256,8 @@ async function main(runFixture, emailEnabled = true) {
     return new Response(null, { status: 204 });
   };
   let providerStatus = 204;
-  const options = {
+  const optionsFor = ({ monitoring, consumer, hasRecovery }) => ({
+    ...(upgrade ? { durableObjectsPersist: upgrade.persist } : {}),
     unsafeLocalExplorer: emailEnabled,
     log: new Log(LogLevel.NONE),
     handleStructuredLogs: log => { if (log.level === 'error') errors.push(log.message); },
@@ -263,7 +278,7 @@ async function main(runFixture, emailEnabled = true) {
       { name: 'delivery', modules: true, script: consumer, compatibilityDate: '2026-11-18',
         bindings: { EMAIL_FROM: sender },
         ...(emailEnabled ? { email: { send_email: [{ name: 'EMAIL' }] } } : {}),
-        durableObjects: { NOTIFICATION_RECOVERY: { className: 'NotificationRecovery', useSQLite: true } },
+        ...(hasRecovery ? { durableObjects: { NOTIFICATION_RECOVERY: { className: 'NotificationRecovery', useSQLite: true } } } : {}),
         queueConsumers: {
           notifications: { maxBatchTimeout: 0.1, maxRetries: 10 },
           'final-notifications': { maxBatchTimeout: 0.1, maxRetries: 0 },
@@ -292,8 +307,9 @@ async function main(runFixture, emailEnabled = true) {
         },
       },
     ],
-  };
-  const mf = new Miniflare(convertV4MiniflareOptions(options));
+  });
+  const options = optionsFor(current);
+  const mf = new Miniflare(convertV4MiniflareOptions(upgrade ? optionsFor(upgrade.old) : options));
   const captureEndpoint = '/cdn-cgi/local/explorer/api/local/email/sending?worker=delivery';
   async function capturedMail(query = '') {
     const response = await mf.dispatchFetch(new URL(captureEndpoint + query, await mf.ready));
@@ -366,10 +382,82 @@ async function main(runFixture, emailEnabled = true) {
   }
 
   try {
+    if (upgrade) {
+      const hosts = ['personal.example', 'legacy-tenant.example'];
+      const address = 'legacy-alert@example.net';
+      const selected = [];
+      const recipient = (link, origin = link.origin) => mf.dispatchFetch(origin + link.pathname, {
+        method: 'POST', body: new URLSearchParams({ token: link.hash.slice(1) }),
+      });
+      for (const host of hosts) {
+        const { destinations: [destination] } = await json(host, path, 'POST', { channel: 'email', address }, 201);
+        const message = await until(async () => {
+          if (completedBatches !== batches.length) return;
+          return (await capturedMail()).find(capture => capture.to.includes(address) &&
+            !selected.some(item => item.messageId === capture.messageId));
+        });
+        const link = await confirmationLink(message, address);
+        assert.equal(link.host, host);
+        assert.equal((await recipient(link)).status, 200);
+        const { monitor } = await json(host, monitors, 'POST', {
+          name: 'Existing Monitor', url: 'https://internal.example:8443/target-secret', failureThreshold: 1,
+        }, 201);
+        const snapshot = await json(host, monitors + '/' + monitor.id, 'PATCH', { destinationIds: [destination.id] });
+        assert.equal(snapshot.destinations[0].confirmed, true);
+        assert.deepEqual(snapshot.monitor.destinationIds, [destination.id]);
+        selected.push({ destination, monitor, messageId: message.messageId });
+      }
+      await mf.setOptions(convertV4MiniflareOptions(options));
+
+      const withdrawals = [];
+      for (const [index, host] of hosts.entries()) {
+        const { destination, monitor } = selected[index];
+        const before = completedBatches;
+        const openedAt = at;
+        await tick(host);
+        await until(() => completedBatches > before);
+        assert.ok(batches.at(-1).some(job => job.destinationId === destination.id && job.monitorId === monitor.id &&
+          job.event.kind === 'incident.opened'), 'the first Incident reached the native Queue consumer');
+        const openings = (await capturedMail()).filter(message => message.to.includes(address) &&
+          message.subject === 'Irisbeat: Incident opened');
+        assert.equal(openings.length, index + 1, host + ' sends its first alert before any Operator request');
+        const mail = await capturedMail('&email_id=' + encodeURIComponent(openings.find(message =>
+          !withdrawals.some(item => item.messageId === message.messageId)).messageId));
+        const href = mail.text.match(/https:\/\/[^\s]+/)?.[0];
+        assert.ok(href && mail.html.includes('href="' + href + '"'));
+        const link = new URL(href);
+        assert.equal(link.origin + link.pathname, 'https://' + host + '/notifications/unsubscribe');
+        assert.match(link.hash, /^#[a-f0-9-]{36}$/);
+        withdrawals.push({ link, messageId: mail.messageId });
+        const status = await json(host, '/api/status', 'GET', undefined, 200, { authorization: '' });
+        assert.equal(status.incidents[0].openedAt, openedAt);
+      }
+
+      const [personal, hosted] = withdrawals;
+      assert.equal((await recipient(hosted.link, personal.link.origin)).status, 400);
+      assert.equal((await recipient(hosted.link)).status, 200);
+      assert.equal((await recipient(hosted.link)).status, 400);
+      const personalStatus = await json(hosts[0], '/api/operator');
+      assert.equal(personalStatus.destinations[0].confirmed, true);
+      assert.deepEqual(personalStatus.monitor.destinationIds, [selected[0].destination.id]);
+      const hostedStatus = await json(hosts[1], '/api/operator');
+      assert.deepEqual(hostedStatus.destinations, []);
+      assert.deepEqual(hostedStatus.monitor.destinationIds, []);
+      console.log('PASS confirmation-only Worker upgrade: first Incident email without Operator traffic and context-scoped withdrawal');
+      return;
+    }
     if (runFixture) {
       await runFixture((url, init) => mf.dispatchFetch(url, init), async address => {
-        const message = await until(async () => (await capturedMail()).find(message => message.to.includes(address)));
+        const message = await until(async () => (await capturedMail()).find(message => message.to.includes(address) &&
+          message.subject === 'Confirm Irisbeat email notifications'));
         return (await confirmationLink(message, address)).href;
+      }, async address => {
+        const message = await until(async () => (await capturedMail()).find(message => message.to.includes(address) &&
+          message.subject === 'Irisbeat: Maintenance started'));
+        const mail = await capturedMail('&email_id=' + encodeURIComponent(message.messageId));
+        const link = mail.text.match(/https:\/\/[^\s]+/)?.[0];
+        assert.ok(link);
+        return link;
       });
       return;
     }
@@ -1357,9 +1445,231 @@ async function main(runFixture, emailEnabled = true) {
     assert.deepEqual(batches.flat().filter(job => job.monitorId === activeWatchdog.id).map(job => job.event.kind), ['maintenance.started']);
     console.log('PASS delayed Watchdog silence: Maintenance exclusion, one expiry and normal detection at the window end');
     console.log('PASS Maintenance Queue delivery: private fan-out, safe content, no-op, update, early end, selection cancellation and natural expiry');
+
+    const alertHost = 'email-alerts.example';
+    const address = 'alert-recipient@example.net';
+    const seenInvitations = new Set();
+    const addInbox = async (host, address) => (await json(host, path, 'POST', { channel: 'email', address }, 201))
+      .destinations.find(destination => destination.address === address);
+    const confirmInbox = async (host, address) => {
+      const destination = await addInbox(host, address);
+      const message = await until(async () => (await capturedMail()).find(message => message.to.includes(address) &&
+        message.subject === 'Confirm Irisbeat email notifications' &&
+        !seenInvitations.has(message.messageId)));
+      seenInvitations.add(message.messageId);
+      const link = await confirmationLink(message, address);
+      assert.equal(link.host, host);
+      const result = await mf.dispatchFetch(link.origin + link.pathname, {
+        method: 'POST', body: new URLSearchParams({ token: link.hash.slice(1) }),
+      });
+      assert.equal(result.status, 200);
+      return destination;
+    };
+    const destination = await confirmInbox(alertHost, address);
+    const name = '<img src=x onerror="bad()">& @everyone';
+    const { monitor: emailMonitor } = await json(alertHost, monitors, 'POST', {
+      name, url: 'https://internal.example:8443/target-secret', published: false, failureThreshold: 1, recoveryThreshold: 1,
+    }, 201);
+    const emailMonitorPath = monitors + '/' + emailMonitor.id;
+    const alertMail = async (inbox = address) => (await capturedMail()).filter(message => message.to.includes(inbox) &&
+      message.subject !== 'Confirm Irisbeat email notifications');
+    await json(alertHost, emailMonitorPath, 'PATCH', { destinationIds: [destination.id] });
+    at = wallTime + 60_000;
+    healthy = false;
+    const openedAt = at;
+    await tick(alertHost);
+    const openedMessage = await until(async () => (await alertMail())[0]);
+    const openMail = await capturedMail('&email_id=' + encodeURIComponent(openedMessage.messageId));
+    assert.deepEqual(openMail.to, [address]);
+    assert.equal(openMail.from, sender);
+    assert.match(openMail.subject, /Incident opened/);
+    assert.ok(openMail.text.includes(name));
+    assert.ok(openMail.text.includes(new Date(openedAt).toISOString()));
+    assert.match(openMail.html, /&lt;img src=x onerror=&quot;bad\(\)&quot;&gt;&amp;/);
+    assert.doesNotMatch(openMail.html, /<img/);
+    assert.doesNotMatch(openMail.text + openMail.html, /internal\.example|8443|target-secret/);
+    const href = openMail.text.match(/https:\/\/[^\s]+/)?.[0];
+    assert.ok(href);
+    const withdraw = new URL(href);
+    assert.equal(withdraw.origin + withdraw.pathname, 'https://' + alertHost + '/notifications/unsubscribe');
+    assert.ok(withdraw.hash.length > 1);
+    assert.ok(openMail.html.includes('href="' + href + '"'));
+
+    const secondAddress = 'second-alert@example.net';
+    const second = await confirmInbox(alertHost, secondAddress);
+    const webhookUrl = 'https://hooks.example/mixed-alerts';
+    const { destinations: mixedDestinations } = await json(alertHost, path, 'POST', { url: webhookUrl }, 201);
+    const webhook = mixedDestinations.find(item => item.url === webhookUrl);
+    await json(alertHost, emailMonitorPath, 'PATCH', { destinationIds: [destination.id, second.id, webhook.id] });
+    assert.equal((await alertMail(secondAddress)).length, 0, 'confirmation and selection do not replay the open Incident');
+    healthy = true;
+    const recoveredAt = at;
+    const beforeMixed = batches.length;
+    emailFaults.set(address, 'E_RATE_LIMIT_EXCEEDED');
+    let recoveryJob, webhookJob;
+    await holdTransition(alertHost, () => {
+      recoveryJob = batches.at(-1).find(job => job.destinationId === destination.id);
+      webhookJob = batches.at(-1).find(job => job.destinationId === webhook.id);
+    });
+    assert.equal(batches[beforeMixed].length, 3, 'the event fans out email and webhook in the same Queue batch');
+    assert.ok(actions.some(action => action.id === recoveryJob.deliveryId && action.retry?.delaySeconds === 5));
+    assert.ok(actions.some(action => action.id === webhookJob.deliveryId && action.ack));
+    const result = async id => (await json(alertHost, path)).destinations.find(item => item.id === id).latestSubmission;
+    assert.equal((await result(destination.id)).status, 'retrying');
+    assert.equal((await result(destination.id)).reason, 'rate_limited');
+    assert.equal((await result(webhook.id)).status, 'accepted');
+    assert.equal((await alertMail()).length, 1, 'rate limiting did not reach native email acceptance');
+
+    reportFaults.set(recoveryJob.deliveryId, 100);
+    await until(() => actions.some(action => action.id === recoveryJob.deliveryId && action.ack), 10_000);
+    assert.equal((await result(destination.id)).status, 'retrying', 'the acceptance report is still unavailable');
+    const acceptedMail = (await alertMail()).map(message => message.messageId);
+    assert.equal(acceptedMail.length, 2);
+    assert.equal(submissions.filter(submission => submission.url === webhookUrl).length, 1);
+    assert.ok(submissions.find(submission => submission.url === webhookUrl).payload.text.includes(new Date(recoveredAt).toISOString()));
+    await redeliver(producer, recoveryJob);
+    assert.deepEqual(actions.at(-1), { id: recoveryJob.deliveryId, ack: true });
+    assert.deepEqual((await alertMail()).map(message => message.messageId), acceptedMail,
+      'a renewed Queue copy cannot submit a previously accepted email while its report is unavailable');
+    reportFaults.delete(recoveryJob.deliveryId);
+    await until(async () => (await result(destination.id)).status === 'accepted', 15_000);
+    await redeliver(producer, recoveryJob);
+    assert.deepEqual((await alertMail()).map(message => message.messageId), acceptedMail,
+      'a renewed Queue copy cannot submit a previously accepted email again');
+    await json(alertHost, path + '/' + webhook.id, 'DELETE');
+
+    const recovery = async inbox => {
+      const message = await until(async () => (await alertMail(inbox)).find(mail => mail.subject === 'Irisbeat: Incident recovered'));
+      return capturedMail('&email_id=' + encodeURIComponent(message.messageId));
+    };
+    for (const inbox of [address, secondAddress]) {
+      const mail = await recovery(inbox);
+      assert.deepEqual(mail.to, [inbox]);
+      assert.ok(mail.text.includes(new Date(recoveredAt).toISOString()));
+      assert.ok(mail.text.includes('Opened ' + new Date(openedAt).toISOString()));
+    }
+
+    const otherHost = 'other-alerts.example';
+    const other = await confirmInbox(otherHost, address);
+    const { monitor: publicEmailMonitor } = await json(otherHost, monitors, 'POST', {
+      name: 'Public email Monitor', url: 'https://internal.example:8443/target-secret', failureThreshold: 1,
+    }, 201);
+    await json(otherHost, monitors + '/' + publicEmailMonitor.id, 'PATCH', { destinationIds: [other.id] });
+    const { monitors: withSpareMonitor } = await json(alertHost, monitors, 'POST', { name: 'Spare email Monitor', kind: 'heartbeat' }, 201);
+    const spareMonitor = withSpareMonitor.at(-1);
+    await json(alertHost, monitors + '/' + spareMonitor.id, 'PATCH', { destinationIds: [destination.id] });
+    const recipient = (method, origin = withdraw.origin) => mf.dispatchFetch(origin + withdraw.pathname, {
+      method, ...(method === 'POST' ? { body: new URLSearchParams({ token: withdraw.hash.slice(1) }) } : {}),
+    });
+    const snapshot = await json(alertHost, '/api/operator');
+    const landing = await recipient('GET');
+    assert.equal(landing.status, 200);
+    assert.equal(landing.headers.get('Referrer-Policy'), 'no-referrer');
+    assert.doesNotMatch(await landing.text(), /alert-recipient@example\.net/);
+    assert.equal((await recipient('POST', 'https://' + otherHost)).status, 400);
+    assert.deepEqual((await json(alertHost, '/api/operator')).destinations, snapshot.destinations,
+      'a link fetch or wrong context cannot unsubscribe');
+
+    const emailMaintenance = emailMonitorPath + '/maintenance';
+    const expectedEnd = wallTime + 600_000;
+    const updatedEnd = expectedEnd + 60_000;
+    const beforeWithdrawal = (await alertMail()).length;
+    await holdTransition(alertHost, async () => {
+      assert.equal((await recipient('POST')).status, 200);
+      assert.equal((await recipient('POST')).status, 400);
+    }, () => json(alertHost, emailMaintenance, 'PUT', { endsAt: expectedEnd }));
+    assert.equal((await alertMail()).length, beforeWithdrawal, 'withdrawal cancels queued Maintenance for the original inbox');
+    const unsubscribed = await json(alertHost, '/api/operator');
+    assert.deepEqual(unsubscribed.destinations.map(destination => destination.id), [second.id]);
+    assert.deepEqual(unsubscribed.monitors.find(item => item.id === emailMonitor.id).destinationIds, [second.id]);
+    assert.deepEqual(unsubscribed.monitors.find(item => item.id === spareMonitor.id).destinationIds, []);
+
+    const maintenanceMail = async (subject, detail) => {
+      const message = await until(async () => (await alertMail(secondAddress)).find(mail => mail.subject === 'Irisbeat: ' + subject));
+      const mail = await capturedMail('&email_id=' + encodeURIComponent(message.messageId));
+      assert.deepEqual(mail.to, [secondAddress]);
+      assert.ok(mail.text.includes(detail));
+      assert.ok(mail.html.includes(detail));
+      const link = mail.text.match(/https:\/\/[^\s]+/)?.[0];
+      assert.ok(link);
+      assert.match(link, /^https:\/\/email-alerts\.example\/notifications\/unsubscribe#[a-f0-9-]{36}$/);
+      assert.ok(mail.html.includes('href="' + link + '"'));
+      return link;
+    };
+    const secondWithdrawal = await maintenanceMail('Maintenance started', 'Scheduled end ' + new Date(expectedEnd).toISOString());
+    assert.notEqual(secondWithdrawal, href);
+    await json(alertHost, emailMaintenance, 'PUT', { endsAt: updatedEnd });
+    await maintenanceMail('Maintenance end time changed', 'Previous end ' + new Date(expectedEnd).toISOString());
+    await json(alertHost, emailMaintenance, 'DELETE');
+    await maintenanceMail('Maintenance ended early', 'Scheduled end ' + new Date(updatedEnd).toISOString());
+    await json(alertHost, emailMaintenance, 'PUT', { endsAt: expectedEnd });
+    at = expectedEnd;
+    await tick(alertHost);
+    await maintenanceMail('Maintenance expired', new Date(expectedEnd).toISOString());
+
+    const beforeOther = new Set((await alertMail()).map(message => message.messageId));
+    healthy = false;
+    await tick(otherHost);
+    const publicMessage = await until(async () => (await alertMail()).find(mail => !beforeOther.has(mail.messageId)));
+    const publicMail = await capturedMail('&email_id=' + encodeURIComponent(publicMessage.messageId));
+    assert.match(publicMail.text, /Incident opened\nPublic email Monitor/);
+    assert.match(publicMail.text, /https:\/\/other-alerts\.example\/notifications\/unsubscribe#/);
+    assert.ok((await json(otherHost, '/api/status')).incidents.length);
+
+    wallTime = expectedEnd + 1_000;
+    const beforeStale = (await alertMail(secondAddress)).length;
+    emailFaults.set(secondAddress, 'E_INTERNAL_SERVER_ERROR');
+    let stale;
+    await holdTransition(alertHost, () => { [stale] = batches.at(-1); },
+      () => json(alertHost, emailMaintenance, 'PUT', { endsAt: updatedEnd }));
+    assert.deepEqual(actions.at(-1), { id: stale.deliveryId, retry: { delaySeconds: 5 } });
+    assert.equal((await result(second.id)).reason, 'provider_unavailable');
+    await json(alertHost, emailMonitorPath, 'PATCH', { destinationIds: [] });
+    await json(alertHost, emailMonitorPath, 'PATCH', { destinationIds: [second.id] });
+    await until(() => actions.some(action => action.id === stale.deliveryId && action.ack), 10_000);
+    assert.equal((await result(second.id)).status, 'canceled');
+    assert.equal((await alertMail(secondAddress)).length, beforeStale, 'reselection cannot revive a retrying alert');
+    const replacementAddress = 'replacement-alert@example.net';
+    await holdTransition(alertHost, async () => {
+      const replacement = await json(alertHost, path + '/' + second.id, 'PUT', { channel: 'email', address: replacementAddress });
+      const pending = replacement.destinations.find(destination => destination.address === replacementAddress);
+      assert.equal(pending.confirmed, false);
+      assert.deepEqual(replacement.monitors.find(item => item.id === emailMonitor.id).destinationIds, []);
+      assert.equal((await request(alertHost, emailMonitorPath, 'PATCH', { destinationIds: [pending.id] })).status, 400);
+      const oldLink = new URL(secondWithdrawal);
+      assert.equal((await mf.dispatchFetch(oldLink.origin + oldLink.pathname, {
+        method: 'POST', body: new URLSearchParams({ token: oldLink.hash.slice(1) }),
+      })).status, 400);
+    }, () => json(alertHost, emailMaintenance, 'DELETE'));
+    await redeliver(producer, stale);
+    await until(() => completedBatches === batches.length);
+    assert.equal((await alertMail(secondAddress)).length, beforeStale);
+    assert.equal((await alertMail(replacementAddress)).length, 0);
+    wallTime += 300_000;
+    const readded = await confirmInbox(alertHost, address);
+    assert.notEqual(readded.id, destination.id);
+    assert.equal((await recipient('POST')).status, 400, 'the old link cannot remove the same inbox after it confirms again');
+    assert.deepEqual((await json(alertHost, '/api/operator')).monitors.find(item => item.id === emailMonitor.id).destinationIds, []);
+    assert.ok(!JSON.stringify(batches).includes(withdraw.hash.slice(1)));
+    assert.ok(errors.every(error => !error.includes(address) && !error.includes(withdraw.hash.slice(1))));
+    console.log('PASS email alerts: native capture, independent webhook acceptance, classified retries, duplicate suppression during report outage, withdrawal and cancellation');
   } finally {
     await mf.dispose();
   }
 }
+async function testUpgrade() {
+  const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-email-upgrade-'));
+  const base = '2f1fba80b7fa6bed019298c41844c5201b28a600'; // #82, the confirmation-only integration revision.
+  try {
+    const archive = execFileSync('git', ['archive', base, 'src']);
+    execFileSync('tar', ['-x', '-C', temporary], { input: archive });
+    const old = await deliveryBundles(join(temporary, 'src'), false);
+    await main(undefined, true, { old, persist: join(temporary, 'state') });
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+}
+
 exports.withDelivery = main;
-if (require.main === module) main().catch(error => { console.error(error); process.exitCode = 1; });
+if (require.main === module) (process.argv.includes('--upgrade') ? testUpgrade() : main())
+  .catch(error => { console.error(error); process.exitCode = 1; });

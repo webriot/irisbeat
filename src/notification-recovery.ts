@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { DurableObject } from "cloudflare:workers";
 import { submitConfirmation } from "./email-confirmation-transport";
-import { parseEmailAddress, type ConfirmationIdentity, type ConfirmationJob, type NotificationEligibility, type NotificationQueueJob, type TerminalNotificationJob } from "./notification-jobs";
+import { submitAlertEmail } from "./email-transport";
+import { parseEmailAddress, type AlertDestination, type ConfirmationIdentity, type ConfirmationJob, type NotificationEligibility, type NotificationQueueJob, type TerminalNotificationJob } from "./notification-jobs";
 import type {
   DeadLetter, ExhaustionReason, NotificationDeliveryIdentity, SubmissionOutcome, SubmissionReport, TransportOutcome,
 } from "./notification-outcomes";
@@ -13,7 +14,7 @@ export type DeliveryBindings = {
   NOTIFICATION_DELIVERY: {
     resolveConfirmation(job: ConfirmationJob): Promise<{ address: string; url: string } | null>;
     markConfirmationSubmitted(job: ConfirmationIdentity): Promise<void>;
-    resolveWebhook(job: NotificationEligibility): Promise<string | null>;
+    resolveAlert(job: NotificationEligibility): Promise<AlertDestination | null>;
     reportSubmission(job: NotificationDeliveryIdentity, report: SubmissionReport): Promise<void>;
   };
   NOTIFICATION_DLQ: Pick<Queue<DeadLetter>, "send">;
@@ -64,9 +65,16 @@ export class NotificationRecovery extends DurableObject<DeliveryBindings> {
         eligible = !!destination;
         if (destination) submit = () => submitConfirmation(this.env.EMAIL, from, destination);
       } else {
-        const url = await this.env.NOTIFICATION_DELIVERY.resolveWebhook(job);
-        eligible = !!url;
-        if (url && !("terminal" in job)) submit = () => submitWebhook(url, job);
+        const { contextId, monitorId, destinationId, generation, pauseGeneration, deliveryId } = job;
+        const destination = await this.env.NOTIFICATION_DELIVERY.resolveAlert({
+          contextId, monitorId, destinationId, generation, pauseGeneration, deliveryId,
+        });
+        eligible = !!destination;
+        if (destination && !("terminal" in job)) {
+          submit = destination.channel === "email"
+            ? () => submitAlertEmail(destination, job, this.env)
+            : () => submitWebhook(destination.url, job);
+        }
       }
     } catch {
       eligibilityAvailable = false;

@@ -81,3 +81,7 @@ export type NotificationEligibility = Omit<NotificationJob, "event">;
 export type TerminalNotificationJob = (ConfirmationJob | (NotificationEligibility & {
   event: Pick<NotificationEvent, "at" | "order">;
 })) & { terminal: true; queuedAt: number };
+
+export type AlertDestination =
+  | { channel: "webhook"; url: string }
+  | { channel: "email"; address: string; unsubscribeUrl: string };
