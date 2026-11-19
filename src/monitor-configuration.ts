@@ -56,6 +56,9 @@ export type Monitor = MonitorConfiguration & Timing & {
   recoveryReceiptAt: number | null;
   heartbeatDigest?: ArrayBuffer;
   scheduleRevision?: number;
+  historyRevision?: number;
+  historyRetryToken?: string;
+  historyChangedAt?: number;
   notificationSelections?: NotificationSelection[];
 };
 

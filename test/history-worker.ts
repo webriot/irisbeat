@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import worker, { MonitoringContext as EngineContext, type NotificationQueueJob } from '../src/index';
+import { availabilityFixture } from './availability-fixture';
 
 // Test-only series fault injection; production exports no control endpoint.
-let mode = 'available';
-let historyReads = 0;
+const analytics = availabilityFixture();
+let backend = 'managed';
+let interruptObservation = false;
 let queued: NotificationQueueJob[] = [];
 let queueUnavailable = false;
 let checkFloor: string | undefined;
@@ -12,6 +14,10 @@ export class MonitoringContext extends EngineContext {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, {
       ...env,
+      get AVAILABILITY_HISTORY() { return backend === 'unconfigured' ? undefined : analytics.bindings.AVAILABILITY_HISTORY; },
+      get AVAILABILITY_QUERY() { return backend === 'managed' ? analytics.bindings.AVAILABILITY_QUERY : undefined; },
+      get AVAILABILITY_ACCOUNT_ID() { return backend === 'direct' ? 'a'.repeat(32) : undefined; },
+      get AVAILABILITY_API_TOKEN() { return backend === 'direct' ? 'test-analytics-token' : undefined; },
       get MIN_CHECK_INTERVAL_SECONDS() { return checkFloor; },
       NOTIFICATION_QUEUE: {
         async sendBatch(messages) {
@@ -23,11 +29,9 @@ export class MonitoringContext extends EngineContext {
     });
   }
 
-  protected queryHistory(id: string, start: number, end: number) {
-    historyReads++;
-    if (mode === 'missing') return null;
-    if (mode === 'failed') throw new Error('substituted series query failure');
-    return super.queryHistory(id, start, end);
+  protected override publishViewChanges(...args: Parameters<EngineContext['publishViewChanges']>) {
+    if (interruptObservation) throw new Error('Interrupted before Analytics Engine handoff');
+    super.publishViewChanges(...args);
   }
 
   protected outboundStartTime(scheduledAt: number) {
@@ -53,9 +57,11 @@ export default {
       return Response.json(queued);
     }
     if (url.pathname === '/__test-history') {
-      if (request.method === 'GET' && url.searchParams.has('reads')) return Response.json(historyReads);
-      historyReads = 0;
-      mode = url.searchParams.get('mode') ?? 'available';
+      if (!url.searchParams.has('mode')) return Response.json({ points: analytics.points, queries: analytics.queries });
+      const mode = url.searchParams.get('mode')!;
+      backend = mode === 'unconfigured' || mode === 'direct' ? mode : 'managed';
+      interruptObservation = mode === 'interrupt-observation';
+      analytics.setMode(mode);
       return new Response(null, { status: 204 });
     }
     return worker.fetch(request, env);

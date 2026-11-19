@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, renderViewPartial, renderViewSnapshot, statusPage, styleSheet, themeScript } from "./ui";
+import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, renderViewPartial, renderViewSnapshot, statusJson, statusPage, styleSheet, themeScript, type StatusProjection } from "./ui";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
 import { minimumCheckIntervalSeconds, MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
@@ -8,9 +8,11 @@ import { parseEmailAddress, type AlertDestination, type ConfirmationIdentity, ty
 import type { NotificationDeliveryIdentity, SubmissionReport } from "./notification-outcomes";
 import { configurationScopes, mergeScopes, monitorScopes, sharedScopes, type ViewAudience, type ViewChanges, type ViewHint, type ViewScope } from "./view-changes";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import { Availability, availabilityWriteLimit, DAY, historyStart, type AvailabilityEnv, type AvailabilityHistory } from "./availability-history";
+export type { AvailabilityHistory, AvailabilityQuery, AvailabilityQueryService, AvailabilityRow, HistoryDay } from "./availability-history";
 
 export const CONTRACT_VERSION = "1" as const;
-export interface EngineEnv {
+export interface EngineEnv extends AvailabilityEnv {
   MONITORING: DurableObjectNamespace<MonitoringContext>;
   INSTALLATION_SECRET?: string;
   MIN_CHECK_INTERVAL_SECONDS?: string | number;
@@ -58,19 +60,8 @@ export type {
   NotificationQueueJob,
 } from "./notification-jobs";
 export type { MaintenanceWindow } from "./monitor-configuration";
-const DAY = 86_400_000;
-const historyStart = (at: number) => Math.floor(at / DAY) * DAY - 89 * DAY;
-export type HistoryDay = {
-  date: string;
-  state: "up" | "down" | "degraded" | "maintenance" | "empty";
-  successes: number;
-  failures: number;
-  maintenance: number;
-};
-export type AvailabilityHistory = { days: HistoryDay[]; percentage: number | null };
-type DailyCounts = { day: number; successes: number; failures: number; maintenance: number };
 export type { ViewAudience, ViewHint, ViewScope } from "./view-changes";
-export type Status = ReturnType<MonitoringContext["status"]>;
+export type Status = ReturnType<typeof statusJson>;
 const CONFIRMATION_COOLDOWN = 5 * 60_000;
 type ConfirmationInvitation = { id: string; token: string; origin: string; expiresAt: number; submitted?: boolean };
 type StoredContext = {
@@ -122,9 +113,6 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS incidents (
       id TEXT PRIMARY KEY, monitorId TEXT NOT NULL, openedAt INTEGER NOT NULL, closedAt INTEGER
     )`);
-    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS observations (
-      id INTEGER PRIMARY KEY, monitorId TEXT NOT NULL, at INTEGER NOT NULL, outcome TEXT NOT NULL
-    )`);
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS subscription_tickets (
       token TEXT PRIMARY KEY, scope TEXT NOT NULL, expiresAt INTEGER NOT NULL
     )`);
@@ -135,8 +123,6 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       id INTEGER PRIMARY KEY, monitorId TEXT NOT NULL, startedAt INTEGER NOT NULL, endsAt INTEGER NOT NULL
     )`);
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS calendar_maintenance_monitor ON calendar_maintenance (monitorId, endsAt)");
-    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS observations_monitor_at ON observations (monitorId, at)");
-    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS observations_at ON observations (at)");
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS incidents_opened ON incidents (openedAt DESC, id)");
     if (!ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(incidents)").toArray().some(column => column.name === "monitorName")) {
       ctx.storage.sql.exec("ALTER TABLE incidents ADD COLUMN monitorName TEXT");
@@ -232,13 +218,42 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const day = this.viewClock().day ?? Math.floor(now / DAY);
     const boundary = observed.length ? Math.min((day + 1) * DAY,
       ...observed.flatMap(monitor => monitor.maintenance ? [monitor.maintenance.endsAt] : [])) : Infinity;
-    const at = Math.min(boundary, ...operators.map(state => state.expiresAt));
+    const at = Math.min(boundary, this.availability.flushAt ?? Infinity, ...operators.map(state => state.expiresAt));
     this.ctx.waitUntil(Number.isFinite(at) ? this.ctx.storage.setAlarm(at) : this.ctx.storage.deleteAlarm());
   }
 
-  alarm() {
-    this.read();
-    this.scheduleSubscriptionAlarm();
+  async alarm() {
+    const now = Date.now();
+    this.read(now);
+    if ((this.availability.flushAt ?? Infinity) <= now) {
+      // Persist the next wakeup before handing off any points from this alarm.
+      this.availability.delayFlush(now);
+      this.scheduleSubscriptionAlarm();
+      await this.drainAvailability(availabilityWriteLimit);
+    } else {
+      this.scheduleSubscriptionAlarm();
+    }
+  }
+
+  private async drainAvailability(limit: number) {
+    if (limit <= 0 || this.availability.flushAt === undefined) return;
+    // Keep new observations and other drains out until the selected work is durable.
+    await this.ctx.blockConcurrencyWhile(async () => {
+      await this.ctx.storage.sync();
+      const now = Date.now();
+      const state = this.ctx.storage.kv.get<StoredContext>("context");
+      this.ctx.storage.transactionSync(() => {
+        const changed = this.availability.flush(now, limit);
+        for (const monitor of state?.monitors ?? []) {
+          if (changed.has(monitor.id)) {
+            monitor.historyRevision = (monitor.historyRevision ?? 0) + 1;
+            monitor.historyChangedAt = now;
+          }
+        }
+        if (state && changed.size) this.ctx.storage.kv.put("context", state);
+        this.scheduleSubscriptionAlarm();
+      });
+    });
   }
 
   private viewClock(): ViewClock {
@@ -258,10 +273,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       if (day !== undefined) clock.day = day;
       else clock.day ??= Math.floor(Date.now() / DAY);
       if (day !== undefined || Object.keys(hints).length) this.ctx.storage.kv.put("view-clock", clock);
+      if (Object.keys(hints).length) this.scheduleSubscriptionAlarm();
       return { hints, revision: clock.editor };
     });
     if (Object.keys(hints).length) {
-      this.scheduleSubscriptionAlarm();
       this.publishViewChanges(hints);
     }
     return { revision, scopes: hints.editor?.scopes ?? [] };
@@ -667,6 +682,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (!monitor) return null;
     return this.commitViewChanges(() => {
       this.clearCalendarEvidence(id);
+      this.availability.remove(id);
       state.monitors = state.monitors.filter(monitor => monitor.id !== id);
       this.ctx.storage.kv.put("context", state);
       return configurationScopes(monitor, undefined, false);
@@ -699,14 +715,16 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     }
   }
 
-  async check(at: number) {
+  async check(at: number, writeLimit = availabilityWriteLimit) {
     const pending: Promise<void>[] = [];
     const { monitors } = this.read(Math.max(at, Date.now()), { pending });
+    if (this.availability.flushAt !== undefined) this.scheduleSubscriptionAlarm();
     const calendarPolicy = this.prepareOutboundCalendars();
     await Promise.all([calendarPolicy, ...pending, ...monitors.map(async monitor => {
       if (monitor.kind !== "heartbeat" && monitor.scheduleMode === "calendar") await calendarPolicy;
       await this.checkMonitor(monitor.id, at);
     })]);
+    await this.drainAvailability(Math.min(writeLimit, availabilityWriteLimit));
   }
 
   protected outboundStartTime(_scheduledAt: number) {
@@ -839,20 +857,22 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     let transition: "opened" | "recovered" | undefined;
     let transitionedIncident: Pick<Incident, "id" | "openedAt"> | undefined;
     let order: number | undefined;
+    const observation = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" } as const;
+    const now = Date.now();
+    const inRange = this.availability.configured && at >= historyStart(Math.max(at, now));
     this.commitViewChanges(() => {
       const previousState = monitor.state;
-      monitor.lastResult = { at, outcome: maintenance ? "maintenance" : success ? "success" : "failure" };
+      monitor.lastResult = observation;
+      if (inRange) {
+        monitor.historyRevision = (monitor.historyRevision ?? 0) + 1;
+        monitor.historyChangedAt = now;
+        monitor.historyRetryToken = crypto.randomUUID();
+        this.availability.enqueue(monitor.id, observation);
+      }
       if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
         this.ctx.storage.sql.exec("DELETE FROM calendar_receipts WHERE monitorId = ? AND occurrence < ?", monitor.id, monitor.nextDue);
         this.ctx.storage.sql.exec("DELETE FROM calendar_maintenance WHERE monitorId = ? AND endsAt <= ?", monitor.id, at);
       }
-      if (monitor.kind !== "heartbeat" || monitor.scheduleMode !== "calendar" || at >= historyStart(Math.max(at, Date.now())))
-        this.ctx.storage.sql.exec("INSERT INTO observations (monitorId, at, outcome) VALUES (?, ?, ?)", monitor.id, at, monitor.lastResult.outcome);
-      // Bounded cleanup keeps the entire current UTC day and never touches Incidents.
-      this.ctx.storage.sql.exec(
-        "DELETE FROM observations WHERE id IN (SELECT id FROM observations WHERE at < ? ORDER BY at LIMIT 1000)",
-        historyStart(Math.max(at, Date.now())),
-      );
       if (maintenance) {
         this.ctx.storage.kv.put("context", current);
         return monitorScopes(monitor, `monitor/${monitor.id}`);
@@ -1044,10 +1064,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       commitFreshness();
     } else if (monitor.maintenance) {
       await this.record(current, monitor, at, true, 1, monitor.recoveryThreshold, !!monitor.maintenance);
+      await this.drainAvailability(1);
     } else if (monitor.state !== "down" || monitor.recoveryReceiptAt === null ||
         at >= monitor.recoveryReceiptAt + monitor.recoverySpacingSeconds * 1000) {
       monitor.recoveryReceiptAt = at;
       await this.record(current, monitor, at, true, 1, monitor.recoveryThreshold, !!monitor.maintenance);
+      await this.drainAvailability(1);
     } else {
       commitFreshness();
     }
@@ -1072,36 +1094,23 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return monitor ? this.heartbeat(monitor.id, at) : false;
   }
 
-  // Separate series reads so their failure never hides current state or Incidents.
-  protected queryHistory(id: string, start: number, end: number): DailyCounts[] | null {
-    return this.ctx.storage.sql.exec<DailyCounts>(
-      `SELECT CAST(at / ${DAY} AS INTEGER) AS day,
-        SUM(outcome = 'success') AS successes, SUM(outcome = 'failure') AS failures,
-        SUM(outcome = 'maintenance') AS maintenance
-       FROM observations WHERE monitorId = ? AND at >= ? AND at < ? GROUP BY day`,
-      id, start, end,
-    ).toArray();
+  private availability = new Availability(this.env, this.ctx);
+
+  availabilityReadiness() {
+    return this.availability.readiness(this.read().monitors, Date.now());
   }
 
-  private history(id: string, start: number): AvailabilityHistory | null {
-    try {
-      const rows = this.queryHistory(id, start, start + 90 * DAY);
-      if (!rows) return null;
-      const counts = new Map(rows.map(row => [row.day, row]));
-      const days: HistoryDay[] = Array.from({ length: 90 }, (_, index) => {
-        const at = start + index * DAY;
-        const { successes = 0, failures = 0, maintenance = 0 } = counts.get(at / DAY) ?? {};
-        return { date: new Date(at).toISOString().slice(0, 10),
-          state: successes && failures ? "degraded" : successes ? "up" : failures ? "down" : maintenance ? "maintenance" : "empty",
-          successes, failures, maintenance };
-      });
-      const successes = days.reduce((total, day) => total + day.successes, 0);
-      const failures = days.reduce((total, day) => total + day.failures, 0);
-      return { days, percentage: successes + failures ? successes / (successes + failures) * 100 : null };
-    } catch {
-      console.error(JSON.stringify({ event: "history_query_failed" }));
-      return null;
-    }
+  private projectedMonitors(state: StoredContext, projection: StatusProjection) {
+    const selected = new Set(projection.monitors.map(monitor => monitor.id));
+    return state.monitors.filter(monitor => selected.has(monitor.id));
+  }
+
+  private readAvailability(state: StoredContext, projection: StatusProjection, at: number, operator: boolean) {
+    return this.availability.read(this.projectedMonitors(state, projection), at, () => {
+      const state = this.ctx.storage.kv.get<StoredContext>("context");
+      return new Map(state?.monitors.filter(monitor => operator || monitor.published)
+        .map(monitor => [monitor.id, monitor.historyRevision]));
+    });
   }
 
   provisionEmailWithdrawals(origin: string) {
@@ -1118,26 +1127,41 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   firstMonitorId() { return this.read().monitors[0]?.id ?? null; }
 
-  status(operator = false, secrets = operator) {
-    const at = Date.now();
-    return this.project(this.read(at), operator, secrets, at);
-  }
-
-  readView(scope: ViewScope, audience: ViewAudience) {
+  snapshot(operator = false, secrets = operator) {
     const at = Date.now();
     const state = this.read(at);
-    return { revision: this.viewClock()[audience], data: this.project(state, audience !== "public", audience === "editor", at, scope) };
+    const data = this.project(state, operator, secrets, at);
+    return attachAvailability(data, this.availability.cached(this.projectedMonitors(state, data), at));
+  }
+
+  async status(operator = false, secrets = operator): Promise<StatusProjection> {
+    const at = Date.now();
+    const state = this.read(at);
+    const data = this.project(state, operator, secrets, at);
+    return attachAvailability(data, await this.readAvailability(state, data, at, operator));
+  }
+
+  async readView(scope: ViewScope, audience: ViewAudience, minimum = 0) {
+    const at = Date.now();
+    const state = this.read(at);
+    const revision = this.viewClock()[audience];
+    const operator = audience !== "public";
+    const data = this.project(state, operator, audience === "editor", at, scope);
+    if (revision < minimum || !includesLedger(scope) || !data.monitors.length) return { revision, data };
+    const history = await this.readAvailability(state, data, at, operator);
+    return { revision, data: attachAvailability(data, history) };
   }
 
   private project(state: StoredContext, operator: boolean, secrets: boolean, at: number, scope?: ViewScope) {
     const start = historyStart(at);
     const row = scope?.startsWith("monitor/") ? scope.slice("monitor/".length) : null;
-    const withHistory = !scope || scope === "monitors" || row !== null;
+    const withHistory = !scope || includesLedger(scope);
     const withIncidents = !scope || scope === "incidents" || scope === "banner" && !operator;
     const visible = withHistory || withIncidents || scope === "destinations"
       ? state.monitors.filter(monitor => (operator || monitor.published) && (row === null || monitor.id === row)) : [];
     const monitors = visible.map(monitor => ({
-      id: monitor.id, name: monitor.name, kind: monitor.kind, history: withHistory ? this.history(monitor.id, start) : null,
+      id: monitor.id, name: monitor.name, kind: monitor.kind, history: null as AvailabilityHistory | null,
+      ...(monitor.historyRetryToken ? { historyRetryToken: monitor.historyRetryToken } : {}),
       ...(monitor.kind === "heartbeat" ? { lastSeen: monitor.lastSeen } : {}), state: state.paused ? "paused" as const : monitor.maintenance ? "maintenance" as const : monitor.state, maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult,
       ...(secrets ? { destinationIds: (monitor.notificationSelections ?? []).map(selection => selection.destinationId) } : {}),
       ...(operator ? {
@@ -1180,6 +1204,15 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         .toArray().filter(incident => operator || visible.some(monitor => monitor.id === incident.monitorId)) : [],
     };
   }
+}
+
+function includesLedger(scope: ViewScope) {
+  return scope === "monitors" || scope.startsWith("monitor/");
+}
+
+function attachAvailability(status: StatusProjection, history: Map<string, AvailabilityHistory | null>): StatusProjection {
+  const monitors = status.monitors.map(monitor => ({ ...monitor, history: history.get(monitor.id) ?? null }));
+  return { ...status, monitors, monitor: monitors[0] ?? null };
 }
 
 async function authorized(request: Request, secret: string | undefined) {
@@ -1236,11 +1269,14 @@ function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E
           prior.notificationOrigin !== origin)) throw new Error("Conflicting hosted context");
       unique.set(context.id, { ...context, notificationOrigin: origin });
     }
-    await Promise.all([...unique.values()].map(async (policy) => {
+    if (!unique.size) return;
+    const perContext = Math.floor(availabilityWriteLimit / unique.size);
+    const extra = availabilityWriteLimit % unique.size;
+    await Promise.all([...unique.values()].map(async (policy, index) => {
       const context = env.MONITORING.getByName(policy.id);
       if (policy.notificationOrigin) await context.provisionEmailWithdrawals(policy.notificationOrigin);
       if (policy.paused !== undefined) await context.setPaused(policy.paused, policy.policyRevision);
-      await context.check(controller.scheduledTime);
+      await context.check(controller.scheduledTime, perContext + Number(index < extra));
     }));
   },
   async fetch(request: Request, env: E) {
@@ -1349,15 +1385,17 @@ async function configuredConfirmationOrigin<E extends EngineEnv>(c: Context<Http
 
 const viewMediaType = "application/vnd.irisbeat.view+json";
 
-async function operatorSnapshot<E extends EngineEnv>(c: Context<HttpEnv<E>>, status = 200) {
+async function operatorSnapshot<E extends EngineEnv>(c: Context<HttpEnv<E>>, status = 200, cached = false) {
   const resolved = c.get("resolved");
   const permission = c.get("permission")!;
-  const result = await c.get("context").status(true, permission === "editor");
+  const context = c.get("context");
+  const result = cached ? await context.snapshot(true, permission === "editor")
+    : await context.status(true, permission === "editor");
   const emailConfigured = permission === "editor" && !!await confirmationOrigin(c);
   if (c.req.header("Accept") === viewMediaType) {
     return Response.json({ ...renderViewSnapshot(result, permission, emailConfigured), hosted: !!resolved, permission }, { status });
   }
-  return Response.json({ ...result, ...(emailConfigured ? { emailConfigured: true } : {}),
+  return Response.json({ ...statusJson(result), ...(emailConfigured ? { emailConfigured: true } : {}),
     ...(resolved ? { hosted: true, permission: resolved.permission } : {}) }, { status });
 }
 
@@ -1366,7 +1404,7 @@ function operatorMutationResponse<E extends EngineEnv>(c: Context<HttpEnv<E>>, a
     const scopes = refresh ? mergeScopes(ack.scopes, [refresh]) : ack.scopes;
     return Response.json({ ...ack, scopes }, { status });
   }
-  return operatorSnapshot(c, status);
+  return operatorSnapshot(c, status, true);
 }
 
 async function readBoundedBody(request: Request) {
@@ -1456,7 +1494,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   app.get("/api/operator/events/v2", getOnly, subscribe);
   app.get("/api/status", getOnly, async (c: Context<HttpEnv<E>>) => {
     const data = await c.get("context").status();
-    return c.json(c.req.header("Accept") === viewMediaType ? renderViewSnapshot(data, "public", false) : data);
+    return c.json(c.req.header("Accept") === viewMediaType ? renderViewSnapshot(data, "public", false) : statusJson(data));
   });
 
   for (const action of ["confirm", "unsubscribe"] as const) {
@@ -1486,10 +1524,11 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   const destinationsPath = "/api/operator/destinations";
   const destinationPath = destinationsPath + "/:id";
   const resendPath = destinationPath + "/confirmation";
+  const readinessPath = "/api/operator/history/readiness";
   const publicPartials = "/api/status/partials";
   const operatorPartials = "/api/operator/partials";
   const operatorPartialPaths = [operatorPartials + "/:section", operatorPartials + "/monitor/:id"];
-  const operatorPaths = [...operatorPartialPaths, ticketPath, previewPath, destinationsPath, destinationPath, resendPath, "/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
+  const operatorPaths = [readinessPath, ...operatorPartialPaths, ticketPath, previewPath, destinationsPath, destinationPath, resendPath, "/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
   for (const path of operatorPaths) app.use(path, async (c, next) => {
     const resolved = c.get("resolved");
     if (path === rotationPath && !resolved) return c.notFound();
@@ -1511,7 +1550,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     const minimum = c.req.query("revision") ?? "0";
     if (!/^\d+$/.test(minimum) || !Number.isSafeInteger(Number(minimum))) return c.text("Invalid revision", 400);
     const scope = resource as ViewScope;
-    const { revision, data } = await c.get("context").readView(scope, audience);
+    const { revision, data } = await c.get("context").readView(scope, audience, Number(minimum));
     if (revision < Number(minimum)) return c.text("Revision unavailable", 409);
     const emailConfigured = scope === "destinations" && !!await confirmationOrigin(c);
     return c.json({ revision, ...renderViewPartial(scope, data, audience, emailConfigured), ...(operator ? { permission: audience } : {}) });
@@ -1519,6 +1558,11 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   for (const path of [publicPartials + "/:section", publicPartials + "/monitor/:id", ...operatorPartialPaths]) {
     app.get(path, getOnly, partial);
   }
+  app.get(readinessPath, getOnly, async (c: Context<HttpEnv<E>>) => {
+    if (c.get("permission") !== "editor") return Response.json({ error: "Forbidden" }, { status: 403 });
+    const result = await c.get("context").availabilityReadiness();
+    return Response.json(result, { status: result.ready ? 200 : 503 });
+  });
   app.post(ticketPath, async c => {
     const url = new URL(c.req.url);
     if (!allowedSubscriptionOrigin(c.req.raw, false)) return new Response(null, { status: 403 });
@@ -1649,7 +1693,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     return result ? operatorMutationResponse(c, result) : Response.json({ error: "Monitor changed; reload before saving" }, { status: 409 });
   });
   for (const path of operatorPaths) app.all(path, () => methodNotAllowed(
-    (path === rotationPath || path === previewPath) ? "POST" : path === maintenancePath ? "PUT, DELETE" : path === monitorPath ? "PATCH, DELETE" : path === destinationPath ? "PUT, DELETE" : (path === "/api/operator/monitors" || path === destinationsPath) ? "GET, POST" : "GET, PUT",
+    path === readinessPath ? "GET" : (path === rotationPath || path === previewPath) ? "POST" : path === maintenancePath ? "PUT, DELETE" : path === monitorPath ? "PATCH, DELETE" : path === destinationPath ? "PUT, DELETE" : (path === "/api/operator/monitors" || path === destinationsPath) ? "GET, POST" : "GET, PUT",
   ));
   return app;
 }

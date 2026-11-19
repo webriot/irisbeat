@@ -4,6 +4,10 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-11-13",
   "workers_dev": true,
+  "keep_vars": true,
+  "analytics_engine_datasets": [
+    { "binding": "AVAILABILITY_HISTORY", "dataset": "irisbeat_availability" },
+  ],
   "triggers": {
     "crons": ["* * * * *"],
   },
@@ -31,6 +35,6 @@
     },
   },
   "secrets": {
-    "required": ["INSTALLATION_SECRET"],
+    "required": ["INSTALLATION_SECRET", "AVAILABILITY_API_TOKEN"],
   },
 }
