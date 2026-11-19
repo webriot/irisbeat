@@ -39,6 +39,68 @@ it('authenticates only through the first message, then sends private invalidatio
   socket.send('ack'); await settle(); expect(messages).toEqual(['authorized', 'changed', 'changed']);
 });
 const closes = (socket: WebSocket) => new Promise<number>(resolve => socket.addEventListener('close', event => resolve(event.code), { once: true }));
+it('writes only changed subscription deadlines and wakes for overlapping leases after eviction', async () => {
+  const at = Date.parse('2030-11-16T10:00Z');
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(at);
+  const context = env.MONITORING.getByName('personal');
+  const alarm = () => runInDurableObject(context, (_instance, state) => state.storage.getAlarm());
+  const writes: (number | null)[] = [];
+  const trackWrites = () => runInDurableObject(context, (_instance, { storage }) => {
+    const setAlarm = storage.setAlarm.bind(storage);
+    const deleteAlarm = storage.deleteAlarm.bind(storage);
+    vi.spyOn(storage, 'setAlarm').mockImplementation((deadline, options) => {
+      writes.push(Number(deadline));
+      return setAlarm(deadline, options);
+    });
+    vi.spyOn(storage, 'deleteAlarm').mockImplementation(options => {
+      writes.push(null);
+      return deleteAlarm(options);
+    });
+  });
+
+  await trackWrites();
+  await request('/api/operator', 'PUT', { pageName: 'No subscribers' });
+  await request('/api/operator', 'PUT', { pageName: 'Still no subscribers' });
+  expect(await alarm()).toBeNull();
+  expect(writes).toEqual([]);
+
+  const grant = await ticket();
+  const [operator, sameDeadline] = await Promise.all([subscribe(), subscribe()]);
+  expect(await alarm()).toBe(at + 10_000);
+  expect(writes).toEqual([at + 10_000]);
+
+  await evictDurableObject(context);
+  await trackWrites();
+  const expired = await subscribe();
+  expect(await alarm()).toBe(at + 10_000);
+  expect(writes).toEqual([at + 10_000]);
+
+  operator.socket.send(JSON.stringify({ type: 'auth', ticket: grant.ticket }));
+  await vi.waitFor(() => expect(operator.messages).toEqual(['authorized']));
+  expect(await alarm()).toBe(at + 10_000);
+  expect(writes).toEqual([at + 10_000]);
+
+  const sameClosed = closes(sameDeadline.socket), expiredClosed = closes(expired.socket);
+  clock.mockReturnValue(at + 10_000);
+  expect(await runDurableObjectAlarm(context)).toBe(true);
+  expect(await Promise.all([sameClosed, expiredClosed])).toEqual([1008, 1008]);
+  expect(await alarm()).toBe(at + 300_000);
+
+  const earlier = await subscribe();
+  expect(await alarm()).toBe(at + 20_000);
+  for (const { socket } of [earlier, operator]) {
+    const closed = closes(socket);
+    socket.close();
+    await closed;
+  }
+  expect(await alarm()).toBeNull();
+  expect(writes).toEqual([
+    at + 10_000,
+    null, // runDurableObjectAlarm removes the alarm before invoking the handler.
+    at + 300_000, at + 20_000, at + 300_000, null,
+  ]);
+});
+
 it('atomically consumes tickets once, rejects wrong first messages and expired tickets after hibernation', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2030-11-16T10:00Z'));
   const grant = await ticket();
