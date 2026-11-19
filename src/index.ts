@@ -110,7 +110,7 @@ function publicMonitor(monitor: Monitor, paused: boolean) {
     id: monitor.id, name: monitor.name, kind,
     ...(kind === "heartbeat" ? { lastSeen: monitor.lastSeen ?? null } : {}),
     state: paused ? "paused" as const : monitor.maintenance ? "maintenance" as const : monitor.state,
-    maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult,
+    maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult, historyRevision: monitor.historyRevision,
   };
 }
 

@@ -31,8 +31,9 @@ export function createStatusLedger() {
   };
   const ledger = {
     stateLabel,
-    history(history: AvailabilityHistory | null | undefined, id: string) {
-      const retry = !history || history.stale || history.pending ? ' data-history-retry="' + encodeURIComponent(id) + '"' : '';
+    history(history: AvailabilityHistory | null | undefined, id: string, revision = 0) {
+      const retry = !history || history.stale || history.pending
+        ? ' data-history-retry="' + encodeURIComponent(id) + '" data-history-revision="' + revision + '"' : '';
       if (!history) return '<p class="history-unavailable"' + retry + '>Bars unavailable</p>';
       return '<div class="availability"' + retry + '><div class="history-head"><span>past 90 days</span><span class="percentage" aria-label="Availability">' +
         (history.percentage === null ? 'No observations' : history.percentage.toFixed(2) + '%') +

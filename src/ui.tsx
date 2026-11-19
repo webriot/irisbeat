@@ -67,7 +67,7 @@ function OperatorRows({ monitors, canEdit, floor }: { monitors: ViewMonitor[]; c
           </button>)}
       </div></td>
     </tr>
-    <tr data-key={`${monitor.id}:history`}><td colSpan={5} id={`history-${monitor.id}`} aria-label={`${monitor.name} availability`}>{raw(statusLedger.history(monitor.history, monitor.id))}</td></tr>
+    <tr data-key={`${monitor.id}:history`}><td colSpan={5} id={`history-${monitor.id}`} aria-label={`${monitor.name} availability`}>{raw(statusLedger.history(monitor.history, monitor.id, monitor.historyRevision))}</td></tr>
   </>)}</>;
 }
 
@@ -75,7 +75,7 @@ function PublicRow({ monitor }: { monitor: ViewMonitor }) {
   const heading = `monitor-name-${monitor.id}`;
   return <article data-key={monitor.id} aria-labelledby={heading}>
     <div class="ledger-row" data-state={monitor.state}><h2 id={heading}>{monitor.name}</h2><span class="status">{statusLedger.stateLabel[monitor.state]}</span></div>
-    {raw(statusLedger.history(monitor.history, monitor.id))}
+    {raw(statusLedger.history(monitor.history, monitor.id, monitor.historyRevision))}
   </article>;
 }
 
@@ -343,11 +343,14 @@ function liveSnapshots(path, read, authorize) {
   let socket, retry, handshake, renewal, polling, historyTimer, stopped = false, ready = false, delay = 1000;
   let minimumRevision = 0;
   const historyAttempts = new Map();
+  const historyAttemptCount = id => historyAttempts.get(id)?.count ?? 0;
   function historyRows() {
-    const ids = [...document.querySelectorAll('[data-history-retry]')].map(node => node.dataset.historyRetry);
-    for (const id of historyAttempts.keys()) if (!ids.includes(id)) historyAttempts.delete(id);
-    return ids.filter(id => (historyAttempts.get(id) || 0) < ${historyRetryAttempts})
-      .sort((a, b) => (historyAttempts.get(a) || 0) - (historyAttempts.get(b) || 0)).slice(0, 32);
+    const rows = new Map([...document.querySelectorAll('[data-history-retry]')]
+      .map(node => [node.dataset.historyRetry, node.dataset.historyRevision]));
+    for (const [id, attempt] of historyAttempts)
+      if (!rows.has(id) || rows.get(id) !== attempt.revision) historyAttempts.delete(id);
+    return [...rows].filter(([id]) => historyAttemptCount(id) < ${historyRetryAttempts})
+      .sort(([a], [b]) => historyAttemptCount(a) - historyAttemptCount(b)).slice(0, 32);
   }
   function scheduleHistory() {
     if (!ready || stopped || document.hidden) {
@@ -357,9 +360,9 @@ function liveSnapshots(path, read, authorize) {
         historyTimer = undefined;
         if (!ready || stopped || document.hidden) return;
         if (!running) {
-          const ids = historyRows();
-          for (const id of ids) historyAttempts.set(id, (historyAttempts.get(id) || 0) + 1);
-          if (ids.length) enqueue({ revision: minimumRevision, scopes: ids.map(id => 'monitor/' + id), history: true });
+          const rows = historyRows();
+          for (const [id, revision] of rows) historyAttempts.set(id, { revision, count: historyAttemptCount(id) + 1 });
+          if (rows.length) enqueue({ revision: minimumRevision, scopes: rows.map(([id]) => 'monitor/' + id), history: true });
         }
         scheduleHistory();
       }, ${historyRetryInterval});

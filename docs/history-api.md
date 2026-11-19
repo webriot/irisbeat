@@ -106,7 +106,8 @@ from an overlapping successful read stays fresh. Without cached data a failed
 read yields unavailable history. Before any new observation, a configured
 Monitor has an empty series. History may lag current status while an observation
 is being ingested or the cached totals age out. Connected, visible pages retry
-only affected rows, every 30 seconds, up to four attempts while a row stays
+only affected rows, every 30 seconds, up to four attempts per observation
+revision while a row stays
 pending, stale, or unavailable. Status, detection, Incidents,
 and notification handoff commit independently of query availability.
 
