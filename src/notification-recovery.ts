@@ -2,7 +2,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { submitConfirmation } from "./email-confirmation-transport";
 import { submitAlertEmail } from "./email-transport";
-import { parseEmailAddress, type AlertDestination, type ConfirmationIdentity, type ConfirmationJob, type NotificationEligibility, type NotificationQueueJob, type TerminalNotificationJob } from "./notification-jobs";
+import type { AlertDestination, ConfirmationIdentity, ConfirmationJob, NotificationEligibility, NotificationQueueJob, TerminalNotificationJob } from "./notification-jobs";
 import type {
   DeadLetter, ExhaustionReason, NotificationDeliveryIdentity, SubmissionOutcome, SubmissionReport, TransportOutcome,
 } from "./notification-outcomes";
@@ -60,10 +60,9 @@ export class NotificationRecovery extends DurableObject<DeliveryBindings> {
     let eligibilityAvailable = true;
     try {
       if ("kind" in job) {
-        const from = parseEmailAddress(this.env.EMAIL_FROM);
         const destination = await this.env.NOTIFICATION_DELIVERY.resolveConfirmation(job);
         eligible = !!destination;
-        if (destination) submit = () => submitConfirmation(this.env.EMAIL, from, destination);
+        if (destination) submit = () => submitConfirmation(destination, this.env);
       } else {
         const { contextId, monitorId, destinationId, generation, pauseGeneration, deliveryId } = job;
         const destination = await this.env.NOTIFICATION_DELIVERY.resolveAlert({

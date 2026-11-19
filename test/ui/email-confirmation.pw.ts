@@ -38,7 +38,9 @@ test('Recipients confirm and withdraw a selected inbox from captured mail', asyn
     await add.focus();
     await page.keyboard.press('Enter');
     const address = 'ui+confirm@example.net';
-    await expect(page.getByLabel('Email address')).toBeFocused();
+    const editor = page.getByRole('form', { name: 'Add email', exact: true });
+    await expect(editor.getByLabel('Email address')).toBeFocused();
+    await expect(editor.getByRole('heading')).toHaveCount(0);
     await page.getByLabel('Email address').fill(address);
     await page.getByRole('button', { name: 'Save email' }).click();
     await expect(page.getByText('Pending confirmation')).toBeVisible();

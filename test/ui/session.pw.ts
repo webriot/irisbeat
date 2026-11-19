@@ -104,7 +104,7 @@ test('older current-session Calendar preview denial clears private state after a
     await expect(page.getByLabel('Installation secret', { exact: true })).toHaveValue('');
     await expect(page.getByLabel('Monitor name', { exact: true })).toHaveValue('');
     await expect(page.getByLabel('HTTP(S) target', { exact: true })).toHaveValue('');
-    await expect(page.locator('#webhookUrl')).toHaveValue('');
+    await expect(page.locator('#destination-address')).toHaveValue('');
     await expect(page.locator('#message')).toHaveText('Unauthorized');
   } finally {
     release();

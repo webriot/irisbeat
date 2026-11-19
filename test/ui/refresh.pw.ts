@@ -29,7 +29,7 @@ test(kind + ' retry preserves rows, drafts, and focus while reconciling collecti
   await page.locator('#settings-button').click();
   await page.locator('#pageName').fill('Draft page');
   await page.getByRole('button', { name: 'Add webhook' }).click();
-  await page.locator('#webhookUrl').fill('https://example.com/draft');
+  await page.locator('#destination-address').fill('https://example.com/draft');
   const row = await page.locator('#monitor-rows tr').first().elementHandle();
   data.pageName = 'Remote';
   failure = true;
@@ -44,12 +44,12 @@ test(kind + ' retry preserves rows, drafts, and focus while reconciling collecti
   await expect(page.locator('#maintenance-end')).toHaveValue('2027-01-01T12:00');
   if (kind === 'http') await expect(page.locator('#url')).toHaveValue('https://draft.example.com');
   if (kind === 'tcp') { await expect(page.locator('#hostname')).toHaveValue('draft.internal'); await expect(page.locator('#port')).toHaveValue('8443'); }
-  await expect(page.locator('#webhookUrl')).toHaveValue('https://example.com/draft');
+  await expect(page.locator('#destination-address')).toHaveValue('https://example.com/draft');
   expect(await row!.evaluate(node => node === document.querySelector('#monitor-rows tr'))).toBe(true);
   data.pageName = 'Saved page';
   await page.getByRole('button', { name: 'Save page', exact: true }).click();
   await expect(page.locator('#pageName')).toHaveValue('Saved page');
-  await expect(page.locator('#webhookUrl')).toHaveValue('https://example.com/draft');
+  await expect(page.locator('#destination-address')).toHaveValue('https://example.com/draft');
   await expect(page.locator('#name')).toHaveValue('Draft');
   await page.locator('#back-monitors').click();
   data.monitors[0].state = 'down';
@@ -206,7 +206,7 @@ test('authorization loss clears private drafts and ignores an earlier in-flight 
   release();
   await expect(page.locator('#editor')).toBeHidden();
   await expect(page.locator('#hostname')).toHaveValue('');
-  await expect(page.locator('#webhookUrl')).toHaveValue('');
+  await expect(page.locator('#destination-address')).toHaveValue('');
   await expect(page.locator('#monitor-rows')).toBeEmpty();
   expect(await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }))).not.toContain('ui-test-secret');
 });
@@ -237,7 +237,7 @@ for (const newerStatus of [200, 503]) {
     else await expect(page.locator('#pageName')).toHaveValue('Newer');
     release();
     await expect(page.locator('#login')).toBeVisible();
-    await expect(page.locator('#webhookUrl')).toHaveValue('');
+    await expect(page.locator('#destination-address')).toHaveValue('');
     await expect(page.locator('#editor')).toBeHidden();
   });
 }
@@ -337,7 +337,7 @@ for (const dirty of [false, true]) {
     }
     await expect(page.locator('#destination-rows')).toBeEmpty();
     await expect(page.locator('#destination-choices')).toBeEmpty();
-    await expect(page.locator('#webhookUrl')).toHaveValue('');
+    await expect(page.locator('#destination-address')).toHaveValue('');
     await expect(page.getByRole('heading', { name: 'Monitors' })).toBeFocused();
     data.permission = 'editor';
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));

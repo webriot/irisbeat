@@ -24,6 +24,9 @@ test('webhook ledger and inline Monitor selections require explicit opt-in', asy
       await add.focus();
       await page.keyboard.press('Enter');
       await expect(url).toBeFocused();
+      const editor = page.getByRole('form', { name: 'Add webhook', exact: true });
+      await expect(editor.getByLabel('HTTPS webhook URL')).toBeVisible();
+      await expect(editor.getByRole('heading')).toHaveCount(0);
       await url.fill(address);
       await page.getByRole('button', { name: 'Save webhook' }).click();
       await expect(ledger.getByText(address, { exact: true })).toBeVisible();
@@ -54,6 +57,9 @@ test('webhook ledger and inline Monitor selections require explicit opt-in', asy
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     await page.getByRole('button', { name: 'Replace ' + first, exact: true }).click();
     await expect(url).toBeFocused();
+    const editor = page.getByRole('form', { name: 'Replace webhook', exact: true });
+    await expect(editor.getByLabel('HTTPS webhook URL')).toBeVisible();
+    await expect(editor.getByRole('heading')).toHaveCount(0);
     await url.fill(replacement);
     await page.getByRole('button', { name: 'Replace webhook' }).click();
     await expect(ledger.getByText(replacement, { exact: true })).toBeVisible();

@@ -128,9 +128,8 @@ function Operator({ hosted }: { hosted: boolean }) {
         </section>
         <section aria-labelledby="destinations-heading">
           <div class="operator-heading"><h2 id="destinations-heading">Notification destinations</h2><div class="destination-actions"><button id="add-email" type="button" hidden>Add email</button><button id="add-webhook" type="button">Add webhook</button></div></div>
-          <form id="webhook" hidden aria-labelledby="webhook-heading">
-            <h3 id="webhook-heading">Add webhook</h3>
-            <label for="webhookUrl" id="destination-address-label">HTTPS webhook URL</label><input id="webhookUrl" name="url" type="url" required maxlength={2048} autocomplete="off" />
+          <form id="webhook" hidden aria-label="Add webhook">
+            <label for="destination-address" id="destination-address-label">HTTPS webhook URL</label><input id="destination-address" name="address" type="url" required maxlength={2048} autocomplete="off" />
             <p id="webhook-impact" hidden></p>
             <p id="destination-missing" role="status" hidden>This destination was removed or replaced. Copy your draft or cancel.</p>
             <button id="save-webhook">Save webhook</button><button id="cancel-webhook" type="button">Cancel</button>
@@ -603,7 +602,7 @@ const destinationsPath = '/api/operator/destinations';
 const destinationRows = byId('destination-rows');
 const addWebhook = byId('add-webhook');
 const addEmail = byId('add-email');
-const webhookUrl = byId('webhookUrl');
+const destinationAddress = byId('destination-address');
 function updateWebhook() {
   const missing = replacingDestination !== null && !destinations.some(destination => destination.id === replacingDestination);
   byId('destination-missing').hidden = !missing;
@@ -622,17 +621,17 @@ function closeWebhook(focus = false) {
 }
 function openDestination(channel, destination) {
   const id = destination?.id ?? null;
-  if (!webhook.hidden && replacingDestination === id && destinationChannel === channel) { webhookUrl.focus(); return; }
+  if (!webhook.hidden && replacingDestination === id && destinationChannel === channel) { destinationAddress.focus(); return; }
   replacingDestination = id;
   destinationChannel = channel;
   const email = channel === 'email';
-  webhookUrl.type = email ? 'email' : 'url';
-  webhookUrl.maxLength = email ? 254 : 2048;
-  webhookUrl.value = (email ? destination?.address : destination?.url) ?? '';
+  destinationAddress.type = email ? 'email' : 'url';
+  destinationAddress.maxLength = email ? 254 : 2048;
+  destinationAddress.value = (email ? destination?.address : destination?.url) ?? '';
   byId('destination-address-label').textContent = email ? 'Email address' : 'HTTPS webhook URL';
-  byId('webhook-heading').textContent = (destination ? 'Replace ' : 'Add ') + channel;
+  webhook.setAttribute('aria-label', (destination ? 'Replace ' : 'Add ') + channel);
   byId('save-webhook').textContent = destination ? 'Replace ' + channel : email ? 'Save email' : 'Save webhook';
-  webhook.hidden = false; updateWebhook(); webhookUrl.focus();
+  webhook.hidden = false; updateWebhook(); destinationAddress.focus();
 }
 function renderSubmission(result) {
   const reasons = {
@@ -895,7 +894,7 @@ webhook.addEventListener('submit', async event => {
   event.preventDefault();
   if (byId('save-webhook').disabled) return;
   const id = replacingDestination;
-  const value = destinationChannel === 'email' ? { channel: 'email', address: webhookUrl.value } : { url: webhookUrl.value };
+  const value = destinationChannel === 'email' ? { channel: 'email', address: destinationAddress.value } : { url: destinationAddress.value };
   await run(id ? destinationsPath + '/' + encodeURIComponent(id) : destinationsPath, id ? 'PUT' : 'POST', value, () => {
     const add = destinationChannel === 'email' ? addEmail : addWebhook;
     closeWebhook(); queueMicrotask(() => add.focus());

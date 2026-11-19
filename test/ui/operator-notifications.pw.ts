@@ -27,15 +27,15 @@ test('renews on the same socket, reauthorizes snapshots and clears private state
   await expect.poll(() => reads).toBe(2);
   await page.locator('#settings-button').click();
   await page.getByRole('button', { name: 'Add webhook' }).click();
-  await page.locator('#webhookUrl').fill('https://draft.example/hook');
+  await page.locator('#destination-address').fill('https://draft.example/hook');
   await page.clock.runFor(240001);
   await expect.poll(() => tickets).toBe(2);
   await expect.poll(() => frames.some(frame => frame.includes('"renew"'))).toBe(true);
   expect(connections).toBe(1);
-  await expect(page.locator('#webhookUrl')).toHaveValue('https://draft.example/hook');
+  await expect(page.locator('#destination-address')).toHaveValue('https://draft.example/hook');
   denied = true; await page.clock.runFor(240001);
   await expect(page.locator('#login')).toBeVisible();
-  await expect(page.locator('#monitor-rows')).toBeEmpty(); await expect(page.locator('#webhookUrl')).toHaveValue('');
+  await expect(page.locator('#monitor-rows')).toBeEmpty(); await expect(page.locator('#destination-address')).toHaveValue('');
   await expect(page.locator('#configuration')).toBeHidden();
   const count = tickets;
   await page.clock.runFor(600000); expect(tickets).toBe(count); expect(connections).toBe(1);
@@ -92,7 +92,7 @@ for (const boundary of ['ticket', 'snapshot', 'renewal']) {
     await expect(page.locator('#login')).toBeVisible();
     await page.clock.runFor(600000);
     await expect(page.locator('#editor')).toBeHidden(); await expect(page.locator('#monitor-rows')).toBeEmpty();
-    await expect(page.locator('#webhookUrl')).toHaveValue('');
+    await expect(page.locator('#destination-address')).toHaveValue('');
     expect(frames.length).toBe(count); expect(connections).toBe(1);
     expect(await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }))).not.toContain('grant');
     expect(await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }))).not.toContain('ui-test-secret');

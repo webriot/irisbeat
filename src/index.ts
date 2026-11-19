@@ -878,8 +878,6 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         (state.emailConfirmations?.[destination.id]?.id !== job.deliveryId && !(accepted && destination.confirmed)))) return;
     const current = destination.submission;
     const terminal = report.result.status !== "retrying";
-    if (report.result.status === "canceled" &&
-      (current?.deliveryId !== job.deliveryId || current.result.status !== "retrying")) return;
     const now = Date.now();
     let changed = false;
     this.ctx.storage.transactionSync(() => {
@@ -908,6 +906,9 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         sql.exec("INSERT OR REPLACE INTO notification_retries VALUES (?, ?, ?, ?)",
           job.deliveryId, report.attempt, report.result.at, now + 14 * DAY);
       }
+      // An unreported cancellation still closes the delivery against delayed retry reports.
+      if (report.result.status === "canceled" &&
+        (current?.deliveryId !== job.deliveryId || current.result.status !== "retrying")) return;
       if (current?.deliveryId === job.deliveryId) {
         if (current.result.status === "accepted") return;
       } else if (current) {

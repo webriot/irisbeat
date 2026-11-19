@@ -181,6 +181,7 @@ async function main(runFixture, emailEnabled = true, upgrade, packageName) {
   let completedBatches = 0;
   let heldProviderStatus = 403;
   const reportFaults = new Map();
+  const retryReportGates = new Map();
   const recoveryFaults = new Map();
   const recoveryCalls = [];
   const confirmationFaults = new Map();
@@ -194,8 +195,9 @@ async function main(runFixture, emailEnabled = true, upgrade, packageName) {
   const gate = async request => {
     const path = new URL(request.url).pathname;
     if (path === '/report') {
-      const { job } = await request.json();
+      const { job, report } = await request.json();
       reportAttempts.push(job.deliveryId);
+      if (report.result.status === 'retrying') await retryReportGates.get(job.deliveryId);
       const remaining = reportFaults.get(job.deliveryId) ?? 0;
       if (remaining) {
         reportFaults.set(job.deliveryId, remaining - 1);
@@ -1026,6 +1028,62 @@ async function main(runFixture, emailEnabled = true, upgrade, packageName) {
 
       console.log('PASS real Queue delivery: independent ack/retry, deadline and limits, cancellation, submission ordering, durable result recovery and safe DLQ recovery');
     }
+    for (const status of [429, 204]) {
+      const host = 'cancellation-' + status + '.example';
+      const url = 'https://hooks.example/cancellation-' + status;
+      const { monitor } = await json(host, monitors, 'POST', { name: 'Maintenance Monitor', url: target }, 201);
+      const { destinations: [destination] } = await json(host, path, 'POST', { url }, 201);
+      const monitorPath = monitors + '/' + monitor.id;
+      const select = destinationIds => json(host, monitorPath, 'PATCH', { destinationIds });
+      const latest = async () => (await json(host, path)).destinations[0].latestSubmission;
+      await select([destination.id]);
+      providerStatuses.set(url, status);
+      const before = submissions.length;
+      const priorBatches = batches.length;
+      const priorActions = actions.length;
+      let release;
+      const held = new Promise(resolve => { release = resolve; });
+      let job;
+      try {
+        if (status === 204) {
+          holdProvider = held;
+          heldEventTime = monitor.name;
+          heldProviderStatus = status;
+        }
+        let admit;
+        holdBatch = new Promise(resolve => { admit = resolve; });
+        try {
+          await json(host, monitorPath + '/maintenance', 'PUT', { endsAt: Date.now() + 60_000 });
+          await until(() => batches.length > priorBatches);
+          [job] = batches.at(-1);
+          if (status === 429) retryReportGates.set(job.deliveryId, held);
+        } finally {
+          admit();
+          holdBatch = undefined;
+        }
+        await until(() => status === 429 ? reportAttempts.includes(job.deliveryId) : submissions.length > before);
+        await select([]);
+        // The source Queue waits for its held batch. Use the other fixture Queue for the concurrent copy.
+        await redeliver(await mf.getQueueProducer('FINAL_QUEUE', 'monitoring'), job);
+        assert.equal(reportAttempts.filter(id => id === job.deliveryId).length, status === 429 ? 2 : 1);
+        assert.deepEqual(actions.slice(priorActions), [{ id: job.deliveryId, ack: true }]);
+        assert.equal(await latest(), undefined, 'cancellation before any reported result stays hidden');
+        await select([destination.id]);
+      } finally {
+        release();
+        holdProvider = heldEventTime = undefined;
+        if (job) retryReportGates.delete(job.deliveryId);
+      }
+      await until(() => actions.length === priorActions + 2);
+      heldProviderStatus = 403;
+      assert.deepEqual(actions.at(-1), { id: job.deliveryId, ack: true });
+      assert.equal((await latest())?.status, status === 204 ? 'accepted' : undefined,
+        'a late retry stays hidden while an already-submitted acceptance is preserved');
+      await redeliver(producer, job);
+      assert.equal(submissions.length, before + 1, 're-selection cannot revive the canceled job');
+    }
+    console.log('PASS real Queue cancellation: delayed retry suppressed and already-submitted acceptance preserved');
+
     {
       const host = 'concurrent-exhaustion.example';
       const url = 'https://hooks.example/concurrent-exhaustion';
@@ -1309,7 +1367,7 @@ async function main(runFixture, emailEnabled = true, upgrade, packageName) {
     {
       const host = 'confirmation-recovery.example';
       const address = 'retry-confirmation@example.net';
-      emailFaults.set(address, 'E_RATE_LIMIT_EXCEEDED');
+      emailFaults.set(address, 'E_EMAIL_SENDING_NOT_READY');
       let release;
       holdBatch = new Promise(resolve => { release = resolve; });
       const before = completedBatches;
@@ -1327,9 +1385,13 @@ async function main(runFixture, emailEnabled = true, upgrade, packageName) {
       await until(() => completedBatches > before);
       assert.deepEqual(actions.at(-1).retry, { delaySeconds: 5 });
       assert.equal((await capturedMail()).length, beforeMail);
-      assert.equal((await json(host, path)).destinations[0].latestSubmission.status, 'retrying');
+      const retrying = (await json(host, path)).destinations[0].latestSubmission;
+      assert.equal(retrying.status, 'retrying');
+      assert.equal(retrying.reason, 'provider_unavailable');
       await until(() => completedBatches > before + 1, 9000);
       assert.equal((await capturedMail()).length, beforeMail + 1, 'a real broker retry submits the confirmation');
+      assert.deepEqual(batches.at(-1), [job], 'the broker retries the original invitation job');
+      assert.equal((await json(host, path)).destinations[0].latestSubmission.status, 'accepted');
       assert.equal(confirmationReports.filter(report => report.deliveryId === job.deliveryId).length, 1);
       await redeliver(producer, job);
       assert.equal((await capturedMail()).length, beforeMail + 1, 'known acceptance closes confirmation while marking is pending');
@@ -1342,6 +1404,10 @@ async function main(runFixture, emailEnabled = true, upgrade, packageName) {
       assert.doesNotMatch(recoveryPayload + errors.join('\n'), /retry-confirmation@example\.net|sensitive provider response/);
       assert.ok(!(recoveryPayload + errors.join('\n')).includes(link.hash.slice(1)));
       assert.equal(emailCalls.filter(to => to === address).length, 2);
+      const confirmed = await mf.dispatchFetch(new URL(link.pathname, link.origin), {
+        method: 'POST', body: new URLSearchParams({ token: link.hash.slice(1) }),
+      });
+      assert.equal(confirmed.status, 200, 'the retried invitation can still confirm the inbox');
       const rejected = 'permanent-confirmation@example.net';
       const rejectedBatch = completedBatches;
       emailFaults.set(rejected, 'E_RECIPIENT_SUPPRESSED');
@@ -1351,7 +1417,7 @@ async function main(runFixture, emailEnabled = true, upgrade, packageName) {
       assert.equal(emailCalls.filter(to => to === rejected).length, 1);
       assert.equal((await capturedMail()).length, beforeMail + 1);
       assert.equal((await json(host, path)).destinations.find(destination => destination.address === rejected).latestSubmission.reason, 'provider_rejected');
-      console.log('PASS confirmation transport recovery: provider backoff, one acceptance through mark failure, and safe recovery');
+      console.log('PASS confirmation transport recovery: readiness backoff, one acceptance through mark failure, and safe recovery');
     }
 
     const host = 'personal.example';

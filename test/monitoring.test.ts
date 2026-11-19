@@ -320,7 +320,7 @@ it("presents the selected Status ledger with separate operator Settings", async 
   expect(operator).toContain('id="page-settings">Status page</h2>');
   expect(operator).not.toContain("Schedule Maintenance");
   expect(operator).toContain("Save webhook");
-  expect(operator).toContain('for="webhookUrl"');
+  expect(operator).toContain('for="destination-address"');
   expect(operator).toContain('id="webhook"');
   await configure();
   network.use(

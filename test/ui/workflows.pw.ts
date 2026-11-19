@@ -95,7 +95,7 @@ test('hosted editor rotates Heartbeat credentials and reader sees a read-only le
     await expect(page.locator('#heartbeat-credential')).toHaveText('');
     await expect(page.locator('#destination-rows')).toBeEmpty();
     await expect(page.locator('#destination-choices')).toBeEmpty();
-    await expect(page.locator('#webhookUrl')).toHaveValue('');
+    await expect(page.locator('#destination-address')).toHaveValue('');
 
     await page.getByLabel('Access token', { exact: true }).fill('ui-reader');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
