@@ -1,0 +1,92 @@
+<!doctype html>
+<!-- Throwaway prototype. Three treatments for effective intervals and suspended Calendar schedules in the Operator ledger. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Operator schedule prototype</title>
+<style>
+* { box-sizing: border-box }
+body { color: var(--foreground, CanvasText); font-family: var(--font-sans, system-ui) }
+main { padding: 12px 0 18px }
+header, .heading, nav, .switcher { display: flex; align-items: center; gap: 12px }
+header, .heading { justify-content: space-between }
+header { padding: 12px 0; border-bottom: 1px solid var(--border, #8a8a8a55) }
+h1 { font-size: 24px; margin: 16px 0 }
+header strong { letter-spacing: -.035em }
+nav { font-size: 13px; color: var(--muted-foreground, GrayText) }
+nav b { color: var(--foreground, CanvasText) }
+button { background: var(--secondary, ButtonFace); color: var(--secondary-foreground, ButtonText); padding: 5px 9px; border: 1px solid var(--border, #8a8a8a55); border-radius: 5px; cursor: pointer }
+.ledger { background: var(--card, Canvas); border: 1px solid var(--border, #8a8a8a55); border-radius: var(--radius, 8px); overflow: hidden }
+table { border-collapse: collapse; width: 100%; text-align: left; font-size: 13px }
+th, td { padding: 10px 9px; border-bottom: 1px solid var(--border, #8a8a8a55) }
+tbody tr:last-child td { border-bottom: 0 }
+th { color: var(--muted-foreground, GrayText); font-size: 12px }
+td:last-child, th:last-child { text-align: right }
+.ok { color: var(--success, #00804a) }
+.warn { color: var(--warning, #aa5700) }
+.sub { display: block; font-size: 11px; color: var(--muted-foreground, GrayText); margin-top: 3px }
+.strip { display: grid; grid-template-columns: max-content 1fr auto; gap: 8px 12px; align-items: center; font-size: 13px; padding: 12px; margin-bottom: 12px; border: 1px solid var(--border, #8a8a8a55); border-radius: var(--radius, 8px); background: var(--card, Canvas) }
+.strip strong { grid-column: 1 / -1 }
+.switcher { position: sticky; bottom: 9px; width: fit-content; margin: 0 auto 10px; border: 1px solid var(--border, #8a8a8a55); border-radius: 999px; padding: 4px 8px; background: var(--popover, Canvas); color: var(--popover-foreground, CanvasText); white-space: nowrap; font-size: 12px }
+.switcher button { border-radius: 999px }
+@media (max-width: 430px) {
+  th, td { padding: 8px 5px }
+  [data-variant='B'] .publication { display: none }
+}
+</style>
+</head>
+<body>
+<main data-variant="A">
+  <header><strong>irisbeat</strong><nav><span>Status page</span><b>Operator</b></nav></header>
+  <div class="heading"><h1>Monitors</h1><span><button>New Monitor</button> <button>Settings</button></span></div>
+  <div id="layout"></div>
+</main>
+<div class="switcher" aria-label="Prototype variants"><button id="previous" aria-label="Previous variant">←</button><output id="variant" aria-live="polite"></output><button id="next" aria-label="Next variant">→</button></div>
+<script>
+const variants = ['A · In the State column', 'B · Dedicated Schedule column', 'C · Schedule exceptions above the ledger'];
+const monitors = [
+  {name:'API', kind:'HTTP(S)', publication:'Published', schedule:'Every 5 min', saved:'Saved interval 1 min', state:'Operational', adjusted:true},
+  {name:'Database', kind:'TCP', publication:'Private', schedule:'Suspended', saved:'Calendar · Below 5 min minimum', state:'Operational', suspended:true},
+  {name:'Backup job', kind:'Heartbeat', publication:'Private', schedule:'Every 1 min', state:'Operational'},
+];
+const output = document.querySelector('#variant');
+const layout = document.querySelector('#layout');
+let variant = Math.max(0, ['A', 'B', 'C'].indexOf(new URLSearchParams(location.search).get('variant')));
+function render() {
+  const inline = variant === 0;
+  const column = variant === 1;
+  document.querySelector('main').dataset.variant = ['A', 'B', 'C'][variant];
+  output.value = variants[variant];
+  const exceptions = variant === 2 ? '<section class="strip"><strong>Schedule exceptions</strong><span>API</span><span>Every 5 min · Saved 1 min</span><button>Edit</button><span>Database</span><span class="warn">Calendar suspended</span><button>Edit</button></section>' : '';
+  layout.innerHTML = exceptions + '<div class="ledger"><table><thead><tr><th>Monitor</th><th>State</th>' +
+    (column ? '<th>Schedule</th>' : '') +
+    '<th class="publication">Publication</th><th>Actions</th></tr></thead><tbody>' + monitors.map(monitor => {
+      const availability = '<span class="ok">' + monitor.state + '</span>';
+      const schedule = '<span' + (monitor.suspended ? ' class="warn"' : '') + '>' + monitor.schedule + '</span>' +
+        (monitor.saved ? '<span class="sub">' + monitor.saved + '</span>' : '');
+      const state = inline && monitor.suspended
+        ? schedule + '<span class="sub">Last check operational</span>'
+        : availability + (inline && monitor.adjusted ? '<span class="sub">Every 5 min · Saved 1 min</span>' : '');
+      return '<tr><td><strong>' + monitor.name + '</strong><span class="sub">' + monitor.kind +
+        '</span></td><td>' + state + '</td>' + (column ? '<td>' + schedule + '</td>' : '') +
+        '<td class="publication">' + monitor.publication + '</td><td><button>Edit</button></td></tr>';
+    }).join('') + '</tbody></table></div>';
+}
+function move(offset) {
+  variant = (variant + offset + variants.length) % variants.length;
+  const url = new URL(location.href);
+  url.searchParams.set('variant', ['A', 'B', 'C'][variant]);
+  try { history.replaceState(null, '', url); } catch {}
+  render();
+}
+document.querySelector('#previous').onclick = () => move(-1);
+document.querySelector('#next').onclick = () => move(1);
+document.addEventListener('keydown', event => {
+  if (event.target.matches?.('input, textarea, [contenteditable]')) return;
+  if (event.key === 'ArrowLeft') move(-1);
+  if (event.key === 'ArrowRight') move(1);
+});
+render();
+</script>
+</body>
+</html>
