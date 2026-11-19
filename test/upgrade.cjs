@@ -129,6 +129,23 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
         assert.equal(await previous.title(), 'Before upgrade');
         assert.equal(await previous.locator('.percentage').textContent(), '100.00%');
 
+        async function signIn(page) {
+          await page.goto(new URL('/operator', url).href);
+          await page.getByLabel('Installation secret', { exact: true }).fill('upgrade-test-secret');
+          await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+          await page.locator('#editor').waitFor({ state: 'visible' });
+        }
+        const previousOperator = await browser.newPage();
+        const oldOperatorSocket = previousOperator.waitForEvent('websocket', socket => socket.url().endsWith('/api/operator/events'));
+        await signIn(previousOperator);
+        await oldOperatorSocket;
+        const edit = previousOperator.getByRole('button', { name: 'Edit Retained Heartbeat', exact: true });
+        await edit.focus();
+        await previousOperator.keyboard.press('Enter');
+        await previousOperator.getByLabel('Monitor name', { exact: true }).fill('Unsaved draft');
+        await previousOperator.getByRole('button', { name: 'Settings', exact: true }).click();
+        assert.equal(await previousOperator.getByLabel('Page name').inputValue(), 'Before upgrade');
+
         await mf.setOptions(options(await bundle(join(project, 'src/index.ts')), 'state', false, Number(new URL(url).port)));
         const legacyUpgrade = await mf.dispatchFetch('https://irisbeat.example/api/status/events', {
           headers: { Upgrade: 'websocket', Origin: 'https://irisbeat.example' },
@@ -142,8 +159,29 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
         await next.locator('#updates-mode').waitFor({ state: 'hidden' });
         await next.getByRole('heading', { name: 'Retained Heartbeat' }).waitFor();
         assert.equal(await next.locator('.percentage').textContent(), 'No observations');
+        const nextOperator = await browser.newPage();
+        const authorized = nextOperator.waitForEvent('websocket', socket => socket.url().endsWith('/api/operator/events/v2'))
+          .then(socket => socket.waitForEvent('framereceived', frame => frame.payload === 'authorized'));
+        await signIn(nextOperator);
+        await authorized;
+        await nextOperator.getByRole('button', { name: 'Settings', exact: true }).click();
+        assert.equal(await nextOperator.getByLabel('Page name').inputValue(), 'Before upgrade');
+
         const partial = next.waitForResponse(response => response.url().includes('/api/status/partials/page?revision=1'));
-        await request('/api/operator', 'PUT', { pageName: 'After upgrade' });
+        const operatorPartial = nextOperator.waitForResponse(response => response.url().includes('/api/operator/partials/page?revision=1'));
+        const legacyWrite = previousOperator.waitForResponse(response => response.url().endsWith('/api/operator') && response.request().method() === 'PUT');
+        await previousOperator.getByLabel('Page name').fill('After upgrade');
+        await previousOperator.getByRole('button', { name: 'Save page', exact: true }).click();
+        const legacyData = await (await legacyWrite).json();
+        assert.equal(legacyData.pageName, 'After upgrade');
+        assert.equal(legacyData.monitors[0].id, monitor.id);
+        assert.equal(legacyData.monitors[0].history.percentage, null);
+        assert.deepEqual(await (await operatorPartial).json(), {
+          revision: 1, html: '<h1>After upgrade</h1>', pageName: 'After upgrade', permission: 'editor',
+        });
+        await nextOperator.waitForFunction(() => document.querySelector('#pageName').value === 'After upgrade');
+        await previousOperator.getByRole('button', { name: 'Monitors', exact: true }).click();
+        assert.equal(await previousOperator.getByLabel('Monitor name', { exact: true }).inputValue(), 'Unsaved draft');
         assert.deepEqual(await (await partial).json(), { revision: 1, html: '<h1>After upgrade</h1>' });
         await next.getByRole('heading', { name: 'After upgrade' }).waitFor();
         const row = next.waitForResponse(response => response.url().includes('/api/status/partials/monitor/' + monitor.id + '?revision=2'));
@@ -153,7 +191,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
         await previous.bringToFront();
         await previous.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
         await previous.getByRole('heading', { name: 'After upgrade' }).waitFor();
-        console.log('PASS: pre-upgrade browser resyncs via HTTP; new browser receives scoped revisions over preserved Monitor state');
+        console.log('PASS: legacy Status and Operator recover through HTTP and new tabs receive scoped revisions over preserved Monitor state');
       } finally { await browser.close(); }
       return;
     }

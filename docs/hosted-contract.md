@@ -504,8 +504,15 @@ publication point. Each entry is a `ViewHint` containing the committed revision
 and affected resources for its audience. `readView(scope, audience)` returns
 projection input and its committed revision together. Hono owns the HTML
 rendering. The availability provider is consulted only for ledger or row reads.
-The internal mutation RPCs return a success marker. Compatibility HTTP writes
-fetch their existing JSON response after commit.
+The internal Operator configuration, Maintenance, and destination RPCs return the editor revision and affected
+scopes. The bundled clients request `Accept: application/vnd.irisbeat.view+json`
+for full refreshes of `/api/status` and `/api/operator`. Hono renders those
+refreshes with the same components as the scoped resources. Bundled Operator
+writes use the same header and receive `{ revision, scopes }` after commit.
+The browser fetches those scopes over authenticated HTTP immediately, including
+when its WebSocket is disconnected. A failed partial refresh triggers a full
+read. Legacy clients retain the existing JSON reads and mutation responses
+without the media type.
 
 For delayed public publication ([#88](https://github.com/Webriot/irisbeat/issues/88)),
 the publisher can retain the public hint while forwarding reader and editor

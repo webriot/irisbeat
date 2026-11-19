@@ -354,8 +354,10 @@ it('queries history for only the requested authorized ledger rows and never for 
 it('bounds a dispatch across Monitors and drains overflow after eviction without delaying detection', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
   const input = { kind: 'heartbeat', scheduleMode: 'calendar', cron: '* * * * *', timezone: 'UTC', graceSeconds: 30 };
-  const first = await create({ ...input, url: undefined, failureThreshold: undefined });
-  const second = await create({ ...input, url: undefined, failureThreshold: undefined, published: false });
+  const calendars = [];
+  for (let i = 0; i < 4; i++) {
+    calendars.push(await create({ ...input, url: undefined, failureThreshold: undefined, published: i === 0 }));
+  }
   await create({ name: 'Outbound check' });
   vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
   await request('/__test-history?mode=failed');
@@ -366,16 +368,19 @@ it('bounds a dispatch across Monitors and drains overflow after eviction without
   expect((await calls()).points).toHaveLength(250);
   expect((await calls()).queries).toHaveLength(0);
   const before = await status(true);
-  expect(before.monitors.map(monitor => monitor.state)).toEqual(['down', 'down', 'up']);
-  expect(before.incidents).toHaveLength(2);
+  expect(before.monitors.map(monitor => monitor.state)).toEqual(['down', 'down', 'down', 'down', 'up']);
+  expect(before.incidents).toHaveLength(4);
 
   const context = env.MONITORING.getByName('personal');
   await evictDurableObject(context);
   clock.mockReturnValue(catchUp + 5_000);
   expect(await runDurableObjectAlarm(context)).toBe(true);
+  expect((await calls()).points).toHaveLength(500);
+  clock.mockReturnValue(catchUp + 10_000);
+  expect(await runDurableObjectAlarm(context)).toBe(true);
   const { points } = await calls();
-  expect(points).toHaveLength(257);
-  for (const monitor of [first, second]) {
+  expect(points).toHaveLength(513);
+  for (const monitor of calendars) {
     expect(points.filter(point => point.blobs?.[0] === monitor.id).map(point => point.doubles?.[0]))
       .toEqual(Array.from({ length: 128 }, (_, i) => today + (i + 1) * 60_000 + 30_000));
   }
@@ -401,4 +406,62 @@ it('keeps a successful first query when a newer observation commits while it is 
   expect((await initial).monitor!.history).toMatchObject({ percentage: 100, stale: true });
   await evictDurableObject(env.MONITORING.getByName('personal'));
   expect((await status()).monitor).toMatchObject({ state: 'down', history: { percentage: 100, stale: true } });
+});
+
+it('marks aggregates pending during ingestion and refreshes them without another observation', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(today);
+  const monitor = await create();
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await tick(today);
+  await request('/__test-history?mode=lagging');
+  expect((await status()).monitor!.history).toMatchObject({ percentage: null, pending: true });
+  await request('/__test-history?mode=ingested');
+  clock.mockReturnValue(today + 14_999);
+  expect((await status()).monitor!.history?.percentage).toBeNull();
+  clock.mockReturnValue(today + 15_000);
+  expect((await status()).monitor!.history?.percentage).toBe(100);
+  clock.mockReturnValue(today + 60_000);
+  const path = '/api/status/partials/monitor/' + monitor.id;
+  const { html } = await (await request(path)).json<{ html: string }>();
+  expect(html).toContain('100.00%');
+  expect(html).not.toContain('data-history-retry');
+});
+
+it('shares scoped history rendering with negotiated snapshots and keeps mutation acknowledgments query-free', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(today);
+  const published = await create({ name: 'Public row' });
+  const hidden = await create({ name: 'Private row', published: false });
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }));
+  await tick(today);
+
+  const headers = { authorization, 'Content-Type': 'application/json', Accept: 'application/vnd.irisbeat.view+json' };
+  const response = await request('/api/operator', { method: 'PUT', headers, body: JSON.stringify({ pageName: 'Renamed page' }) });
+  expect(response.status).toBe(200);
+  const { revision, scopes } = await response.json<{ revision: number; scopes: string[] }>();
+  expect(scopes).toEqual(['page']);
+  const partial = await request('/api/operator/partials/page?revision=' + revision, { headers });
+  expect(await partial.json()).toMatchObject({ pageName: 'Renamed page', revision });
+
+  const monitorWrite = await request('/api/operator/monitors/' + published.id, {
+    method: 'PATCH', headers, body: JSON.stringify({ name: 'Renamed public row' }),
+  });
+  expect(await monitorWrite.json()).toMatchObject({ scopes: ['monitor/' + published.id, 'incidents'] });
+  const legacy = await mutate('/api/operator', 'PUT', { pageName: 'Legacy page' });
+  expect(await legacy.json()).toMatchObject({ pageName: 'Legacy page', monitors: [{ history: null }, { history: null }] });
+  const queriedIds = async () => (await (await request('/__test-history')).json<{ queries: { monitorIds: string[] }[] }>())
+    .queries.map(query => query.monitorIds);
+  expect(await queriedIds()).toEqual([]);
+
+  for (const [api, name] of [['status', 'Renamed public row'], ['operator', 'Private row']]) {
+    const snapshot = await (await request('/api/' + api, { headers })).json<{
+      html?: string; partials?: { scope: string; data: { html: string } }[];
+    }>();
+    const html = snapshot.html ?? snapshot.partials!.find(partial => partial.scope === 'monitors')!.data.html;
+    expect(html).toContain(name);
+    expect(html).toContain('100.00%');
+    if (api === 'status') expect(html).not.toContain('Private row');
+    const scoped = await (await request('/api/' + api + '/partials/monitors', { headers })).json<{ html: string }>();
+    expect(html).toContain(scoped.html);
+  }
+  expect(await queriedIds()).toEqual([[published.id], [hidden.id]]);
 });

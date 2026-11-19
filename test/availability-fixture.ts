@@ -26,6 +26,7 @@ export function availabilityFixture(storage?: DurableObjectStorage) {
       AVAILABILITY_QUERY: {
         async queryAvailability(query: AvailabilityQuery): Promise<AvailabilityRow[]> {
           queries.push(query);
+          if (mode === "lagging") return [];
           if (mode === "failed" || mode === "missing") throw new Error("Substituted Analytics Engine query failure");
           const rows = new Map<string, AvailabilityRow>();
           for (const point of points) {

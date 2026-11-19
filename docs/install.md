@@ -266,7 +266,8 @@ The history bars show a stale message if a cached series survives, or
 “Bars unavailable” if it does not. Workers Logs expose sanitized
 `history_write_failed` and `history_query_failed` events.
 
-An upgrade from SQLite history discards only the raw availability series.
+An upgrade from SQLite history discards the raw availability series after
+both the write binding and a query path are configured.
 Keep the existing Durable Object namespace so configuration, last results,
 detection progress, Maintenance and Incidents survive. Bars fill from new
 observations after the upgrade. The local cutover check is

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { fulfillView } from './view-response';
 import { expect, test } from '@playwright/test';
 import { monitorAction } from './actions';
 
@@ -13,7 +14,7 @@ test(kind + ' retry preserves rows, drafts, and focus while reconciling collecti
     { id: 'web', name: 'Website', kind, url: 'https://example.com', state: 'up', published: true, history: null as null | { percentage: number; days: { date: string; state: string; successes: number; failures: number; maintenance: number }[] } },
   ], incidents: [] };
   let failure = false;
-  await page.route('**/api/operator', route => route.fulfill(failure ? { status: 503, json: { error: 'Unavailable' } } : { json: data }));
+  await page.route('**/api/operator', route => fulfillView(route, failure ? { status: 503, json: { error: 'Unavailable' } } : { json: data }));
   await page.goto('/operator');
   await page.getByLabel('Installation secret', { exact: true }).fill('ui-test-secret');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -118,9 +119,9 @@ for (const path of ['/', '/operator']) {
       if (hold) {
         const deferred = hold; hold = undefined;
         const obsolete = structuredClone(data); obsolete.pageName = 'Obsolete'; obsolete.monitors[0].name = 'Obsolete';
-        await deferred(); return route.fulfill({ json: obsolete });
+        await deferred(); return fulfillView(route, { json: obsolete });
       }
-      await route.fulfill(failure ? { status: 503, json: { error: 'Unavailable' } } : { json: data });
+      await fulfillView(route, failure ? { status: 503, json: { error: 'Unavailable' } } : { json: data });
     });
     await page.goto(path);
     if (path === '/operator') {
@@ -188,7 +189,7 @@ test('authorization loss clears private drafts and ignores an earlier in-flight 
   const data = { pageName: 'Private page', webhookUrl: 'https://example.com/private-hook', monitors: [
     { id: 'private', name: 'Private monitor', kind: 'tcp', hostname: 'private.internal', port: 443, state: 'up', published: false, history: null },
   ], incidents: [] };
-  await page.route('**/api/operator', route => route.fulfill({ json: data }));
+  await page.route('**/api/operator', route => fulfillView(route, { json: data }));
   await page.goto('/operator');
   await page.locator('#secret').fill('ui-test-secret');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -196,7 +197,7 @@ test('authorization loss clears private drafts and ignores an earlier in-flight 
   await page.locator('#settings-button').click();
   let release!: () => void;
   await page.route('**/api/operator', async route => {
-    if (!release) { await new Promise<void>(resolve => { release = resolve; }); return route.fulfill({ json: data }); }
+    if (!release) { await new Promise<void>(resolve => { release = resolve; }); return fulfillView(route, { json: data }); }
     return route.fulfill({ status: 401, json: { error: 'Unauthorized' } });
   });
   await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
@@ -214,7 +215,7 @@ test('authorization loss clears private drafts and ignores an earlier in-flight 
 for (const newerStatus of [200, 503]) {
   test(`older current-session 401 signs out after newer ${newerStatus}`, async ({ page }) => {
     const data = { pageName: 'Private', webhookUrl: 'https://example.com/private' as string | null, monitors: [], incidents: [] };
-    await page.route('**/api/operator', route => route.fulfill({ json: data }));
+    await page.route('**/api/operator', route => fulfillView(route, { json: data }));
     await page.goto('/operator');
     await page.locator('#secret').fill('ui-test-secret');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -226,7 +227,7 @@ for (const newerStatus of [200, 503]) {
         await new Promise<void>(resolve => { release = resolve; });
         return route.fulfill({ status: 401, json: { error: 'Unauthorized' } });
       }
-      return route.fulfill({ status: newerStatus, json: newerStatus === 200 ? { ...data, pageName: 'Newer' } : { error: 'Unavailable' } });
+      return fulfillView(route, { status: newerStatus, json: newerStatus === 200 ? { ...data, pageName: 'Newer' } : { error: 'Unavailable' } });
     });
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await expect.poll(() => !!release).toBe(true);
@@ -245,7 +246,7 @@ for (const newerStatus of [200, 503]) {
 for (const status of [200, 401, 503]) {
   test(`previous-session ${status} cannot alter a newer sign-in with the same credential`, async ({ page }) => {
     const data = { pageName: 'Previous session', destinations: [{ id: 'hook', url: 'https://example.com/previous', channel: 'webhook' }], monitors: [], incidents: [] };
-    await page.route('**/api/operator', route => route.fulfill({ json: data }));
+    await page.route('**/api/operator', route => fulfillView(route, { json: data }));
     await page.goto('/operator');
     await page.locator('#secret').fill('ui-test-secret');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -255,9 +256,9 @@ for (const status of [200, 401, 503]) {
       if (!release) {
         const previous = structuredClone(data);
         await new Promise<void>(resolve => { release = resolve; });
-        return route.fulfill({ status, json: status === 200 ? previous : { error: 'Previous session error' } });
+        return fulfillView(route, { status, json: status === 200 ? previous : { error: 'Previous session error' } });
       }
-      return route.fulfill({ json: data });
+      return fulfillView(route, { json: data });
     });
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await expect.poll(() => !!release).toBe(true);
@@ -280,7 +281,7 @@ for (const status of [200, 401, 503]) {
 
 test('pristine Settings refresh and page saves reset the draft baseline', async ({ page }) => {
   const data = { pageName: 'Original', monitors: [], incidents: [], destinations: [{ id: 'hook', url: 'https://example.com/original', channel: 'webhook' }] };
-  await page.route('**/api/operator', route => route.fulfill({ json: data }));
+  await page.route('**/api/operator', route => fulfillView(route, { json: data }));
   await page.goto('/operator');
   await page.locator('#secret').fill('ui-test-secret');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -315,7 +316,7 @@ for (const dirty of [false, true]) {
     const data = { pageName: 'Hosted', hosted: true, permission: 'editor', destinations: [destination], monitors: [
       { id: 'hosted', name: 'Hosted Monitor', kind: 'heartbeat', state: 'up', destinationIds: ['hook'] },
     ], incidents: [] };
-    await page.route('**/api/operator', route => route.fulfill({ json: data }));
+    await page.route('**/api/operator', route => fulfillView(route, { json: data }));
     await page.goto('/operator');
     await page.locator('#secret').fill('ui-editor');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -354,11 +355,11 @@ test('Maintenance changes preserve focused publication actions and keyboard beha
     { id: 'one', name: 'One', kind: 'http', url: 'https://example.com', state: 'up', published: true, maintenance: null as { endsAt: number } | null },
   ], incidents: [] };
   const mutations: { method: string; path: string; body: unknown }[] = [];
-  await page.route('**/api/operator', route => route.fulfill({ json: data }));
+  await page.route('**/api/operator', route => fulfillView(route, { json: data }));
   await page.route('**/api/operator/monitors/**', async route => {
     mutations.push({ method: route.request().method(), path: new URL(route.request().url()).pathname, body: route.request().postDataJSON() });
     if (route.request().method() === 'PATCH') data.monitors[0].published = route.request().postDataJSON().published;
-    await route.fulfill({ json: data });
+    await fulfillView(route, { json: data });
   });
   await page.goto('/operator');
   await page.locator('#secret').fill('ui-test-secret');
@@ -393,11 +394,11 @@ test('deleting an edited Monitor preserves its editor and closed Maintenance dra
   const data = { pageName: 'Delete', webhookUrl: null, monitors: [
     { id: 'one', name: 'One', kind: 'http', url: 'https://example.com', state: 'up', published: true, history: null },
   ], incidents: [] };
-  await page.route('**/api/operator', route => route.fulfill({ json: data }));
+  await page.route('**/api/operator', route => fulfillView(route, { json: data }));
   await page.route('**/api/operator/monitors/one', async route => {
     expect(route.request().method()).toBe('DELETE');
     data.monitors = [];
-    await route.fulfill({ json: data });
+    await fulfillView(route, { json: data });
   });
   await page.goto('/operator');
   await page.locator('#secret').fill('ui-test-secret');

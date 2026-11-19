@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { fulfillView } from './view-response';
 import { expect, test } from '@playwright/test';
 
 for (const path of ['/', '/operator']) {
@@ -12,8 +13,8 @@ for (const path of ['/', '/operator']) {
         ...(path === '/operator' ? [{ monitorId: 'removed', monitorName: 'Deleted producer', openedAt: Date.parse('2026-11-01T08:15:00Z'), closedAt: null }] : []),
       ],
     };
-    await page.route('**/api/operator', route => route.fulfill({ json: data }));
-    await page.route('**/api/status', route => route.fulfill({ json: data }));
+    await page.route('**/api/operator', route => fulfillView(route, { json: data }));
+    await page.route('**/api/status', route => fulfillView(route, { json: data }));
     if (path === '/') await page.route('**/*', async route => {
       if (new URL(route.request().url()).pathname !== '/') return route.fallback();
       const response = await request.post('/__ui/status', { data });
@@ -66,7 +67,7 @@ test('local midnight and repeated DST hours retain dates, offsets and elapsed ti
     { monitorId: 'web', openedAt: Date.parse('2026-11-01T06:30:00Z'), closedAt: Date.parse('2026-11-01T07:30:00Z') },
     { monitorId: 'web', openedAt: Date.parse('2026-11-01T08:30:00Z'), closedAt: Date.parse('2026-11-01T09:30:00Z') },
   ] };
-  await page.route('**/api/status', route => route.fulfill({ json: data }));
+  await page.route('**/api/status', route => fulfillView(route, { json: data }));
   await page.route(new URL('/', baseURL).href, async route => {
     const response = await context.request.post('/__ui/status', { data });
     await route.fulfill({ response });

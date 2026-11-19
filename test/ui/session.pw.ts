@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { fulfillView } from './view-response';
 import { expect, test } from '@playwright/test';
 
 const snapshot = {
@@ -13,7 +14,7 @@ const preview = {
 test.beforeEach(async ({ page }) => {
   // Calendar races are independent of subscription transport.
   await page.addInitScript(() => { Object.defineProperty(window, 'WebSocket', { value: class { constructor() { throw new Error('offline'); } } }); });
-  await page.route('**/api/operator', route => route.fulfill({ json: snapshot }));
+  await page.route('**/api/operator', route => fulfillView(route, { json: snapshot }));
   await page.clock.install({ time: new Date('2026-11-16T12:00:00Z') });
   await page.clock.pauseAt(new Date('2026-11-16T12:00:01Z'));
   await page.goto('/operator');
