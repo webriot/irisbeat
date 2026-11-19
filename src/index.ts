@@ -573,9 +573,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
       if (hints.public && this.renderInterval) {
         const pending = this.pendingStatus();
-        const since = pending?.since ?? at;
         const scopes = mergeScopes(pending?.scopes ?? [], hints.public.scopes);
-        this.ctx.storage.kv.put("status-pending", { since, scopes } satisfies PendingStatus);
+        // Any pending record left after sealing retains its original deadline.
+        if (!pending || scopes.length !== pending.scopes.length || scopes.some((scope, i) => scope !== pending.scopes[i]))
+          this.ctx.storage.kv.put("status-pending", { since: pending?.since ?? at, scopes } satisfies PendingStatus);
       }
       if (day !== undefined) clock.day = day;
       else clock.day ??= Math.floor(at / DAY);

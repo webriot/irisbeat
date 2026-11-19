@@ -50,6 +50,18 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
           ${analyticsConstructor}
           testHistoryMode(mode) { this.testAnalytics.setMode(mode); }
           testHistoryQueries() { return this.testAnalytics.queries; }
+          testPendingStatusWrites() {
+            if (this.pendingStatusWrites === undefined) {
+              const kv = this.ctx.storage.kv;
+              const put = kv.put.bind(kv);
+              this.pendingStatusWrites = 0;
+              kv.put = (key, value) => {
+                if (key === "status-pending") this.pendingStatusWrites++;
+                return put(key, value);
+              };
+            }
+            return this.pendingStatusWrites;
+          }
           testClock(at) { Date.now = at === null ? wallNow : () => at; }
           testAlarmAt() { return this.ctx.storage.getAlarm(); }
           testDelayedAlarm() { return this.alarm(); }
@@ -84,6 +96,9 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
         }
         if (url.pathname === '/test-history-queries') {
           return Response.json(await env.MONITORING.getByName('personal').testHistoryQueries());
+        }
+        if (url.pathname === '/test-status-pending-writes') {
+          return Response.json(await env.MONITORING.getByName('personal').testPendingStatusWrites());
         }
         if (url.pathname === '/test-status-delayed-alarm') {
           await env.MONITORING.getByName('personal').testDelayedAlarm();

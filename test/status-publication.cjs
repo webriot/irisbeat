@@ -20,7 +20,68 @@ async function eventually(assertion, deadline = Date.now() + 3_000) {
   }
 }
 
+async function testPendingStatusWrites(runtime) {
+  const request = (path, method = 'GET', body, headers = {}) => runtime.dispatchFetch(origin + path, {
+    method, headers: { authorization: 'Bearer upgrade-test-secret', 'content-type': 'application/json', ...headers },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  const json = async path => (await request(path)).json();
+  const clock = async at => assert.equal((await request('/test-status-clock?at=' + at)).status, 204);
+  const update = async pageName => assert.equal((await request('/api/operator', 'PUT', { pageName })).status, 200);
+  const writes = () => json('/test-status-pending-writes');
+  const evict = webSockets => runtime.unsafeEvictDurableObject('irisbeat', 'MonitoringContext', { name: 'personal', webSockets });
+  const start = Date.UTC(2030, 0, 2, 12);
+  await clock(start);
+  const { revision } = await json(page);
+  const upgrade = await request('/api/status/events/v2', 'GET', undefined, { Upgrade: 'websocket', Origin: origin });
+  assert.equal(upgrade.status, 101);
+  const socket = upgrade.webSocket;
+  socket.accept();
+  const hints = [];
+  socket.addEventListener('message', event => hints.push(JSON.parse(event.data)));
+
+  assert.equal(await writes(), 0);
+  await update('First edit');
+  await clock(start + 1_000);
+  await update('Second edit');
+  assert.equal(await writes(), 1, 'same deadline and scopes write the pending record once');
+  const created = await request('/api/operator/monitors', 'POST', { name: 'New Monitor', kind: 'heartbeat' });
+  assert.equal(created.status, 201);
+  const { monitor } = await created.json();
+  assert.equal(await writes(), 2, 'new scopes are persisted');
+
+  await evict('hibernate');
+  assert.equal(await writes(), 0);
+  await update('Last edit in the first window');
+  assert.equal(await writes(), 0, 'the pending record still covers the page scope after eviction');
+  await clock(start + 60_000);
+  await update('First edit in the second window');
+  assert.equal(await writes(), 1, 'rollover starts a new pending record');
+  await update('Last edit in the second window');
+  assert.equal(await writes(), 1, 'repeated changes also coalesce in the new window');
+
+  assert.equal((await request('/test-status-delayed-alarm')).status, 204);
+  await eventually(() => assert.deepEqual(hints, [
+    { type: 'changed', revision: revision + 4, scopes: ['page', 'monitors', 'banner', 'incidents'] },
+  ]));
+  assert.deepEqual(await json(page), { revision: revision + 4, html: '<h1>Last edit in the first window</h1>' });
+  assert.equal((await json('/api/status')).monitor.id, monitor.id);
+
+  await evict('close');
+  await clock(start + 120_000);
+  const published = await json('/test-status-published');
+  assert.equal(published.hint.revision, revision + 4);
+  assert.equal((await json('/api/status')).pageName, 'Last edit in the second window');
+  assert.deepEqual(await json(page), { revision: revision + 6, html: '<h1>Last edit in the second window</h1>' });
+  assert.deepEqual((await json('/test-status-published')).hint,
+    { type: 'changed', revision: revision + 6, scopes: ['page'] });
+}
+
 module.exports = async function test({ mf, options, application, cachedSQLite, request, tick, deliveries, fresh }) {
+  const pending = fresh(options(application, 'pending-status-state', false, undefined, { STATUS_RENDER_INTERVAL_SECONDS: '60' }));
+  try { await testPendingStatusWrites(pending); }
+  finally { await pending.dispose(); }
+
   const update = name => request('/api/operator', 'PUT', { pageName: name });
   const status = async () => (await request('/api/status')).json();
   const browserSnapshot = async () => (await mf.dispatchFetch(origin + '/api/status', {
