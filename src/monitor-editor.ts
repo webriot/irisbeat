@@ -45,6 +45,9 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
   type DurationUnit = keyof typeof durationFactors;
   const durations = new Map<EditorControl, { control: EditorControl; min: number; max: number; unit: DurationUnit; seconds: number; display: string }>();
   let editingId: string | null = null;
+  let minimumCheckInterval = timingDefaults.intervalSeconds;
+  let savedInterval: number | undefined;
+  let newIntervalDefault = timingDefaults.intervalSeconds;
   let monitorIds = new Set<string>();
   let destinations: NotificationDestination[] = [];
   let savedSelections = new Set<string>();
@@ -61,6 +64,9 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
         if (field === 'silenceSeconds' || field === 'recoverySpacingSeconds') return heartbeat && !calendar;
         return !heartbeat;
       });
+    },
+    outboundIntervalMinimum() {
+      return controls.get('kind').value === 'heartbeat' ? timingDefaults.intervalSeconds : minimumCheckInterval;
     },
     preview() {
       controls.get('cron').setCustomValidity('');
@@ -91,6 +97,10 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
     validate(input: EditorControl) {
       const seconds = duration.seconds(input);
       const state = durations.get(input)!;
+      if (input.id === 'intervalSeconds' && seconds !== null && seconds < controls.outboundIntervalMinimum() && seconds !== savedInterval) {
+        input.setCustomValidity('Enter an interval of at least ' + controls.outboundIntervalMinimum() + ' seconds.');
+        return null;
+      }
       input.setCustomValidity(seconds === null ? 'Enter whole seconds between ' + state.min + ' and ' + state.max + '.' : '');
       return seconds;
     },
@@ -103,6 +113,13 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
       input.value = String(seconds / durationFactors[unit]);
       state.display = input.value;
       input.setCustomValidity('');
+    },
+    updateIntervalBounds() {
+      const input = controls.get('intervalSeconds');
+      const state = durations.get(input)!;
+      const minimum = controls.outboundIntervalMinimum();
+      input.min = String(Math.min(minimum, savedInterval ?? minimum) / durationFactors[state.unit]);
+      if (!input.disabled) duration.validate(input);
     },
   };
   const monitorEditor = {
@@ -121,12 +138,15 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
       controls.get('port').value = String(monitor?.port || '');
       controls.get('published').checked = monitor?.published ?? true;
       controls.get('scheduleMode').value = monitor?.scheduleMode || 'interval';
+      savedInterval = controls.get('scheduleMode').value === 'interval' ? monitor?.intervalSeconds : undefined;
+      newIntervalDefault = controls.outboundIntervalMinimum();
       controls.get('cron').value = monitor?.cron || '0 9 * * *';
       controls.get('timezone').value = monitor?.timezone || 'UTC';
       controls.get('cron').setCustomValidity('');
       for (const [field, value] of Object.entries(timingDefaults) as [TimingField, number][]) {
         const input = controls.get(field);
-        if (durations.has(input)) duration.display(input, monitor?.[field] ?? value);
+        if (field === 'intervalSeconds') duration.display(input, savedInterval ?? Math.max(monitor?.intervalSeconds ?? value, newIntervalDefault));
+        else if (durations.has(input)) duration.display(input, monitor?.[field] ?? value);
         else input.value = String(monitor?.[field] ?? value);
       }
       controls.get('heartbeat-path').textContent = monitor?.kind === 'heartbeat' ? (hosted ? 'POST /heartbeat' : 'POST /heartbeat/' + monitor.id) : '';
@@ -135,6 +155,10 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
       (monitor ? controls.get('history-' + monitor.id) : controls.get('new-monitor-panel')).append(form);
       form.hidden = false; monitorEditor.update(); controls.preview();
       controls.get('name').focus();
+    },
+    setMinimumCheckInterval(seconds: number) {
+      minimumCheckInterval = seconds;
+      if (!form.hidden) duration.updateIntervalBounds();
     },
     close() {
       session.cancelPreview(); controls.get('cron').setCustomValidity('');
@@ -185,6 +209,12 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
       controls.get('intervalSeconds').closest('.duration')!.hidden = calendar;
       controls.get('intervalSeconds').disabled = calendar;
       controls.get('intervalSeconds-unit').disabled = calendar;
+      const interval = controls.get('intervalSeconds');
+      const minimum = controls.outboundIntervalMinimum();
+      if (!editingId && minimum !== newIntervalDefault && duration.seconds(interval) === newIntervalDefault)
+        duration.display(interval, minimum, durations.get(interval)!.unit);
+      newIntervalDefault = minimum;
+      duration.updateIntervalBounds();
       for (const target of ['http', 'tcp']) {
         controls.get(target + '-target').hidden = kind !== target;
         controls.get(target + '-target').disabled = kind !== target;
@@ -236,6 +266,7 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
       const seconds = duration.validate(input);
       if (seconds === null) { control.value = durations.get(input)!.unit; input.reportValidity(); return; }
       duration.display(input, seconds, control.value as DurationUnit);
+      if (input.id === 'intervalSeconds') duration.updateIntervalBounds();
     });
   }
   for (const field of ['cron', 'timezone', 'graceSeconds']) controls.get(field).addEventListener('input', controls.preview);
@@ -260,6 +291,8 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
       body[field] = durations.has(input) ? duration.validate(input) : Number(input.value);
       if (body[field] === null) { input.reportValidity(); return; }
     }
+    if (savedInterval !== undefined && body.intervalSeconds === savedInterval && savedInterval < controls.outboundIntervalMinimum())
+      delete body.intervalSeconds;
     if (selectionChanges.size) body.destinationChanges = Object.fromEntries(selectionChanges);
     await session.run('/api/operator/monitors' + (editingId ? '/' + encodeURIComponent(editingId) : ''), editingId ? 'PATCH' : 'POST', body, monitorEditor.close);
   });

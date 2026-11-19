@@ -67,3 +67,29 @@ Authenticated editors can `POST /api/operator/schedule-preview` with `{ cron, ti
 Creation, mode/cron/timezone changes, and hosted resume anchor at the next future occurrence. A delayed dispatch executes one current Check and persists the next future occurrence before outbound I/O. Identity, last results, availability and open Incidents survive schedule edits; consecutive progress resets. Active attempts retain starting configuration and do not overwrite newer schedules or seed their consecutive progress. Maintenance observations and pause suppression use the existing detector/history/delivery paths. Interval timing edits keep the established last-dispatch anchor and progress semantics.
 
 HTTP and TCP reuse the Calendar calculation in `src/calendar.ts`, the preview endpoint, and the same schedule controls. TCP occurrences use native plain connections with the configured timeout and existing bounded cleanup. Calendar Heartbeat receipt windows remain separate.
+
+## Outbound check floor
+
+`MIN_CHECK_INTERVAL_SECONDS` applies across the installation. [Installation
+settings](install.md#outbound-check-floor) describe its bounds and failure behavior.
+
+- Authenticated Operator snapshots expose `minCheckIntervalSeconds`. For HTTP/TCP
+  Interval Monitors, `intervalSeconds` stays the saved value and
+  `effectiveIntervalSeconds` is the larger of that value and the floor.
+  New outbound Interval Monitors default to the floor when the interval is
+  omitted. Explicit lower values return 400, including in legacy saves. Omit
+  `intervalSeconds` to keep an existing saved Interval while editing other fields.
+- For HTTP/TCP Calendar Monitors, `scheduleSuspended` reports whether the
+  saved Calendar is suspended. When true, `scheduleSuspensionFloorSeconds`
+  gives the floor that caused suspension. New or explicitly submitted outbound
+  Calendars must have every occurrence at least the floor apart, including
+  timezone offset transitions. The schedule-preview endpoint applies this rule
+  to outbound schedules and validates Heartbeat grace when `graceSeconds` is supplied.
+- Saving a compatible schedule resumes a suspended Calendar. Calendar saves
+  resume at the next future occurrence and preserve observations and Incidents.
+  When a delayed outbound Calendar dispatch would put a following occurrence
+  inside the floor, the scheduler skips that occurrence and returns to the Calendar.
+
+These fields belong to the Operator projection. Public availability and
+Incidents still reflect observations. Heartbeat retains its existing fields,
+receipt windows and silence timing.

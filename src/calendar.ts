@@ -70,9 +70,9 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
     }
     throw new Error('No future calendar occurrence');
   };
-  function* graceSteps(seconds: number, after: number): Generator<void, boolean> {
-    // Future cron instants are minute-aligned; sub-minute windows cannot overlap.
-    if (seconds < 60) return true;
+  function* gapSteps(seconds: number, after: number, inclusiveMinimum = false): Generator<void, boolean> {
+    // Future cron instants are minute-aligned.
+    if (seconds < 60 || (inclusiveMinimum && seconds === 60)) return true;
     const offsetFormatter = new Intl.DateTimeFormat('en-US', { timeZone: formatter.resolvedOptions().timeZone, hour: 'numeric', timeZoneName: 'longOffset' });
     const zoneOffset = (at: number) => {
       const name = offsetFormatter.formatToParts(at).find(part => part.type === 'timeZoneName')!.value;
@@ -82,6 +82,7 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
       return (match[1] === '+' ? 1 : -1) * (Number(match[2]) * 3600 + Number(match[3]) * 60 + Number(match[4] ?? 0)) * 1000;
     };
     const limit = seconds * 1000;
+    const tooClose = (gap: number) => inclusiveMinimum ? gap < limit : gap <= limit;
     const minutes = fields[1].flatMap(hour => fields[0].map(minute => hour * 60 + minute));
     const insideGap = Math.min(...minutes.slice(1).map((minute, i) => (minute - minutes[i]) * 60_000));
     const start = Math.floor(local(after) / DAY) * DAY;
@@ -96,7 +97,7 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
     };
     // Prefix counts let each valid wall-time range check all its internal gaps in O(1).
     const close = [0];
-    for (let i = 1; i < minutes.length; i++) close.push(close[i - 1] + Number((minutes[i] - minutes[i - 1]) * 60_000 <= limit));
+    for (let i = 1; i < minutes.length; i++) close.push(close[i - 1] + Number(tooClose((minutes[i] - minutes[i - 1]) * 60_000)));
     const lower = (minute: number) => {
       let lo = 0, hi = minutes.length;
       while (lo < hi) {
@@ -128,7 +129,7 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
       let first: number;
       let last: number;
       if (candidates.length === 1) {
-        if (insideGap <= limit) return false;
+        if (tooClose(insideGap)) return false;
         first = day + minutes[0] * 60_000 - candidates[0];
         last = day + minutes[minutes.length - 1] * 60_000 - candidates[0];
       } else {
@@ -153,7 +154,7 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
             if (lo === hi) continue;
             if (close[hi - 1] !== close[lo]) return false;
             const at = day + minutes[lo] * 60_000 - delta;
-            if (Number.isFinite(last) && at - last <= limit) return false;
+            if (Number.isFinite(last) && tooClose(at - last)) return false;
             if (!Number.isFinite(first)) first = at;
             last = day + minutes[hi - 1] * 60_000 - delta;
           }
@@ -161,7 +162,7 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
         }
         if (!Number.isFinite(first)) continue;
       }
-      if (previous !== undefined && first - previous <= limit) return false;
+      if (previous !== undefined && tooClose(first - previous)) return false;
       previous = last;
       for (const cached of offsets.keys()) if (cached < day - 2 * DAY) offsets.delete(cached);
       for (const cached of transitions.keys()) if (cached < day - 2 * DAY) transitions.delete(cached);
@@ -169,13 +170,13 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
     return true;
   };
   const acceptsGrace = (seconds: number, after: number) => {
-    const steps = graceSteps(seconds, after);
+    const steps = gapSteps(seconds, after);
     let step = steps.next();
     while (!step.done) step = steps.next();
     return step.value;
   };
-  const acceptsGraceAsync = async (seconds: number, after: number) => {
-    const steps = graceSteps(seconds, after);
+  const acceptsGapAsync = async (seconds: number, after: number, inclusiveMinimum: boolean) => {
+    const steps = gapSteps(seconds, after, inclusiveMinimum);
     let step = steps.next();
     while (!step.done) {
       await scheduler.wait(0);
@@ -194,5 +195,10 @@ export function calendar(cron: unknown, timezone: unknown = 'UTC') {
   const allDow = fields[4].length === 7;
   const days = dayOr ? dom + ' OR ' + dow
     : allDom && allDow ? 'every day' : allDom ? dow : allDow ? dom : dom + ' AND ' + dow;
-  return { cron: sources.join(' '), timezone, next, acceptsGrace, acceptsGraceAsync, explanation: `${time}; ${days}; ${sources[3] === '*' ? 'every month' : 'months ' + list(3)} (${timezone}).` };
+  return {
+    cron: sources.join(' '), timezone, next, acceptsGrace,
+    acceptsGraceAsync: (seconds: number, after: number) => acceptsGapAsync(seconds, after, false),
+    acceptsMinimumGap: (seconds: number, after: number) => acceptsGapAsync(seconds, after, true),
+    explanation: `${time}; ${days}; ${sources[3] === '*' ? 'every month' : 'months ' + list(3)} (${timezone}).`,
+  };
 }

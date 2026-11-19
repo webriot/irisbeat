@@ -5,10 +5,12 @@ import worker, { MonitoringContext as EngineContext, type NotificationQueueJob }
 let mode = 'available';
 let queued: NotificationQueueJob[] = [];
 let queueUnavailable = false;
+let checkFloor: string | undefined;
 export class MonitoringContext extends EngineContext {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, {
       ...env,
+      get MIN_CHECK_INTERVAL_SECONDS() { return checkFloor; },
       NOTIFICATION_QUEUE: {
         async sendBatch(messages) {
           if (queueUnavailable) throw new Error("substituted private Queue error");
@@ -29,6 +31,10 @@ export default {
   ...worker,
   async fetch(request: Request, env: Env) {
     const url = new URL(request.url);
+    if (url.pathname === '/__test-check-floor' && request.method === 'PUT') {
+      checkFloor = url.searchParams.get('seconds') ?? undefined;
+      return new Response(null, { status: 204 });
+    }
     if (url.pathname === '/__test-notification-queue') {
       if (request.method === 'DELETE') {
         queued = [];

@@ -2,7 +2,7 @@
 import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, statusPage, styleSheet, themeScript } from "./ui";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
-import { MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
+import { minimumCheckIntervalSeconds, MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
 import { connect } from "cloudflare:sockets";
 import { parseEmailAddress, type AlertDestination, type ConfirmationIdentity, type ConfirmationJob, type NewNotificationDestination, type NotificationDestination, type NotificationEligibility, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
 import type { NotificationDeliveryIdentity, SubmissionReport } from "./notification-outcomes";
@@ -12,6 +12,7 @@ export const CONTRACT_VERSION = "1" as const;
 export interface EngineEnv {
   MONITORING: DurableObjectNamespace<MonitoringContext>;
   INSTALLATION_SECRET?: string;
+  MIN_CHECK_INTERVAL_SECONDS?: string | number;
   NOTIFICATION_PUBLIC_ORIGIN?: string;
   NOTIFICATION_EMAIL?: { isConfigured(): Promise<boolean> };
   NOTIFICATION_QUEUE?: Pick<Queue<NotificationQueueJob>, "sendBatch">;
@@ -377,6 +378,9 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       const parsed = calendar(value.cron, value.timezone === undefined ? "UTC" : value.timezone);
       if ("graceSeconds" in value && (typeof value.graceSeconds !== "number" || !Number.isInteger(value.graceSeconds) || value.graceSeconds < 1 || value.graceSeconds > 86400 || !await parsed.acceptsGraceAsync(value.graceSeconds, after)))
         throw new Error("Grace must be 1–86400 whole seconds and shorter than every occurrence gap");
+      const floor = minimumCheckIntervalSeconds(this.env.MIN_CHECK_INTERVAL_SECONDS);
+      if (!("graceSeconds" in value) && !await parsed.acceptsMinimumGap(floor, after))
+        throw new Error(`Calendar occurrences must be at least ${floor} seconds apart`);
       return { cron: parsed.cron, timezone: parsed.timezone, explanation: parsed.explanation, occurrences: parsed.next(after, 3) };
     } catch (error) {
       return { error: error instanceof Error ? error.message : "Enter a valid Calendar Schedule" };
@@ -384,6 +388,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   private monitorConfigurations = new MonitorConfigurations({
+    minimumCheckIntervalSeconds: () => minimumCheckIntervalSeconds(this.env.MIN_CHECK_INTERVAL_SECONDS),
     read: () => this.read(),
     snapshot: (state: StoredContext) => this.subscriptionSnapshot(state),
     commit: (state: StoredContext, before: ReturnType<MonitoringContext["subscriptionSnapshot"]>) => {
@@ -632,10 +637,35 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   // Keep overlap evidence with the running attempt even after a window is replaced or ends.
   private checking = new Map<string, { maintenance: boolean; paused: boolean }>();
 
+  async prepareOutboundCalendars() {
+    const floor = minimumCheckIntervalSeconds(this.env.MIN_CHECK_INTERVAL_SECONDS);
+    if (floor === timingDefaults.intervalSeconds) return;
+    const needsProof = (monitor: Monitor) => monitor.kind !== "heartbeat" && monitor.scheduleMode === "calendar" &&
+      monitor.outboundCalendarFloor?.compatible !== false && monitor.outboundCalendarFloor?.seconds !== floor;
+    for (;;) {
+      const candidate = this.ctx.storage.kv.get<StoredContext>("context")?.monitors?.find(needsProof);
+      if (!candidate) return;
+      const compatible = await calendar(candidate.cron, candidate.timezone).acceptsMinimumGap(floor, Date.now());
+      const state = this.read();
+      // Another request may have changed the schedule while the proof was running.
+      const matches = state.monitors.filter(monitor => needsProof(monitor) &&
+        monitor.cron === candidate.cron && monitor.timezone === candidate.timezone);
+      if (!matches.length) continue;
+      const before = this.subscriptionSnapshot(state);
+      for (const monitor of matches) monitor.outboundCalendarFloor = { seconds: floor, compatible };
+      this.ctx.storage.kv.put("context", state);
+      if (!compatible) this.notify(before);
+    }
+  }
+
   async check(at: number) {
     const pending: Promise<void>[] = [];
     const { monitors } = this.read(Math.max(at, Date.now()), { pending });
-    await Promise.all([...pending, ...monitors.map(monitor => this.checkMonitor(monitor.id, at))]);
+    const calendarPolicy = this.prepareOutboundCalendars();
+    await Promise.all([calendarPolicy, ...pending, ...monitors.map(async monitor => {
+      if (monitor.kind !== "heartbeat" && monitor.scheduleMode === "calendar") await calendarPolicy;
+      await this.checkMonitor(monitor.id, at);
+    })]);
   }
 
   private async checkMonitor(id: string, at: number) {
@@ -656,10 +686,24 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
       return;
     }
-    if (this.checking.has(id) || at < attempt.nextDue) return;
+    if (this.checking.has(id) || at < attempt.nextDue || attempt.outboundCalendarFloor?.compatible === false) return;
+    const floor = minimumCheckIntervalSeconds(this.env.MIN_CHECK_INTERVAL_SECONDS) * 1000;
+    const calendarMode = attempt.scheduleMode === "calendar";
+    const earliest = calendarMode
+      ? (attempt.lastOutboundCheckAt ?? attempt.lastResult?.at ?? -Infinity) + floor
+      : Math.max(attempt.nextDue ? attempt.nextDue - attempt.intervalSeconds * 1000 : -Infinity,
+        attempt.lastOutboundCheckAt ?? -Infinity) + floor;
+    if (at < earliest) {
+      if (calendarMode) {
+        attempt.nextDue = calendar(attempt.cron, attempt.timezone).next(earliest - 1)[0];
+        this.ctx.storage.kv.put("context", state);
+      }
+      return;
+    }
     const observation = { maintenance: !!attempt.maintenance, paused: false };
     this.checking.set(id, observation);
-    attempt.nextDue = attempt.scheduleMode === "calendar" ? calendar(attempt.cron, attempt.timezone).next(at)[0] : at + attempt.intervalSeconds * 1000;
+    attempt.lastOutboundCheckAt = at;
+    attempt.nextDue = calendarMode ? calendar(attempt.cron, attempt.timezone).next(at)[0] : at + attempt.intervalSeconds * 1000;
     this.ctx.storage.kv.put("context", state);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), attempt.timeoutSeconds * 1000);
@@ -1032,6 +1076,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         ...(monitor.kind === "tcp" ? { hostname: monitor.hostname, port: monitor.port } : monitor.kind === "http" ? { url: monitor.url } : {}),
         published: monitor.published,
         scheduleMode: monitor.scheduleMode ?? "interval",
+        ...(monitor.kind !== "heartbeat" && monitor.scheduleMode !== "calendar"
+          ? { effectiveIntervalSeconds: Math.max(monitor.intervalSeconds, minimumCheckIntervalSeconds(this.env.MIN_CHECK_INTERVAL_SECONDS)) } : {}),
+        ...(monitor.kind !== "heartbeat" && monitor.scheduleMode === "calendar" ? {
+          scheduleSuspended: monitor.outboundCalendarFloor?.compatible === false,
+          ...(monitor.outboundCalendarFloor?.compatible === false ? { scheduleSuspensionFloorSeconds: monitor.outboundCalendarFloor.seconds } : {}),
+        } : {}),
         ...(monitor.scheduleMode === "calendar" ? { cron: monitor.cron, timezone: monitor.timezone ?? "UTC" } : {}),
         ...(monitor.kind !== "heartbeat" || monitor.scheduleMode !== "calendar" ? { intervalSeconds: monitor.intervalSeconds } : {}), recoveryThreshold: monitor.recoveryThreshold,
         ...(monitor.kind === "heartbeat"
@@ -1047,6 +1097,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         })),
         webhookUrl: legacy?.channel === "webhook" ? legacy.url : null,
       } : {}),
+      ...(operator ? { minCheckIntervalSeconds: minimumCheckIntervalSeconds(this.env.MIN_CHECK_INTERVAL_SECONDS) } : {}),
       paused: !!state.paused,
       pageName: state.pageName,
       monitors,
@@ -1101,6 +1152,7 @@ function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E
   const app = createApp(adapter);
   return {
   async scheduled(controller: ScheduledController, env: E) {
+    minimumCheckIntervalSeconds(env.MIN_CHECK_INTERVAL_SECONDS);
     const contexts = adapter ? await adapter.contexts(env) : ["personal"];
     const unique = new Map<string, ScheduledContext>();
     for (const value of contexts) {
@@ -1121,6 +1173,12 @@ function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E
     }));
   },
   async fetch(request: Request, env: E) {
+    try {
+      minimumCheckIntervalSeconds(env.MIN_CHECK_INTERVAL_SECONDS);
+    } catch (error) {
+      console.error(JSON.stringify({ event: "invalid_configuration", message: (error as Error).message }));
+      return requestFailed(request);
+    }
     try {
       return await app.fetch(request, env);
     } catch {
@@ -1347,6 +1405,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     if (!permission) return Response.json({ error: "Unauthorized" }, { status: 401 });
     if (permission !== "editor" && c.req.method !== "GET" && path !== ticketPath) return Response.json({ error: "Forbidden" }, { status: 403 });
     c.set("permission", permission);
+    if (path !== ticketPath && path !== previewPath) await c.get("context").prepareOutboundCalendars();
     await next();
   });
   app.post(ticketPath, async c => {
