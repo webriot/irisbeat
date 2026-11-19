@@ -597,20 +597,28 @@ contract 1). Its prepared artifacts had these SHA-256 checksums:
 Release maintainers first review the PR and full implementation, complete local
 release verification and the candidate runtime acceptance above, then merge the
 reviewed source to main. Keep #12 open and its publication acceptance incomplete.
-Regenerate artifacts from the **final** clean release revision and
-repeat `npm run release:verify`; integration candidate bytes do not represent a
-later merge commit. Set version/source links together for future releases.
+Choose a version that has no tag or release in the repository. Before preparing
+the release, set that version in `package.json`, `package-lock.json`, and the
+Status and Operator Source links in `src/ui.tsx`. Regenerate the versioned
+artifacts from the **final** clean release revision and repeat
+`npm run release:verify` on that revision.
 
-Only after authorization, create tag `v0.3.0` on that exact revision and a draft
-GitHub release, attach all four artifacts, verify downloaded hashes, then publish.
-For example, after creating and pushing the reviewed tag:
+Once authorized, tag that exact revision with the unused version, create a draft
+GitHub release, and attach all four regenerated artifacts. Verify the downloaded
+hashes before publishing. Set `IRISBEAT_RELEASE_NOTES` to the reviewed notes
+file and run the following after pushing the tag.
 
 ```sh
-gh release create v0.3.0 --verify-tag --draft --title 'Irisbeat 0.3.0' --notes-file <reviewed-notes-file> dist/irisbeat-0.3.0.tgz dist/irisbeat-0.3.0-source.tar.gz dist/release.json dist/SHA256SUMS --repo Webriot/irisbeat
+IRISBEAT_RELEASE_VERSION="$(node -p 'require("./package.json").version')"
+gh release create "v$IRISBEAT_RELEASE_VERSION" --verify-tag --draft \
+  --title "Irisbeat $IRISBEAT_RELEASE_VERSION" --notes-file "$IRISBEAT_RELEASE_NOTES" \
+  "dist/irisbeat-$IRISBEAT_RELEASE_VERSION.tgz" \
+  "dist/irisbeat-$IRISBEAT_RELEASE_VERSION-source.tar.gz" \
+  dist/release.json dist/SHA256SUMS --repo Webriot/irisbeat
 ```
 
 Follow [GitHub release guidance](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository).
-Never replace published bytes for the same version; issue a new version instead.
+Publish changes under a new version and preserve existing release artifacts.
 The public/operator Source link targets that release's source archive. It remains
 pending until publication. Irisbeat's own code is AGPL-3.0-only, with LICENSE and
 NOTICE in both archives. Provide Corresponding Source to network users of your
