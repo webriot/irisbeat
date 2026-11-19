@@ -33,21 +33,14 @@ they fall inside a naturally expired window. Missing executions create no result
 and record Maintenance, including closely spaced receipts; they never recover an
 Incident. Subsequent recovery requires the Monitor's normal post-window rule.
 
-## History #9
+## Availability history
 
-The additive SQLite `observations` table retains executed observations from this
-revision forward: `id INTEGER PRIMARY KEY`, `monitorId TEXT`, `at INTEGER` (epoch
-milliseconds), `outcome TEXT` (`success`, `failure`, `maintenance`). Outbound `at`
-retains the existing attempt-start convention. Heartbeat receipts and actual
-scheduled silence evaluations use their event timestamp. No row is generated for a
-missing/not-due/in-flight-skipped execution or merely entering/ending Maintenance.
-Rows survive eviction and Monitor deletion; the last result is also observable in
-normal status responses. Maintenance replaces the raw outcome so it cannot enter
-the success/failure denominator. There is no public raw-history endpoint.
-
-[History #9](history-api.md) implements aggregation, query/filter contracts, indexes and bounded observation cleanup.
-Prior historical observations cannot be reconstructed from the single last result;
-this change does not synthesize them. Existing Incident history is unchanged.
+Executed observations are submitted to Analytics Engine with their event
+timestamp. Outbound checks use attempt start. Heartbeat receipts, actual silence
+evaluations and finalized Calendar windows follow their respective timestamps.
+Entering or ending Maintenance and skipped executions create no observations.
+Maintenance is recorded as its own outcome and excluded from the
+success/failure denominator. See the [availability history contract](history-api.md).
 
 ## Hosted #10 and pause #11
 

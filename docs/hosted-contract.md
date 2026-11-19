@@ -75,6 +75,35 @@ so they cannot bypass the allowance. Page-only `PUT /api/operator` still works.
 The personal default export retains its complete existing interface and unlimited
 creation with the installation secret.
 
+## Availability history
+
+Bind `AVAILABILITY_HISTORY` as an Analytics Engine dataset on the Worker that
+hosts `MonitoringContext`. Configure the self-hosted SQL inputs or supply
+`AVAILABILITY_QUERY` as a trusted service binding on that Worker. The query service
+and the write binding use the same Analytics Engine account and dataset. The
+service binding takes precedence over the direct credentials when supplied.
+
+Import `AvailabilityQueryService`, `AvailabilityQuery`, and `AvailabilityRow`
+from `irisbeat`. The engine calls
+`queryAvailability(query: AvailabilityQuery): Promise<AvailabilityRow[]>`.
+The request carries an opaque `tenantKey` (the context's Durable Object ID),
+a batch of 1–50 authorized `monitorIds`, and `start` and `end` in Unix
+milliseconds. The service always filters by the tenant key and the listed IDs.
+Filter on the actual observation timestamp and include `start`, excluding
+`end`. Group by Monitor and UTC day. Return one
+`{ monitorId, date, successes, failures, maintenance }` per observed day, with
+`date` as `YYYY-MM-DD` and each count weighted by `_sample_interval`. Return
+an empty array when no rows match and reject on read failure. When the request
+includes `observation: { at, outcome }`, add both exact filters for the
+installation readiness probe. Keep this service private to trusted Worker
+callers. The caller supplies identity after authorizing the public or Operator
+read, and the service never accepts scopes from browser headers or URLs.
+
+The field layout and cutover are in the
+[availability history handoff](history-api.md). The readiness endpoint is
+editor-only. Existing status payloads keep the 90-day history shape with an
+optional `stale: true` on previously successful aggregates.
+
 ## Heartbeat credentials
 
 An editor calls `POST /api/operator/monitors/:id/heartbeat-secret` to issue or

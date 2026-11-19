@@ -34,11 +34,31 @@ function PublicIncidents({ data }: { data: Status }) {
   return <section id="public-incidents" hidden={!data.monitors.length} aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>{raw(statusLedger.incidents(data))}</section>;
 }
 
-function OperatorRows({ monitors, canEdit }: { monitors: ViewMonitor[]; canEdit: boolean }) {
-  if (!monitors.length) return <tr><td colSpan={4}>No Monitors</td></tr>;
+function scheduleDuration(seconds: number) {
+  for (const [factor, unit] of [[86400, "d"], [3600, "h"], [60, "min"]] as const) {
+    if (seconds % factor === 0) return `${seconds / factor} ${unit}`;
+  }
+  return `${seconds} s`;
+}
+
+function operatorSchedule(monitor: ViewMonitor, floor: number) {
+  if (!("scheduleMode" in monitor)) return "";
+  if (monitor.scheduleSuspensionFloorSeconds !== undefined) {
+    const suspendedAt = monitor.scheduleSuspensionFloorSeconds;
+    return `Suspended (${scheduleDuration(suspendedAt)} minimum${suspendedAt === floor ? "" : " at suspension"})`;
+  }
+  if (monitor.scheduleMode === "calendar") return "Calendar";
+  if (monitor.kind === "heartbeat") return "Watchdog";
+  const saved = monitor.intervalSeconds ?? floor;
+  const effective = monitor.effectiveIntervalSeconds ?? saved;
+  return `Every ${scheduleDuration(effective)}${saved === effective ? "" : ` (saved ${scheduleDuration(saved)})`}`;
+}
+
+function OperatorRows({ monitors, canEdit, floor }: { monitors: ViewMonitor[]; canEdit: boolean; floor: number }) {
+  if (!monitors.length) return <tr><td colSpan={5}>No Monitors</td></tr>;
   return <>{monitors.map(monitor => <>
     <tr data-key={monitor.id}>
-      <td>{monitor.name}</td><td class="status" data-state={monitor.state}>{statusLedger.stateLabel[monitor.state]}</td><td>{"published" in monitor && monitor.published ? "Published" : "Private"}</td>
+      <td>{monitor.name}</td><td class="status" data-state={monitor.state}>{statusLedger.stateLabel[monitor.state]}</td><td>{operatorSchedule(monitor, floor)}</td><td>{"published" in monitor && monitor.published ? "Published" : "Private"}</td>
       <td><div class="monitor-actions" id={`actions-${monitor.id}`} role="group" aria-label={`Actions ${monitor.name}`}>
         {canEdit && monitorActions({ published: "published" in monitor && monitor.published }).map(({ key, label, icon }) =>
           <button type="button" data-key={key} class={key === "delete" ? "monitor-action danger" : "monitor-action"} title={label} aria-label={`${label} ${monitor.name}`}>
@@ -46,7 +66,7 @@ function OperatorRows({ monitors, canEdit }: { monitors: ViewMonitor[]; canEdit:
           </button>)}
       </div></td>
     </tr>
-    <tr data-key={`${monitor.id}:history`}><td colSpan={4} id={`history-${monitor.id}`} aria-label={`${monitor.name} availability`}>{raw(statusLedger.history(monitor.history, monitor.id))}</td></tr>
+    <tr data-key={`${monitor.id}:history`}><td colSpan={5} id={`history-${monitor.id}`} aria-label={`${monitor.name} availability`}>{raw(statusLedger.history(monitor.history, monitor.id))}</td></tr>
   </>)}</>;
 }
 
@@ -90,9 +110,9 @@ export function renderViewPartial(scope: ViewScope, data: Status, audience: View
     default: {
       const all = scope === "monitors";
       const html = operator
-        ? (data.monitors.length || all ? String(<OperatorRows monitors={data.monitors} canEdit={audience === "editor"} />) : "")
+        ? (data.monitors.length || all ? String(<OperatorRows monitors={data.monitors} canEdit={audience === "editor"} floor={data.minCheckIntervalSeconds ?? 60} />) : "")
         : String(<PublicRows monitors={data.monitors} />);
-      return { html, ...(operator ? { monitors: data.monitors.map(({ history: _history, ...monitor }) => monitor) } : {}) };
+      return { html, ...(operator ? { monitors: data.monitors.map(({ history: _history, ...monitor }) => monitor), minCheckIntervalSeconds: data.minCheckIntervalSeconds } : {}) };
     }
   }
 }
@@ -319,19 +339,44 @@ function fragment(html) {
 }
 function liveSnapshots(path, read, authorize) {
   let running, queued, ackSocket;
-  let socket, retry, handshake, renewal, polling, stopped = false, ready = false, delay = 1000;
+  let socket, retry, handshake, renewal, polling, historyTimer, stopped = false, ready = false, delay = 1000;
+  let minimumRevision = 0;
+  const historyAttempts = new Map();
+  function historyRows() {
+    const ids = [...document.querySelectorAll('[data-history-retry]')].map(node => node.dataset.historyRetry);
+    for (const id of historyAttempts.keys()) if (!ids.includes(id)) historyAttempts.delete(id);
+    return ids.filter(id => (historyAttempts.get(id) || 0) < 4)
+      .sort((a, b) => (historyAttempts.get(a) || 0) - (historyAttempts.get(b) || 0)).slice(0, 32);
+  }
+  function scheduleHistory() {
+    if (!ready || stopped || document.hidden) {
+      clearTimeout(historyTimer); historyTimer = undefined;
+    } else if (!historyTimer && historyRows().length) {
+      historyTimer = setTimeout(() => {
+        historyTimer = undefined;
+        if (!ready || stopped || document.hidden) return;
+        if (!running) {
+          const ids = historyRows();
+          for (const id of ids) historyAttempts.set(id, (historyAttempts.get(id) || 0) + 1);
+          if (ids.length) enqueue({ revision: minimumRevision, scopes: ids.map(id => 'monitor/' + id), history: true });
+        }
+        scheduleHistory();
+      }, 30000);
+    }
+  }
   function pollingMode() {
     const mode = document.getElementById('updates-mode');
     if (mode) mode.hidden = ready;
     if (ready || document.hidden || stopped) { clearInterval(polling); polling = undefined; }
     else if (!polling) polling = setInterval(sync, 60000);
+    scheduleHistory();
   }
   function sync(hint) { enqueue(hint || { full: true }); }
   async function enqueue(request) {
     if (stopped) return;
     if (running) {
       const previous = queued || running;
-      queued = request.full || previous.full ? { full: true } : {
+      queued = previous.history ? request : request.full || previous.full ? { full: true } : {
         revision: Math.max(previous.revision, request.revision),
         scopes: mergeScopes(previous.scopes, request.scopes),
       };
@@ -339,14 +384,15 @@ function liveSnapshots(path, read, authorize) {
     }
     running = request;
     const source = socket;
-    if (!authorize) snapshotPending(true);
+    if (!authorize && !request.history) snapshotPending(true);
     try {
       const success = await read(() => !stopped && !queued && (request.full || source === socket), request.full ? undefined : request);
       if (success === false) socket?.close();
       else if (ready) delay = 1000;
     } finally {
       running = undefined;
-      if (!authorize) snapshotPending(false);
+      if (!authorize && !request.history) snapshotPending(false);
+      scheduleHistory();
       if (queued && !stopped) {
         const next = queued;
         queued = undefined;
@@ -373,7 +419,7 @@ function liveSnapshots(path, read, authorize) {
       const current = socket = new WebSocket(url);
       handshake = setTimeout(() => current.close(), 10000);
       function connected() {
-        clearTimeout(handshake); ready = true; pollingMode(); sync();
+        clearTimeout(handshake); minimumRevision = 0; ready = true; pollingMode(); sync();
         if (authorize) {
           clearTimeout(renewal);
           renewal = setTimeout(() => {
@@ -398,6 +444,7 @@ function liveSnapshots(path, read, authorize) {
             !hint.scopes.every(scope => typeof scope === 'string' && /^(page|banner|monitors|incidents|destinations|monitor\\/[A-Za-z0-9_-]{1,80})$/.test(scope))) {
           current.close(); return;
         }
+        minimumRevision = Math.max(minimumRevision, hint.revision);
         ackSocket = current; enqueue(hint);
       };
       current.onerror = () => current.close();
@@ -416,6 +463,7 @@ function liveSnapshots(path, read, authorize) {
   function visible() { pollingMode(); if (!document.hidden) sync(); }
   function suspend() {
     stopped = true; ready = false; queued = undefined; clearTimeout(retry); clearTimeout(handshake); clearTimeout(renewal); clearInterval(polling); polling = undefined;
+    clearTimeout(historyTimer); historyTimer = undefined;
     const previous = socket; socket = undefined; ackSocket = undefined; previous?.close();
   }
   function resume() { if (stopped) { stopped = false; pollingMode(); connect(); } }
@@ -557,9 +605,10 @@ document.addEventListener('DOMContentLoaded', () => {
           reconcile(document.getElementById('public-status'), fragment(data.html));
           document.title = data.pageName;
         }
-        initializeDisplay(hint?.scopes); snapshotFailure(false);
+        initializeDisplay(hint?.scopes);
+        if (!hint?.history) snapshotFailure(false);
       } catch {
-        if (current()) { snapshotFailure(true); return false; }
+        if (!hint?.history && current()) { snapshotFailure(true); return false; }
       } finally { clearTimeout(timeout); if (hint) controller.abort(); }
     });
     document.getElementById('retry').addEventListener('click', () => updates.sync());
@@ -827,13 +876,6 @@ function updateDeleted() {
   byId('end-maintenance').disabled = maintenanceMissing;
 }
 
-function scheduleDuration(seconds) {
-  for (const [factor, unit] of [[86400, 'd'], [3600, 'h'], [60, 'min']]) {
-    if (seconds % factor === 0) return (seconds / factor) + ' ' + unit;
-  }
-  return seconds + ' s';
-}
-
 function focusActions(id) { (document.getElementById('actions-' + id)?.querySelector('button') || byId('new-monitor')).focus(); }
 function localMinute(date) { return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16); }
 function declareMaintenance(monitor) {
@@ -863,10 +905,14 @@ function clearSession() {
   updateDeleted();
   message.textContent = ''; byId('secret').value = ''; byId('secret').focus();
 }
+let monitorFloor = 60;
 function bindMonitorActions(group, monitor) {
   const path = '/api/operator/monitors/' + encodeURIComponent(monitor.id);
   const actions = {
-    edit: () => monitorEditor.open(monitor, hosted),
+    edit: () => {
+      monitorEditor.setSchedulePolicy(monitorFloor, monitor.scheduleSuspended === true);
+      monitorEditor.open(monitor, hosted);
+    },
     publication: () => run(path, 'PATCH', { published: !monitor.published }),
     maintenance: () => declareMaintenance(monitor),
     delete: () => { if (confirm('Delete ' + monitor.name + '? Checks and publication stop. Incident history is retained.')) run(path, 'DELETE'); },
@@ -898,6 +944,9 @@ function renderOperatorPartials(partials, savedField) {
       renderDestinations(data.destinations, data.selections, next);
       monitorEditor.refreshDestinations(destinations, data.selections.find(monitor => monitor.id === monitorEditor.id)?.destinationIds);
     } else {
+      monitorFloor = data.minCheckIntervalSeconds ?? 60;
+      const edited = data.monitors.find(monitor => monitor.id === monitorEditor.id);
+      if (edited || !monitorEditor.id) monitorEditor.setSchedulePolicy(monitorFloor, edited?.scheduleSuspended === true);
       const id = scope.startsWith('monitor/') ? scope.slice(8) : null;
       if (id) {
         if (data.monitors.length) monitorIds.add(id);
@@ -1021,7 +1070,7 @@ function showSettings(settings) {
 }
 byId('settings-button').addEventListener('click', () => { showSettings(true); byId('pageName').focus(); });
 byId('back-monitors').addEventListener('click', () => { showSettings(false); byId('settings-button').focus(); });
-byId('new-monitor').addEventListener('click', () => monitorEditor.open(null, hosted));
+byId('new-monitor').addEventListener('click', () => { monitorEditor.setSchedulePolicy(monitorFloor, false); monitorEditor.open(null, hosted); });
 byId('retry').addEventListener('click', () => run());
 byId('logout').addEventListener('click', session.signOut);
 `;

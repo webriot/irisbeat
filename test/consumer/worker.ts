@@ -2,8 +2,13 @@
 // Deliberately a package import: this fixture must not resolve repository source.
 import { createHostedWorker, MonitoringContext as EngineContext, type EngineEnv, type IncidentTransition, type ScheduledContext } from 'irisbeat';
 export { NotificationDelivery } from 'irisbeat';
+import { availabilityFixture } from '../availability-fixture';
 
 export class MonitoringContextWithoutQueue extends EngineContext {
+  constructor(ctx: DurableObjectState, env: EngineEnv) {
+    super(ctx, { ...env, ...availabilityFixture(ctx.storage).bindings });
+  }
+
   protected async onIncidentTransition(event: IncidentTransition) {
     // The real hosted consumer supplies its own transport/identity mapping here.
     const response = await fetch('https://delivery.example/transitions', { method: 'POST', body: JSON.stringify(event) });
