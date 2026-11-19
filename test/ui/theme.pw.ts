@@ -58,7 +58,7 @@ for (const path of ['/', '/operator']) {
 for (const colorScheme of ['light', 'dark'] as const) {
   for (const width of [390, 1280]) {
     for (const path of ['/', '/operator']) {
-      test(`${path} compact ${colorScheme} layout at ${width}px preserves editor drafts`, async ({ page, request }, testInfo) => {
+      test(`${path} fits a ${colorScheme} layout at ${width}px and preserves any open draft when switching themes`, async ({ page, request }) => {
         const headers = { Authorization: 'Bearer ui-test-secret' };
         const response = await request.post('/api/operator/monitors', {
           headers, data: { name: 'Theme layout Monitor', url: 'https://example.invalid', kind: 'http' },
@@ -79,7 +79,6 @@ for (const colorScheme of ['light', 'dark'] as const) {
           await expect(page.locator('h1')).toHaveCSS('font-size', width === 390 ? '24px' : '28px');
           await expect(page.locator('html')).toHaveCSS('color-scheme', colorScheme);
           expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
-          await page.screenshot({ path: testInfo.outputPath('layout.png'), fullPage: true });
           await page.getByRole('combobox', { name: 'Theme', exact: true }).selectOption(colorScheme === 'dark' ? 'light' : 'dark');
           if (path === '/operator') {
             await expect(page.getByLabel('Monitor name', { exact: true })).toHaveValue('Unsaved draft');

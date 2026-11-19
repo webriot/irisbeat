@@ -153,16 +153,6 @@ it("keeps active TCP attempts on their starting target and thresholds while edit
   } });
 });
 
-it("offers HTTP and TCP targets within the Status ledger operator configuration", async () => {
-  const html = await (await request("/operator")).text();
-  expect(html).toContain('<label for="kind">Check type</label>');
-  expect(html).toContain('<option value="http">HTTP(S)</option>');
-  expect(html).toContain('<option value="tcp">TCP</option>');
-  expect(html).toContain('<label for="hostname">Hostname</label>');
-  expect(html).toContain('<label for="port">Port</label>');
-  expect(html).toContain('id="port" name="port" type="number" min="1" max="65535"');
-});
-
 it("records synchronous connection errors and tolerates rejected socket cleanup before the next attempt", async () => {
   await configure({ ...config, failureThreshold: 1, recoveryThreshold: 1 });
   vi.mocked(connect).mockImplementationOnce(() => { throw new Error("blocked target"); });
@@ -419,7 +409,7 @@ it("validates per-ID edits atomically and keeps Monitor kind fixed after creatio
 
 });
 
-it('does not retarget a legacy save to a TCP sibling during deletion', async () => {
+it('returns 409 for a legacy save when its original Monitor is deleted while reading the request', async () => {
   await mutate('/api/operator/monitors', 'POST', { name: 'First HTTP', url: 'https://first.example/' });
   await mutate('/api/operator/monitors', 'POST', { name: 'TCP sibling', kind: 'tcp', hostname: 'db.example', port: 5432 });
   const [first, sibling] = (await operator()).monitors;

@@ -1,14 +1,28 @@
 # Hosted engine contract 1
 
-Implements [ticket #10](https://github.com/webriot/irisbeat/issues/10) under
-[spec #1](https://github.com/webriot/irisbeat/issues/1). Product decisions remain in
-those issues. This is an AGPL-3.0-only release candidate, not a registry publication
-or production deployment. Final release/distribution remains pending under #12; see [release operations](install.md).
+Hosted services use this versioned interface to integrate the Irisbeat monitoring
+and notification delivery Workers.
+
+## Contents
+
+- [Install the engine](#consumption)
+- [Resolve tenants and permissions](#trusted-adapter)
+- [Read availability history](#availability-history)
+- [Issue and rotate Heartbeat credentials](#heartbeat-credentials)
+- [Deliver notifications](#incident-notifications) and [manage email consent](#email-consent)
+- [Pause and resume monitoring](#pause-and-resume)
+- [Subscribe to public updates](#public-subscriptions) and [Operator updates](#operator-subscriptions)
+- [Public rendering and revision rules](#committed-revision-and-publication-handoff)
 
 ## Consumption
 
-Run `npm ci`, `npm run check`, then `npm run test:consumer`. This produces
-`dist/irisbeat-0.4.0.tgz` and `dist/SHA256SUMS`. The test packs twice and compares
+Download the engine tarball, `release.json`, and `SHA256SUMS` from your chosen
+[GitHub release](https://github.com/Webriot/irisbeat/releases). Verify the
+tarball and pin its version and integrity in the consuming project.
+
+To verify the integration locally from the source checkout, run `npm ci`,
+`npm run check`, then `npm run test:consumer`. This produces
+`dist/irisbeat-0.4.1.tgz` and `dist/SHA256SUMS`. The test packs twice and compares
 SHA-256, resolves the exact local version in `test/consumer/package.json`, verifies
 lockfile SHA-512 integrity, installs with offline `npm ci`, typechecks the installed
 package and runs both package exports as separate Workers in local workerd,
@@ -270,7 +284,6 @@ identity and pause generation.
 
 ## Pause and resume
 
-[#11](https://github.com/webriot/irisbeat/issues/11) extends contract 1 additively.
 `ResolvedContext` and exported `ScheduledContext` accept either omitted policy or
 `{ paused: boolean, policyRevision: number }`. Each explicit pause/resume requires
 both fields. `policyRevision` is a nonnegative safe integer from the trusted
@@ -354,14 +367,12 @@ paused and rejects jobs from an earlier pause generation, including when both
 pause and resume happened between attempts. Resume creates no notification
 backlog. Target requests and provider submissions already in flight cannot be
 recalled. A policy update can race with provider submission after the eligibility
-check, since they are separate operations. Maintenance #8 suppresses Incident
-transitions before the engine reaches Queue handoff. Editors use
-`PUT`/`DELETE /api/operator/monitors/:id/maintenance`.
-See [Maintenance handoff](maintenance-api.md) for status
-fields, observation retention, and the #11 precedence seam. Installed-consumer
-coverage verifies Queue suppression for all three check kinds.
-[History #9](history-api.md) adds the same filtered per-Monitor series to personal and hosted status, including readers; it does not change credentials, permissions, allowances or delivery. The release candidate must be
-regenerated after integration changes, before #12 publishes anything.
+check, since they are separate operations. During
+[Maintenance](maintenance-api.md), the engine suppresses Incident transitions
+before sending to the Queue. Editors set or end a window via
+`PUT` or `DELETE` on `/api/operator/monitors/:id/maintenance`. Pausing takes
+precedence over Maintenance. Hosted readers see the same filtered per-Monitor
+[availability history](history-api.md) as self-hosted installations.
 
 ### HTTP and TCP Calendar compatibility
 

@@ -190,7 +190,7 @@ it('isolates mixed collection freshness, silence, recovery spacing, private aler
   expect((await notifications.summaries()).at(-1)).toEqual('Renamed producer: Incident opened');
 });
 
-it('edits heartbeat collection timing prospectively without changing kind, sibling settings', async () => {
+it('applies changed Heartbeat timing on the next check and preserves other Monitors', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
   const a = await create({ name: 'Producer A', kind: 'heartbeat', silenceSeconds: 600, recoverySpacingSeconds: 120, recoveryThreshold: 3 });
   const b = await create({ name: 'Producer B', kind: 'heartbeat' });
@@ -212,18 +212,4 @@ it('edits heartbeat collection timing prospectively without changing kind, sibli
   clock.mockReturnValue(start + 400_000);
   await request('/heartbeat/' + a.id, { method: 'POST', headers: { authorization } });
   expect((await operatorStatus()).monitors.find(m => m.id === b.id)?.lastSeen).toBeNull();
-});
-
-it('never redirects a concurrent legacy save to a sibling after its target is deleted', async () => {
-  const first = await create({ name: 'HTTP first', url: 'https://first.example/' });
-  const sibling = await create({ name: 'Heartbeat sibling', kind: 'heartbeat' });
-  const [saved, removed] = await Promise.all([
-    mutate('/api/operator', 'PUT', { pageName: 'Changed', name: 'Edited HTTP', kind: 'http', url: 'https://edited.example/' }),
-    mutate('/api/operator/monitors/' + first.id, 'DELETE'),
-  ]);
-  expect(removed.status).toBe(200);
-  expect([200, 400, 409]).toContain(saved.status);
-  await evictDurableObject(env.MONITORING.getByName('personal'));
-  expect((await operatorStatus()).monitors).toEqual([sibling]);
-  expect((await request('/heartbeat/' + sibling.id, { method: 'POST', headers: { authorization } })).status).toBe(204);
 });

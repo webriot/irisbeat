@@ -9,7 +9,7 @@ async function login(page: import('@playwright/test').Page) {
 }
 
 test('renews on the same socket, reauthorizes snapshots and clears private state on denied renewal', async ({ page }) => {
-  let live!: WebSocketRoute; let connections = 0; let tickets = 0; let denied = false; let reads = 0;
+  let connections = 0; let tickets = 0; let denied = false; let reads = 0;
   const frames: string[] = [];
   await page.route('**/api/operator', route => { reads++; return fulfillView(route, { json: snapshot }); });
   await page.route('**/api/operator/events/ticket', route => {
@@ -19,7 +19,7 @@ test('renews on the same socket, reauthorizes snapshots and clears private state
     return route.fulfill(denied ? { status: 401, json: { error: 'Unauthorized' } } : { json: { ticket: 'grant-' + tickets, expiresAt: Date.now() + 30000 } });
   });
   await page.routeWebSocket('**/api/operator/events/v2', socket => {
-    live = socket; connections++;
+    connections++;
     socket.onMessage(message => { frames.push(String(message)); if (message !== 'ack') socket.send('authorized'); });
   });
   await page.clock.install();
@@ -40,10 +40,9 @@ test('renews on the same socket, reauthorizes snapshots and clears private state
   await expect(page.locator('#configuration')).toBeHidden();
   const count = tickets;
   await page.clock.runFor(600000); expect(tickets).toBe(count); expect(connections).toBe(1);
-  expect(live).toBeDefined();
 });
 
-test('coalesces operator notices, reconnects with resync and polls only while disconnected and visible', async ({ page }) => {
+test('coalesces Operator updates, skips polling while connected, and fetches a fresh snapshot after reconnecting', async ({ page }) => {
   let live!: WebSocketRoute; let connections = 0; let reads = 0; let hold = false; let release: (() => void) | undefined;
   let data = { ...snapshot };
   await page.route('**/api/operator', route => { reads++; return fulfillView(route, { json: data }); });

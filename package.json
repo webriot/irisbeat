@@ -1,6 +1,6 @@
 {
   "name": "irisbeat",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "type": "module",
   "license": "AGPL-3.0-only",
@@ -49,12 +49,8 @@
     "src",
     "LICENSE",
     "README.md",
-    "docs/hosted-contract.md",
-    "docs/maintenance-api.md",
-    "docs/history-api.md",
-    "docs/install.md",
-    "docs/heartbeat-api.md",
-    "docs/monitor-api.md",
+    "docs",
+    "GLOSSARY.md",
     "wrangler.jsonc",
     "wrangler.delivery.jsonc",
     "NOTICE"

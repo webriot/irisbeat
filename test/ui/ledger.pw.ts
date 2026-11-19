@@ -69,7 +69,7 @@ for (const scenario of [
   });
 }
 
-test('ledger keeps four aligned actions and Maintenance owns its lifecycle', async ({ page, request }) => {
+test('aligns the four Monitor actions and lets operators start, change, or end Maintenance', async ({ page, request }) => {
   const headers = { Authorization: 'Bearer ui-test-secret' };
   const names = ['Ledger short ' + Date.now(), 'Ledger ' + 'long Monitor name '.repeat(6)];
   const ids: string[] = [];
@@ -133,7 +133,6 @@ test('ledger keeps four aligned actions and Maintenance owns its lifecycle', asy
     await dialog.getByRole('button', { name: 'End Maintenance', exact: true }).click();
     await expect(dialog).toBeHidden();
     await expect(rows[0]).toContainText('Awaiting check');
-    await page.screenshot({ path: '.tmp/ledger-desktop.png', fullPage: true });
     for (const theme of ['Light', 'Dark', 'System']) {
       await page.getByRole('combobox', { name: 'Theme', exact: true }).selectOption({ label: theme });
       await page.setViewportSize({ width: 320, height: 900 });
@@ -145,7 +144,6 @@ test('ledger keeps four aligned actions and Maintenance owns its lifecycle', asy
           expect(box!.width).toBeGreaterThanOrEqual(44); expect(box!.height).toBeGreaterThanOrEqual(44);
         }
       }
-      await page.screenshot({ path: '.tmp/ledger-mobile-' + theme + '.png', fullPage: true });
     }
   } finally { for (const id of ids) await request.delete('/api/operator/monitors/' + id, { headers }); }
 });

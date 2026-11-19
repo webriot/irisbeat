@@ -32,7 +32,7 @@ afterEach(async () => {
   })));
   vi.restoreAllMocks(); await reset();
 });
-it.each([true, false])('notifies scoped Calendar Heartbeat receipts and catch-up commits with coalescing (published=%s)', async published => {
+it.each([true, false])('groups live updates for Calendar receipts and overdue windows (published=%s)', async published => {
   const start = Date.parse('2030-11-16T10:00Z');
   const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
   expect((await request('/api/operator/monitors', 'POST', {

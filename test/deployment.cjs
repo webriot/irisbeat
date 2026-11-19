@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const { createRequire } = require('node:module');
 const { execFileSync } = require('node:child_process');
 const { mkdtempSync, rmSync, readFileSync, symlinkSync, mkdirSync } = require('node:fs');
-const { join } = require('node:path');
+const { basename, join } = require('node:path');
 const { createHash, randomBytes } = require('node:crypto');
 const { version } = require('../package.json');
 const { experimental_patchConfig, unstable_readConfig } = require('wrangler');
@@ -86,6 +86,23 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     const [recovery] = consumerConfig.durable_objects.bindings;
     assert.equal(queueConsumer.dead_letter_queue, undefined, 'source jobs must not be transferred with their full bodies');
     assert.ok(consumerConfig.migrations.some(migration => migration.new_sqlite_classes?.includes(recovery.class_name)));
+    const secret = randomBytes(32).toString('hex');
+    const monitoringBundle = basename(producerConfig.main, '.ts') + '.js';
+    mf = new Miniflare(convertV4MiniflareOptions({ workers: [{
+      modules: true,
+      script: readFileSync(join(temporary, monitoringName + '-build', monitoringBundle), 'utf8'),
+      compatibilityDate: producerConfig.compatibility_date,
+      bindings: { INSTALLATION_SECRET: secret },
+      durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } },
+    }] }));
+    const deployedStatus = await mf.dispatchFetch(origin + '/api/operator', {
+      headers: { authorization: 'Bearer ' + secret },
+    });
+    assert.equal(deployedStatus.status, 200, 'the Wrangler monitoring bundle starts and serves Operator requests');
+    assert.deepEqual((await deployedStatus.json()).monitors, []);
+    await mf.dispose();
+    mf = undefined;
+
     const delivery = readFileSync(join(temporary, deliveryName + '-build', 'notification-delivery.js'), 'utf8');
     const script = (await build({ stdin: { contents: `
       import worker, { MonitoringContext as EngineContext } from './src/index.ts';
@@ -119,7 +136,6 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     }] })).outputFiles[0].text;
     let outcome = 503;
     const alerts = [], targets = [];
-    const secret = randomBytes(32).toString('hex');
     mf = new Miniflare(convertV4MiniflareOptions({ unsafeLocalExplorer: true, workers: [
       { name: monitoringName, modules: true, script, compatibilityDate: '2026-11-13',
         bindings: { INSTALLATION_SECRET: secret, STATUS_RENDER_INTERVAL_SECONDS: "0", ...producerConfig.vars },
@@ -278,7 +294,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     const withdrawn = await status();
     assert.deepEqual(withdrawn.destinations.map(destination => destination.id), [destinations[0].id]);
     assert.deepEqual(withdrawn.monitors.find(monitor => monitor.id === monitors[1].id).destinationIds, [destinations[0].id]);
-    console.log('PASS exact-source personal deployment: isolated Wrangler bundles, Queue and service wiring, HTTP/TCP/Heartbeat, mixed Maintenance and Incident delivery, native email consent and withdrawal, Settings results and public privacy');
+    console.log('PASS exact-source personal deployment: Worker startup, isolated Wrangler bundles, Queue and service wiring, HTTP/TCP/Heartbeat, mixed Maintenance and Incident delivery, native email consent and withdrawal, Settings results and public privacy');
   } finally {
     if (mf) await mf.dispose();
     rmSync(temporary, { recursive: true, force: true });

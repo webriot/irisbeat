@@ -57,7 +57,7 @@ it('validates grace atomically against the smallest gap, including an irregular 
   expect((await request(path, 'PATCH', { scheduleMode: 'interval', graceSeconds: 30 })).status).toBe(400);
 });
 
-it('chronologically catches up bounded restartable batches without losing later receipts or alerts', async () => {
+it('processes missed windows in order across restarts and keeps later receipts and alerts', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
   await create();
   const id = (await read()).monitor!.id;
@@ -434,7 +434,7 @@ it.each([
   expect(schedule.acceptsGrace(gap, start)).toBe(false);
 });
 
-it('retains sparse Gregorian-cycle dates and does not mistake residue proximity for overlap', () => {
+it('accepts rare dates and distinguishes nearby calendar dates from overlapping windows', () => {
   const schedule = calendar('0 9 29 2 */7', 'Pacific/Chatham');
   expect(schedule.next(Date.UTC(2096, 2, 1), 3)).toEqual([
     Date.parse('2128-02-28T19:15:00Z'), Date.parse('2156-02-28T19:15:00Z'), Date.parse('2184-02-28T19:15:00Z'),
@@ -549,7 +549,7 @@ it.each([
   expect((await read()).monitor!.lastResult).toEqual({ at: start + (status === 200 ? 180_000 : 150_000), outcome: 'failure' });
 });
 
-it('bounds work between yields as well as total exact validation work', async () => {
+it('limits Calendar validation work per batch and overall', async () => {
   const format = Intl.DateTimeFormat.prototype.formatToParts;
   let total = 0, chunk = 0, maximum = 0;
   vi.spyOn(Intl.DateTimeFormat.prototype, 'formatToParts').mockImplementation(function (this: Intl.DateTimeFormat, at) {

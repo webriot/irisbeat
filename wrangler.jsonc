@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "irisbeat",
-  "main": "src/index.ts",
+  "main": "src/worker.ts",
   "compatibility_date": "2026-11-13",
   "workers_dev": true,
   "version_metadata": { "binding": "IRISBEAT_VERSION" },

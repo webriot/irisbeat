@@ -1,13 +1,13 @@
-# Availability history handoff
+# Availability history API
 
-Implements [#9](https://github.com/webriot/irisbeat/issues/9) under
-[spec #1](https://github.com/webriot/irisbeat/issues/1). Product policy and the
-owner-selected Status ledger remain in those issues and #2.
+Irisbeat shows the current UTC day and the preceding 89 days in Status and
+Operator. See [installation and readiness](install.md#availability-history)
+to configure availability history on a self-hosted Worker.
 
 ## Responses and rendering
 
-Existing status and operator endpoints, including mutation responses and the
-legacy first-Monitor alias, add `monitor.history`:
+Status and Operator responses include `monitors[].history`. The legacy
+first-Monitor alias also includes `monitor.history`.
 
 ```ts
 history: {
@@ -31,8 +31,7 @@ never acquire public bars. Hosted readers receive the operator view with unchang
 secret filtering and no editing controls. The UI formats a counted percentage to
 two decimals. An empty denominator displays “No observations”. Unavailable
 history displays “Bars unavailable”. A stale result keeps the bars and shows
-“Availability history is stale”. Each strip has one keyboard entry point with arrow-key navigation and touch
-selection. Both views label the range “past 90 days”. Selected days show compact
+“Availability history is stale”. Use the arrow keys or tap a day to move through the history strip. Both views label the range “past 90 days”. Selected days show compact
 successful/failed counts and Maintenance counts when present; unobserved days
 remain “No observations”. Historical dates stay explicit in UTC. “Exact time
 range” expands the UTC midnight boundaries and browser-local endpoints with
@@ -106,9 +105,8 @@ read yields unavailable history. Before any new observation, a configured
 Monitor has an empty series. History may lag current status while an observation
 is being ingested or the cached totals age out. Connected, visible pages retry
 only affected rows, every 30 seconds, up to four attempts per observation while
-a row stays
-pending, stale, or unavailable. Status, detection, Incidents,
-and notification handoff commit independently of query availability.
+a row stays pending, stale, or unavailable. Status, detection, Incidents, and
+notification handoff commit independently of query availability.
 
 The first activation with both the write binding and query configuration drops
 the previous SQLite raw observations table and indexes. Retained SQLite Status renders and their series are invalidated. Readiness reports

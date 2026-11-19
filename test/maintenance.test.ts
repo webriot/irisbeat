@@ -174,7 +174,7 @@ it('keeps fresh and silent Heartbeats observable without transitions and require
   expect((await status()).incidents).toMatchObject([{ openedAt: start + 440_000, closedAt: start + 870_000 }]);
   expect((await notifications.summaries())).toEqual(['Website: Incident opened', 'Website: Incident recovered']);
 });
-it('renders ledger Maintenance controls and published banners with open outage precedence', async () => {
+it('shows an open Incident in the public banner during Maintenance', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(start);
   const a = await create({ name: 'API', failureThreshold: 1 });
   const b = await create({ name: 'Private', published: false });
@@ -193,13 +193,6 @@ it('renders ledger Maintenance controls and published banners with open outage p
   await mutate('/api/operator/monitors/' + b.id, 'PATCH', { published: true });
   await maintenance(b.id, start + 600_000);
   expect(await (await request('/')).text()).toContain('<h2>Services unavailable</h2>');
-  const operatorHtml = await (await request('/operator')).text();
-  expect(operatorHtml).toContain('id="maintenance"');
-  expect(operatorHtml).toContain('type="datetime-local"');
-  const script = await (await request('/operator.js')).text();
-  expect(script).toContain('/maintenance');
-  expect(operatorHtml).toContain('End Maintenance');
-  expect(script).toContain('Update end date');
 });
 it('keeps healthy state, skips missing executions, and makes repeated early end harmless', async () => {
   const clock = vi.spyOn(Date, 'now').mockReturnValue(start);

@@ -279,7 +279,7 @@ for (const status of [200, 401, 503]) {
   });
 }
 
-test('pristine Settings refresh and page saves reset the draft baseline', async ({ page }) => {
+test('refreshes unedited Settings and treats saved values as the starting point for new edits', async ({ page }) => {
   const data = { pageName: 'Original', monitors: [], incidents: [], destinations: [{ id: 'hook', url: 'https://example.com/original', channel: 'webhook' }] };
   await page.route('**/api/operator', route => fulfillView(route, { json: data }));
   await page.goto('/operator');

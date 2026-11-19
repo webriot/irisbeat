@@ -42,7 +42,7 @@ it('discards previous-session responses while an older current-session 401 still
   expect(callbacks.failed).toHaveBeenLastCalledWith('Unauthorized', false);
 });
 
-it('serializes writes and refreshes the committed scopes over HTTP without a socket hint', async () => {
+it('runs one save at a time and refreshes changed sections without a WebSocket message', async () => {
   const { session, callbacks, responses, requests, live } = setup();
   const login = session.signIn('secret'); responses[0].resolve(Response.json(snapshot())); await login;
   const write = session.run('/api/operator', 'PUT', { pageName: 'saved' });
@@ -60,7 +60,7 @@ it('serializes writes and refreshes the committed scopes over HTTP without a soc
   expect(vi.mocked(live).mock.results[0].value.sync).not.toHaveBeenCalled();
 });
 
-it('keeps a socket update scoped when it arrives during a write', async () => {
+it('refreshes only the named section when a WebSocket update arrives during a save', async () => {
   const { session, callbacks, responses, requests, live } = setup();
   const login = session.signIn('secret'); responses[0].resolve(Response.json(snapshot())); await login;
   const write = session.run('/api/operator', 'PUT', { pageName: 'saved' });
@@ -136,7 +136,7 @@ it('owns authenticated subscription tickets and stops the old lifecycle before a
   expect(callbacks.signedOut).toHaveBeenCalledTimes(2);
 });
 
-it('rechecks eligibility after JSON decoding and honors subscription coalescing', async () => {
+it('checks whether a live update still applies after parsing its response', async () => {
   const { session, callbacks, responses, live } = setup();
   const login = session.signIn('secret'); responses[0].resolve(Response.json(snapshot())); await login;
   const body = deferred<unknown>(); const decoding = deferred<void>();

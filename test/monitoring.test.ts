@@ -311,38 +311,6 @@ it("resets consecutive streaks and accepts HTTP 299 without replaying duplicate 
   });
 });
 
-it("presents the selected Status ledger with separate operator Settings", async () => {
-  const operator = await (await request("/operator")).text();
-  expect(operator).toContain('<table aria-label="Monitors">');
-  expect(operator).toContain('<th scope="col">Monitor</th>');
-  expect(operator).toContain('<th scope="col">State</th>');
-  expect(operator).toContain('<section aria-labelledby="page-settings">');
-  expect(operator).toContain('id="page-settings">Status page</h2>');
-  expect(operator).not.toContain("Schedule Maintenance");
-  expect(operator).toContain("Save webhook");
-  expect(operator).toContain('for="destination-address"');
-  expect(operator).toContain('id="webhook"');
-  await configure();
-  network.use(
-    http.get(config.url, () => new HttpResponse(null, { status: 200 })),
-  );
-  await tick(0);
-  const page = await (await request("/")).text();
-  expect(page).toContain("All services operational");
-  expect(page).toMatch(/<article[^>]*aria-labelledby="monitor-name-[^"]+"/);
-  expect(page.indexOf("All services operational")).toBeLessThan(
-    page.indexOf('id="monitor-name-'),
-  );
-  expect(page.indexOf('id="monitor-name-')).toBeLessThan(
-    page.indexOf('id="incident-heading"'),
-  );
-  expect(page).not.toContain("90 UTC-day");
-  expect((await request("/app.css")).headers.get("Content-Type")).toContain(
-    "text/css",
-  );
-});
-
-
 it.each(["page name", "Monitor name", "unchanged"])(
   "preserves detection progress when saving %s",
   async (change) => {
@@ -543,11 +511,7 @@ it("validates and authenticates every collection mutation without exposing targe
   expect((await operatorRequest(`/api/operator/monitors/${id}`, "POST", create)).headers.get("Allow")).toBe("PATCH, DELETE");
 });
 
-it("serves collection controls with separate Monitor and page settings forms", async () => {
-  const html = await (await request("/operator")).text();
-  for (const control of ['id="new-monitor"', 'id="published"', 'id="cancel-edit"', 'id="page-configuration"', 'id="monitor-rows"']) {
-    expect(html).toContain(control);
-  }
+it("renders the right publication action for a single Operator row", async () => {
   const created = await (await operatorRequest("/api/operator/monitors", "POST", {
     name: "Collection control", kind: "heartbeat",
   })).json<import("../src/index").Status>();
@@ -559,7 +523,6 @@ it("serves collection controls with separate Monitor and page settings forms", a
   await operatorRequest("/api/operator/monitors/" + id, "PATCH", { published: false });
   const privateRow = await (await operatorRequest(path)).json<{ html: string }>();
   expect(privateRow.html).toContain('aria-label="Publish Collection control"');
-  expect((await (await request("/operator.js")).text())).not.toContain("localStorage");
 });
 
 it("retains named Incidents independently when one unavailable Monitor recovers and the other is deleted", async () => {

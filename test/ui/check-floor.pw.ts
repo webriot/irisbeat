@@ -11,7 +11,7 @@ async function renderOperatorFixture(page: Page, snapshot: object, monitorId: st
   await page.route('**/api/operator/monitors/' + monitorId, route => route.fulfill({ json }));
 }
 
-test('Schedule carries the floor and suspension while State shows the last observed result', async ({ page }) => {
+test('shows schedule limits separately from the Monitor’s last observed result', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 820 });
   const base = { kind: 'http', url: 'https://example.invalid', published: true, lastResult: null, history: null };
   const snapshot = {

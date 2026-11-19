@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { fulfillView } from './view-response';
-import { expect, test } from '@playwright/test';
+import { expect, test, type WebSocketRoute } from '@playwright/test';
 import { monitorAction } from './actions';
 
 function snapshot() {
@@ -23,7 +23,7 @@ for (const settings of [
   test.describe(settings.timezoneId, () => {
     test.use({ locale: settings.locale, timezoneId: settings.timezoneId });
     for (const path of ['/', '/operator']) {
-      test(`${path} localizes instants and inspects UTC history`, async ({ page, request }) => {
+      test(`${path} shows local Incident times and lets users inspect UTC history`, async ({ page, request }) => {
         const data = snapshot();
         await page.routeWebSocket(path === '/' ? '**/api/status/events/v2' : '**/api/operator/events/v2', socket => socket.close());
         await page.route('**/api/operator', route => fulfillView(route, { json: data }));
@@ -163,7 +163,7 @@ test('fall daylight-saving repeated hours retain distinct exact instants', async
 });
 
 
-test('Maintenance preserves an unchanged fold instant and rejects gap or ambiguous edits', async ({ browser }) => {
+test('keeps a saved Maintenance end time and rejects invalid or ambiguous daylight saving edits', async ({ browser }) => {
   const context = await browser.newContext({ timezoneId: 'America/Los_Angeles' });
   const page = await context.newPage();
   await page.routeWebSocket('**/api/operator/events/v2', socket => socket.close());
@@ -304,58 +304,57 @@ for (const { path, unavailable } of [{ path: '/', unavailable: false }, { path: 
   });
 }
 
-test('a new observation receives its own connected history retry budget', async ({ page, request }) => {
-  const headers = { Authorization: 'Bearer ui-test-secret' };
-  const created = await request.post('/api/operator/monitors', { headers, data: { name: 'Delayed history', kind: 'heartbeat' } });
-  const { id } = (await created.json()).monitors.at(-1);
+test('a new observation enables four more history retries', async ({ page }) => {
+  const id = 'delayed-history';
   const row = page.locator('[data-key="' + id + '"]');
+  const monitor = {
+    id, name: 'Delayed history', kind: 'heartbeat', state: 'up',
+    history: { percentage: null, pending: true, days: [] },
+    historyRetryToken: 'first-receipt',
+  };
   let reads = 0;
   let snapshots = 0;
   let ingested = false;
-  try {
-    expect((await request.post('/heartbeat/' + id, { headers })).status()).toBe(204);
-    await page.clock.install();
-    await page.route('**/api/status', async route => {
-      snapshots++;
-      const response = await route.fetch();
-      const data = await response.json();
-      data.html = data.html.replace('data-key="' + id + '"', 'data-key="' + id + '" data-test-snapshot-ready');
-      await route.fulfill({ response, json: data });
-    });
-    await page.route('**/api/status/partials/monitor/' + id + '?*', async route => {
-      const response = await route.fetch();
-      const data = await response.json();
-      data.html = data.html.replace('class="availability"', 'class="availability" data-test-history-read="' + ++reads + '"');
-      if (!ingested) data.html = data.html.replace('100.00%', 'No observations');
-      await route.fulfill({ response, json: data });
-    });
-    await page.goto('/');
-    await expect(page.getByText('Polling', { exact: true })).toBeHidden();
-    await expect(row).toHaveAttribute('data-test-snapshot-ready', '');
-    await expect(row.locator('[data-history-retry]')).toBeVisible();
-    const read = (count: number) => row.locator('[data-test-history-read="' + count + '"]');
-    for (const count of [1, 2, 3, 4]) {
-      await page.clock.fastForward(30_000);
-      await expect(read(count)).toBeVisible();
-    }
-    await page.clock.fastForward(60_000);
-    expect(reads).toBe(4);
-
-    expect((await request.post('/heartbeat/' + id, { headers })).status()).toBe(204);
-    await expect(read(5)).toBeVisible();
-    for (const count of [6, 7, 8]) {
-      await page.clock.fastForward(30_000);
-      await expect(read(count).locator('.percentage')).toHaveText('No observations');
-    }
-    ingested = true;
+  let socket!: WebSocketRoute;
+  const start = new Date('2026-03-31T12:00:00Z');
+  await page.clock.install({ time: start });
+  await page.clock.pauseAt(start);
+  await page.routeWebSocket('**/api/status/events/v2', route => { socket = route; });
+  await page.route('**/api/status', route => {
+    snapshots++;
+    return fulfillView(route, { json: { pageName: 'Status', monitors: [monitor] } });
+  });
+  await page.route('**/api/status/partials/monitor/' + id + '?*', route => {
+    const revision = Number(new URL(route.request().url()).searchParams.get('revision'));
+    const percentage = ingested ? '100.00%' : 'No observations';
+    const html = `<article data-key="${id}"><div class="availability" data-history-retry="${id}"
+      data-history-token="${monitor.historyRetryToken}" data-test-history-read="${++reads}">
+      <span class="percentage">${percentage}</span></div></article>`;
+    return route.fulfill({ json: { revision, html } });
+  });
+  await page.goto('/');
+  await expect(page.getByText('Polling', { exact: true })).toBeHidden();
+  await expect(row.locator('[data-history-token="first-receipt"]')).toBeVisible();
+  const read = (count: number) => row.locator('[data-test-history-read="' + count + '"]');
+  for (const count of [1, 2, 3, 4]) {
     await page.clock.fastForward(30_000);
-    await expect(read(9).locator('.percentage')).toHaveText('100.00%');
-    await expect(row.locator('[data-history-retry]')).toBeVisible();
-    await page.clock.fastForward(60_000);
-    expect(reads).toBe(9);
-    expect(snapshots).toBe(1);
-  } finally {
-    await page.close();
-    await request.delete('/api/operator/monitors/' + id, { headers });
+    await expect(read(count).locator('.percentage')).toHaveText('No observations');
   }
+  await page.clock.fastForward(60_000);
+  expect(reads).toBe(4);
+
+  monitor.historyRetryToken = 'second-receipt';
+  socket.send(JSON.stringify({ type: 'changed', revision: 1, scopes: ['monitor/' + id] }));
+  await expect(read(5)).toHaveAttribute('data-history-token', 'second-receipt');
+  for (const count of [6, 7, 8]) {
+    await page.clock.fastForward(30_000);
+    await expect(read(count).locator('.percentage')).toHaveText('No observations');
+  }
+  ingested = true;
+  await page.clock.fastForward(30_000);
+  await expect(read(9).locator('.percentage')).toHaveText('100.00%');
+  await expect(row.locator('[data-history-retry]')).toBeVisible();
+  await page.clock.fastForward(60_000);
+  expect(reads).toBe(9);
+  expect(snapshots).toBe(1);
 });
