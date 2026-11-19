@@ -28,6 +28,23 @@ real install drill. The button deploys the monitoring Worker only. For a complet
 webhook installation, use the per-install Queue and delivery Worker setup below.
 Do not put a credential in Wrangler vars or a repository.
 
+## Outbound check floor
+
+Set the optional `MIN_CHECK_INTERVAL_SECONDS` variable on the monitoring Worker
+to a whole number of seconds from 60 through 86,400. For example, use
+`"vars": { "MIN_CHECK_INTERVAL_SECONDS": 300 }` in the installation's Wrangler
+configuration. Omit it for the 60-second default.
+
+The Worker validates the setting at entry. An invalid value returns HTTP 500
+with an `invalid_configuration` log entry and causes scheduled invocations to
+fail before dispatch. Dry-run bundling does not execute this validation.
+
+Existing HTTP/TCP Interval Monitors use the larger of the saved interval and the
+floor. Lowering the floor restores eligible saved intervals. An incompatible
+HTTP/TCP Calendar is suspended until an Operator saves a compatible schedule.
+The Operator ledger shows these changes in Schedule, alongside the last observed
+State. Heartbeat scheduling continues to use its own timing rules.
+
 ## Exact-source CLI installation
 
 Requires Node >=22.12, npm, a Cloudflare account and its workers.dev subdomain.

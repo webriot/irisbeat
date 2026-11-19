@@ -62,6 +62,10 @@ HTML or script receives heartbeat credentials or their digests. Operator JSON ad
 `hosted: true` and `permission`; the existing ledger hides editing controls for
 readers and offers hosted credential rotation for editors.
 
+The monitoring Worker's optional `MIN_CHECK_INTERVAL_SECONDS` binding applies
+the same outbound check floor across all resolved contexts. Operator snapshots
+include the effective Interval or Calendar suspension details. [Monitor API](monitor-api.md#outbound-check-floor)
+
 Creation passes the adapter's allowance into the same synchronous DO operation
 that checks the active collection and saves the new Monitor. Private Monitors
 count; deleted ones release capacity. Lowering the allowance does not delete

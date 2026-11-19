@@ -83,7 +83,7 @@ function Operator({ hosted }: { hosted: boolean }) {
       <h2 id="paused" hidden>Monitoring paused</h2>
       <div id="workspace">
         <div id="new-monitor-panel"></div>
-      <table aria-label="Monitors"><colgroup><col class="monitor-column" /><col class="state-column" /><col class="publication-column" /><col class="actions-column" /></colgroup><thead><tr><th scope="col">Monitor</th><th scope="col">State</th><th scope="col">Publication</th><th scope="col">Actions</th></tr></thead><tbody id="monitor-rows"></tbody></table>
+      <table aria-label="Monitors"><colgroup><col class="monitor-column" /><col class="state-column" /><col class="schedule-column" /><col class="publication-column" /><col class="actions-column" /></colgroup><thead><tr><th scope="col">Monitor</th><th scope="col">State</th><th scope="col">Schedule</th><th scope="col">Publication</th><th scope="col">Actions</th></tr></thead><tbody id="monitor-rows"></tbody></table>
       <dialog id="maintenance-dialog" aria-labelledby="maintenance-heading"><form id="maintenance" hidden aria-labelledby="maintenance-heading">
         <h2 id="maintenance-heading">Maintenance</h2>
         <label for="maintenance-end">End time</label><input id="maintenance-end" type="datetime-local" required />
@@ -118,7 +118,7 @@ function Operator({ hosted }: { hosted: boolean }) {
           <fieldset id="destination-selection" hidden><legend tabindex={-1}>Notification destinations</legend>
             <div id="destination-choices"></div><p id="no-destination-choices">No destinations</p>
           </fieldset>
-          <p id="monitor-deleted" role="status" hidden>This Monitor was deleted. Copy your draft or cancel.</p><button id="save-monitor">Save Monitor</button><button id="cancel-edit" type="button">Cancel</button>
+          <p id="monitor-deleted" role="status" hidden>This Monitor was deleted. Copy your draft or cancel.</p><button id="save-monitor">Save Monitor</button><button id="resume-schedule" hidden>Save and Resume</button><button id="cancel-edit" type="button">Cancel</button>
         </form>
       <section aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2><div id="incidents"></div></section>
       </div>
@@ -470,7 +470,8 @@ h2 { margin: 0; font-size: 16px; font-weight: 650; }
 .ledger-row[data-state="maintenance"] .status, .status[data-state="maintenance"], .ledger-row[data-state="paused"] .status, .status[data-state="paused"] { color: var(--info); }
 table { width: 100%; table-layout: fixed; border-spacing: 0; margin-top: 20px; }
 .monitor-column { width: auto; }
-.state-column, .publication-column { width: 19%; }
+.state-column, .schedule-column { width: 17%; }
+.publication-column { width: 15%; }
 .actions-column { width: 226px; }
 th, td { padding: 12px 16px; text-align: left; }
 th { font-size: 12px; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--line); }
@@ -716,6 +717,13 @@ function updateDeleted() {
   byId('end-maintenance').disabled = maintenanceMissing;
 }
 
+function scheduleDuration(seconds) {
+  for (const [factor, unit] of [[86400, 'd'], [3600, 'h'], [60, 'min']]) {
+    if (seconds % factor === 0) return (seconds / factor) + ' ' + unit;
+  }
+  return seconds + ' s';
+}
+
 function focusActions(id) { (document.getElementById('actions-' + id)?.querySelector('button') || byId('new-monitor')).focus(); }
 function localMinute(date) { return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16); }
 function declareMaintenance(monitor) {
@@ -762,10 +770,12 @@ function render(data, savedField) {
     savedPageName = data.pageName;
   }
   monitorIds = new Set(data.monitors.map(monitor => monitor.id));
+  const editedMonitor = data.monitors.find(monitor => monitor.id === monitorEditor.id);
+  monitorEditor.setSchedulePolicy(data.minCheckIntervalSeconds ?? 60, editedMonitor?.scheduleSuspended === true);
   emailConfigured = canEdit && data.emailConfigured === true;
   addEmail.hidden = !emailConfigured;
   renderDestinations(canEdit ? data.destinations ?? [] : [], canEdit ? data.monitors : []);
-  monitorEditor.refreshDestinations(destinations, data.monitors.find(monitor => monitor.id === monitorEditor.id)?.destinationIds);
+  monitorEditor.refreshDestinations(destinations, editedMonitor?.destinationIds);
   updateDeleted();
   if (monitorEditor.id && !monitorIds.has(monitorEditor.id) && form.parentElement !== byId('new-monitor-panel')) {
     byId('new-monitor-panel').append(form);
@@ -773,11 +783,24 @@ function render(data, savedField) {
   }
   const rows = data.monitors.flatMap(monitor => {
     const row = document.createElement('tr'); row.dataset.key = monitor.id;
-    for (const text of [monitor.name, statusLedger.stateLabel[monitor.state], monitor.published ? 'Published' : 'Private']) {
-      const cell = document.createElement('td'); cell.textContent = text;
-      if (row.children.length === 1) { cell.className = 'status'; cell.dataset.state = monitor.state; }
-      row.append(cell);
+    const name = document.createElement('td'); name.textContent = monitor.name;
+    const state = document.createElement('td'); state.textContent = statusLedger.stateLabel[monitor.state];
+    state.className = 'status'; state.dataset.state = monitor.state;
+    const schedule = document.createElement('td');
+    if (monitor.scheduleSuspended) {
+      const suspensionFloor = monitor.scheduleSuspensionFloorSeconds;
+      schedule.textContent = 'Suspended (' + scheduleDuration(suspensionFloor) + ' minimum' + (suspensionFloor === data.minCheckIntervalSeconds ? '' : ' at suspension') + ')';
+    } else if (monitor.scheduleMode === 'calendar') {
+      schedule.textContent = 'Calendar';
+    } else if (monitor.kind === 'heartbeat') {
+      schedule.textContent = 'Watchdog';
+    } else {
+      const effective = monitor.effectiveIntervalSeconds ?? monitor.intervalSeconds;
+      schedule.textContent = 'Every ' + scheduleDuration(effective);
+      if (monitor.intervalSeconds !== effective) schedule.textContent += ' (saved ' + scheduleDuration(monitor.intervalSeconds) + ')';
     }
+    const publication = document.createElement('td'); publication.textContent = monitor.published ? 'Published' : 'Private';
+    row.append(name, state, schedule, publication);
     const actions = document.createElement('td');
     const group = document.createElement('div'); group.className = 'monitor-actions'; group.id = 'actions-' + monitor.id; group.setAttribute('role', 'group'); group.setAttribute('aria-label', 'Actions ' + monitor.name);
     const path = '/api/operator/monitors/' + encodeURIComponent(monitor.id);
@@ -799,7 +822,7 @@ function render(data, savedField) {
     }
     actions.append(group); row.append(actions);
     const historyRow = document.createElement('tr'); historyRow.dataset.key = monitor.id + ':history';
-    const availability = document.createElement('td'); availability.colSpan = 4;
+    const availability = document.createElement('td'); availability.colSpan = 5;
     availability.id = 'history-' + monitor.id;
     availability.setAttribute('aria-label', monitor.name + ' availability');
     availability.innerHTML = statusLedger.history(monitor.history, monitor.id); historyRow.append(availability);
@@ -807,7 +830,7 @@ function render(data, savedField) {
   });
   if (!rows.length) {
     const row = document.createElement('tr'); const cell = document.createElement('td');
-    cell.colSpan = 4; cell.textContent = 'No Monitors'; row.append(cell); rows.push(row);
+    cell.colSpan = 5; cell.textContent = 'No Monitors'; row.append(cell); rows.push(row);
   }
   reconcileNodes(byId('monitor-rows'), rows);
   const incidentContent = document.createElement('div');

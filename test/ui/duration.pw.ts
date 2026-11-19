@@ -77,7 +77,7 @@ for (const kind of ['http', 'tcp', 'heartbeat']) {
       const saved = page.waitForResponse(response => response.request().method() === 'PATCH');
       await page.getByRole('button', { name: 'Save Monitor', exact: true }).click();
       const edited = (await (await saved).json()).monitors.find((item: { id: string }) => item.id === original.id);
-      expect(edited).toMatchObject({ ...original, intervalSeconds: 90, recoveryThreshold: 3, ...(kind === 'heartbeat' ? { silenceSeconds: 86400, recoverySpacingSeconds: 90 } : { timeoutSeconds: 30 }) });
+      expect(edited).toMatchObject({ ...original, intervalSeconds: 90, recoveryThreshold: 3, ...(kind === 'heartbeat' ? { silenceSeconds: 86400, recoverySpacingSeconds: 90 } : { timeoutSeconds: 30, effectiveIntervalSeconds: 90 }) });
       await monitorAction(page, 'Edit ' + name);
       await expect(page.getByLabel(interval, { exact: true })).toHaveValue('90');
       await page.getByLabel(interval + ' unit', { exact: true }).selectOption('days');
