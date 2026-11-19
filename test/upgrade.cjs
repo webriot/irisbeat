@@ -12,7 +12,8 @@ const localRequire = createRequire(join(project, 'node_modules/@cloudflare/vites
 const { build } = localRequire('esbuild');
 const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
 const legacyNotificationRevision = '70ba924ee9a2b15a3d6b6cc49abc8039aedb7f70';
-const base = (process.argv.includes('--notifications') ? legacyNotificationRevision : process.argv[2]) || '6fb95ccec52d9c5c29b82f82c3d77ed3a7e356d3';
+const liveViews = process.argv.includes('--live-views');
+const base = (liveViews ? '4f9442a0e660907b02c00c942e05ed4e43abab3c' : process.argv.includes('--notifications') ? legacyNotificationRevision : process.argv[2]) || '6fb95ccec52d9c5c29b82f82c3d77ed3a7e356d3';
 const tcp = process.argv[3] === 'tcp';
 const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
 (async () => {
@@ -58,7 +59,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
     entryPoints: ['src/notification-delivery.ts'], bundle: true, write: false,
     format: 'esm', platform: 'neutral', external: ['cloudflare:workers'],
   })).outputFiles[0].text;
-  function options(script, stateDirectory = 'state', withQueue = false) {
+  function options(script, stateDirectory = 'state', withQueue = false, port) {
     const monitoring = {
       name: 'irisbeat', modules: true, script, compatibilityDate: '2026-11-13',
       bindings: { INSTALLATION_SECRET: 'upgrade-test-secret' },
@@ -71,7 +72,7 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
       },
     };
     return convertV4MiniflareOptions({
-      durableObjectsPersist: join(temporary, stateDirectory), workers: [monitoring, ...(withQueue ? [{
+      durableObjectsPersist: join(temporary, stateDirectory), ...(port ? { port } : {}), workers: [monitoring, ...(withQueue ? [{
         name: 'delivery', modules: true, script: delivery, compatibilityDate: '2026-11-18',
         queueConsumers: { 'upgrade-notifications': { maxBatchTimeout: 0.1, maxRetries: 10 } },
         queueProducers: { NOTIFICATION_HANDOFF: 'upgrade-notifications', NOTIFICATION_DLQ: 'upgrade-dlq' },
@@ -86,6 +87,45 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
   const tick = at => request('/test-tick?at='+at);
   const start = Date.UTC(2026,10,13);
   try {
+    if (liveViews) {
+      const { chromium } = require('@playwright/test');
+      const browser = await chromium.launch();
+      try {
+        await request('/api/operator', 'PUT', { pageName: 'Before upgrade' });
+        const { monitor } = await (await request('/api/operator/monitors', 'POST', { name: 'Retained Heartbeat', kind: 'heartbeat' })).json();
+        await request('/heartbeat/' + monitor.id, 'POST');
+        const previous = await browser.newPage();
+        const url = (await mf.ready).href;
+        await Promise.all([
+          previous.waitForEvent('websocket', socket => socket.url().endsWith('/api/status/events')),
+          previous.goto(url),
+        ]);
+        assert.equal(await previous.title(), 'Before upgrade');
+
+        await mf.setOptions(options(await bundle(join(project, 'src/index.ts')), 'state', false, Number(new URL(url).port)));
+        const legacyUpgrade = await mf.dispatchFetch('https://irisbeat.example/api/status/events', {
+          headers: { Upgrade: 'websocket', Origin: 'https://irisbeat.example' },
+        });
+        assert.equal(legacyUpgrade.status, 404);
+        const next = await browser.newPage();
+        await Promise.all([
+          next.waitForEvent('websocket', socket => socket.url().endsWith('/api/status/events/v2')),
+          next.goto((await mf.ready).href),
+        ]);
+        await next.locator('#updates-mode').waitFor({ state: 'hidden' });
+        await next.getByRole('heading', { name: 'Retained Heartbeat' }).waitFor();
+        assert.equal(await next.locator('.percentage').textContent(), '100.00%');
+        const partial = next.waitForResponse(response => response.url().includes('/api/status/partials/page?revision=1'));
+        await request('/api/operator', 'PUT', { pageName: 'After upgrade' });
+        assert.deepEqual(await (await partial).json(), { revision: 1, html: '<h1>After upgrade</h1>' });
+        await next.getByRole('heading', { name: 'After upgrade' }).waitFor();
+        await previous.bringToFront();
+        await previous.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+        await previous.getByRole('heading', { name: 'After upgrade' }).waitFor();
+        console.log('PASS: pre-upgrade browser resyncs via HTTP; new browser receives scoped revisions over preserved Monitor state');
+      } finally { await browser.close(); }
+      return;
+    }
     if (process.argv.includes('--heartbeat')) {
       assert.equal((await request('/api/operator/webhook','PUT',{url:destination})).status,200);
       assert.equal((await request('/api/operator','PUT',{pageName:'Old page',name:'Legacy producer',kind:'heartbeat',silenceSeconds:180,recoverySpacingSeconds:120,recoveryThreshold:3},start)).status,200);

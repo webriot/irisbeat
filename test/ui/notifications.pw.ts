@@ -5,16 +5,23 @@ test('subscribes before resync, coalesces notices and reconnects', async ({ page
   let live!: import('@playwright/test').WebSocketRoute;
   let connections = 0;
   const acks: string[] = [];
-  await page.routeWebSocket('**/api/status/events', socket => { live = socket; connections++; socket.onMessage(message => { acks.push(String(message)); }); });
+  await page.routeWebSocket('**/api/status/events/v2', socket => { live = socket; connections++; socket.onMessage(message => { acks.push(String(message)); }); });
   let name = 'After subscription';
   let reads = 0;
   let release: (() => void) | undefined;
   let held = false;
-  await page.route('**/api/status', async route => {
+  await page.route('**/api/status', route => {
     reads++;
+    return route.fulfill({ json: { pageName: name, paused: false, monitors: [], incidents: [] } });
+  });
+  let partialReads = 0;
+  let stale = false;
+  await page.route('**/api/status/partials/page?*', async route => {
+    partialReads++;
     const pageName = name;
     if (held) await new Promise<void>(resolve => { release = resolve; });
-    await route.fulfill({ json: { pageName, paused: false, monitors: [], incidents: [] } });
+    const revision = Number(new URL(route.request().url()).searchParams.get('revision'));
+    await route.fulfill({ json: { revision: stale ? revision - 1 : revision, html: '<h1>' + (stale ? 'Stale render' : pageName) + '</h1>' } });
   });
   await page.goto('/');
   await expect(page).toHaveTitle('After subscription');
@@ -23,15 +30,18 @@ test('subscribes before resync, coalesces notices and reconnects', async ({ page
   await page.clock.fastForward(180000);
   expect(reads).toBe(1);
   await page.clock.resume();
-  held = true; live.send('changed');
+  held = true; live.send(JSON.stringify({ type: 'changed', revision: 1, scopes: ['page'] }));
   await expect.poll(() => !!release).toBe(true);
-  for (let i = 0; i < 100; i++) live.send('changed');
+  for (let i = 2; i <= 101; i++) live.send(JSON.stringify({ type: 'changed', revision: i, scopes: ['page'] }));
   name = 'Coalesced latest'; held = false; release!();
   await expect(page).toHaveTitle('Coalesced latest');
-  expect(reads).toBeLessThanOrEqual(3);
+  expect(reads).toBe(1);
+  expect(partialReads).toBe(2);
   await expect.poll(() => acks.length).toBeGreaterThan(0);
-  name = 'Reconnect latest'; live.close();
+  name = 'Reconnect latest'; stale = true;
+  live.send(JSON.stringify({ type: 'changed', revision: 102, scopes: ['page'] }));
   await expect(page.getByText('Polling', { exact: true })).toBeVisible();
+  await expect(page).toHaveTitle('Coalesced latest');
   await expect.poll(() => connections).toBe(2);
   await expect(page).toHaveTitle('Reconnect latest');
   await expect(page.getByText('Polling', { exact: true })).toBeHidden();
@@ -94,7 +104,7 @@ test('real operator private notifications preserve unsaved drafts, focus, action
   const saved = await (await request.post('/api/operator/monitors', { headers, data: { name: 'Operator socket', kind: 'heartbeat', published: false } })).json();
   const monitor = saved.monitors.at(-1); const path = '/api/operator/monitors/' + monitor.id;
   let connected = false;
-  page.on('websocket', socket => { if (socket.url().endsWith('/api/operator/events')) socket.on('framereceived', frame => { if (frame.payload === 'authorized') connected = true; }); });
+  page.on('websocket', socket => { if (socket.url().endsWith('/api/operator/events/v2')) socket.on('framereceived', frame => { if (frame.payload === 'authorized') connected = true; }); });
   try {
     await page.goto('/operator');
     await page.locator('#secret').fill('ui-test-secret');

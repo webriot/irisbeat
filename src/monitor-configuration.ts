@@ -48,16 +48,13 @@ export type Monitor = MonitorConfiguration & Timing & {
 };
 
 // Internal synchronous operations owned by MonitoringContext. Only grace validation may yield.
-type ConfigurationRuntime<State, Snapshot, Result> = {
+type ConfigurationRuntime<State, Result> = {
   read(): State;
-  snapshot(state: State): Snapshot;
-  // Persist synchronously, notify, then return the current operator Status.
-  commit(state: State, before: Snapshot): Result;
-  resetCalendarEvidence(monitor: Monitor): void;
+  commit(state: State, previousName: string, previous?: Monitor, current?: Monitor): Result;
 };
 
-export class MonitorConfigurations<State extends { pageName: string; monitors: Monitor[]; destinations?: NotificationDestination[] }, Snapshot, Result> {
-  constructor(private runtime: ConfigurationRuntime<State, Snapshot, Result>) {}
+export class MonitorConfigurations<State extends { pageName: string; monitors: Monitor[]; destinations?: NotificationDestination[] }, Result> {
+  constructor(private runtime: ConfigurationRuntime<State, Result>) {}
 
   private graceProof(configuration: Pick<MonitorConfiguration, "kind" | "scheduleMode" | "cron" | "timezone" | "graceSeconds">, current?: MonitorConfiguration) {
     if (configuration.kind !== "heartbeat" || configuration.scheduleMode !== "calendar") return null;
@@ -98,7 +95,8 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
         }
         configuration = parsed;
       }
-      const before = this.runtime.snapshot(state);
+      const previousName = state.pageName;
+      const previous = "kind" in configuration && state.monitors[0] ? { ...state.monitors[0] } : undefined;
       if ("kind" in configuration) {
         const { pageName: _pageName, ...settings } = configuration;
         const monitor = state.monitors[0];
@@ -106,7 +104,7 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
         else state.monitors.push(this.newMonitor(settings));
       }
       state.pageName = configuration.pageName;
-      return this.runtime.commit(state, before);
+      return this.runtime.commit(state, previousName, previous, "kind" in configuration ? state.monitors[0] : undefined);
     }
   }
 
@@ -122,11 +120,11 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
     if (!configuration) return undefined;
     if (this.graceProof(configuration) && !await this.acceptsProof(configuration)) return undefined;
     const state = this.runtime.read();
-    const before = this.runtime.snapshot(state);
     // No await between allowance check and synchronous persistence: concurrent RPCs serialize.
     if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0 || state.monitors.length >= limit)) return null;
-    state.monitors.push(this.newMonitor(configuration));
-    return this.runtime.commit(state, before);
+    const monitor = this.newMonitor(configuration);
+    state.monitors.push(monitor);
+    return this.runtime.commit(state, state.pageName, undefined, monitor);
   }
 
   async edit(id: string, value: unknown) {
@@ -145,7 +143,7 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
         proofs.add(proof);
         continue;
       }
-      const before = this.runtime.snapshot(state);
+      const previous = { ...monitor };
       if (value && typeof value === "object" && "destinationChanges" in value) {
         const changes = value.destinationChanges;
         if ("destinationIds" in value || !changes || typeof changes !== "object" || Array.isArray(changes)) return undefined;
@@ -169,7 +167,7 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
           { destinationId, generation: crypto.randomUUID() });
       }
       this.applyEdit(monitor, patch);
-      return this.runtime.commit(state, before);
+      return this.runtime.commit(state, state.pageName, previous, monitor);
     }
   }
 
@@ -178,7 +176,6 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
     if (changed) {
       Object.assign(monitor, patch);
       if (monitor.scheduleMode === "interval") { delete monitor.cron; delete monitor.timezone; }
-      this.runtime.resetCalendarEvidence(monitor);
       monitor.recoveryReceiptAt = null;
       monitor.scheduleRevision = (monitor.scheduleRevision ?? 0) + 1;
       monitor.nextDue = monitor.scheduleMode === "calendar" ? calendar(monitor.cron, monitor.timezone).next(Date.now())[0] : Date.now() + monitor.intervalSeconds * 1000;

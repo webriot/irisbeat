@@ -112,7 +112,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
   const incidentTransitionsFor = monitorId => incidentJobs().filter(job => job.monitorId === monitorId).map(job => job.event.kind);
   try {
     {
-      const response = await mf.dispatchFetch('https://a.example/api/status/events', { headers: { Upgrade: 'websocket', Origin: 'https://a.example', 'x-test-at': String(now) } });
+      const response = await mf.dispatchFetch('https://a.example/api/status/events/v2', { headers: { Upgrade: 'websocket', Origin: 'https://a.example', 'x-test-at': String(now) } });
       assert.equal(response.status, 101, 'packed consumer routes public upgrades');
       const socket = response.webSocket;
       socket.accept();
@@ -124,7 +124,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       await settle(); assert.deepEqual(messages, [], 'private changes and other contexts remain silent');
       await request('a.example', '/api/operator/monitors/' + created.monitor.id, 'DELETE');
       await request('a.example', '/api/operator', 'PUT', { pageName: 'Public consumer' });
-      await settle(); assert.deepEqual(messages, ['changed'], 'only a fixed public invalidation crosses the consumer boundary');
+      await settle(); assert.deepEqual(messages.map(JSON.parse), [{ type: 'changed', revision: 1, scopes: ['page'] }], 'only a scoped public hint crosses the consumer boundary');
       assert.equal((await (await request('a.example', '/api/status')).json()).pageName, 'Public consumer');
       const closed = new Promise(resolve => socket.addEventListener('close', resolve, { once: true }));
       socket.close(); await closed;
@@ -132,7 +132,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     {
       // Use wall time for this real socket exchange; deterministic dispatch tests below retain their clock.
       const previousNow = now; now = Date.now();
-      const socketResponse = await mf.dispatchFetch('https://a.example/api/operator/events', { headers: { Upgrade: 'websocket', Origin: 'https://a.example', 'x-test-at': String(now) } });
+      const socketResponse = await mf.dispatchFetch('https://a.example/api/operator/events/v2', { headers: { Upgrade: 'websocket', Origin: 'https://a.example', 'x-test-at': String(now) } });
       assert.equal(socketResponse.status, 101);
       const socket = socketResponse.webSocket; socket.accept();
       const messages = []; socket.addEventListener('message', event => { messages.push(event.data); });
@@ -148,11 +148,11 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
       await request('b.example', '/api/operator', 'PUT', { pageName: 'Other operator context' });
       await settle(); assert.deepEqual(messages, ['authorized'], 'other contexts cannot reach an operator subscription');
       const created = await (await request('a.example', '/api/operator/monitors', 'POST', { name: 'Private operator producer', kind: 'heartbeat', published: false })).json();
-      await settle(); assert.deepEqual(messages, ['authorized', 'changed'], 'reader receives notification only; authorized HTTP owns the projection');
+      await settle(); assert.deepEqual(messages.map(message => message === 'authorized' ? message : JSON.parse(message).type), ['authorized', 'changed'], 'reader receives notification only; authorized HTTP owns the projection');
       socket.send('ack'); await settle();
       const renewal = await request('a.example', '/api/operator/events/ticket', 'POST');
       socket.send(JSON.stringify({ type: 'renew', ticket: (await renewal.json()).ticket }));
-      await settle(); assert.deepEqual(messages, ['authorized', 'changed', 'authorized'], 'permission promotion renews in place');
+      await settle(); assert.deepEqual(messages.map(message => message === 'authorized' ? message : JSON.parse(message).type), ['authorized', 'changed', 'authorized'], 'permission promotion renews in place');
       await request('a.example', '/test-operator-permission?value=revoked');
       assert.equal((await request('a.example', '/api/operator/events/ticket', 'POST')).status, 401, 'unchanged bearer cannot renew after hosted revocation');
       assert.equal((await request('a.example', '/api/operator')).status, 401, 'snapshot checks remain independent');

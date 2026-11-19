@@ -17,7 +17,7 @@ test('renews on the same socket, reauthorizes snapshots and clears private state
     tickets++;
     return route.fulfill(denied ? { status: 401, json: { error: 'Unauthorized' } } : { json: { ticket: 'grant-' + tickets, expiresAt: Date.now() + 30000 } });
   });
-  await page.routeWebSocket('**/api/operator/events', socket => {
+  await page.routeWebSocket('**/api/operator/events/v2', socket => {
     live = socket; connections++;
     socket.onMessage(message => { frames.push(String(message)); if (message !== 'ack') socket.send('authorized'); });
   });
@@ -45,46 +45,54 @@ test('renews on the same socket, reauthorizes snapshots and clears private state
 test('coalesces operator notices, reconnects with resync and polls only while disconnected and visible', async ({ page }) => {
   let live!: WebSocketRoute; let connections = 0; let reads = 0; let hold = false; let release: (() => void) | undefined;
   let data = { ...snapshot };
-  await page.route('**/api/operator', async route => {
-    reads++; const response = data;
+  await page.route('**/api/operator', route => { reads++; return route.fulfill({ json: data }); });
+  let partialReads = 0;
+  await page.route('**/api/operator/partials/page?*', async route => {
+    partialReads++;
+    const pageName = data.pageName;
     if (hold) await new Promise<void>(resolve => { release = resolve; });
-    await route.fulfill({ json: response });
+    const revision = Number(new URL(route.request().url()).searchParams.get('revision'));
+    await route.fulfill({ json: { revision, permission: 'editor', pageName, html: '<h1>' + pageName + '</h1>' } });
   });
   await page.route('**/api/operator/events/ticket', route => route.fulfill({ json: { ticket: 'grant', expiresAt: Date.now() + 30000 } }));
-  await page.routeWebSocket('**/api/operator/events', socket => { live = socket; connections++; socket.onMessage(message => { if (message !== 'ack') socket.send('authorized'); }); });
+  await page.routeWebSocket('**/api/operator/events/v2', socket => { live = socket; connections++; socket.onMessage(message => { if (message !== 'ack') socket.send('authorized'); }); });
   await login(page); await expect.poll(() => reads).toBe(2);
   await page.clock.runFor(180000); expect(reads).toBe(2); await page.clock.resume();
-  hold = true; live.send('changed'); await expect.poll(() => !!release).toBe(true);
-  for (let i = 0; i < 100; i++) live.send('changed');
+  hold = true; live.send(JSON.stringify({ type: 'changed', revision: 1, scopes: ['page'] })); await expect.poll(() => !!release).toBe(true);
+  for (let i = 2; i <= 101; i++) live.send(JSON.stringify({ type: 'changed', revision: i, scopes: ['page'] }));
   data = { ...snapshot, pageName: 'Latest coalesced' }; hold = false; release!();
-  await expect(page.locator('#pageName')).toHaveValue('Latest coalesced'); expect(reads).toBeLessThanOrEqual(4);
+  await expect(page.locator('#pageName')).toHaveValue('Latest coalesced'); expect(reads).toBe(2); expect(partialReads).toBe(2);
   data = { ...snapshot, pageName: 'Reconnect snapshot' }; live.close();
   await expect(page.locator('#updates-mode')).toBeVisible();
   await expect.poll(() => connections).toBe(2);
   await expect(page.locator('#pageName')).toHaveValue('Reconnect snapshot');
 });
 
-for (const boundary of ['ticket', 'snapshot', 'renewal']) {
+for (const boundary of ['ticket', 'partial', 'renewal']) {
   test('sign-out rejects a delayed ' + boundary + ' response and stops renewal/reconnection', async ({ page }) => {
     let live!: WebSocketRoute; let connections = 0; let tickets = 0; let release: (() => void) | undefined; let held = false;
     const frames: string[] = [];
-    await page.route('**/api/operator', async route => {
-      if (held && boundary === 'snapshot') await new Promise<void>(resolve => { release = resolve; });
-      await route.fulfill({ json: snapshot });
+    await page.route('**/api/operator', route => route.fulfill({ json: snapshot }));
+    await page.route('**/api/operator/partials/page?*', async route => {
+      if (held) await new Promise<void>(resolve => { release = resolve; });
+      await route.fulfill({ json: { revision: 1, permission: 'editor', pageName: 'Late private page', html: '<h1>Late private page</h1>' } });
     });
     await page.route('**/api/operator/events/ticket', async route => {
       tickets++;
       if ((boundary === 'ticket' && tickets === 1) || (boundary === 'renewal' && tickets === 2)) await new Promise<void>(resolve => { release = resolve; });
       await route.fulfill({ json: { ticket: 'grant', expiresAt: Date.now() + 30000 } });
     });
-    await page.routeWebSocket('**/api/operator/events', socket => {
+    await page.routeWebSocket('**/api/operator/events/v2', socket => {
       live = socket; connections++;
       socket.onMessage(message => { frames.push(String(message)); if (message !== 'ack') socket.send('authorized'); });
     });
     await page.clock.install();
     await login(page);
-    if (boundary !== 'ticket') await expect.poll(() => frames.length).toBeGreaterThan(0);
-    if (boundary === 'snapshot') { held = true; live.send('changed'); }
+    if (boundary !== 'ticket') {
+      await expect.poll(() => frames.length).toBeGreaterThan(0);
+      await expect(page.locator('#updates-mode')).toBeHidden();
+    }
+    if (boundary === 'partial') { held = true; live.send(JSON.stringify({ type: 'changed', revision: 1, scopes: ['page'] })); }
     if (boundary === 'renewal') await page.clock.runFor(240001);
     await expect.poll(() => !!release).toBe(true);
     await page.locator('#logout').click();

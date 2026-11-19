@@ -6,14 +6,90 @@ import { createOperatorSession } from "./operator-session";
 import { createMonitorEditor } from "./monitor-editor";
 import type { Child } from "hono/jsx";
 import { raw } from "hono/html";
-import { createStatusLedger } from "./status-ledger";
+import { createStatusLedger, monitorActions } from "./status-ledger";
+
+import { mergeScopes, type ViewAudience, type ViewScope } from "./view-changes";
 
 const statusLedger = createStatusLedger();
+type ViewMonitor = Status["monitors"][number];
+
+function PublicBanner({ data }: { data: Status }) {
+  const label = statusLedger.banner(data);
+  return <section class="banner" data-state={label === "All services operational" ? "up" : label === "Services unavailable" ? "down" : "unknown"} aria-label="Current status"><h2>{label}</h2></section>;
+}
+
+function PublicIncidents({ data }: { data: Status }) {
+  return <section id="public-incidents" hidden={!data.monitors.length} aria-labelledby="incident-heading"><h2 id="incident-heading">Incidents</h2>{raw(statusLedger.incidents(data))}</section>;
+}
+
+function OperatorRows({ monitors, canEdit }: { monitors: ViewMonitor[]; canEdit: boolean }) {
+  if (!monitors.length) return <tr><td colSpan={4}>No Monitors</td></tr>;
+  return <>{monitors.map(monitor => <>
+    <tr data-key={monitor.id}>
+      <td>{monitor.name}</td><td class="status" data-state={monitor.state}>{statusLedger.stateLabel[monitor.state]}</td><td>{"published" in monitor && monitor.published ? "Published" : "Private"}</td>
+      <td><div class="monitor-actions" id={`actions-${monitor.id}`} role="group" aria-label={`Actions ${monitor.name}`}>
+        {canEdit && monitorActions({ published: "published" in monitor && monitor.published }).map(({ key, label, icon }) =>
+          <button type="button" data-key={key} class={key === "delete" ? "monitor-action danger" : "monitor-action"} title={label} aria-label={`${label} ${monitor.name}`}>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d={icon} /></svg><span class="action-label" aria-hidden="true">{label}</span>
+          </button>)}
+      </div></td>
+    </tr>
+    <tr data-key={`${monitor.id}:history`}><td colSpan={4} id={`history-${monitor.id}`} aria-label={`${monitor.name} availability`}>{raw(statusLedger.history(monitor.history, monitor.id))}</td></tr>
+  </>)}</>;
+}
+
+function PublicRow({ monitor }: { monitor: ViewMonitor }) {
+  const heading = `monitor-name-${monitor.id}`;
+  return <article data-key={monitor.id} aria-labelledby={heading}>
+    <div class="ledger-row" data-state={monitor.state}><h2 id={heading}>{monitor.name}</h2><span class="status">{statusLedger.stateLabel[monitor.state]}</span></div>
+    {raw(statusLedger.history(monitor.history, monitor.id))}
+  </article>;
+}
+
+function DestinationRows({ destinations, emailConfigured }: { destinations: NonNullable<Status["destinations"]>; emailConfigured: boolean }) {
+  return <>{destinations.map(destination => {
+    const email = destination.channel === "email";
+    const value = email ? destination.address : destination.url;
+    const submission = destination.latestSubmission;
+    return <li data-key={destination.id}>
+      <div class="destination-details">
+        <div class="destination-address">{value}</div>
+        {email && <div>{destination.confirmed ? "Confirmed" : "Pending confirmation"}</div>}
+        {submission && <div class="destination-submission">
+          <span>{statusLedger.submissionLabel(submission)}</span>{" · "}
+          <time datetime={new Date(submission.at).toISOString()}>{new Date(submission.at).toISOString()}</time>
+        </div>}
+      </div>
+      <div class="destination-actions">{statusLedger.destinationActions(destination, emailConfigured).map(label =>
+        <button type="button" id={label === "Replace" ? `replace-${destination.id}` : undefined} data-action={label}
+          class={label === "Remove" ? "danger" : undefined} aria-label={`${label} ${value}`}>{label}</button>)}</div>
+    </li>;
+  })}</>;
+}
+
+export function renderViewPartial(scope: ViewScope, data: Status, audience: ViewAudience, emailConfigured: boolean) {
+  const operator = audience !== "public";
+  switch (scope) {
+    case "page": return { html: String(<h1>{data.pageName}</h1>), ...(operator ? { pageName: data.pageName } : {}) };
+    case "banner": return { html: operator ? String(<h2 id="paused" hidden={!data.paused}>Monitoring paused</h2>) : String(<PublicBanner data={data} />) };
+    case "incidents": return { html: operator ? statusLedger.incidents(data, true) : String(<PublicIncidents data={data} />) };
+    case "destinations": return { html: String(<DestinationRows destinations={data.destinations ?? []} emailConfigured={emailConfigured} />), destinations: data.destinations ?? [], emailConfigured,
+      selections: data.monitors.map(({ id, destinationIds }) => ({ id, destinationIds })) };
+    default: {
+      const all = scope === "monitors";
+      const html = operator
+        ? (data.monitors.length || all ? String(<OperatorRows monitors={data.monitors} canEdit={audience === "editor"} />) : "")
+        : String(<>{data.monitors.map(monitor => <PublicRow monitor={monitor} />)}</>);
+      return { html, ...(operator ? { monitors: data.monitors.map(({ history: _history, ...monitor }) => monitor) } : {}) };
+    }
+  }
+}
+
 
 function Document({ title, operator = false, children }: { title: string; operator?: boolean; children: Child }) {
   return <html lang="en"><head>
     <meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>{title}</title><script src="/theme.js"></script><link rel="stylesheet" href="/app.css" />
+    <title>{title}</title><script src="/theme.js?live=2"></script><link rel="stylesheet" href="/app.css" />
   </head><body>
     <header><a class="brand" href="/">irisbeat</a><nav aria-label="Application">
       <a href="/" aria-current={operator ? undefined : "page"}>Status page</a>
@@ -27,7 +103,7 @@ function Document({ title, operator = false, children }: { title: string; operat
 }
 
 export function statusPage(status: Status) {
-  return "<!doctype html>" + <Document title={status.pageName}><div id="public-status">{raw(statusLedger.render(status))}</div></Document>;
+  return "<!doctype html>" + <Document title={status.pageName}><div id="public-status"><h1>{status.pageName}</h1><PublicBanner data={status} /><div class="ledger">{status.monitors.map(monitor => <PublicRow monitor={monitor} />)}</div><PublicIncidents data={status} /></div></Document>;
 }
 
 export const recipientAction = {
@@ -141,7 +217,7 @@ function Operator({ hosted }: { hosted: boolean }) {
       <div class="actions"><span id="updates-mode" role="status">Polling</span><button id="logout" type="button">Sign out</button></div>
     </section>
     <p id="message" role="status" aria-live="polite"></p>
-    <script src="/operator.js" defer></script>
+    <script src="/operator.js?live=2" defer></script>
   </>;
 }
 
@@ -152,10 +228,12 @@ export function operatorPage(hosted = false) {
 // Runs before the stylesheet to apply a saved preference before first paint.
 export const themeScript = `
 const statusLedger = (${createStatusLedger.toString()})();
-function reconcile(parent, next) {
+const monitorActions = (${monitorActions.toString()});
+const mergeScopes = (${mergeScopes.toString()});
+function reconcile(parent, next, only) {
   const key = node => node.nodeType === 1 ? node.getAttribute('data-key') || node.getAttribute('data-date') : null;
   // Inline forms own their drafts and stay attached while snapshot siblings change.
-  const old = [...parent.childNodes].filter(node => node.nodeName !== 'FORM');
+  const old = [...parent.childNodes].filter(node => node.nodeName !== 'FORM' && (!only || only.includes(key(node))));
   const identities = new Set([...next.childNodes].map(key).filter(Boolean));
   old.forEach(node => { if (key(node) && !identities.has(key(node))) node.remove(); });
   const used = new Set();
@@ -174,7 +252,9 @@ function reconcile(parent, next) {
         if (!node.classList.contains('history-detail') && node.tagName !== 'TIME') reconcile(node, fresh);
       }
     }
-    if (parent.childNodes[index] !== node) parent.insertBefore(node, parent.childNodes[index] || null);
+    if (only) {
+      if (node !== current) parent.insertBefore(node, current || null);
+    } else if (parent.childNodes[index] !== node) parent.insertBefore(node, parent.childNodes[index] || null);
   });
   old.forEach(node => { if (!used.has(node)) node.remove(); });
 }
@@ -207,8 +287,16 @@ function snapshotFailure(failed) {
   stale.hidden = !failed;
   announcement.textContent = failed ? 'Updates unavailable' : recovered ? 'Updates restored' : announcement.textContent;
 }
+function partialURL(base, scope, revision) {
+  return base + '/partials/' + scope + '?revision=' + revision;
+}
+function fragment(html) {
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  return template.content;
+}
 function liveSnapshots(path, read, authorize) {
-  let running = false, queued = false, ackSocket;
+  let running, queued, ackSocket;
   let socket, retry, handshake, renewal, polling, stopped = false, ready = false, delay = 1000;
   function pollingMode() {
     const mode = document.getElementById('updates-mode');
@@ -216,20 +304,32 @@ function liveSnapshots(path, read, authorize) {
     if (ready || document.hidden || stopped) { clearInterval(polling); polling = undefined; }
     else if (!polling) polling = setInterval(sync, 60000);
   }
-  async function sync() {
+  function sync() { enqueue({ full: true }); }
+  async function enqueue(request) {
     if (stopped) return;
-    if (running) { queued = true; return; }
-    running = true;
+    if (running) {
+      const previous = queued || running;
+      queued = request.full || previous.full ? { full: true } : {
+        revision: Math.max(previous.revision, request.revision),
+        scopes: mergeScopes(previous.scopes, request.scopes),
+      };
+      return;
+    }
+    running = request;
+    const source = socket;
     if (!authorize) snapshotPending(true);
     try {
-      const success = await read(() => !stopped && !queued);
+      const success = await read(() => !stopped && !queued && (request.full || source === socket), request.full ? undefined : request);
       if (success === false) socket?.close();
       else if (ready) delay = 1000;
     } finally {
-      running = false;
+      running = undefined;
       if (!authorize) snapshotPending(false);
-      if (queued && !stopped) { queued = false; sync(); }
-      else if (ackSocket) {
+      if (queued && !stopped) {
+        const next = queued;
+        queued = undefined;
+        enqueue(next);
+      } else if (ackSocket) {
         if (ackSocket === socket && socket.readyState === WebSocket.OPEN) socket.send('ack');
         ackSocket = undefined;
       }
@@ -268,8 +368,15 @@ function liveSnapshots(path, read, authorize) {
       current.onmessage = event => {
         if (current !== socket) return;
         if (authorize && event.data === 'authorized') { connected(); return; }
-        if (!ready || event.data !== 'changed') return;
-        ackSocket = current; sync();
+        if (!ready) return;
+        let hint;
+        try { hint = JSON.parse(event.data); } catch { current.close(); return; }
+        if (hint?.type !== 'changed' || !Number.isSafeInteger(hint.revision) || hint.revision < 1 ||
+            !Array.isArray(hint.scopes) || !hint.scopes.length || hint.scopes.length > 37 ||
+            !hint.scopes.every(scope => typeof scope === 'string' && /^(page|banner|monitors|incidents|destinations|monitor\\/[A-Za-z0-9_-]{1,80})$/.test(scope))) {
+          current.close(); return;
+        }
+        ackSocket = current; enqueue(hint);
       };
       current.onerror = () => current.close();
       current.onclose = () => {
@@ -286,7 +393,7 @@ function liveSnapshots(path, read, authorize) {
   }
   function visible() { pollingMode(); if (!document.hidden) sync(); }
   function suspend() {
-    stopped = true; ready = false; clearTimeout(retry); clearTimeout(handshake); clearTimeout(renewal); clearInterval(polling); polling = undefined;
+    stopped = true; ready = false; queued = undefined; clearTimeout(retry); clearTimeout(handshake); clearTimeout(renewal); clearInterval(polling); polling = undefined;
     const previous = socket; socket = undefined; ackSocket = undefined; previous?.close();
   }
   function resume() { if (stopped) { stopped = false; pollingMode(); connect(); } }
@@ -328,9 +435,10 @@ function updateTimeDisplays() {
     if (duration.textContent !== label) duration.textContent = label;
   });
 }
-function initializeDisplay() {
+function initializeDisplay(scopes) {
   updateTimeDisplays();
   document.querySelectorAll('.history').forEach(strip => {
+    if (scopes && !scopes.includes('monitors') && !scopes.includes('monitor/' + strip.dataset.monitor)) return;
     const days = [...strip.children];
     if (!days.length) return;
     const detail = strip.nextElementSibling;
@@ -392,23 +500,44 @@ document.addEventListener('DOMContentLoaded', () => {
     else updateTimeDisplays();
   }, 1000);
   if (document.getElementById('public-status')) {
-    const updates = liveSnapshots('/api/status/events', async current => {
+    const updates = liveSnapshots('/api/status/events/v2', async (current, hint) => {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 10000);
       try {
-        const response = await fetch('/api/status', { signal: controller.signal });
-        if (!response.ok) throw new Error('Request failed');
-        const data = await response.json();
-        if (!current()) return;
-        const next = document.createElement('div');
-        next.innerHTML = statusLedger.render(data);
-        reconcile(document.getElementById('public-status'), next);
-        document.title = data.pageName;
-        initializeDisplay(); snapshotFailure(false);
+        if (hint) {
+          const partials = await Promise.all(hint.scopes.map(async scope => {
+            const response = await fetch(partialURL('/api/status', scope, hint.revision), { signal: controller.signal });
+            if (!response.ok) throw new Error('Request failed');
+            const data = await response.json();
+            if (data.revision < hint.revision || !Number.isSafeInteger(data.revision)) throw new Error('Revision unavailable');
+            return [scope, fragment(data.html)];
+          }));
+          if (!current()) return;
+          const ledger = document.querySelector('#public-status .ledger');
+          for (const [scope, next] of partials) {
+            if (scope === 'monitors') reconcile(ledger, next);
+            else if (scope.startsWith('monitor/')) reconcile(ledger, next, [scope.slice(8)]);
+            else {
+              const target = document.querySelector({ page: '#public-status h1', banner: '#public-status .banner', incidents: '#public-incidents' }[scope]);
+              const fresh = next.firstElementChild;
+              target.hidden = fresh.hidden;
+              if (scope === 'banner') target.dataset.state = fresh.dataset.state;
+              reconcile(target, fresh);
+              if (scope === 'page') document.title = target.textContent;
+            }
+          }
+        } else {
+          const response = await fetch('/api/status', { signal: controller.signal });
+          if (!response.ok) throw new Error('Request failed');
+          const data = await response.json();
+          if (!current()) return;
+          reconcile(document.getElementById('public-status'), fragment(statusLedger.render(data)));
+          document.title = data.pageName;
+        }
+        initializeDisplay(hint?.scopes); snapshotFailure(false);
       } catch {
-        if (current()) snapshotFailure(true);
-        return false;
-      } finally { clearTimeout(timeout); }
+        if (current()) { snapshotFailure(true); return false; }
+      } finally { clearTimeout(timeout); if (hint) controller.abort(); }
     });
     document.getElementById('retry').addEventListener('click', updates.sync);
   }
@@ -634,21 +763,9 @@ function openDestination(channel, destination) {
   webhook.hidden = false; updateWebhook(); destinationAddress.focus();
 }
 function renderSubmission(result) {
-  const reasons = {
-    network: 'Provider connection failed',
-    rate_limited: 'Provider rate limit',
-    provider_unavailable: 'Provider unavailable',
-    provider_rejected: 'Provider rejected the submission',
-    eligibility_unavailable: 'Eligibility check unavailable',
-    expired: 'Job expired',
-    attempts_exhausted: 'Retry limit reached',
-  };
   const submission = document.createElement('div'); submission.className = 'destination-submission';
   const label = document.createElement('span');
-  const status = result.status === 'accepted' ? 'Submission accepted'
-    : result.status === 'canceled' ? 'Submission canceled'
-      : result.status === 'retrying' ? 'Submission failed · Retrying' : 'Submission failed';
-  label.textContent = [status, reasons[result.reason]].filter(Boolean).join(' · ');
+  label.textContent = statusLedger.submissionLabel(result);
   const time = document.createElement('time');
   const at = new Date(result.at);
   time.dateTime = at.toISOString();
@@ -656,7 +773,21 @@ function renderSubmission(result) {
   submission.append(label, ' · ', time);
   return submission;
 }
-function renderDestinations(next, monitors) {
+function bindDestinationActions(row, destination) {
+  const path = destinationsPath + '/' + encodeURIComponent(destination.id);
+  const value = destination.channel === 'email' ? destination.address : destination.url;
+  const actions = {
+    Replace: () => openDestination(destination.channel, destination),
+    'Resend confirmation': () => run(path + '/confirmation', 'POST'),
+    Remove: () => {
+      if (confirm('Remove ' + value + '? Monitors will lose this selection.')) {
+        run(path, 'DELETE', undefined, () => queueMicrotask(() => addWebhook.focus()));
+      }
+    },
+  };
+  row.querySelectorAll('button').forEach(button => { button.onclick = actions[button.dataset.action]; });
+}
+function renderDestinations(next, monitors, markup) {
   destinations = next;
   destinationUses = new Map();
   for (const monitor of monitors) for (const id of monitor.destinationIds ?? []) {
@@ -664,7 +795,7 @@ function renderDestinations(next, monitors) {
   }
   const focused = document.activeElement;
   const focusedRow = destinationRows.contains(focused);
-  reconcileNodes(destinationRows, destinations.map(destination => {
+  const rows = markup ? [...markup.children] : destinations.map(destination => {
     const row = document.createElement('li'); row.dataset.key = destination.id;
     const email = destination.channel === 'email';
     const value = email ? destination.address : destination.url;
@@ -677,29 +808,19 @@ function renderDestinations(next, monitors) {
       details.append(consent);
     }
     const actions = document.createElement('div'); actions.className = 'destination-actions';
-    const labels = email ? (emailConfigured ? (destination.confirmed ? ['Replace', 'Remove'] : ['Resend confirmation', 'Replace', 'Remove']) : ['Remove'])
-      : ['Replace', 'Remove'];
-    for (const label of labels) {
+    for (const label of statusLedger.destinationActions(destination, emailConfigured)) {
       const button = document.createElement('button'); button.type = 'button'; button.textContent = label;
+      button.dataset.action = label;
       button.setAttribute('aria-label', label + ' ' + value);
-      if (label === 'Replace') {
-        button.id = 'replace-' + destination.id;
-        button.onclick = () => openDestination(destination.channel, destination);
-      } else if (label === 'Resend confirmation') {
-        button.onclick = () => run(destinationsPath + '/' + encodeURIComponent(destination.id) + '/confirmation', 'POST');
-      } else {
-        button.className = 'danger';
-        button.onclick = () => {
-          if (confirm('Remove ' + value + '? Monitors will lose this selection.')) {
-            run(destinationsPath + '/' + encodeURIComponent(destination.id), 'DELETE', undefined, () => queueMicrotask(() => addWebhook.focus()));
-          }
-        };
-      }
+      if (label === 'Replace') button.id = 'replace-' + destination.id;
+      if (label === 'Remove') button.className = 'danger';
       actions.append(button);
     }
     if (destination.latestSubmission) details.append(renderSubmission(destination.latestSubmission));
     row.append(details, actions); return row;
-  }));
+  });
+  rows.forEach((row, index) => bindDestinationActions(row, destinations[index]));
+  reconcileNodes(destinationRows, rows);
   byId('no-destinations').hidden = destinations.length !== 0;
   updateWebhook();
   if (focusedRow && destinationRows.contains(focused) && document.activeElement !== focused) focused.focus();
@@ -745,6 +866,61 @@ function clearSession() {
   updateDeleted();
   message.textContent = ''; byId('secret').value = ''; byId('secret').focus();
 }
+function bindMonitorActions(group, monitor) {
+  const path = '/api/operator/monitors/' + encodeURIComponent(monitor.id);
+  const actions = {
+    edit: () => monitorEditor.open(monitor, hosted),
+    publication: () => run(path, 'PATCH', { published: !monitor.published }),
+    maintenance: () => declareMaintenance(monitor),
+    delete: () => { if (confirm('Delete ' + monitor.name + '? Checks and publication stop. Incident history is retained.')) run(path, 'DELETE'); },
+  };
+  group.querySelectorAll('button').forEach(button => { button.onclick = actions[button.dataset.key]; });
+}
+function updatePageName(value, saved) {
+  const input = byId('pageName');
+  if (saved || input.value === savedPageName) {
+    if (input.value !== value) input.value = value;
+    savedPageName = value;
+  }
+}
+function restoreOperatorFocus(focused) {
+  if (focused !== document.body && (document.activeElement === document.body ||
+      (focused === document.activeElement && focused.closest('[hidden]')))) {
+    byId(byId('new-monitor').hidden ? 'operator-title' : 'new-monitor').focus();
+  }
+}
+function renderOperatorPartials(partials) {
+  const focused = document.activeElement;
+  for (const { scope, data } of partials) {
+    const next = fragment(data.html);
+    if (scope === 'page') updatePageName(data.pageName);
+    else if (scope === 'banner') byId('paused').hidden = next.firstElementChild.hidden;
+    else if (scope === 'incidents') reconcile(byId('incidents'), next);
+    else if (scope === 'destinations') {
+      emailConfigured = data.emailConfigured; addEmail.hidden = !emailConfigured;
+      renderDestinations(data.destinations, data.selections, next);
+      monitorEditor.refreshDestinations(destinations, data.selections.find(monitor => monitor.id === monitorEditor.id)?.destinationIds);
+    } else {
+      const id = scope.startsWith('monitor/') ? scope.slice(8) : null;
+      if (id) {
+        if (data.monitors.length) monitorIds.add(id);
+        else monitorIds.delete(id);
+      } else monitorIds = new Set(data.monitors.map(monitor => monitor.id));
+      for (const monitor of data.monitors) {
+        const group = next.getElementById('actions-' + monitor.id);
+        if (group) bindMonitorActions(group, monitor);
+      }
+      if (monitorEditor.id && !monitorIds.has(monitorEditor.id) && form.parentElement !== byId('new-monitor-panel')) {
+        byId('new-monitor-panel').append(form);
+        if (form.contains(focused)) focused.focus();
+      }
+      reconcile(byId('monitor-rows'), next, id ? [id, id + ':history'] : undefined);
+      updateDeleted();
+    }
+  }
+  initializeDisplay(partials.map(partial => partial.scope));
+  restoreOperatorFocus(focused);
+}
 function render(data, savedField) {
   const initial = editor.hidden;
   login.hidden = true; editor.hidden = false; byId('operator-navigation').hidden = false;
@@ -756,11 +932,7 @@ function render(data, savedField) {
     monitorEditor.close(); closeMaintenance(); closeWebhook(); showSettings(false);
   }
   byId('new-monitor').hidden = !canEdit || !byId('settings').hidden; byId('settings-button').hidden = !canEdit || !byId('settings').hidden;
-  const pageName = byId('pageName');
-  if (initial || savedField === 'pageName' || pageName.value === savedPageName) {
-    if (pageName.value !== data.pageName) pageName.value = data.pageName;
-    savedPageName = data.pageName;
-  }
+  updatePageName(data.pageName, initial || savedField === 'pageName');
   monitorIds = new Set(data.monitors.map(monitor => monitor.id));
   emailConfigured = canEdit && data.emailConfigured === true;
   addEmail.hidden = !emailConfigured;
@@ -780,23 +952,16 @@ function render(data, savedField) {
     }
     const actions = document.createElement('td');
     const group = document.createElement('div'); group.className = 'monitor-actions'; group.id = 'actions-' + monitor.id; group.setAttribute('role', 'group'); group.setAttribute('aria-label', 'Actions ' + monitor.name);
-    const path = '/api/operator/monitors/' + encodeURIComponent(monitor.id);
-    for (const [key, label, action] of (canEdit ? [
-      ['edit', 'Edit', () => monitorEditor.open(monitor, hosted)],
-      ['publication', monitor.published ? 'Unpublish' : 'Publish', () => run(path, 'PATCH', { published: !monitor.published })],
-      ['maintenance', 'Maintenance', () => declareMaintenance(monitor)],
-      ['delete', 'Delete', () => { if (confirm('Delete ' + monitor.name + '? Checks and publication stop. Incident history is retained.')) run(path, 'DELETE'); }]
-    ] : [])) {
+    for (const { key, label, icon } of canEdit ? monitorActions(monitor) : []) {
       const button = document.createElement('button'); button.type = 'button'; button.dataset.key = key; button.className = 'monitor-action';
-      const icons = { edit: 'M13 3l4 4-9 9-5 1 1-5z M11 5l4 4', publication: monitor.published ? 'M2 2l16 16 M8 4a10 10 0 0 1 10 6 12 12 0 0 1-3 4 M5 5a12 12 0 0 0-3 5 10 10 0 0 0 10 6 M8 8a3 3 0 0 0 4 4' : 'M2 10s3-6 8-6 8 6 8 6-3 6-8 6-8-6-8-6z M13 10a3 3 0 1 1-6 0 3 3 0 0 1 6 0', maintenance: 'M12 3a5 5 0 0 0-5 6l-5 5a2 2 0 0 0 4 4l5-5a5 5 0 0 0 6-6l-3 3-3-3 3-3z', delete: 'M3 5h14 M7 5V2h6v3 M5 5l1 13h8l1-13 M8 8v7 M12 8v7' };
-      button.innerHTML = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="' + icons[key] + '"/></svg>';
+      button.innerHTML = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="' + icon + '"/></svg>';
       const tooltip = document.createElement('span'); tooltip.className = 'action-label'; tooltip.textContent = label; tooltip.setAttribute('aria-hidden', 'true'); button.append(tooltip);
       button.title = label;
       button.setAttribute('aria-label', label + ' ' + monitor.name);
       if (key === 'delete') button.classList.add('danger');
-      button.onclick = () => action();
       group.append(button);
     }
+    bindMonitorActions(group, monitor);
     actions.append(group); row.append(actions);
     const historyRow = document.createElement('tr'); historyRow.dataset.key = monitor.id + ':history';
     const availability = document.createElement('td'); availability.colSpan = 4;
@@ -814,13 +979,11 @@ function render(data, savedField) {
   incidentContent.innerHTML = statusLedger.incidents(data, true);
   reconcile(byId('incidents'), incidentContent);
   initializeDisplay();
-  if (focused !== document.body && (document.activeElement === document.body ||
-      (focused === document.activeElement && focused.closest('[hidden]')))) {
-    byId(byId('new-monitor').hidden ? 'operator-title' : 'new-monitor').focus();
-  }
+  restoreOperatorFocus(focused);
 }
 
 const session = createOperatorSession(liveSnapshots, {
+  partials: renderOperatorPartials,
   received(data, savedField) {
     if (data.secret) byId('heartbeat-credential').textContent = 'Bearer ' + data.secret;
     else render(data, savedField);

@@ -161,7 +161,7 @@ test('a rejected Monitor save refreshes a destination removed during Live update
   let live!: WebSocketRoute;
   try {
     // Keep unrelated changes from parallel tests out of this single-invalidation race.
-    await page.routeWebSocket('**/api/operator/events', socket => {
+    await page.routeWebSocket('**/api/operator/events/v2', socket => {
       live = socket;
       socket.onMessage(message => { if (message !== 'ack') socket.send('authorized'); });
     });
@@ -177,12 +177,12 @@ test('a rejected Monitor save refreshes a destination removed during Live update
     await name.fill(tag + ' draft');
     await choice.check();
 
-    await page.route('**/api/operator', async route => {
+    await page.route('**/api/operator/partials/destinations?*', async route => {
       await new Promise<void>(resolve => { release = resolve; });
       await route.continue();
     }, { times: 1 });
     expect((await request.delete('/api/operator/destinations/' + destination.id, { headers })).ok()).toBe(true);
-    live.send('changed');
+    live.send(JSON.stringify({ type: 'changed', revision: 1, scopes: ['destinations'] }));
     await expect.poll(() => Boolean(release)).toBe(true);
     await expect(choice).toBeChecked();
     const rejected = page.waitForResponse(response => response.url().endsWith(path) && response.request().method() === 'PATCH');

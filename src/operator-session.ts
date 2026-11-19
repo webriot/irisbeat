@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { Status } from './index';
+import type { ViewHint, ViewScope } from './view-changes';
+
+type PartialData = { html: string; revision: number; permission: 'reader' | 'editor' };
+type OperatorPartial = { scope: ViewScope; data: PartialData };
 
 type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 type OperatorResponse = Status | { secret: string };
@@ -7,10 +11,11 @@ export type SchedulePreview = { explanation: string; timezone: string; occurrenc
 export type ScheduleInput = { cron: string; timezone: string; graceSeconds?: number | null };
 export type LiveSnapshots = (
   path: string,
-  read: (current: () => boolean) => Promise<boolean | void>,
+  read: (current: () => boolean, hint?: ViewHint) => Promise<boolean | void>,
   authorize: () => Promise<string>,
 ) => { sync(): void; stop(): void };
 export interface OperatorSessionCallbacks {
+  partials?(data: OperatorPartial[]): void;
   received(data: OperatorResponse, savedField?: 'pageName'): void;
   reading?(state: 'pending' | 'success' | 'idle'): void;
   signedOut(): void;
@@ -24,6 +29,7 @@ export interface OperatorSessionCallbacks {
 // Self-contained: ui.tsx embeds this factory into the classic Operator script.
 export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: OperatorSessionCallbacks) {
   let secret = '';
+  let permission: 'reader' | 'editor' = 'editor';
   let generation = 0;
   let requestVersion = 0;
   let readingVersion: number | undefined;
@@ -37,7 +43,7 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
     startUpdates() {
       if (updates) return;
       const started = generation;
-      updates = liveSnapshots('/api/operator/events', current => session.run('/api/operator', 'GET', undefined, undefined, current), async () => {
+      updates = liveSnapshots('/api/operator/events/v2', (current, hint) => session.run('/api/operator', 'GET', undefined, undefined, current, hint), async () => {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 10000);
         try {
@@ -61,7 +67,7 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
       session.cancelPreview();
       ui.signedOut();
     },
-    async run(path = '/api/operator', method: Method = 'GET', body?: unknown, after?: (data: OperatorResponse) => void, current = () => true) {
+    async run(path = '/api/operator', method: Method = 'GET', body?: unknown, after?: (data: OperatorResponse) => void, current = () => true, hint?: ViewHint) {
       const reading = method === 'GET';
       if (busy) { if (reading) pendingRefresh = true; return; }
       const supersedesRead = !reading && readingVersion === requestVersion;
@@ -73,6 +79,25 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 10000);
       try {
+        if (hint) {
+          const partials = await Promise.all(hint.scopes.map(async scope => {
+            const response = await fetch(path + '/partials/' + scope + '?revision=' + hint.revision, {
+              headers: { Authorization: 'Bearer ' + secret }, signal: controller.signal,
+            });
+            if (started === generation && response.status === 401) lifecycle.unauthorized();
+            if (!response.ok) throw new Error('Request failed');
+            const data = await response.json() as PartialData;
+            if (data.permission !== permission || !Number.isSafeInteger(data.revision) || data.revision < hint.revision) {
+              throw new Error('Revision or permission changed');
+            }
+            return { scope, data };
+          }));
+          if (started === generation && version === requestVersion && current()) {
+            ui.partials?.(partials);
+            ui.reading?.('success');
+          }
+          return;
+        }
         const response = await fetch(path, {
           signal: controller.signal,
           method, headers: { Authorization: 'Bearer ' + secret, 'Content-Type': 'application/json' },
@@ -88,6 +113,8 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
           throw new Error(data.error || 'Request failed');
         }
         if (reading && !current()) return;
+        if (!('secret' in data)) permission = (data as Status & { permission?: 'reader' | 'editor' }).permission ?? 'editor';
+        else if (supersedesRead) pendingRefresh = true;
         ui.received(data, method === 'PUT' && path === '/api/operator' ? 'pageName' : undefined);
         if (reading) ui.reading?.('success');
         lifecycle.startUpdates();
@@ -97,11 +124,14 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
         if (started === generation && version === requestVersion) {
           // A failed write has no snapshot to replace the read it superseded.
           if (supersedesRead) pendingRefresh = true;
-          ui.failed((error as Error).message, reading);
+          if (!reading || current()) {
+            ui.failed((error as Error).message, reading);
+            return false;
+          }
         }
-        return false;
       } finally {
         clearTimeout(timeout);
+        if (hint) controller.abort();
         if (reading && started === generation && version === readingVersion) {
           readingVersion = undefined;
           ui.reading?.('idle');
