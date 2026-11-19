@@ -2,7 +2,7 @@
 import worker, { type Status } from '../src/index';
 import { env, exports } from 'cloudflare:workers';
 import { createScheduledController, evictDurableObject, reset, runDurableObjectAlarm } from 'cloudflare:test';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, expect, expectTypeOf, it, vi } from 'vitest';
 
 const day = 86_400_000;
 const today = Date.UTC(2026, 10, 13);
@@ -522,6 +522,8 @@ it('shares scoped history rendering with negotiated snapshots and keeps mutation
 });
 
 it('uses opaque retry tokens without exposing private observation counts after republication', async () => {
+  expectTypeOf<Extract<keyof Status['monitors'][number], 'historyRevision' | 'historyRetryToken'>>().toBeNever();
+  expectTypeOf<Extract<keyof NonNullable<Status['monitor']>, 'historyRevision' | 'historyRetryToken'>>().toBeNever();
   vi.spyOn(Date, 'now').mockReturnValue(today);
   const monitor = await create({ name: 'Heartbeat visibility', kind: 'heartbeat', url: undefined, failureThreshold: undefined });
   const configuration = '/api/operator/monitors/' + monitor.id;

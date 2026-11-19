@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, renderViewPartial, renderViewSnapshot, statusJson, statusPage, styleSheet, themeScript } from "./ui";
+import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, renderViewPartial, renderViewSnapshot, statusJson, statusPage, styleSheet, themeScript, type StatusProjection } from "./ui";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
 import { MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
@@ -60,7 +60,7 @@ export type {
 } from "./notification-jobs";
 export type { MaintenanceWindow } from "./monitor-configuration";
 export type { ViewAudience, ViewHint, ViewScope } from "./view-changes";
-export type Status = ReturnType<MonitoringContext["project"]>;
+export type Status = ReturnType<typeof statusJson>;
 const CONFIRMATION_COOLDOWN = 5 * 60_000;
 type ConfirmationInvitation = { id: string; token: string; origin: string; expiresAt: number; submitted?: boolean };
 type StoredContext = {
@@ -1039,12 +1039,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return this.availability.readiness(this.read().monitors, Date.now());
   }
 
-  private projectedMonitors(state: StoredContext, projection: Status) {
+  private projectedMonitors(state: StoredContext, projection: StatusProjection) {
     const selected = new Set(projection.monitors.map(monitor => monitor.id));
     return state.monitors.filter(monitor => selected.has(monitor.id));
   }
 
-  private readAvailability(state: StoredContext, projection: Status, at: number, operator: boolean) {
+  private readAvailability(state: StoredContext, projection: StatusProjection, at: number, operator: boolean) {
     return this.availability.read(this.projectedMonitors(state, projection), at, () => {
       const state = this.ctx.storage.kv.get<StoredContext>("context");
       return new Map(state?.monitors.filter(monitor => operator || monitor.published)
@@ -1073,7 +1073,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return attachAvailability(data, this.availability.cached(this.projectedMonitors(state, data), at));
   }
 
-  async status(operator = false, secrets = operator): Promise<Status> {
+  async status(operator = false, secrets = operator): Promise<StatusProjection> {
     const at = Date.now();
     const state = this.read(at);
     const data = this.project(state, operator, secrets, at);
@@ -1099,7 +1099,8 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const visible = withHistory || withIncidents || scope === "destinations"
       ? state.monitors.filter(monitor => (operator || monitor.published) && (row === null || monitor.id === row)) : [];
     const monitors = visible.map(monitor => ({
-      id: monitor.id, name: monitor.name, kind: monitor.kind, history: null as AvailabilityHistory | null, historyRetryToken: monitor.historyRetryToken,
+      id: monitor.id, name: monitor.name, kind: monitor.kind, history: null as AvailabilityHistory | null,
+      ...(monitor.historyRetryToken ? { historyRetryToken: monitor.historyRetryToken } : {}),
       ...(monitor.kind === "heartbeat" ? { lastSeen: monitor.lastSeen } : {}), state: state.paused ? "paused" as const : monitor.maintenance ? "maintenance" as const : monitor.state, maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult,
       ...(secrets ? { destinationIds: (monitor.notificationSelections ?? []).map(selection => selection.destinationId) } : {}),
       ...(operator ? {
@@ -1141,7 +1142,7 @@ function includesLedger(scope: ViewScope) {
   return scope === "monitors" || scope.startsWith("monitor/");
 }
 
-function attachAvailability(status: Status, history: Map<string, AvailabilityHistory | null>): Status {
+function attachAvailability(status: StatusProjection, history: Map<string, AvailabilityHistory | null>): StatusProjection {
   const monitors = status.monitors.map(monitor => ({ ...monitor, history: history.get(monitor.id) ?? null }));
   return { ...status, monitors, monitor: monitors[0] ?? null };
 }
