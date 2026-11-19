@@ -133,10 +133,9 @@ show published rows only. Changes can take up to 60 seconds to appear. Set
 local deployment configuration to change this window. For example,
 `"STATUS_RENDER_INTERVAL_SECONDS": "120"` uses two minutes. Positive values
 through 86,400 choose UTC-aligned windows in whole seconds. An explicit `"0"`
-opts into immediate public rendering. An invalid binding fails Worker requests
-and scheduled invocations and logs `invalid_status_render_interval`. Operator
-authorization, Checks, and alert delivery continue on their regular schedules
-with a valid configuration, independently of public rendering.
+opts into immediate public rendering. An invalid binding falls back to 60
+seconds and logs `invalid_status_render_interval`. Operator authorization,
+Checks, and alert delivery run independently of public rendering.
 
 HTTP/TCP targets must be reachable from Cloudflare;
 TCP is plain connection establishment, not TLS/protocol verification. Cloudflare

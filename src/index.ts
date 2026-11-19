@@ -106,9 +106,24 @@ type PublishedStatus = {
   renders: Map<StatusResource, StatusRender>;
 };
 type PublishedStatusMeta = Pick<Status, "paused" | "pageName"> & { revision: number };
+type StatusBaseline = PublishedStatusMeta & {
+  monitors: ReturnType<typeof publicMonitor>[];
+  at: number;
+  observationId: number;
+};
 type MutationAck = Pick<ViewHint, "revision" | "scopes">;
 type ViewClock = Record<ViewAudience, number> & { day?: number };
 type Ticket = { origin: string; contextId: string; permission: "reader" | "editor"; expiresAt: number; leaseEndsAt: number };
+
+function publicMonitor(monitor: Monitor, paused: boolean) {
+  const kind = monitor.kind ?? "http";
+  return {
+    id: monitor.id, name: monitor.name, kind,
+    ...(kind === "heartbeat" ? { lastSeen: monitor.lastSeen ?? null } : {}),
+    state: paused ? "paused" as const : monitor.maintenance ? "maintenance" as const : monitor.state,
+    maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult,
+  };
+}
 
 function allowedSubscriptionOrigin(request: Request, requireOrigin: boolean) {
   const url = new URL(request.url);
@@ -150,9 +165,18 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS observations_monitor_at ON observations (monitorId, at)");
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS observations_at ON observations (at)");
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS incidents_opened ON incidents (openedAt DESC, id)");
-    if (this.renderInterval) ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS status_publication (
-      kind TEXT NOT NULL, position INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (kind, position)
-    )`);
+    if (this.renderInterval) {
+      ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS status_publication (
+        kind TEXT NOT NULL, position INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (kind, position)
+      )`);
+    } else if (ctx.storage.kv.get("status-published") || ctx.storage.kv.get("status-pending") || this.statusBaseline()) {
+      ctx.storage.transactionSync(() => {
+        ctx.storage.kv.delete("status-published");
+        ctx.storage.kv.delete("status-pending");
+        ctx.storage.kv.delete("status-baseline");
+        ctx.storage.sql.exec("DROP TABLE IF EXISTS status_publication");
+      });
+    }
     if (!ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(incidents)").toArray().some(column => column.name === "monitorName")) {
       ctx.storage.sql.exec("ALTER TABLE incidents ADD COLUMN monitorName TEXT");
     }
@@ -269,27 +293,54 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return pending ? statusWindowEnd(pending.since, this.renderInterval) : Infinity;
   }
 
+  // Keep the inputs to the first publication before a write can change them.
+  private captureStatusBaseline(revision: number, at: number) {
+    const stored = this.ctx.storage.kv.get<StoredContext>("context");
+    const paused = !!stored?.paused;
+    const monitors = stored?.monitors?.filter(monitor => monitor.published).map(monitor => publicMonitor(monitor, paused)) ?? [];
+    const observationId = monitors.length ? this.ctx.storage.sql.exec<{ id: number }>(
+      "SELECT COALESCE(MAX(id), 0) AS id FROM observations",
+    ).one().id : 0;
+    if (monitors.length) this.ctx.storage.sql.exec(
+      `INSERT INTO status_publication (kind, position, data)
+       SELECT 'baseline-incident', ROW_NUMBER() OVER (ORDER BY openedAt DESC, id), json_object('id', id, 'monitorId', monitorId,
+         'monitorName', monitorName, 'openedAt', openedAt, 'closedAt', closedAt)
+       FROM incidents WHERE openedAt < ? AND (closedAt IS NULL OR closedAt > ?)
+       AND monitorId IN (SELECT value FROM json_each(?))`,
+      historyStart(at) + 90 * DAY, historyStart(at), JSON.stringify(monitors.map(monitor => monitor.id)),
+    );
+    const baseline: StatusBaseline = { revision, at, observationId, monitors, pageName: stored?.pageName ?? "Irisbeat", paused };
+    this.ctx.storage.kv.put("status-baseline", baseline);
+  }
+
+  private statusBaseline() {
+    return this.ctx.storage.kv.get<StatusBaseline>("status-baseline");
+  }
+
+  private publicationRows<T>(kind: string) {
+    return [...this.ctx.storage.sql.exec<{ data: string }>(
+      "SELECT data FROM status_publication WHERE kind = ? ORDER BY position", kind,
+    )].map(row => JSON.parse(row.data) as T);
+  }
+
   private loadPublishedStatus(): PublishedStatus | undefined {
     if (this.publishedStatus) return this.publishedStatus;
     const meta = this.ctx.storage.kv.get<PublishedStatusMeta>("status-published");
     if (!meta) return;
     const { revision, ...fields } = meta;
-    const rows = <T>(kind: string) => [...this.ctx.storage.sql.exec<{ data: string }>(
-      "SELECT data FROM status_publication WHERE kind = ? ORDER BY position", kind
-    )].map(row => JSON.parse(row.data) as T);
-    const monitors = rows<Status["monitors"][number]>("monitor");
+    const monitors = this.publicationRows<Status["monitors"][number]>("monitor");
     return this.publishedStatus = {
-      revision, data: { ...fields, monitors, monitor: monitors[0] ?? null, incidents: rows<Incident>("incident") }, renders: new Map(),
+      revision, data: { ...fields, monitors, monitor: monitors[0] ?? null, incidents: this.publicationRows<Incident>("incident") }, renders: new Map(),
     };
   }
 
   private publishStatus(state: StoredContext, at: number): PublishedStatus {
     const pending = this.pendingStatus();
     const revision = this.viewClock().public;
+    // Attach Analytics Engine history here before rendering or committing a public generation.
     const data = this.project(state, false, false, at);
     const renders = new Map<StatusResource, StatusRender>();
-    const notify = pending && this.liveSockets("public").length > 0;
-    if (notify) {
+    if (pending) {
       for (const scope of pending.scopes) renders.set(scope, renderStatus(scope, data, revision));
     }
 
@@ -303,28 +354,72 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       store("incident", incidents);
       this.ctx.storage.kv.put("status-published", { revision, pageName, paused });
       this.ctx.storage.kv.delete("status-pending");
+      this.ctx.storage.kv.delete("status-baseline");
     });
     const published = this.publishedStatus = { revision, data, renders };
-    if (notify) this.broadcast("public", { public: { type: "changed", scopes: pending.scopes, revision } });
+    if (pending) {
+      try {
+        this.onStatusPublished({ type: "changed", scopes: pending.scopes, revision });
+      } catch {
+        console.error(JSON.stringify({ event: "status_publication_hook_failed", revision }));
+      }
+    }
     return published;
+  }
+
+  protected onStatusPublished(hint: ViewHint) {
+    this.broadcast("public", { public: hint });
+  }
+
+  private advanceStatusPublication(state: StoredContext, at: number) {
+    const revision = this.viewClock().public;
+    const pending = this.pendingStatus();
+    if (pending && this.statusPublicationAt(pending) <= at) {
+      this.publishStatus(state, at);
+      this.scheduleSubscriptionAlarm();
+      return revision;
+    }
+    if (pending) {
+      return this.ctx.storage.kv.get<PublishedStatusMeta>("status-published")?.revision
+        ?? this.statusBaseline()?.revision ?? revision;
+    }
+    return revision;
+  }
+
+  // Only the publishing DO can say which revision an ordinary GET may reuse.
+  statusPublicationRevision() {
+    const at = Date.now();
+    return {
+      revision: this.advanceStatusPublication(this.read(at), at),
+      cacheSeconds: this.renderInterval / 1000,
+    };
   }
 
   readPublishedStatus(resource: StatusResource, minimum: number) {
     const at = Date.now();
     const state = this.read(at);
+    const revision = this.advanceStatusPublication(state, at);
+    if (revision < minimum) return null;
     if (!this.renderInterval) {
-      const revision = this.viewClock().public;
-      if (revision < minimum) return null;
-      const scope = resource === "/" || (resource === "/api/status" || resource === "snapshot") ? undefined : resource;
+      const scope = resource === "/" || resource === "/api/status" || resource === "snapshot" ? undefined : resource;
       return { revision, ...renderStatus(resource, this.project(state, false, false, at, scope), revision), cacheable: false };
     }
-    const prior = this.loadPublishedStatus();
-    const pending = this.pendingStatus();
-    const due = pending ? this.statusPublicationAt(pending) <= at : prior?.revision !== this.viewClock().public;
-    const published = !prior || due ? this.publishStatus(state, at) : prior;
-    const { revision, data, renders } = published;
-    if (published !== prior) this.scheduleSubscriptionAlarm();
-    if (revision < minimum) return null;
+    let published = this.loadPublishedStatus();
+    if (published?.revision !== revision) {
+      const baseline = this.pendingStatus() && this.statusBaseline();
+      if (baseline?.revision === revision) {
+        const { pageName, paused, at: baselineAt, observationId } = baseline;
+        const start = historyStart(baselineAt);
+        const monitors = baseline.monitors.map(monitor => ({ ...monitor, history: this.history(monitor.id, start, observationId) }));
+        const incidents = this.publicationRows<Incident>("baseline-incident");
+        published = this.publishedStatus = {
+          revision, data: { pageName, paused, monitors, monitor: monitors[0] ?? null, incidents }, renders: new Map(),
+        };
+      } else {
+        published = this.publishStatus(state, at);
+      }
+    }
+    const { data, renders } = published;
     const render = renders.get(resource) ?? renderStatus(resource, data, revision);
     const cacheable = !resource.startsWith("monitor/") || data.monitors.some(monitor => monitor.id === resource.slice("monitor/".length));
     if (cacheable) renders.set(resource, render);
@@ -338,8 +433,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   // The write and revisions share one transaction. Only committed hints leave the DO.
   private commitViewChanges(write: () => ViewChanges, day?: number) {
     const { hints, revision } = this.ctx.storage.transactionSync(() => {
-      const changes = write();
       const clock = this.viewClock();
+      if (this.renderInterval && !this.ctx.storage.kv.get("status-published") && !this.statusBaseline())
+        this.captureStatusBaseline(clock.public, (clock.day ?? Math.floor(Date.now() / DAY)) * DAY);
+      const changes = write();
       const hints: Partial<Record<ViewAudience, ViewHint>> = {};
       for (const audience of ["public", "reader", "editor"] as const) {
         const scopes = mergeScopes([], changes[audience] ?? []);
@@ -884,10 +981,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
       if (monitor.kind !== "heartbeat" || monitor.scheduleMode !== "calendar" || at >= historyStart(Math.max(at, Date.now())))
         this.ctx.storage.sql.exec("INSERT INTO observations (monitorId, at, outcome) VALUES (?, ?, ?)", monitor.id, at, monitor.lastResult.outcome);
-      // Bounded cleanup keeps the entire current UTC day and never touches Incidents.
+      // Preserve the baseline's rows and ID fence only while its window is open.
+      const baseline = this.statusPublicationAt() > Date.now() ? this.statusBaseline() : undefined;
+      const retainBaseline = baseline?.observationId ? baseline : undefined;
       this.ctx.storage.sql.exec(
-        "DELETE FROM observations WHERE id IN (SELECT id FROM observations WHERE at < ? ORDER BY at LIMIT 1000)",
-        historyStart(Math.max(at, Date.now())),
+        "DELETE FROM observations WHERE id IN (SELECT id FROM observations WHERE at < ? AND id != ? ORDER BY at LIMIT 1000)",
+        historyStart(Math.min(Math.max(at, Date.now()), retainBaseline?.at ?? Infinity)), retainBaseline?.observationId ?? 0,
       );
       if (maintenance) {
         this.ctx.storage.kv.put("context", current);
@@ -933,6 +1032,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       if (transition || previousState !== monitor.state) scopes.push("banner");
       return monitorScopes(monitor, ...scopes);
     });
+    // Analytics Engine observation writes belong after the Check commit, before any alert handoff.
     if (!transition || !transitionedIncident) return;
     if (monitor.notificationSelections?.length) {
       await this.enqueueNotifications(monitor, pauseGeneration, {
@@ -1109,19 +1209,19 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   // Separate series reads so their failure never hides current state or Incidents.
-  protected queryHistory(id: string, start: number, end: number): DailyCounts[] | null {
+  protected queryHistory(id: string, start: number, end: number, throughId?: number): DailyCounts[] | null {
     return this.ctx.storage.sql.exec<DailyCounts>(
       `SELECT CAST(at / ${DAY} AS INTEGER) AS day,
         SUM(outcome = 'success') AS successes, SUM(outcome = 'failure') AS failures,
         SUM(outcome = 'maintenance') AS maintenance
-       FROM observations WHERE monitorId = ? AND at >= ? AND at < ? GROUP BY day`,
-      id, start, end,
+       FROM observations WHERE monitorId = ? AND at >= ? AND at < ? AND id <= COALESCE(?, id) GROUP BY day`,
+      id, start, end, throughId ?? null,
     ).toArray();
   }
 
-  private history(id: string, start: number): AvailabilityHistory | null {
+  private history(id: string, start: number, throughId?: number): AvailabilityHistory | null {
     try {
-      const rows = this.queryHistory(id, start, start + 90 * DAY);
+      const rows = this.queryHistory(id, start, start + 90 * DAY, throughId);
       if (!rows) return null;
       const counts = new Map(rows.map(row => [row.day, row]));
       const days: HistoryDay[] = Array.from({ length: 90 }, (_, index) => {
@@ -1173,8 +1273,8 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const visible = withHistory || withIncidents || scope === "destinations"
       ? state.monitors.filter(monitor => (operator || monitor.published) && (row === null || monitor.id === row)) : [];
     const monitors = visible.map(monitor => ({
-      id: monitor.id, name: monitor.name, kind: monitor.kind, history: withHistory ? this.history(monitor.id, start) : null,
-      ...(monitor.kind === "heartbeat" ? { lastSeen: monitor.lastSeen } : {}), state: state.paused ? "paused" as const : monitor.maintenance ? "maintenance" as const : monitor.state, maintenance: monitor.maintenance ?? null, lastResult: monitor.lastResult,
+      ...publicMonitor(monitor, !!state.paused),
+      history: withHistory ? this.history(monitor.id, start) : null,
       ...(secrets ? { destinationIds: (monitor.notificationSelections ?? []).map(selection => selection.destinationId) } : {}),
       ...(operator ? {
         kind: monitor.kind,
@@ -1252,7 +1352,6 @@ function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E
   const app = createApp(adapter);
   return {
   async scheduled(controller: ScheduledController, env: E) {
-    statusRenderInterval(env.STATUS_RENDER_INTERVAL_SECONDS);
     const contexts = adapter ? await adapter.contexts(env) : ["personal"];
     const unique = new Map<string, ScheduledContext>();
     for (const value of contexts) {
@@ -1274,7 +1373,6 @@ function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E
   },
   async fetch(request: Request, env: E) {
     try {
-      statusRenderInterval(env.STATUS_RENDER_INTERVAL_SECONDS);
       return await app.fetch(request, env);
     } catch {
       return requestFailed(request);
@@ -1470,18 +1568,18 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     `/.irisbeat-cache/v1/${c.get("context").id.toString()}/${encodeURIComponent(resource)}/${encodeURIComponent(version)}`, c.req.url
   ));
   const publicRender = async (c: Context<HttpEnv<E>>, resource: StatusResource, minimum = 0) => {
-    const interval = statusRenderInterval(c.env.STATUS_RENDER_INTERVAL_SECONDS);
-    // An entry from a prior window cannot satisfy an ordinary request after publication.
-    const until = interval ? statusWindowEnd(Date.now(), interval) : 0;
-    const key = interval ? edgeKey(c, resource, `${c.env.IRISBEAT_VERSION?.id ?? "source"}:${interval}:${until}`) : null;
-    if (key) {
-      const cached = await readEdge(key);
-      if (cached && Date.now() < until && Number(cached.headers.get("X-Irisbeat-Revision")) >= minimum)
-        return cachedRenderResponse(cached);
+    const context = c.get("context");
+    const keyFor = (revision: number) => edgeKey(c, resource, `${c.env.IRISBEAT_VERSION?.id ?? "source"}:published:${revision}`);
+    const publication = c.env.STATUS_RENDER_INTERVAL_SECONDS === "0" ? null : await context.statusPublicationRevision();
+    if (publication && publication.revision < minimum) return c.text("Revision unavailable", 409);
+    if (publication?.cacheSeconds) {
+      const cached = await readEdge(keyFor(publication.revision));
+      if (cached) return cachedRenderResponse(cached);
     }
-    const render = await c.get("context").readPublishedStatus(resource, minimum);
+    const render = await context.readPublishedStatus(resource, minimum);
     if (!render) return c.text("Revision unavailable", 409);
-    if (key && render.cacheable) await writeEdge(key, render, Math.floor((until - Date.now()) / 1000), render.revision);
+    if (publication?.cacheSeconds && render.cacheable)
+      await writeEdge(keyFor(render.revision), render, publication.cacheSeconds);
     return renderResponse(render);
   };
   app.get("/", getOnly, (c: Context<HttpEnv<E>>) => publicRender(c, "/"));

@@ -14,7 +14,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
 const legacyNotificationRevision = '70ba924ee9a2b15a3d6b6cc49abc8039aedb7f70';
 const liveViews = process.argv.includes('--live-views');
 const statusPublication = process.argv.includes('--status-publication');
-const base = (statusPublication ? '4f7e794da35b4d3af46b1851d126c02cd09c1ed1' : liveViews ? '4f9442a0e660907b02c00c942e05ed4e43abab3c' : process.argv.includes('--notifications') ? legacyNotificationRevision : process.argv[2]) || '6fb95ccec52d9c5c29b82f82c3d77ed3a7e356d3';
+const base = (statusPublication ? 'c4fcfa3a2eeac1f8ee18cb962c499c3d81f2d59a' : liveViews ? '4f9442a0e660907b02c00c942e05ed4e43abab3c' : process.argv.includes('--notifications') ? legacyNotificationRevision : process.argv[2]) || '6fb95ccec52d9c5c29b82f82c3d77ed3a7e356d3';
 const tcp = process.argv[3] === 'tcp';
 const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
 (async () => {
@@ -32,6 +32,12 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
         export { NotificationDelivery };
         export class MonitoringContext extends EngineContext {
           testAlarmAt() { return this.ctx.storage.getAlarm(); }
+          testPublished() { return this.ctx.storage.kv.get("test-publication") ?? null; }
+          onStatusPublished(hint) {
+            const partials = hint.scopes.map(scope => [scope, JSON.parse(this.readPublishedStatus(scope, hint.revision).body)]);
+            this.ctx.storage.kv.put("test-publication", { hint, partials });
+            super.onStatusPublished(hint);
+          }
         }
         const hosted = createHostedWorker({
           contractVersion: "1",
@@ -51,6 +57,9 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
         }
         ${publicationFixture ? `if (url.pathname === '/test-status-alarm') {
           return Response.json(await env.MONITORING.getByName('personal').testAlarmAt());
+        }
+        if (url.pathname === '/test-status-published') {
+          return Response.json(await env.MONITORING.getByName('personal').testPublished());
         }` : ''}
         const testAt = request.headers.get('x-test-at');
         const now = Date.now;
@@ -107,7 +116,11 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
       },
     };
     return convertV4MiniflareOptions({
-      durableObjectsPersist: join(temporary, stateDirectory), ...(port ? { port } : {}), workers: [monitoring, ...(withQueue ? [{
+      durableObjectsPersist: join(temporary, stateDirectory), ...(port ? { port } : {}), workers: [monitoring, ...(statusPublication && withQueue ? [{
+        name: 'status-edge', modules: true, script, compatibilityDate: monitoring.compatibilityDate,
+        bindings: monitoring.bindings,
+        durableObjects: { MONITORING: { className: 'MonitoringContext', scriptName: 'irisbeat' } },
+      }] : []), ...(withQueue ? [{
         name: 'delivery', modules: true, script: delivery, compatibilityDate: '2026-11-18',
         queueConsumers: { 'upgrade-notifications': { maxBatchTimeout: 0.1, maxRetries: 10 } },
         queueProducers: { NOTIFICATION_HANDOFF: 'upgrade-notifications', NOTIFICATION_DLQ: 'upgrade-dlq' },

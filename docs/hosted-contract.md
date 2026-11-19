@@ -473,8 +473,9 @@ its trusted context and audience. It is independent of hosted policy revision.
 
 `MonitoringContext.publishViewChanges(hints)` is the synchronous post-commit
 hook for committed changes. Each entry is a `ViewHint` containing the committed
-revision and affected resources for its audience. Hosted overrides should treat
-a public hint here as pending until its revision has been published. `readView(scope, audience)` returns
+revision and affected resources for its audience. In delayed mode, hosted
+overrides forward public hints from `onStatusPublished(hint)`. In immediate
+mode they can forward them from `publishViewChanges`. `readView(scope, audience)` returns
 projection input and its committed revision together. Hono owns the HTML
 rendering. The availability provider is consulted only for ledger or row reads.
 The internal Operator configuration, Maintenance, and destination RPCs return the editor revision and affected
@@ -491,30 +492,70 @@ Public publication coalesces revisions and scopes in a durable pending record.
 `STATUS_RENDER_INTERVAL_SECONDS` defaults to 60. Positive values through 86,400
 set a UTC-aligned window. An explicit `"0"` opts into immediate public
 rendering. Use the same binding in the HTTP Worker and the MonitoringContext
-Worker when they are configured separately. Invalid values fail the Worker
-request or scheduled invocation.
+Worker when they are configured separately. Invalid values fall back to 60
+seconds and log `invalid_status_render_interval`.
 
-With public subscribers, the existing subscription alarm also wakes at the
-next publication boundary. The Hono render functions prepare affected partials
-and the MonitoringContext stores their public projection before releasing the
-coalesced hint. Reader and editor hints still follow their committed revisions
-immediately. The published projection survives hibernation. With no public
-subscribers, the first GET after the boundary advances the publication. The
-first public read of a context without a saved publication bootstraps from
-committed data. An unpublish can take the same window to appear on anonymous
-Status. Operator data, authorization, Check commits, and alert handoff stay
-independent of the public window.
+With public subscribers, the subscription alarm wakes at the next publication
+boundary. The Hono render functions prepare the affected partials and the
+MonitoringContext saves the public projection. The synchronous protected
+`onStatusPublished(hint)` hook then receives the coalesced public hint. Call
+`super.onStatusPublished(hint)` to retain built-in WebSocket delivery. An
+override can read the prepared partials through `readPublishedStatus(scope,
+hint.revision)`. The saved projection supports those reads after eviction.
+Reader and editor hints still follow their committed revisions immediately.
+
+With no public subscribers, the first GET after the boundary advances
+publication and invokes the same hook. Before the first delayed change, the
+MonitoringContext saves the prior public inputs so even a first-ever GET within
+the window sees the pre-change Status. Entering immediate mode discards the
+old delayed publication and pending hints. Returning to delayed mode starts
+from the current state. An unpublish can take the same window to appear on
+anonymous Status. Operator authorization, Check commits, and alert handoff
+stay independent of the public window.
 
 Cloudflare's Cache API stores anonymous documents, snapshots, and partials
-regionally. The Worker keys them by the resolved Durable Object ID, resource,
-and publication window, so an ordinary GET after the window catches up even
-when it missed the hint. A hinted revision is a lower bound on the same URL.
-An edge miss reads the published projection and an unavailable minimum returns
-409. Static assets and the generic Operator shell use content-based cache keys.
-Client-facing responses retain `Cache-Control: no-store`. Hosted deployments
-can bind `IRISBEAT_VERSION` using Wrangler version metadata to isolate Status
-edge entries by deployed Worker version. See [Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/)
+regionally. The MonitoringContext resolves the eligible publication revision
+before the HTTP Worker looks up a cache entry. The key includes the trusted
+Durable Object ID, resource and publication revision, so ordinary GETs catch up
+even when an edge clock differs from the publication clock or a client missed a
+hint. A hinted revision is a lower bound on the same URL. An edge miss renders
+the published projection and an unavailable minimum returns 409. Static assets
+and the generic Operator shell use content-based keys. Client-facing responses
+retain `Cache-Control: no-store`. Hosted deployments can bind
+`IRISBEAT_VERSION` using Wrangler version metadata to isolate Status entries by
+deployed Worker version. See [Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/)
 and [Durable Object alarms](https://developers.cloudflare.com/durable-objects/api/alarms/).
+
+#### Analytics Engine handoff for #89
+
+Attach Analytics Engine availability while assembling the public publication,
+before rendering and persisting its partials. Capture the affected Monitor IDs,
+their history revisions and the UTC history range before awaiting the provider.
+Recheck those inputs and the publication revision before saving so a late
+query cannot publish newer visibility or roll back a newer publication. The
+first-read baseline needs the same history fence so an observation committed
+during the window cannot appear early. The observation write belongs after
+the Check transaction commits. Provider reads belong on publication and
+history reads, while Check commits, alerts, and Operator authorization can
+proceed independently.
+
+For the combined candidate, expose a durable render generation alongside the
+published revision from `statusPublicationRevision()` and return both from
+`readPublishedStatus()` for cache admission. Include the generation in the edge
+key. When a published row reports stale or pending history, its existing
+scoped retry GET should let the MonitoringContext revalidate that row on the
+provider's retry schedule even when an edge entry is warm. Keep a short
+retry-after deadline for unresolved history. After the browser's four
+attempts, a later ordinary GET past that deadline can revalidate only the
+unresolved rows relevant to its resource. On recovery, recheck the published Monitor and its history revision, then replace the row
+and advance the generation together. Use the new generation for the full
+Status, negotiated snapshot and ledger as well as the affected row, and rebuild
+those representations from the corrected retained projection as requested.
+The public hint revision remains a minimum and the configured window still
+controls when new Monitor data becomes public. Verify warm edges under a long
+window return the repaired row and full snapshot when the provider recovers
+during the four attempts over roughly two minutes, including after eviction.
+Also exercise a recovery after that cycle through an ordinary GET.
 
 ### Upgrade from unscoped subscriptions
 

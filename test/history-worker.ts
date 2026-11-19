@@ -20,11 +20,11 @@ export class MonitoringContext extends EngineContext {
     });
   }
 
-  protected queryHistory(id: string, start: number, end: number) {
+  protected queryHistory(id: string, start: number, end: number, throughId?: number) {
     historyReads++;
     if (mode === 'missing') return null;
     if (mode === 'failed') throw new Error('substituted series query failure');
-    return super.queryHistory(id, start, end);
+    return super.queryHistory(id, start, end, throughId);
   }
 }
 export default {

@@ -11,7 +11,7 @@ export function statusRenderInterval(value: string | undefined) {
   if (value === undefined) return 60_000;
   if (typeof value !== "string" || !/^\d+$/.test(value) || Number(value) > 86_400) {
     console.error(JSON.stringify({ event: "invalid_status_render_interval", binding: "STATUS_RENDER_INTERVAL_SECONDS" }));
-    throw new Error("STATUS_RENDER_INTERVAL_SECONDS must be an integer from 0 to 86400");
+    return 60_000;
   }
   return Number(value) * 1000;
 }
@@ -37,13 +37,12 @@ export async function readEdge(key: Request) {
   catch { return undefined; }
 }
 
-export async function writeEdge(key: Request, render: StatusRender, ttl: number, revision = 0) {
+export async function writeEdge(key: Request, render: StatusRender, ttl: number) {
   if (ttl < 1) return;
   try {
     await caches.default.put(key, new Response(render.body, { headers: {
       "Content-Type": render.contentType,
       "Cache-Control": `public, max-age=${ttl}`,
-      "X-Irisbeat-Revision": String(revision),
     } }));
   } catch {
     // A regional cache failure must not make a published resource unavailable.
