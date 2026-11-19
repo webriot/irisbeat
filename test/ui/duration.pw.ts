@@ -104,7 +104,9 @@ test('duration validation rejects subsecond and out-of-range values without savi
   await page.getByLabel('Monitor name', { exact: true }).fill('Invalid duration');
   await page.getByLabel('HTTP(S) target', { exact: true }).fill('https://example.invalid');
   let saves = 0;
-  page.on('request', request => { if (request.method() === 'POST') saves++; });
+  page.on('request', request => {
+    if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/operator/monitors') saves++;
+  });
   const input = page.getByLabel('Interval', { exact: true });
   await page.getByLabel('Interval unit', { exact: true }).selectOption('minutes');
   for (const invalid of ['', '0', '-1', '0.5', '1440.01', '1.01', '1.00000000000000000001']) {

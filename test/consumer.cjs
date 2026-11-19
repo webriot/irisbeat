@@ -30,14 +30,7 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
   const lock = JSON.parse(readFileSync('test/consumer/package-lock.json', 'utf8'));
   assert.equal(lock.packages['node_modules/irisbeat'].version, '0.2.2');
   assert.equal(lock.packages['node_modules/irisbeat'].integrity, 'sha512-' + createHash('sha512').update(readFileSync(artifact)).digest('base64'));
-  await build({
-    stdin: {
-      contents: "export { default, NotificationRecovery, NotificationEmailCapability } from 'irisbeat/notification-delivery';",
-      resolveDir: join(project, 'test/consumer'),
-    },
-    bundle: true, write: false, format: 'esm', platform: 'neutral', external: ['cloudflare:workers'],
-  });
-  console.log('PASS installed delivery entrypoint and SQLite Recovery export');
+  await require('./notification-delivery.cjs').testInstalledDelivery();
   const script = (await build({ entryPoints: ['test/consumer/worker.ts'], bundle: true, write: false, format: 'esm', platform: 'neutral', external: ['cloudflare:workers'], plugins: [{
     name: 'substitute-external-tcp-target',
     setup(builder) {

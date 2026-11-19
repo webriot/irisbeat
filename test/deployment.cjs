@@ -30,32 +30,59 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     const dlqName = queueName + '-dead-letter';
     const monitoringPath = join(source, 'wrangler.jsonc');
     const deliveryPath = join(source, 'wrangler.delivery.jsonc');
-    experimental_patchConfig(monitoringPath, { queues: { producers: [{ queue: queueName }] } }, false);
+    const origin = 'https://personal.example';
+    experimental_patchConfig(monitoringPath, {
+      queues: { producers: [{ queue: queueName }] },
+      vars: { NOTIFICATION_PUBLIC_ORIGIN: origin },
+      services: [{ binding: 'NOTIFICATION_EMAIL', service: deliveryName, entrypoint: 'NotificationEmailCapability' }],
+    }, false);
     experimental_patchConfig(deliveryPath, {
-      queues: { consumers: [{ queue: queueName }], producers: [{ queue: dlqName }] },
+      queues: { consumers: [{ queue: queueName }], producers: [{ queue: dlqName }, { queue: queueName }] },
+      vars: { EMAIL_FROM: 'alerts@sender.example' },
+      send_email: [{ name: 'EMAIL' }],
       services: [{ service: monitoringName }],
     }, false);
     const producerConfig = unstable_readConfig({ config: monitoringPath });
     const consumerConfig = unstable_readConfig({ config: deliveryPath });
     assert.equal(consumerConfig.observability.enabled, true, 'delivery keeps Workers Logs');
     assert.equal(consumerConfig.observability.traces.enabled, false, 'delivery omits credential-bearing fetch spans');
+    const deliveryModules = ['notification-delivery', 'notification-recovery', 'notification-content',
+      'email-confirmation-transport', 'email-transport', 'webhook-transport'];
     for (const [name, config] of [[monitoringName, producerConfig], [deliveryName, consumerConfig]]) {
+      const outdir = join(temporary, name + '-build');
       execFileSync(join(project, 'node_modules/.bin/wrangler'), [
         'deploy', '--dry-run', '--config', config.configPath, '--name', name,
-        '--outdir', join(temporary, name + '-build'),
+        '--outdir', outdir, '--metafile',
       ], { cwd: source, stdio: 'pipe' });
+      const { outputs } = JSON.parse(readFileSync(join(outdir, 'bundle-meta.json'), 'utf8'));
+      const emittedModules = Object.values(outputs).flatMap(output =>
+        Object.entries(output.inputs).filter(([, input]) => input.bytesInOutput > 0).map(([file]) => file));
+      for (const module of deliveryModules) {
+        assert.equal(emittedModules.some(file => file.endsWith('/' + module + '.ts')), name === deliveryName,
+          module + ' belongs exclusively to the delivery bundle');
+      }
     }
     const [queueProducer] = producerConfig.queues.producers;
     const [queueConsumer] = consumerConfig.queues.consumers;
     const deliveryProducers = Object.fromEntries(consumerConfig.queues.producers.map(({ binding, queue }) => [binding, queue]));
     const [deliveryService] = consumerConfig.services;
+    const [emailService] = producerConfig.services;
+    const serviceTarget = ({ service: name, entrypoint }) => ({ name, entrypoint });
+    assert.deepEqual(deliveryProducers, { NOTIFICATION_DLQ: dlqName, NOTIFICATION_HANDOFF: queueName });
+    assert.equal(queueProducer.binding, 'NOTIFICATION_QUEUE');
+    assert.equal(queueProducer.queue, queueConsumer.queue);
+    assert.equal(queueConsumer.max_retries, 10);
+    assert.deepEqual(producerConfig.triggers.crons, ['* * * * *']);
+    assert.deepEqual(producerConfig.queues.consumers ?? [], []);
+    assert.deepEqual(consumerConfig.triggers.crons ?? [], []);
+    assert.equal(consumerConfig.workers_dev, false);
+    assert.equal(consumerConfig.preview_urls, false);
+    assert.deepEqual(serviceTarget(deliveryService), { name: monitoringName, entrypoint: 'NotificationDelivery' });
+    assert.deepEqual(serviceTarget(emailService), { name: deliveryName, entrypoint: 'NotificationEmailCapability' });
     const [recovery] = consumerConfig.durable_objects.bindings;
     assert.equal(queueConsumer.dead_letter_queue, undefined, 'source jobs must not be transferred with their full bodies');
     assert.ok(consumerConfig.migrations.some(migration => migration.new_sqlite_classes?.includes(recovery.class_name)));
-    const delivery = (await build({
-      entryPoints: [join(source, 'src/notification-delivery.ts')],
-      bundle: true, write: false, format: 'esm', platform: 'neutral', external: ['cloudflare:workers'],
-    })).outputFiles[0].text;
+    const delivery = readFileSync(join(temporary, deliveryName + '-build', 'notification-delivery.js'), 'utf8');
     const script = (await build({ stdin: { contents: `
       import worker from './src/index.ts';
       export { MonitoringContext, NotificationDelivery } from './src/index.ts';
@@ -86,8 +113,8 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     const secret = randomBytes(32).toString('hex');
     mf = new Miniflare(convertV4MiniflareOptions({ unsafeLocalExplorer: true, workers: [
       { name: monitoringName, modules: true, script, compatibilityDate: '2026-11-13',
-        bindings: { INSTALLATION_SECRET: secret, NOTIFICATION_PUBLIC_ORIGIN: 'https://personal.example' },
-        serviceBindings: { NOTIFICATION_EMAIL: { name: deliveryName, entrypoint: 'NotificationEmailCapability' } },
+        bindings: { INSTALLATION_SECRET: secret, ...producerConfig.vars },
+        serviceBindings: { [emailService.binding]: serviceTarget(emailService) },
         durableObjects: { MONITORING: { className: 'MonitoringContext', useSQLite: true } },
         queueProducers: { [queueProducer.binding]: queueProducer.queue },
         outboundService: request => {
@@ -97,13 +124,13 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
         },
       },
       { name: deliveryName, modules: true, script: delivery, compatibilityDate: '2026-11-18',
-        email: { send_email: [{ name: 'EMAIL' }] }, bindings: { EMAIL_FROM: 'alerts@sender.example' },
+        email: { send_email: consumerConfig.send_email }, bindings: consumerConfig.vars,
         durableObjects: { [recovery.name]: { className: recovery.class_name, useSQLite: true } },
         queueConsumers: { [queueConsumer.queue]: {
           maxBatchTimeout: 0.1, maxRetries: queueConsumer.max_retries,
         } },
         queueProducers: deliveryProducers,
-        serviceBindings: { [deliveryService.binding]: { name: deliveryService.service, entrypoint: deliveryService.entrypoint } },
+        serviceBindings: { [deliveryService.binding]: serviceTarget(deliveryService) },
         outboundService: async request => {
           assert.equal(request.url, 'https://webhook.example/controlled');
           alerts.push(await request.json()); return new Response(null, { status: 204 });
@@ -189,28 +216,60 @@ const { Miniflare, convertV4MiniflareOptions } = localRequire('miniflare');
     assert.ok(!(await status('/api/status')).incidents.some(incident => incident.monitorId === monitors[0].id));
     const inbox = 'ops@example.net';
     assert.equal((await request('/api/operator/destinations', 'POST', { channel: 'email', address: inbox })).status, 201);
-    const deadline = Date.now() + 5000;
     const capture = '/cdn-cgi/local/explorer/api/local/email/sending?worker=' + deliveryName;
-    const capturedMail = async suffix => {
+    const capturedMail = async (suffix = '') => {
       const response = await mf.dispatchFetch(new URL(capture + suffix, await mf.ready));
       assert.equal(response.status, 200);
       return (await response.json()).result;
     };
-    let mail;
-    while (!(mail = (await capturedMail('')).find(message => message.to.includes(inbox)))) {
-      assert.ok(Date.now() < deadline, 'timed out waiting for packaged confirmation transport');
-      await new Promise(resolve => setTimeout(resolve, 25));
+    async function mailWithSubject(subject) {
+      const deadline = Date.now() + 5000;
+      let mail;
+      while (!(mail = (await capturedMail()).find(message => message.to.includes(inbox) && message.subject === subject))) {
+        assert.ok(Date.now() < deadline, 'timed out waiting for ' + subject);
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      return capturedMail('&email_id=' + encodeURIComponent(mail.messageId));
     }
-    const confirmation = await capturedMail('&email_id=' + encodeURIComponent(mail.messageId));
-    const link = new URL(confirmation.text.match(/https:\/\/[^\s]+/)[0]);
-    assert.equal(link.pathname, '/notifications/confirm');
-    const accepted = await mf.dispatchFetch('https://personal.example/notifications/confirm', {
+    const recipientPost = link => mf.dispatchFetch(link.origin + link.pathname, {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'x-acceptance-time': String(now) },
       body: new URLSearchParams({ token: link.hash.slice(1) }),
     });
-    assert.equal(accepted.status, 200);
-    assert.ok((await status()).destinations.find(destination => destination.address === inbox)?.confirmed);
-    console.log('PASS exact-source personal workerd smoke: named producer and consumer dry runs, matched Queue and service binding, secret guards, named anonymous ledger/source, HTTP/TCP/Heartbeat, Maintenance/history, opening/recovery webhooks, email confirmation, publication and retained Incidents; no live deployment');
+    const confirmation = await mailWithSubject('Confirm Irisbeat email notifications');
+    const link = new URL(confirmation.text.match(/https:\/\/[^\s]+/)[0]);
+    assert.equal(link.origin + link.pathname, origin + '/notifications/confirm');
+    assert.equal((await recipientPost(link)).status, 200);
+    const email = (await status()).destinations.find(destination => destination.address === inbox);
+    assert.ok(email.confirmed);
+    assert.equal((await request(paths[1], 'PATCH', { destinationIds: [email.id, destinations[0].id] })).status, 200);
+    assert.equal((await capturedMail()).length, 1, 'confirmation and selection do not replay history');
+
+    const submissionStarted = Date.now();
+    assert.equal((await request(paths[1] + '/maintenance', 'PUT', { endsAt: start + 600_000 })).status, 200);
+    await waitForAlerts(13);
+    const mail = await mailWithSubject('Irisbeat: Maintenance started');
+    assert.deepEqual(mail.to, [inbox]);
+    assert.equal(mail.from, consumerConfig.vars.EMAIL_FROM);
+    const occurredAt = new Date(now).toISOString();
+    const withdrawal = new URL(mail.text.match(/https:\/\/[^\s]+/)[0]);
+    assert.equal(withdrawal.origin + withdrawal.pathname, origin + '/notifications/unsubscribe');
+    assert.ok(mail.text.includes(occurredAt) && mail.html.includes(occurredAt));
+    assert.ok(mail.html.includes('href="' + withdrawal.href + '"'));
+    assert.ok(alerts.at(-1).text.includes(occurredAt));
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      const results = (await status()).destinations.map(destination => destination.latestSubmission);
+      if (results.every(result => result?.status === 'accepted' && result.at >= submissionStarted)) break;
+      assert.ok(Date.now() < deadline, 'timed out waiting for current Settings results');
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    const publicResponse = await request('/api/status', 'GET', undefined, '');
+    assert.doesNotMatch(await publicResponse.text(), /ops@example\.net|webhook\.example|destinationIds/);
+    assert.equal((await recipientPost(withdrawal)).status, 200);
+    const withdrawn = await status();
+    assert.deepEqual(withdrawn.destinations.map(destination => destination.id), [destinations[0].id]);
+    assert.deepEqual(withdrawn.monitors.find(monitor => monitor.id === monitors[1].id).destinationIds, [destinations[0].id]);
+    console.log('PASS exact-source personal deployment: isolated Wrangler bundles, Queue and service wiring, HTTP/TCP/Heartbeat, mixed Maintenance and Incident delivery, native email consent and withdrawal, Settings results and public privacy');
   } finally {
     if (mf) await mf.dispose();
     rmSync(temporary, { recursive: true, force: true });

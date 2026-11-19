@@ -149,18 +149,19 @@ edit each Monitor that should send Incident notifications, check the desired
 destinations, and save the Monitor. Upgraded webhooks retain their address and
 start unselected on every Monitor. Removing a webhook or replacing its address
 clears its selections. Slack-compatible messages include the Monitor
-name, the transition and its original UTC time. Webhook-only installations need
-no email configuration.
+name, the transition and its original UTC time. The monitoring and delivery Workers can run with webhook bindings alone.
 Declare, replace or end per-Monitor Maintenance in its ledger. Checks continue,
-Incident detection and alerts are suppressed, and Incidents are retained. Selected
-webhooks receive Maintenance notices. History shows 90 UTC calendar days;
+Incident detection and Incident alerts are suppressed, and Incidents are retained.
+Selected webhooks and confirmed inboxes receive Maintenance notices. History shows 90 UTC calendar days;
 Maintenance is excluded from availability. Delete stops checking but retains
 operator Incidents. Detailed bounds and semantics are in README and the API handoffs.
 
 Cron runs each minute; [new trigger propagation](https://developers.cloudflare.com/workers/configuration/cron-triggers/) can take up to 15 minutes.
 Do not expect a live `/__scheduled` endpoint: it is a Wrangler-local test route.
 Settings shows the latest submission result per destination. “Submission accepted”
-means the provider accepted the request. Temporary failures retry independently
+means the provider accepted the request. Email can still fail during subsequent SMTP delivery.
+Events include their original UTC time and can arrive out of order. An ambiguous provider response
+or a crash before recording acceptance can produce duplicates. Temporary failures retry independently
 with exponential delays, up to ten attempts and one hour from Queue acceptance.
 Permanent failures stop immediately. Exhausted jobs go to the dead-letter Queue,
 which has no automatic replay. Keep both Queues in the same jurisdiction.
@@ -172,7 +173,8 @@ Monitor Workers Logs for sanitized `notification_enqueue_failed`,
 `notification_submission_failed`, `notification_submission_report_failed`,
 `notification_dead_letter_failed`, `notification_recovery_unavailable`
 and `notification_handoff_unavailable` events. The Incident or Maintenance
-change remains committed if Queue handoff fails.
+change remains committed if Queue handoff fails. Loss before Queue acceptance
+is possible and there is no replay of those events.
 
 For upgrades, retain the same Worker, `MONITORING` binding, class and migration
 history, and deploy the reviewed new source. Back up operational configuration via
@@ -181,6 +183,13 @@ restore tool. Code rollback does not roll back Durable Object data; review migra
 compatibility before rollback. Never delete/recreate a production namespace to upgrade.
 
 ### Upgrade and roll back notification Workers
+
+When upgrading from the context-wide webhook, retain the monitoring Worker and
+its Durable Object namespace. The saved URL becomes an unselected destination.
+Select it on each Monitor that should send future alerts. Earlier events are
+never replayed. An older bundle with direct webhook delivery can broadcast
+context-wide after rollback. Review the saved legacy URL and audience before
+restoring such a version.
 
 On an existing Queue installation, keep the Worker names, source Queue and
 service binding. Configure the handoff producer on the existing source Queue,
@@ -195,8 +204,10 @@ To roll back, let pending result and diagnostic writes settle before restoring
 a delivery Worker that lacks Recovery. Before restoring a consumer that cannot
 render Maintenance events, stop emitting them and drain queued and in-flight
 Maintenance jobs. Keep compatible monitoring and delivery Workers in place while
-bookkeeping messages can still reach the source Queue. Restore a monitoring Worker
-without `resolveAlert` after switching to a consumer that supports its RPC.
+bookkeeping messages can still reach the source Queue. Before restoring a monitoring Worker that lacks `resolveAlert`, switch to a
+consumer compatible with that older monitoring Worker. Verify both deployed
+versions, bindings and stored data compatibility before restoring either version.
+[Cloudflare rollback limits](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/).
 
 When upgrading from the confirmation-only build, existing inboxes retain consent and
 Monitor selections. The engine provisions withdrawal credentials from
@@ -258,18 +269,30 @@ npm ci
 npm run release:verify
 ```
 
-The command runs the complete behavior suite, separately installed hosted consumer
-with integrity verification, generated binding types/TypeScript, dry-run build,
-reproducibility checks and packaged personal deployment smoke in local workerd.
-External HTTP/TCP/webhook targets are substituted; time is controlled. It makes
-no Cloudflare deployment or third-party delivery. `dist/` is ignored.
+The command runs Worker behavior tests, generated binding types and TypeScript,
+both dry-run builds, archive reproducibility, a separately installed hosted
+consumer and the exact-source personal deployment in local workerd. It exercises
+both notification Workers from installed package exports and checks separation
+using the Wrangler bundle metadata. External targets are substituted and email
+is captured by the local Email Sending binding. `dist/` is ignored.
+
+Run the rendered workflows and both predecessor transitions from the same checkout.
+
+```sh
+npx playwright install chromium
+npm run test:ui
+node test/upgrade.cjs --notifications
+npm run test:delivery:upgrade
+```
+
+These checks use local workerd, controlled time and synthetic recipients.
 
 `npm run release:prepare` creates:
 
 | Artifact | Use |
 | --- | --- |
 | `irisbeat-0.2.2-source.tar.gz` | Exact committed source, lockfile, config, tests, build/install instructions, LICENSE and NOTICE |
-| `irisbeat-0.2.2.tgz` | Source-only hosted engine package; no test adapter/fixtures or credentials |
+| `irisbeat-0.2.2.tgz` | TypeScript exports for both Workers, configuration references, integration docs, LICENSE and NOTICE |
 | `release.json` | Full Git revision, version, contract 1, SHA-256 hashes and engine npm SHA-512 integrity |
 | `SHA256SUMS` | SHA-256 integrity for both archives and the manifest |
 

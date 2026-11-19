@@ -23,6 +23,7 @@ test('Recipients confirm and withdraw a selected inbox from captured mail', asyn
 
     await connect(page);
     await page.setViewportSize({ width: 320, height: 900 });
+    await page.emulateMedia({ colorScheme: 'dark' });
     await page.goto(origin + '/operator');
     await page.getByLabel('Installation secret').fill('test-installation-secret');
     await page.getByRole('button', { name: 'Sign in' }).click();
@@ -64,7 +65,9 @@ test('Recipients confirm and withdraw a selected inbox from captured mail', asyn
       await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
       await expect(choice).toBeVisible();
       await expect(choice).not.toBeChecked();
-      await choice.check();
+      await choice.focus();
+      await page.keyboard.press('Space');
+      await expect(choice).toBeChecked();
       await page.getByRole('button', { name: 'Save Monitor' }).click();
       await monitorAction(page, 'Edit Email Monitor');
       await expect(choice).toBeChecked();

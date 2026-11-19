@@ -52,6 +52,10 @@
     "docs/maintenance-api.md",
     "docs/history-api.md",
     "docs/install.md",
+    "docs/heartbeat-api.md",
+    "docs/monitor-api.md",
+    "wrangler.jsonc",
+    "wrangler.delivery.jsonc",
     "NOTICE"
   ],
   "cloudflare": {
