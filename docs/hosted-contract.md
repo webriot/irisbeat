@@ -93,13 +93,20 @@ Filter on the actual observation timestamp and include `start`, excluding
 `end`. Group by Monitor and UTC day. Return one
 `{ monitorId, date, successes, failures, maintenance }` per observed day, with
 `date` as `YYYY-MM-DD` and each count weighted by `_sample_interval`. Return
-an empty array when no rows match and reject on read failure. For delayed public
-publication, `through` maps every requested Monitor ID to its maximum captured
-observation revision. Apply `double2 <= through[monitorId]` before aggregating
-each Monitor. Preserve this filter when querying retained public rows after a
-newer observation or visibility change. When the request
-includes `observation: { at, outcome }`, add both exact filters for the
-installation readiness probe. Keep this service private to trusted Worker
+an empty array when no rows match and reject on read failure.
+
+Delayed Status requests include `loggedBefore`, an exclusive cutoff in Unix
+seconds for Analytics Engine's built-in `timestamp` column, which records when
+the Worker logged the point. Apply `timestamp < toDateTime(loggedBefore, 'UTC')`
+alongside the actual observation range before grouping. Use the same cutoff for
+retries of a retained publication, including after a visibility change. Points
+logged exactly at the cutoff are eligible for a subsequent publication. A
+point logged before the cutoff can appear in the same publication when it
+becomes queryable. When the request includes `observation: { at, outcome }`,
+apply both exact filters for the installation readiness probe. Operator,
+immediate Status and readiness queries omit `loggedBefore`.
+
+Keep this service private to trusted Worker
 callers. The caller supplies identity after authorizing the public or Operator
 read, and the service never accepts scopes from browser headers or URLs.
 

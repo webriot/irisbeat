@@ -20,7 +20,7 @@ export type AvailabilityQuery = {
   start: number;
   end: number;
   observation?: Observation;
-  through?: Record<string, number>;
+  loggedBefore?: number;
 };
 export type AvailabilityRow = Omit<HistoryDay, "state"> & { monitorId: string };
 export interface AvailabilityQueryService {
@@ -86,12 +86,12 @@ function queryConfiguration(env: AvailabilityEnv) {
 async function directQuery(env: AvailabilityEnv, query: AvailabilityQuery) {
   const config = queryConfiguration(env);
   if (!config) throw new Error("Analytics Engine SQL configuration missing");
-  const { tenantKey, monitorIds, start, end, observation, through } = query;
+  const { tenantKey, monitorIds, start, end, observation, loggedBefore } = query;
   if (!/^[a-f0-9]{64}$/.test(tenantKey) || monitorIds.some(id => !/^[a-zA-Z0-9_-]{1,128}$/.test(id)))
     throw new Error("Invalid Analytics Engine scope");
   const selection = monitorIds.map(id => "'" + id + "'").join(", ");
   const exact = observation ? ` AND double1 = ${observation.at} AND blob2 = '${observation.outcome}'` : "";
-  const fence = through ? " AND (" + monitorIds.map(id => `(blob1 = '${id}' AND double2 <= ${through[id]})`).join(" OR ") + ")" : "";
+  const cutoff = loggedBefore === undefined ? "" : ` AND timestamp < toDateTime(${loggedBefore}, 'UTC')`;
   const sql = `SELECT blob1 AS monitorId,
     formatDateTime(toDateTime(double1 / 1000, 'UTC'), '%Y-%m-%d', 'UTC') AS date,
     SUM(IF(blob2 = 'success', _sample_interval, 0)) AS successes,
@@ -99,13 +99,13 @@ async function directQuery(env: AvailabilityEnv, query: AvailabilityQuery) {
     SUM(IF(blob2 = 'maintenance', _sample_interval, 0)) AS maintenance
     FROM ${config.dataset}
     WHERE index1 = '${tenantKey}' AND blob1 IN (${selection})
-      AND double1 >= ${start} AND double1 < ${end}${exact}${fence}
+      AND double1 >= ${start} AND double1 < ${end}${exact}${cutoff}
     GROUP BY monitorId, date
     LIMIT ${monitorIds.length * 90}
     FORMAT JSON`;
   const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${config.account}/analytics_engine/sql`, {
     method: "POST", body: sql, headers: { Authorization: "Bearer " + config.token, "Content-Type": "text/plain" },
-    redirect: "error", signal: AbortSignal.timeout(timeout),
+    redirect: "manual", signal: AbortSignal.timeout(timeout),
   });
   if (!response.ok) throw new Error("Analytics Engine SQL request failed");
   return (await response.json<{ data: unknown }>()).data;
@@ -139,10 +139,8 @@ export class Availability {
 
   constructor(private env: AvailabilityEnv, private ctx: DurableObjectState) {
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS availability_outbox (
-      id INTEGER PRIMARY KEY, monitorId TEXT NOT NULL, at INTEGER NOT NULL, outcome TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0
+      id INTEGER PRIMARY KEY, monitorId TEXT NOT NULL, at INTEGER NOT NULL, outcome TEXT NOT NULL
     )`);
-    if (!ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(availability_outbox)").toArray().some(column => column.name === "revision"))
-      ctx.storage.sql.exec("ALTER TABLE availability_outbox ADD COLUMN revision INTEGER NOT NULL DEFAULT 0");
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS availability_outbox_monitor ON availability_outbox (monitorId)");
     if (this.configured) ctx.storage.sql.exec("DROP TABLE IF EXISTS observations");
   }
@@ -152,8 +150,8 @@ export class Availability {
       (typeof this.env.AVAILABILITY_QUERY?.queryAvailability === "function" || !!queryConfiguration(this.env));
   }
 
-  enqueue(monitorId: string, { at, outcome }: Observation, revision: number) {
-    this.ctx.storage.sql.exec("INSERT INTO availability_outbox (monitorId, at, outcome, revision) VALUES (?, ?, ?, ?)", monitorId, at, outcome, revision);
+  enqueue(monitorId: string, { at, outcome }: Observation) {
+    this.ctx.storage.sql.exec("INSERT INTO availability_outbox (monitorId, at, outcome) VALUES (?, ?, ?)", monitorId, at, outcome);
     if (this.flushAt === undefined) this.delayFlush(Date.now());
   }
 
@@ -170,11 +168,11 @@ export class Availability {
     if (!this.configured) return changed;
     const sql = this.ctx.storage.sql;
     sql.exec("DELETE FROM availability_outbox WHERE at < ?", historyStart(now));
-    const rows = sql.exec<Observation & { id: number; monitorId: string; revision: number }>(
-      "SELECT id, monitorId, at, outcome, revision FROM availability_outbox ORDER BY id LIMIT ?", limit,
+    const rows = sql.exec<Observation & { id: number; monitorId: string }>(
+      "SELECT id, monitorId, at, outcome FROM availability_outbox ORDER BY id LIMIT ?", limit,
     ).toArray();
-    for (const { id, monitorId, at, outcome, revision } of rows) {
-      if (!this.write(monitorId, { at, outcome }, revision)) break;
+    for (const { id, monitorId, at, outcome } of rows) {
+      if (!this.write(monitorId, { at, outcome })) break;
       sql.exec("DELETE FROM availability_outbox WHERE id = ?", id);
       changed.add(monitorId);
     }
@@ -184,13 +182,13 @@ export class Availability {
     return changed;
   }
 
-  private write(monitorId: string, observation: Observation, revision: number) {
+  private write(monitorId: string, observation: Observation) {
     try {
       if (!this.env.AVAILABILITY_HISTORY) throw new Error("Analytics Engine write binding missing");
       this.env.AVAILABILITY_HISTORY.writeDataPoint({
         indexes: [this.ctx.id.toString()],
         blobs: [monitorId, observation.outcome],
-        doubles: [observation.at, revision],
+        doubles: [observation.at],
       });
       return true;
     } catch {
@@ -204,8 +202,8 @@ export class Availability {
     this.ctx.storage.kv.delete(cacheKey(monitorId));
   }
 
-  private async query(ids: string[], start: number, end: number, observation?: Observation, through?: AvailabilityQuery["through"]) {
-    const query = { tenantKey: this.ctx.id.toString(), monitorIds: ids, start, end, ...(observation ? { observation } : {}), ...(through ? { through } : {}) };
+  private async query(ids: string[], start: number, end: number, observation?: Observation, loggedBefore?: number) {
+    const query = { tenantKey: this.ctx.id.toString(), monitorIds: ids, start, end, ...(observation ? { observation } : {}), ...(loggedBefore === undefined ? {} : { loggedBefore }) };
     const service = this.env.AVAILABILITY_QUERY;
     if (!service) return checkedRows(await directQuery(this.env, query), query);
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -219,7 +217,7 @@ export class Availability {
     }
   }
 
-  async readPublished(fences: HistoryFence[], at: number, now: number, fallback: Map<string, AvailabilityHistory | null>) {
+  async readPublished(fences: HistoryFence[], at: number, loggedBefore: number | undefined, now: number, fallback: Map<string, AvailabilityHistory | null>) {
     const start = historyStart(at);
     const end = start + 90 * DAY;
     const configured = this.configured;
@@ -228,19 +226,17 @@ export class Availability {
       const previous = fallback.get(id);
       result.set(id, previous ? { ...previous, stale: true } : !revision && configured ? series([], start) : null);
     }
-    if (!configured) return result;
+    if (!configured || loggedBefore === undefined) return result;
     const observed = fences.filter(fence => fence.revision);
     const batches = [];
     for (let offset = 0; offset < observed.length; offset += batchSize) batches.push(observed.slice(offset, offset + batchSize));
     await Promise.all(batches.map(async batch => {
       try {
-        const through = Object.fromEntries(batch.map(({ id, revision }) => [id, revision]));
-        const rows = await this.query(batch.map(({ id }) => id), start, end, undefined, through);
+        const rows = await this.query(batch.map(({ id }) => id), start, end, undefined, loggedBefore);
         const byMonitor = new Map(batch.map(({ id }) => [id, [] as AvailabilityRow[]]));
         for (const row of rows) byMonitor.get(row.monitorId)!.push(row);
-        for (const { id, revision, changedAt } of batch) {
-          const pending = now < (changedAt ?? -Infinity) + historyRetryWindow ||
-            this.ctx.storage.sql.exec("SELECT 1 FROM availability_outbox WHERE monitorId = ? AND revision <= ? LIMIT 1", id, revision).toArray().length > 0;
+        for (const { id, changedAt } of batch) {
+          const pending = now < (changedAt ?? -Infinity) + historyRetryWindow;
           result.set(id, series(byMonitor.get(id)!, start, false, pending));
         }
       } catch {

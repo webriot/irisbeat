@@ -92,9 +92,9 @@ type Subscription = { protocol: 2; pending: boolean; queued?: ViewHint } & (
   | OperatorSubscription
 );
 type PendingStatus = { since: number; scopes: ViewScope[] };
-type PublishedStatusMeta = Pick<StatusProjection, "paused" | "pageName"> & { revision: number };
+type PublishedStatusMeta = Pick<StatusProjection, "paused" | "pageName"> & { revision: number; loggedBefore?: number };
 type PublishedHistory = HistoryFence & { retryAt?: number };
-type PublicationInput = { revision: number; at: number; data: StatusProjection; history: Map<string, PublishedHistory> };
+type PublicationInput = { revision: number; at: number; loggedBefore?: number; data: StatusProjection; history: Map<string, PublishedHistory> };
 type PublishedStatus = PublicationInput & { generation: number; renders: Map<StatusResource, StatusRender> };
 type StatusBaseline = PublishedStatusMeta & {
   monitors: (ReturnType<typeof publicMonitor> & { historyFence?: HistoryFence })[];
@@ -285,17 +285,28 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       await this.ctx.storage.sync();
       const now = Date.now();
       const state = this.ctx.storage.kv.get<StoredContext>("context");
-      this.ctx.storage.transactionSync(() => {
+      this.commitViewChanges(() => {
         const changed = this.availability.flush(now, limit);
+        const operator: ViewScope[] = [];
+        const publicScopes: ViewScope[] = [];
         for (const monitor of state?.monitors ?? []) {
-          if (changed.has(monitor.id)) {
-            monitor.historyRevision = (monitor.historyRevision ?? 0) + 1;
-            monitor.historyChangedAt = now;
-          }
+          if (!changed.has(monitor.id)) continue;
+          const changedAt = monitor.historyChangedAt ?? -Infinity;
+          const crossedWindow = this.renderInterval > 0 && (!Number.isFinite(changedAt) ||
+            now >= statusWindowEnd(changedAt, this.renderInterval));
+          monitor.historyRevision = (monitor.historyRevision ?? 0) + 1;
+          monitor.historyChangedAt = now;
+          // A handoff in the observation's window already has a pending public scope.
+          if (!crossedWindow && now < changedAt + availabilityRetryAfter) continue;
+          const scope = `monitor/${monitor.id}` as const;
+          monitor.historyRetryToken = crypto.randomUUID();
+          operator.push(scope);
+          if (monitor.published && (crossedWindow || !this.renderInterval)) publicScopes.push(scope);
         }
         if (state && changed.size) this.ctx.storage.kv.put("context", state);
-        this.scheduleSubscriptionAlarm();
-      });
+        return { public: publicScopes, reader: operator, editor: operator };
+      }, undefined, now);
+      this.scheduleSubscriptionAlarm();
     });
   }
 
@@ -311,7 +322,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return this.statusBaseline()?.publication?.dueAt ?? this.statusPublicationAt();
   }
 
-  private captureStatusBaseline(revision: number, at: number, publication?: StatusBaseline["publication"]) {
+  private captureStatusBaseline(revision: number, at: number, loggedBefore: number, publication?: StatusBaseline["publication"]) {
     const stored = this.ctx.storage.kv.get<StoredContext>("context");
     const paused = !!stored?.paused;
     const monitors = stored?.monitors?.filter(monitor => monitor.published)
@@ -325,7 +336,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
        AND monitorId IN (SELECT value FROM json_each(?))`,
       historyStart(at) + 90 * DAY, historyStart(at), JSON.stringify(monitors.map(monitor => monitor.id)),
     );
-    const baseline: StatusBaseline = { revision, at, monitors, pageName: stored?.pageName ?? "Irisbeat", paused, publication };
+    const baseline: StatusBaseline = { revision, at, loggedBefore, monitors, pageName: stored?.pageName ?? "Irisbeat", paused, publication };
     this.ctx.storage.kv.put("status-baseline", baseline);
   }
 
@@ -336,7 +347,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const end = this.statusPublicationAt(pending);
     if (end > at) return;
     const prior = this.statusBaseline()?.publication;
-    this.captureStatusBaseline(clock.public, (clock.day ?? Math.floor(pending.since / DAY)) * DAY, {
+    this.captureStatusBaseline(clock.public, (clock.day ?? Math.floor(pending.since / DAY)) * DAY, end / 1000, {
       dueAt: prior?.dueAt ?? end,
       scopes: mergeScopes(prior?.scopes ?? [], pending.scopes),
     });
@@ -361,7 +372,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     if (this.publishedStatus) return this.publishedStatus;
     const meta = this.ctx.storage.kv.get<PublishedStatusMeta & { generation?: number; at?: number }>("status-published");
     if (!meta) return;
-    const { revision, generation, at, ...fields } = meta;
+    const { revision, generation, at, loggedBefore, ...fields } = meta;
     const history = new Map<string, PublishedHistory>();
     const monitors = this.publicationRows<StatusProjection["monitors"][number] & { historyFence?: PublishedHistory }>("monitor")
       .map(({ historyFence, ...monitor }) => {
@@ -370,7 +381,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         return { ...monitor, history: generation === undefined ? null : monitor.history };
       });
     return this.publishedStatus = {
-      revision, generation: generation ?? 0, at: at ?? Date.now(), history,
+      revision, generation: generation ?? 0, at: at ?? Date.now(), loggedBefore, history,
       data: { ...fields, monitors, monitor: monitors[0] ?? null, incidents: this.publicationRows<Incident>("incident") },
       renders: new Map(),
     };
@@ -382,7 +393,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   private savePublication(input: PublicationInput, previous: PublishedStatus | undefined, scopes: ViewScope[] = []) {
-    const { revision, at, data, history } = input;
+    const { revision, at, loggedBefore, data, history } = input;
     const generation = (previous?.generation ?? 0) + 1;
     const renders = new Map<StatusResource, StatusRender>();
     for (const scope of scopes) renders.set(scope, renderStatus(scope, data, revision));
@@ -393,7 +404,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       incidents.forEach((incident, position) => this.ctx.storage.sql.exec(
         "INSERT INTO status_publication VALUES ('incident', ?, ?)", position, JSON.stringify(incident),
       ));
-      this.ctx.storage.kv.put("status-published", { revision, generation, at, pageName, paused });
+      this.ctx.storage.kv.put("status-published", { revision, generation, at, loggedBefore, pageName, paused });
       this.ctx.storage.kv.delete("status-baseline");
     });
     const published = this.publishedStatus = { ...input, generation, renders };
@@ -414,17 +425,18 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   private capturePublicationInput(state: StoredContext, revision: number, at: number): PublicationInput {
     const data = this.project(state, false, false, at);
     const history = new Map(state.monitors.filter(monitor => monitor.published).map(monitor => [monitor.id, this.historyFence(monitor)]));
-    return { revision, at, data, history };
+    return { revision, at, loggedBefore: Math.floor(at / 1000), data, history };
   }
 
   private baselinePublicationInput(baseline: StatusBaseline): PublicationInput {
-    const { revision, at, pageName, paused } = baseline;
+    const { revision, at, pageName, paused, publication } = baseline;
+    const loggedBefore = baseline.loggedBefore ?? (publication && publication.dueAt / 1000);
     const history = new Map<string, PublishedHistory>();
     const monitors = baseline.monitors.map(({ historyFence, ...monitor }) => {
       history.set(monitor.id, historyFence ?? { id: monitor.id, revision: 0 });
       return { ...monitor, history: null };
     });
-    return { revision, at, history, data: {
+    return { revision, at, loggedBefore, history, data: {
       pageName, paused, monitors, monitor: monitors[0] ?? null, incidents: this.publicationRows<Incident>("baseline-incident"),
     } };
   }
@@ -466,7 +478,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       }
     }
     const fences = [...input.history.values()].filter(fence => !resolved.has(fence.id));
-    for (const [id, history] of await this.availability.readPublished(fences, input.at, now, fallback)) {
+    for (const [id, history] of await this.availability.readPublished(fences, input.at, input.loggedBefore, now, fallback)) {
       resolved.set(id, history);
       input.history.get(id)!.retryAt = now + availabilityRetryAfter;
     }
@@ -488,7 +500,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         this.storePublicRow(monitor, position, fence);
       }
     });
-    const result = await this.availability.readPublished(retry.map(({ fence }) => fence), published.at, now,
+    const result = await this.availability.readPublished(retry.map(({ fence }) => fence), published.at, published.loggedBefore, now,
       new Map(retry.map(({ monitor }) => [monitor.id, monitor.history])));
     const current = this.loadPublishedStatus();
     if (!current || current.revision !== published.revision || current.at !== published.at) return;
@@ -498,13 +510,13 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       JSON.stringify(result.get(monitor.id)) !== JSON.stringify(monitor.history));
     if (!changes.length) return;
     const generation = current.generation + 1;
-    const { revision, at, data } = current;
+    const { revision, at, loggedBefore, data } = current;
     this.ctx.storage.transactionSync(() => {
       for (const { monitor, position, fence } of changes) {
         monitors[position] = { ...monitor, history: result.get(monitor.id) ?? null };
         this.storePublicRow(monitors[position], position, fence);
       }
-      this.ctx.storage.kv.put("status-published", { revision, generation, at, pageName: data.pageName, paused: data.paused });
+      this.ctx.storage.kv.put("status-published", { revision, generation, at, loggedBefore, pageName: data.pageName, paused: data.paused });
     });
     this.publishedStatus = { ...current, generation, data: { ...data, monitors, monitor: monitors[0] ?? null }, renders: new Map() };
   }
@@ -552,7 +564,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       const clock = this.viewClock();
       this.sealStatusWindow(clock, at);
       if (this.renderInterval && !this.ctx.storage.kv.get("status-published") && !this.statusBaseline())
-        this.captureStatusBaseline(clock.public, (clock.day ?? Math.floor(at / DAY)) * DAY);
+        this.captureStatusBaseline(clock.public, (clock.day ?? Math.floor(at / DAY)) * DAY, Math.floor(at / 1000));
       const changes = write();
       const hints: Partial<Record<ViewAudience, ViewHint>> = {};
       for (const audience of ["public", "reader", "editor"] as const) {
@@ -1183,7 +1195,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
         monitor.historyRevision = (monitor.historyRevision ?? 0) + 1;
         monitor.historyChangedAt = now;
         monitor.historyRetryToken = crypto.randomUUID();
-        this.availability.enqueue(monitor.id, observation, monitor.historyRevision);
+        this.availability.enqueue(monitor.id, observation);
       }
       if (monitor.kind === "heartbeat" && monitor.scheduleMode === "calendar") {
         this.ctx.storage.sql.exec("DELETE FROM calendar_receipts WHERE monitorId = ? AND occurrence < ?", monitor.id, monitor.nextDue);

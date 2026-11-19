@@ -102,6 +102,12 @@ const temporary = mkdtempSync(join(tmpdir(), 'irisbeat-upgrade-'));
         const now = Date.now;
         if (testAt) Date.now = () => Number(testAt);
         try {
+          ${publicationFixture ? `if (url.pathname === '/test-backdated-heartbeat') {
+            const id = url.searchParams.get('id');
+            const observedAt = Number(url.searchParams.get('observed-at'));
+            const accepted = await env.MONITORING.getByName('personal').heartbeat(id, observedAt);
+            return new Response(null, { status: accepted ? 204 : 404 });
+          }` : ''}
           if (scheduledAt !== null) {
             await app.scheduled({ scheduledTime: Number(scheduledAt) }, env, ctx);
             return new Response('checked');

@@ -84,7 +84,6 @@ The dataset contains these Irisbeat fields.
 | `blob1` | Opaque Monitor ID. |
 | `blob2` | `success`, `failure`, or `maintenance`. |
 | `double1` | Actual observation time in Unix milliseconds. |
-| `double2` | The Monitor observation revision assigned at commit. |
 
 HTTP and TCP use attempt start. Watchdog Heartbeats use the receipt or silence
 evaluation time. Calendar Heartbeats use the completed window deadline even if
@@ -123,9 +122,14 @@ cannot restore the retired rows.
 Operator reads use `MonitoringContext.status(operator, secrets)` and
 `MonitoringContext.readView(scope, audience)`. Mutation responses carry cached
 history, empty bars, or unavailable history without waiting for a query.
-Delayed Status reads query only Monitors from the eligible publication. Each
-series is limited to the observation revision and UTC range captured for that
-publication. Renders preserve `stale` and `pending` flags. History-only recovery
+Delayed Status reads query the published Monitor IDs and the UTC range captured
+for that publication. The window end is an exclusive cutoff on Analytics Engine's
+built-in logging `timestamp`. A queued observation handed off at or after that
+cutoff belongs to a later publication. The handoff schedules a scoped update
+for affected published Monitors when it crosses a window boundary. The bars still
+count the observation on the UTC day of its actual timestamp. Points already
+logged before the cutoff can appear on retry after ingestion. Renders preserve
+`stale` and `pending` flags. History-only recovery
 advances the render generation independently of the public revision and updates
 the cache keys for the Status page, JSON, negotiated snapshot, ledger and row.
 

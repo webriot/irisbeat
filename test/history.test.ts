@@ -249,6 +249,8 @@ it('requires a read from the dataset that received the observation', async () =>
     return Response.json({ data: rows });
   });
   function assertReadback(sql: string) {
+    expect(sql).not.toContain("double2");
+    expect(sql).not.toContain("timestamp <");
     expect(points[0].blobs).toEqual([monitor.id, 'success']);
     expect(sql).toContain("index1 = '" + points[0].indexes?.[0] + "'");
     expect(sql).toContain("AND double1 = " + points[0].doubles?.[0] + " AND blob2 = 'success'");
@@ -258,6 +260,13 @@ it('requires a read from the dataset that received the observation', async () =>
   expect(wrong.status).toBe(503);
   expect(await wrong.json()).toEqual({ ready: false, reason: 'observation_unconfirmed' });
   await request('/__test-history?mode=direct&dataset=irisbeat_availability');
+  outbound.mockImplementationOnce(async () => {
+    return new Response(null, { status: 302, headers: { Location: 'https://redirect.example/' } });
+  });
+  const redirect = await mutate(ready, 'GET');
+  expect(outbound.mock.lastCall?.[1]?.redirect).toBe('manual');
+  expect(redirect.status).toBe(503);
+  expect(await redirect.json()).toEqual({ ready: false, reason: 'query_unavailable' });
   const matched = await mutate(ready, 'GET');
   expect(matched.status).toBe(200);
   expect(await matched.json()).toEqual({ ready: true });
@@ -289,7 +298,7 @@ it('queries only published Monitor IDs, reuses their aggregates, and shares no p
   await tick(today);
   const { points } = await (await request('/__test-history')).json<{ points: AnalyticsEngineDataPoint[] }>();
   expect(points.find(point => point.blobs?.[0] === published.id)).toEqual({
-    indexes: [expect.stringMatching(/^[a-f0-9]{64}$/)], blobs: [published.id, 'success'], doubles: [today, 1],
+    indexes: [expect.stringMatching(/^[a-f0-9]{64}$/)], blobs: [published.id, 'success'], doubles: [today],
   });
   await mutate('/api/operator/monitors/' + deleted.id, 'DELETE');
   await request('/__test-history?mode=direct'); // Keep existing points, disable the managed reader temporarily.
@@ -402,7 +411,7 @@ it('submits a committed Calendar Heartbeat after restart without replaying its o
   clock.mockReturnValue(deadline + 10_001);
   expect(await runDurableObjectAlarm(context)).toBe(true);
   await tick(deadline + 10_001);
-  expect(await points()).toEqual([expect.objectContaining({ blobs: [monitor.id, 'failure'], doubles: [deadline, 1] })]);
+  expect(await points()).toEqual([expect.objectContaining({ blobs: [monitor.id, 'failure'], doubles: [deadline] })]);
 });
 
 it('bounds a dispatch across Monitors and drains overflow after eviction without delaying detection', async () => {

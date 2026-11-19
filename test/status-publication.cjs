@@ -391,7 +391,8 @@ module.exports = async function test({ mf, options, application, cachedSQLite, r
     assert.equal((await readAt('/test-history-queries', publishedAt)).length, 1, 'warm unresolved reads respect the retry deadline');
     await at('/api/operator/monitors/' + first.id, publishedAt + 1500, 'PATCH', { published: false });
     // This later receipt is deliberately backdated into the old day.
-    assert.equal((await at('/heartbeat/' + first.id, day + 3000, 'POST')).status, 204);
+    assert.equal((await at('/test-backdated-heartbeat?id=' + first.id + '&observed-at=' + (day + 3000),
+      publishedAt + 2000, 'POST')).status, 204);
     await history.unsafeEvictDurableObject('irisbeat', 'MonitoringContext', { name: 'personal', webSockets: 'hibernate' });
     await mode('ingested');
     const retryAt = publishedAt + 30_000;
@@ -430,6 +431,55 @@ module.exports = async function test({ mf, options, application, cachedSQLite, r
     assert.deepEqual((await queries()).at(-1).monitorIds, [second.id, third.id]);
     assert.ok(await history.purgeCache() > 0, 'warm recovery repopulates the public cache under a new generation');
   } finally { await history.dispose(); }
+
+  // Recover an older Calendar outcome at the exact boundary, then ingest it late.
+  const deferred = fresh(options(application, 'deferred-history-state', false, undefined, { STATUS_RENDER_INTERVAL_SECONDS: '60' }));
+  try {
+    const midnight = Date.now() - Date.now() % 86_400_000;
+    const cutoff = midnight + 12 * 3_600_000;
+    const actual = midnight - 30_000;
+    const at = (path, time, method = 'GET', body) => deferred.dispatchFetch(origin + path, {
+      method, headers: { authorization: 'Bearer upgrade-test-secret', 'content-type': 'application/json', 'x-test-at': String(time) },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    const json = (path, time) => at(path, time).then(response => response.json());
+    const created = await at('/api/operator/monitors', midnight - 61_000, 'POST', {
+      name: 'Deferred Calendar', kind: 'heartbeat', scheduleMode: 'calendar', cron: '59 23 * * *', timezone: 'UTC', graceSeconds: 30,
+    });
+    assert.equal(created.status, 201);
+    const { monitor } = await created.json();
+    const row = '/api/status/partials/monitor/' + monitor.id;
+    const run = (time, schedule = time) => at('/test-tick?at=' + schedule, time);
+    await at('/test-history-mode?mode=write-rejected', cutoff - 30_000);
+    assert.equal((await run(cutoff - 30_000)).status, 200);
+    const operator = await json('/api/operator', cutoff - 30_000);
+    assert.deepEqual(operator.monitor.lastResult, { at: actual, outcome: 'failure' });
+    assert.equal(operator.incidents.length, 1);
+    await deferred.unsafeEvictDurableObject('irisbeat', 'MonitoringContext', { name: 'personal', webSockets: 'hibernate' });
+    await at('/test-history-mode?mode=lagging', cutoff);
+    assert.equal((await run(cutoff, cutoff - 30_000)).status, 200);
+    const sealed = await json('/api/status', cutoff);
+    assert.equal(sealed.monitor.history.days.at(-2).failures, 0);
+    const sealedHint = (await json('/test-status-published', cutoff)).hint;
+
+    await at('/test-history-mode?mode=ingested', cutoff + 15_000);
+    assert.match((await json(row, cutoff + 15_000)).html, /No observations/);
+    assert.equal((await json('/api/status', cutoff + 15_000)).monitor.history.days.at(-2).failures, 0,
+      'a point logged exactly at the cutoff is excluded, even after it becomes queryable');
+
+    await at('/test-history-mode?mode=lagging', cutoff + 60_000);
+    assert.match((await json(row, cutoff + 60_000)).html, /No observations/);
+    const published = await json('/test-status-published', cutoff + 60_000);
+    assert.deepEqual(published.hint.scopes, ['monitor/' + monitor.id]);
+    assert.ok(published.hint.revision > sealedHint.revision);
+    await at('/test-history-mode?mode=ingested', cutoff + 75_000);
+    assert.match((await json(row, cutoff + 75_000)).html, /0.00%/);
+    const repaired = await json('/api/status', cutoff + 75_000);
+    assert.equal(repaired.monitor.history.days.at(-2).failures, 1, 'the Calendar outcome counts on its actual UTC day');
+    assert.equal(repaired.monitor.history.days.at(-1).failures, 0);
+    assert.deepEqual((await json('/test-history-queries', cutoff + 75_000)).map(query => query.loggedBefore),
+      [cutoff / 1000, cutoff / 1000, (cutoff + 60_000) / 1000, (cutoff + 60_000) / 1000]);
+  } finally { await deferred.dispose(); }
 
   console.log('PASS: Worker upgrade, configurable publication, regional misses, hibernation, unsubscribe, alerts, and tenant isolation');
 };
