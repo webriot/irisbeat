@@ -53,13 +53,13 @@ manifest's full revision is the one you intend to deploy.
 For an unpublished candidate, use the artifacts produced by `release:prepare`
 from its reviewed Git revision instead of a release download.
 Download the engine tarball as well so the checksum command can verify every
-listed file. The commands below use 0.4.1 as an example. Use the version you
+listed file. The commands below use 0.4.2 as an example. Use the version you
 downloaded.
 
 ```sh
 sha256sum --check SHA256SUMS
-tar -xzf irisbeat-0.4.1-source.tar.gz
-cd irisbeat-0.4.1
+tar -xzf irisbeat-0.4.2-source.tar.gz
+cd irisbeat-0.4.2
 npm ci
 npm run check
 npm run build
@@ -394,8 +394,8 @@ These checks use local workerd, controlled time and synthetic recipients.
 
 | Artifact | Use |
 | --- | --- |
-| `irisbeat-0.4.1-source.tar.gz` | Exact committed source, lockfile, config, tests, build/install instructions, LICENSE and NOTICE |
-| `irisbeat-0.4.1.tgz` | TypeScript exports for both Workers, configuration references, integration docs, LICENSE and NOTICE |
+| `irisbeat-0.4.2-source.tar.gz` | Exact committed source, lockfile, config, tests, build/install instructions, LICENSE and NOTICE |
+| `irisbeat-0.4.2.tgz` | TypeScript exports for both Workers, configuration references, integration docs, LICENSE and NOTICE |
 | `release.json` | Full Git revision, version, contract 1, SHA-256 hashes and engine npm SHA-512 integrity |
 | `SHA256SUMS` | SHA-256 integrity for both archives and the manifest |
 

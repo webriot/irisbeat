@@ -22,7 +22,7 @@ tarball and pin its version and integrity in the consuming project.
 
 To verify the integration locally from the source checkout, run `npm ci`,
 `npm run check`, then `npm run test:consumer`. This produces
-`dist/irisbeat-0.4.1.tgz` and `dist/SHA256SUMS`. The test packs twice and compares
+`dist/irisbeat-0.4.2.tgz` and `dist/SHA256SUMS`. The test packs twice and compares
 SHA-256, resolves the exact local version in `test/consumer/package.json`, verifies
 lockfile SHA-512 integrity, installs with offline `npm ci`, typechecks the installed
 package and runs both package exports as separate Workers in local workerd,
