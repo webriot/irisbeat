@@ -406,6 +406,20 @@ module.exports = async function test({ mf, options, application, cachedSQLite, r
       assert.match(html, /100.00%/);
       assert.doesNotMatch(html, /Bars unavailable/);
     }
+    assert.equal((await at('/heartbeat/' + second.id, afterRetries + 1000, 'POST')).status, 204);
+    const queries = () => readAt('/test-history-queries', afterRetries);
+    const queryCount = (await queries()).length;
+    await mode('held');
+    const nextWindow = publishedAt + 86_400_000;
+    const inFlight = readAt(json, nextWindow);
+    await eventually(async () => assert.equal((await queries()).length, queryCount + 1));
+    assert.equal((await at('/api/operator/monitors/' + second.id, nextWindow + 1000, 'PATCH', { published: false })).status, 200);
+    await mode('ingested');
+    const sealed = await inFlight;
+    assert.deepEqual(sealed.monitors.map(monitor => monitor.id), [second.id, third.id],
+      'an Operator edit during a query cannot replace its sealed publication');
+    assert.equal(sealed.monitor.history.days.at(-1).successes, 1);
+    assert.deepEqual((await queries()).at(-1).monitorIds, [second.id, third.id]);
     assert.ok(await history.purgeCache() > 0, 'warm recovery repopulates the public cache under a new generation');
   } finally { await history.dispose(); }
 
