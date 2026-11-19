@@ -216,9 +216,11 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
             (state.contextId !== undefined && scope.contextId !== state.contextId)) {
           socket.close(1008, "Invalid authorization"); return;
         }
-        socket.serializeAttachment({ ...state, ...scope, queued: state.permission === scope.permission ? state.queued : undefined,
+        const samePermission = state.permission === scope.permission;
+        socket.serializeAttachment({ ...state, ...scope, queued: samePermission ? state.queued : undefined,
           audience: "operator", authenticated: true, expiresAt: scope.leaseEndsAt } satisfies Subscription);
-        socket.send("authorized");
+        // Only renewals that name the browser's current permission opt into the continuity acknowledgement.
+        socket.send(samePermission && input.type === "renew" && input.permission === scope.permission ? "renewed" : "authorized");
         this.scheduleSubscriptionAlarm();
         return;
       }

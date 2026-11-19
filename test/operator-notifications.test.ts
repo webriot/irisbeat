@@ -21,7 +21,11 @@ async function subscribe() {
   const response = await worker.fetch(new Request(origin + '/api/operator/events/v2', { headers: { Upgrade: 'websocket', Origin: origin } }), env);
   expect(response.status).toBe(101);
   const socket = response.webSocket!; socket.accept(); sockets.push(socket);
-  const messages: unknown[] = []; socket.addEventListener('message', event => { messages.push(event.data === 'authorized' ? 'authorized' : JSON.parse(String(event.data)).type); });
+  const messages: unknown[] = [];
+  socket.addEventListener('message', event => {
+    const frame = String(event.data);
+    messages.push(frame.startsWith('{') ? JSON.parse(frame).type : frame);
+  });
   return { socket, messages };
 }
 it('authenticates only through the first message, then sends private invalidations without data', async () => {
@@ -89,11 +93,14 @@ it('renews in place across hibernation without resetting coalescing and rejects 
   clock.mockReturnValue(at + 240_000);
   const renewal = await ticket();
   await evictDurableObject(env.MONITORING.getByName('personal'));
-  socket.send(JSON.stringify({ type: 'renew', ticket: renewal.ticket })); await settle();
-  expect(messages).toEqual(['authorized', 'changed', 'authorized']);
+  socket.send(JSON.stringify({ type: 'renew', ticket: renewal.ticket, permission: 'editor' })); await settle();
+  expect(messages).toEqual(['authorized', 'changed', 'renewed']);
   clock.mockReturnValue(at + 300_001);
   await request('/api/operator', 'PUT', { pageName: 'After original expiry' }); await settle();
-  socket.send('ack'); await settle(); expect(messages).toEqual(['authorized', 'changed', 'authorized', 'changed']);
+  socket.send('ack'); await settle(); expect(messages).toEqual(['authorized', 'changed', 'renewed', 'changed']);
+  const mismatchedView = await ticket();
+  socket.send(JSON.stringify({ type: 'renew', ticket: mismatchedView.ticket, permission: 'reader' })); await settle();
+  expect(messages.at(-1)).toBe('authorized');
   const closed = closes(socket);
   socket.send(JSON.stringify({ type: 'renew', ticket: renewal.ticket })); expect(await closed).toBe(1008);
 });
@@ -170,7 +177,7 @@ it('drops pending editor-only updates when a connection renews as a reader', asy
   const { socket, messages } = await subscribe(); socket.send(JSON.stringify({ type: 'auth', ticket: (await issue()).ticket })); await settle();
   await request('/api/operator/webhook', 'PUT', { url: 'https://private.example/first' }); await settle();
   await request('/api/operator/webhook', 'PUT', { url: 'https://private.example/latest' }); await settle();
-  permission = 'reader'; socket.send(JSON.stringify({ type: 'renew', ticket: (await issue()).ticket })); await settle();
+  permission = 'reader'; socket.send(JSON.stringify({ type: 'renew', ticket: (await issue()).ticket, permission: 'reader' })); await settle();
   socket.send('ack'); await settle();
   expect(messages).toEqual(['authorized', 'changed', 'authorized']);
   await request('/api/operator/webhook', 'PUT', { url: 'https://private.example/reader-silent' }); await settle();

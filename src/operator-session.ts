@@ -14,6 +14,7 @@ export type LiveSnapshots = (
   path: string,
   read: (current: () => boolean, hint?: ReadHint) => Promise<boolean | void>,
   authorize: () => Promise<string>,
+  viewPermission: () => OperatorSnapshot['permission'],
 ) => { sync(hint?: ReadHint): void; stop(): void };
 export interface OperatorSessionCallbacks {
   partials(data: OperatorPartial[]): void;
@@ -73,7 +74,7 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, ui: Operator
           if (started !== generation) throw new Error('Session ended');
           return grant.ticket;
         } finally { clearTimeout(timeout); }
-      });
+      }, () => permission);
     },
     unauthorized() { session.signOut(); ui.failed('Unauthorized', false); },
   };
