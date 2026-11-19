@@ -51,8 +51,10 @@ for (const scenario of [
     await expect(page.getByRole('heading', { name: scenario.banner, exact: true })).toBeVisible();
     await expect(ledger.locator('script, img')).toHaveCount(0);
     if (data.monitors.length) {
-      await expect(page.getByRole('heading', { name, level: 2, exact: true })).toBeVisible();
-      await ledger.locator('.history li').first().focus();
+      const monitor = ledger.getByRole('article', { name, exact: true });
+      await expect(monitor.getByRole('heading', { name, level: 2, exact: true })).toBeVisible();
+      await expect(ledger.locator(':scope > .banner ~ .ledger ~ #public-incidents')).toBeVisible();
+      await monitor.locator('.history li').first().focus();
     }
     const before = await ledger.innerHTML();
     const row = data.monitors.length ? await ledger.locator('.ledger > article').first().elementHandle() : null;
