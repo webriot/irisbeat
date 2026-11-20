@@ -140,6 +140,16 @@ it("opens on two observed failures, skips missing executions, and recovers on tw
       await request("/api/operator", { headers: { authorization } })
     ).json(),
   ).toMatchObject(await status());
+
+  const { html: incidentHtml } = await (await request("/api/status/partials/incidents")).json<{ html: string }>();
+  expect(incidentHtml).toContain(new Date(start + 780_000).toISOString());
+  const partials = await request("/api/status/partials?scope=incidents&scope=banner");
+  expect(await partials.json()).toMatchObject({
+    partials: [
+      { scope: "banner", html: expect.stringContaining("All services operational") },
+      { scope: "incidents", html: incidentHtml },
+    ],
+  });
 });
 
 it("renders accessible operator controls and escapes public configuration and Incident times", async () => {

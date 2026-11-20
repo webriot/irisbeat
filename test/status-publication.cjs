@@ -197,6 +197,15 @@ module.exports = async function test({ mf, options, application, cachedSQLite, r
   assert.deepEqual(committed.hint, hint);
   assert.deepEqual(committed.partials.map(([scope, partial]) => [scope, partial.revision]), hint.scopes.map(scope => [scope, hint.revision]));
   assert.deepEqual(committed.partials[0], ['page', publicPage]);
+  const batch = '/api/status/partials?revision=' + hint.revision + '&scope=page&scope=monitor/' + monitor.id + '&scope=monitors&scope=incidents&scope=banner';
+  const batchResponse = await request(batch);
+  assert.equal(batchResponse.status, 200);
+  const expectedPartials = committed.partials.map(([scope, partial]) => ({ scope, html: partial.html }))
+    .sort((a, b) => a.scope.localeCompare(b.scope));
+  assert.deepEqual(await batchResponse.json(), { revision: hint.revision, partials: expectedPartials });
+  assert.deepEqual(await (await request(batch + '&scope=page')).json(), { revision: hint.revision, partials: expectedPartials });
+  assert.equal((await request(batch + '&scope=destinations')).status, 404);
+  assert.equal((await request(batch.replace('revision=' + hint.revision, 'revision=' + (hint.revision + 1)))).status, 409);
   assert.equal((await (await request(row + '?revision=' + hint.revision)).json()).html, '');
   assert.equal((await status()).monitor, null, 'ordinary reads catch up without a hint');
   assert.equal((await (await split('cold.example', fastClock)).json()).monitor, null);

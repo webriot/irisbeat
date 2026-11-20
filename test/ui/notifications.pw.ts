@@ -1,6 +1,48 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { fulfillView } from './view-response';
 import { expect, test } from '@playwright/test';
+
+test('public Status disconnects while hidden and refreshes when visible again', async ({ page }) => {
+  await page.clock.install();
+  await page.addInitScript(() => Object.defineProperty(document, 'hidden', { configurable: true, value: true }));
+  const hide = (hidden: boolean) => page.evaluate(value => {
+    Object.defineProperty(document, 'hidden', { configurable: true, value });
+    document.dispatchEvent(new Event('visibilitychange'));
+  }, hidden);
+  let connections = 0;
+  let disconnections = 0;
+  await page.routeWebSocket('**/api/status/events/v2', socket => {
+    connections++;
+    socket.onClose(() => { disconnections++; });
+  });
+  let reads = 0;
+  let pageName = 'First visible';
+  await page.route('**/api/status', route => {
+    reads++;
+    return fulfillView(route, { json: { pageName, monitors: [] } });
+  });
+
+  await page.goto('/');
+  await page.clock.fastForward(120000);
+  expect(connections).toBe(0);
+  expect(reads).toBe(0);
+  await hide(false);
+  await expect(page).toHaveTitle('First visible');
+  expect(connections).toBe(1);
+  expect(reads).toBe(1);
+
+  await hide(true);
+  await expect.poll(() => disconnections).toBe(1);
+  pageName = 'Changed while hidden';
+  await page.clock.fastForward(120000);
+  expect(connections).toBe(1);
+  expect(reads).toBe(1);
+  await hide(false);
+  await expect(page).toHaveTitle('Changed while hidden');
+  expect(connections).toBe(2);
+  expect(reads).toBe(2);
+});
+
 test('subscribes before resync, coalesces notices and reconnects', async ({ page, request }) => {
   await request.put('/api/operator', { headers: { Authorization: 'Bearer ui-test-secret' }, data: { pageName: 'Initial socket page' } });
   let live!: import('@playwright/test').WebSocketRoute;
@@ -53,6 +95,11 @@ test('real public notifications preserve row identity, history selection and foc
   const saved = await (await request.post('/api/operator/monitors', { headers, data: { name: 'Socket producer', kind: 'heartbeat' } })).json();
   const monitor = saved.monitors.at(-1);
   const path = '/api/operator/monitors/' + monitor.id;
+  const partialRequests: URL[] = [];
+  page.on('request', request => {
+    const url = new URL(request.url());
+    if (url.pathname.startsWith('/api/status/partials')) partialRequests.push(url);
+  });
   try {
     await page.goto('/');
     await expect(page.getByText('Polling', { exact: true })).toBeHidden();
@@ -66,6 +113,8 @@ test('real public notifications preserve row identity, history selection and foc
     const node = await strip.elementHandle();
     await request.patch(path, { headers, data: { name: 'Live renamed producer' } });
     await expect(page.getByText('Live renamed producer', { exact: true })).toBeVisible();
+    expect(partialRequests.map(url => url.pathname)).toEqual(['/api/status/partials']);
+    expect(partialRequests[0].searchParams.getAll('scope')).toEqual(['incidents', 'monitor/' + monitor.id]);
     await expect(strip.locator('[aria-current="true"]')).toHaveAttribute('data-date', selected!);
     await expect(day).toBeFocused();
     expect(await node!.evaluate(element => element.isConnected)).toBe(true);
