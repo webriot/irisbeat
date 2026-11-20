@@ -406,11 +406,16 @@ Maintenance, page settings and pause. Public Monitor IDs already appear in the
 anonymous snapshot. Reader hints also cover private Monitor activity in their
 context. Only editor hints include destination and selection changes.
 
-For each hinted scope, fetch
+For one hinted scope, fetch
 `GET /api/status/partials/<scope>?revision=<revision>` or its authorized
 `/api/operator/partials/<scope>` counterpart. Hono returns `{ revision, html }`
 plus Operator permission and the metadata needed to update actions and preserve
-drafts. A gone or invisible row returns empty HTML, as does an unknown row.
+drafts. For multiple public scopes, fetch
+`GET /api/status/partials?revision=<revision>&scope=<scope>&scope=<scope>`.
+The response is `{ revision, partials: [{ scope, html }] }`. The sections share
+one publication revision, deduplicate scopes, and omit row scopes covered by
+`monitors`. The public batch lists sections in scope name order. A gone or
+invisible row returns empty HTML, as does an unknown row.
 An inaccessible section returns 404. A successful response has a revision at
 least as high as the requested minimum (409 if unavailable). The default
 minimum is zero. Each partial uses the current request's trusted tenant and
@@ -435,9 +440,11 @@ when another refresh is queued, and aborts reads after ten seconds. It preserves
 existing row nodes, history selection and focus. Reconnect delays increase from
 one second to at most thirty seconds (including jitter), with a ten-second handshake
 deadline. Disconnected visible pages poll every sixty seconds and show Polling;
-connected pages stop fallback polling. A failed read retains the last snapshot and
-shows Updates unavailable with Retry, including when the first read fails. Visibility
-return and Retry fetch immediately without reloading. Retry stays disabled while
+connected pages stop fallback polling. A hidden public tab closes its socket and
+pauses refreshes. On return, it reconnects and reads a fresh snapshot, or falls
+back to an HTTP read if the connection fails. A failed read retains the last
+snapshot and shows Updates unavailable with Retry, including when the first read
+fails. Retry fetches without reloading and stays disabled while
 pending; only a successful snapshot read clears the failure. Recovery is announced
 and moves focus from the removed Retry control to the page heading.
 Page exit closes the connection, and returning from the browser page cache resubscribes.

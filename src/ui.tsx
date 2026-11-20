@@ -346,7 +346,7 @@ function fragment(html) {
   return template.content;
 }
 function liveSnapshots(path, read, authorize, viewPermission) {
-  let running, queued, ackSocket;
+  let running, queued, ackSocket, publicRead;
   let socket, retry, handshake, renewal, polling, historyTimer, stopped = false, ready = false, delay = 1000;
   let minimumRevision = 0;
   const historyAttempts = new Map();
@@ -395,13 +395,15 @@ function liveSnapshots(path, read, authorize, viewPermission) {
     }
     running = request;
     const source = socket;
+    const controller = publicRead = authorize ? undefined : new AbortController();
     if (!authorize && !request.history) snapshotPending(true);
     try {
-      const success = await read(() => !stopped && !queued && (request.full || source === socket), request.full ? undefined : request);
-      if (success === false) socket?.close();
+      const success = await read(() => !stopped && (!controller || publicRead === controller) && !queued &&
+        (request.full || source === socket), request.full ? undefined : request, controller);
+      if (success === false && source === socket) socket?.close();
       else if (ready) delay = 1000;
     } finally {
-      running = undefined;
+      running = undefined; publicRead = undefined;
       if (!authorize && !request.history) snapshotPending(false);
       scheduleHistory();
       if (queued && !stopped) {
@@ -421,7 +423,7 @@ function liveSnapshots(path, read, authorize, viewPermission) {
       current.send(JSON.stringify({ type, ticket, permission }));
     } catch { if (current === socket) current.close(); }
   }
-  function connect() {
+  function connect(refreshIfUnavailable = false) {
     if (stopped) return;
     clearTimeout(retry);
     try {
@@ -469,27 +471,38 @@ function liveSnapshots(path, read, authorize, viewPermission) {
       current.onerror = () => current.close();
       current.onclose = () => {
         if (current !== socket) return;
+        const refresh = refreshIfUnavailable && !ready;
         clearTimeout(handshake); clearTimeout(renewal); socket = undefined; ackSocket = undefined; ready = false;
         pollingMode(); reconnect();
+        if (refresh) sync();
       };
-    } catch { pollingMode(); reconnect(); }
+    } catch { pollingMode(); reconnect(); if (refreshIfUnavailable) sync(); }
   }
   function reconnect() {
     if (stopped) return;
     retry = setTimeout(connect, delay + Math.random() * delay * 0.2);
     delay = Math.min(delay * 2, 25000);
   }
-  function visible() { pollingMode(); if (!document.hidden) sync(); }
+  function visible() {
+    if (!authorize && document.hidden) { suspend(); return; }
+    if (!authorize && stopped) { resume(); return; }
+    pollingMode(); if (!document.hidden) sync();
+  }
   function suspend() {
     stopped = true; ready = false; queued = undefined; clearTimeout(retry); clearTimeout(handshake); clearTimeout(renewal); clearInterval(polling); polling = undefined;
     clearTimeout(historyTimer); historyTimer = undefined;
+    publicRead?.abort(); publicRead = undefined;
     const previous = socket; socket = undefined; ackSocket = undefined; previous?.close();
   }
-  function resume() { if (stopped) { stopped = false; pollingMode(); connect(); } }
+  function resume() {
+    if (!stopped || (!authorize && document.hidden)) return;
+    stopped = false; pollingMode(); connect(!authorize);
+  }
   document.addEventListener('visibilitychange', visible);
   window.addEventListener('pagehide', suspend);
   window.addEventListener('pageshow', resume);
-  pollingMode(); connect();
+  if (!authorize && document.hidden) suspend();
+  else { pollingMode(); connect(); }
   return { sync, stop() {
     suspend(); document.removeEventListener('visibilitychange', visible);
     window.removeEventListener('pagehide', suspend); window.removeEventListener('pageshow', resume);
@@ -589,21 +602,27 @@ document.addEventListener('DOMContentLoaded', () => {
     else updateTimeDisplays();
   }, 1000);
   if (document.getElementById('public-status')) {
-    const updates = liveSnapshots('/api/status/events/v2', async (current, hint) => {
-      const controller = new AbortController();
+    const updates = liveSnapshots('/api/status/events/v2', async (current, hint, controller) => {
       const timeout = setTimeout(() => controller.abort(), 10000);
       try {
         if (hint) {
-          const partials = await Promise.all(hint.scopes.map(async scope => {
-            const response = await fetch(partialURL('/api/status', scope, hint.revision), { signal: controller.signal });
-            if (!response.ok) throw new Error('Request failed');
-            const data = await response.json();
-            if (data.revision < hint.revision || !Number.isSafeInteger(data.revision)) throw new Error('Revision unavailable');
-            return [scope, fragment(data.html)];
-          }));
+          const scopes = mergeScopes([], hint.scopes).sort();
+          const batch = scopes.length > 1;
+          const url = batch
+            ? '/api/status/partials?' + new URLSearchParams([['revision', hint.revision], ...scopes.map(scope => ['scope', scope])])
+            : partialURL('/api/status', scopes[0], hint.revision);
+          const response = await fetch(url, { signal: controller.signal });
+          if (!response.ok) throw new Error('Request failed');
+          const data = await response.json();
+          if (data.revision < hint.revision || !Number.isSafeInteger(data.revision)) throw new Error('Revision unavailable');
+          const partials = batch ? data.partials : [{ scope: scopes[0], html: data.html }];
+          if (!Array.isArray(partials) || partials.length !== scopes.length ||
+              partials.some((part, index) => part?.scope !== scopes[index] || typeof part.html !== 'string'))
+            throw new Error('Sections unavailable');
           if (!current()) return;
           const ledger = document.querySelector('#public-status .ledger');
-          for (const [scope, next] of partials) {
+          for (const { scope, html } of partials) {
+            const next = fragment(html);
             if (scope === 'monitors') reconcile(ledger, next);
             else if (scope.startsWith('monitor/')) reconcile(ledger, next, [scope.slice(8)]);
             else {
