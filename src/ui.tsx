@@ -4,6 +4,7 @@
 import type { MonitoringContext, Status } from "./index";
 import { createOperatorSession } from "./operator-session";
 import { createMonitorEditor } from "./monitor-editor";
+import { parseEmailAddress, parseWebhook } from "./notification-jobs";
 import type { Child } from "hono/jsx";
 import { raw } from "hono/html";
 import { createStatusLedger, monitorActions } from "./status-ledger";
@@ -825,6 +826,8 @@ h1 { margin: 24px 0 20px; font-size: 24px; }
 export const operatorScript = `
 const createOperatorSession = ${createOperatorSession.toString()};
 const createMonitorEditor = ${createMonitorEditor.toString()};
+const parseEmailAddress = ${parseEmailAddress.toString()};
+const parseWebhook = ${parseWebhook.toString()};
 const byId = id => document.getElementById(id);
 const login = byId('login');
 const editor = byId('editor');
@@ -845,7 +848,11 @@ const addEmail = byId('add-email');
 const destinationName = byId('destination-name');
 const destinationAddress = byId('destination-address');
 function addressChanged(saved) {
-  return !!saved && destinationAddress.value !== (saved.channel === 'email' ? saved.address : saved.url);
+  if (!saved) return false;
+  const address = saved.channel === 'email' ? saved.address : saved.url;
+  const value = destinationAddress.value;
+  if (value === address) return false;
+  return (saved.channel === 'email' ? parseEmailAddress(value) : parseWebhook(value)) !== address;
 }
 function updateDestinationForm() {
   const saved = destinations.find(destination => destination.id === editingDestination);

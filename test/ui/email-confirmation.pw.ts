@@ -54,7 +54,8 @@ test('Recipients confirm and withdraw a selected inbox from captured mail', asyn
     await expect(edit.getByLabel('Destination name')).toHaveValue(originalName);
     await edit.getByLabel('Email address').fill('replacement@example.net');
     await expect(edit.getByText(/The new email address requires confirmation/)).toBeVisible();
-    await edit.getByLabel('Email address').fill(address);
+    await edit.getByLabel('Email address').fill('ui+confirm@EXAMPLE.NET');
+    await expect(edit.getByText(/The new email address requires confirmation/)).toBeHidden();
     await edit.getByLabel('Destination name').fill(destinationName);
     await edit.getByRole('button', { name: 'Save email' }).click();
     await expect(page.getByRole('button', { name: 'Resend confirmation ' + destinationName })).toBeVisible();

@@ -6,9 +6,10 @@ import { monitorAction } from './actions';
 test('webhook ledger and inline Monitor selections require explicit opt-in', async ({ page, request }) => {
   const headers = { Authorization: 'Bearer ui-test-secret' };
   const tag = 'destinations-' + Date.now();
-  const first = 'https://alerts.example.invalid/' + tag + '/first';
+  const discord = 'https://discord.com/api/webhooks/123/' + tag;
+  const first = discord + '/slack';
   const second = 'https://alerts.example.invalid/' + tag + '/second';
-  const replacement = first + '-replacement';
+  const replacement = discord + '-replacement/slack';
   const firstName = tag + ' First';
   const secondName = tag + ' Second';
   const renamed = tag + ' Renamed';
@@ -70,6 +71,8 @@ test('webhook ledger and inline Monitor selections require explicit opt-in', asy
     await expect(editor.getByLabel('HTTPS webhook URL')).toHaveValue(first);
     await expect(name).toHaveValue(firstName);
     const warning = editor.getByText(/clears its Monitor selections/);
+    await expect(warning).toBeHidden();
+    await url.fill(discord);
     await expect(warning).toBeHidden();
     await name.fill(secondName.toUpperCase());
     await editor.getByRole('button', { name: 'Save webhook' }).click();

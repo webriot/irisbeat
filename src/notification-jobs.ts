@@ -26,6 +26,30 @@ export function parseEmailAddress(value: unknown) {
   return local + "@" + domain.toLowerCase();
 }
 
+export function parseWebhook(value: unknown): string | null | undefined {
+  if (value === "") return null;
+  if (typeof value !== "string" || value.length > 2048 || /\s/.test(value))
+    return undefined;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password || url.hash)
+      return undefined;
+    const discordPath = url.pathname.match(
+      /^(\/api(?:\/v\d+)?\/webhooks\/[^/]+\/[^/]+)(?:\/slack)?\/?$/,
+    );
+    if (
+      /^(?:(?:canary|ptb)\.)?discord(?:app)?\.com$/.test(url.hostname) &&
+      discordPath
+    ) {
+      url.pathname = discordPath[1] + "/slack";
+      return url.href;
+    }
+    return value;
+  } catch {
+    return undefined;
+  }
+}
+
 export type NotificationSelection = {
   destinationId: string;
   generation: string;

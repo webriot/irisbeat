@@ -4,7 +4,7 @@ import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
 import { minimumCheckIntervalSeconds, MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
 import { connect } from "cloudflare:sockets";
-import { parseEmailAddress, type AlertDestination, type ConfirmationIdentity, type ConfirmationJob, type NewNotificationDestination, type NotificationDestination, type NotificationEligibility, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
+import { parseEmailAddress, parseWebhook, type AlertDestination, type ConfirmationIdentity, type ConfirmationJob, type NewNotificationDestination, type NotificationDestination, type NotificationEligibility, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
 import type { NotificationDeliveryIdentity, SubmissionReport } from "./notification-outcomes";
 import { configurationScopes, mergeScopes, monitorScopes, sharedScopes, type ViewAudience, type ViewChanges, type ViewHint, type ViewScope } from "./view-changes";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
@@ -1622,30 +1622,6 @@ async function authorized(request: Request, secret: string | undefined) {
     crypto.subtle.digest("SHA-256", encoder.encode(`Bearer ${secret}`)),
   ]);
   return crypto.subtle.timingSafeEqual(actual, expected);
-}
-
-function parseWebhook(value: unknown): string | null | undefined {
-  if (value === "") return null;
-  if (typeof value !== "string" || value.length > 2048 || /\s/.test(value))
-    return undefined;
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "https:" || url.username || url.password || url.hash)
-      return undefined;
-    const discordPath = url.pathname.match(
-      /^(\/api(?:\/v\d+)?\/webhooks\/[^/]+\/[^/]+)(?:\/slack)?\/?$/,
-    );
-    if (
-      /^(?:(?:canary|ptb)\.)?discord(?:app)?\.com$/.test(url.hostname) &&
-      discordPath
-    ) {
-      url.pathname = discordPath[1] + "/slack";
-      return url.href;
-    }
-    return value;
-  } catch {
-    return undefined;
-  }
 }
 
 function createWorker<E extends EngineEnv = EngineEnv>(adapter?: HostedAdapter<E>) {
