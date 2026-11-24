@@ -82,6 +82,7 @@ type StoredContext = {
   notificationOrder?: number;
 };
 type LegacyContext = { webhookUrl?: string | null; monitor: (Monitor & { pageName: string }) | null };
+type DestinationUpdate = (NewNotificationDestination & { name?: string }) | { name: string };
 
 function nextDestinationName(channel: NewNotificationDestination["channel"], used: Set<string>) {
   const prefix = channel === "email" ? "Email" : "Webhook";
@@ -840,17 +841,20 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return changed;
   }
 
-  async configureDestination(id: string | null, address: (NewNotificationDestination & { name?: string }) | null, legacy = false, origin?: string) {
+  async configureDestination(id: string | null, update: DestinationUpdate | null, legacy = false, origin?: string) {
     const state = this.read();
     const destinationId = legacy ? state.legacyDestinationId : id;
     const destinations = state.destinations ?? [];
     const existing = destinations.find(destination => destination.id === destinationId);
     if (destinationId && !existing) return null;
-    const name = address?.name;
-    const used = new Set(destinations.filter(destination => destination !== existing).map(destination => destination.name.toLowerCase()));
-    if (name && used.has(name.toLowerCase())) return "duplicate-name" as const;
-    if (address?.channel === "webhook" && existing?.channel === "webhook" && existing.url === address.url ||
-        address?.channel === "email" && existing?.channel === "email" && existing.address === address.address) {
+    const name = update?.name;
+    const address = update && "channel" in update ? update : null;
+    const matchingName = name && new RegExp("^" + name.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&") + "$", "iu");
+    if (matchingName && destinations.some(destination => destination !== existing && matchingName.test(destination.name)))
+      return "duplicate-name" as const;
+    const sameAddress = address?.channel === "webhook" && existing?.channel === "webhook" && existing.url === address.url ||
+      address?.channel === "email" && existing?.channel === "email" && existing.address === address.address;
+    if (existing && (sameAddress || (update && !address))) {
       if (!name || name === existing.name) return this.unchangedView("destinations");
       return this.commitViewChanges(() => {
         existing.name = name;
@@ -860,7 +864,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     }
     const replacement = address && {
       id: crypto.randomUUID(), ...(address.channel === "email" ? { ...address, confirmed: false } : address),
-      name: name ?? existing?.name ?? nextDestinationName(address.channel, used),
+      name: name ?? existing?.name ?? nextDestinationName(address.channel, new Set(destinations.map(destination => destination.name.toLowerCase()))),
     };
     let job: ConfirmationJob | undefined;
     if (replacement?.channel === "email") {
@@ -1799,8 +1803,8 @@ function operatorMutationResponse<E extends EngineEnv>(c: Context<HttpEnv<E>>, a
   return operatorSnapshot(c, status, true);
 }
 
-async function readBoundedBody(request: Request) {
-  if (Number(request.headers.get("Content-Length")) > 4096) return null;
+async function readBoundedBody(request: Request, maxBytes = 4096) {
+  if (Number(request.headers.get("Content-Length")) > maxBytes) return null;
   const reader = request.body?.getReader();
   if (!reader) return "";
   const decoder = new TextDecoder();
@@ -1811,7 +1815,7 @@ async function readBoundedBody(request: Request) {
       const { done, value } = await reader.read();
       if (done) return body + decoder.decode();
       bytes += value.length;
-      if (bytes > 4096) {
+      if (bytes > maxBytes) {
         await reader.cancel();
         return null;
       }
@@ -2016,11 +2020,12 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
         { error: "Use application/json" },
         { status: 415 },
       );
-    if (Number(request.headers.get("Content-Length")) > 4096)
+    const maxBytes = c.req.path === destinationsPath || c.req.path.startsWith(destinationsPath + "/") ? 16_384 : 4096;
+    if (Number(request.headers.get("Content-Length")) > maxBytes)
       return new Response(null, { status: 413 });
     const selectedMonitorId = c.req.path === "/api/operator" ? await c.get("context").firstMonitorId() : null;
     c.set("selectedMonitorId", selectedMonitorId);
-    const body = await readBoundedBody(request);
+    const body = await readBoundedBody(request, maxBytes);
     if (body === null) return new Response(null, { status: 413 });
     let value: unknown;
     try {
@@ -2071,8 +2076,11 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     const value = c.get("value");
     const fields = value && typeof value === "object" ? value as Record<string, unknown> : {};
     const name = typeof fields.name === "string" ? fields.name.trim() : undefined;
-    if (fields.name !== undefined && (!name || name.length > 120))
-      return Response.json({ error: "Enter a destination name of up to 120 characters" }, { status: 400 });
+    if (fields.name !== undefined && (!name || name.length > 120 || /[\r\n]/.test(name)))
+      return Response.json({ error: "Enter a destination name of up to 120 characters on one line" }, { status: 400 });
+    const creating = c.req.method === "POST";
+    if (!creating && name && fields.channel === undefined && fields.url === undefined && fields.address === undefined)
+      return destinationResponse(c, await c.get("context").configureDestination(monitorId(c), { name }));
     let destination: NewNotificationDestination & { name?: string };
     let origin: string | undefined;
     if (fields.channel === "email") {
@@ -2086,7 +2094,6 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
         return Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
       destination = { channel: "webhook", url, name };
     }
-    const creating = c.req.method === "POST";
     const result = await c.get("context").configureDestination(creating ? null : monitorId(c), destination, false, origin);
     return destinationResponse(c, result, creating ? 201 : 200);
   };

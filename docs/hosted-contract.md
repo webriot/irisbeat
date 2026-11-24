@@ -166,8 +166,9 @@ automatic traces because fetch spans can include credential-bearing webhook URLs
 
 Editors manage webhook destinations with `POST /api/operator/destinations` and
 `PUT` or `DELETE /api/operator/destinations/:id`. Provide an HTTPS `url` and an
-optional `name` on create and update. Names are trimmed, limited to 120 characters,
-and unique across email and webhook destinations in the context, ignoring case.
+optional `name` on create and address replacement. Send only `{ name }` to rename
+a destination. Names are trimmed, limited to 120 characters on one line, and
+unique across email and webhook destinations in the context, ignoring case.
 Creates without a name receive a unique generated name. Updates without a name
 keep the existing name. The authenticated editor snapshot exposes `destinations`
 and each Monitor's `destinationIds`. Use `PATCH /api/operator/monitors/:id`

@@ -257,7 +257,7 @@ function Operator({ hosted }: { hosted: boolean }) {
           <form id="destination-form" hidden aria-label="Add webhook">
             <label for="destination-name">Destination name</label><input id="destination-name" name="name" required maxlength={120} />
             <label for="destination-address" id="destination-address-label">HTTPS webhook URL</label><input id="destination-address" name="address" type="url" required maxlength={2048} autocomplete="off" />
-            <p id="destination-impact" role="status" hidden></p>
+            <p id="destination-impact" role="status"></p>
             <p id="destination-missing" role="status" hidden>This destination was removed or replaced. Copy your draft or cancel.</p>
             <button id="save-destination">Save webhook</button><button id="cancel-destination" type="button">Cancel</button>
           </form>
@@ -760,6 +760,7 @@ button:disabled { opacity: .5; cursor: wait; }
 form button { margin-top: 16px; }
 form button + button { margin-left: 8px; }
 #destination-form { margin: 12px 0; }
+#destination-impact:empty { margin: 0; }
 #destination-rows { list-style: none; padding: 0; margin: 12px 0 28px; }
 #destination-rows li { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 16px; border-top: 1px solid var(--line); padding: 12px 0; }
 .destination-name, #destination-choices label { overflow-wrap: anywhere; }
@@ -843,17 +844,20 @@ const addWebhook = byId('add-webhook');
 const addEmail = byId('add-email');
 const destinationName = byId('destination-name');
 const destinationAddress = byId('destination-address');
+function addressChanged(saved) {
+  return !!saved && destinationAddress.value !== (saved.channel === 'email' ? saved.address : saved.url);
+}
 function updateDestinationForm() {
   const saved = destinations.find(destination => destination.id === editingDestination);
   const missing = editingDestination !== null && !saved;
   const email = destinationChannel === 'email';
-  const changed = saved && destinationAddress.value !== (email ? saved.address : saved.url);
+  const changed = addressChanged(saved);
   byId('destination-missing').hidden = !missing;
   byId('save-destination').disabled = missing || (email && !emailConfigured && (!saved || changed));
   const impact = byId('destination-impact');
-  impact.hidden = !changed;
-  if (changed) impact.textContent = 'Changing the address replaces this destination and clears its Monitor selections.' +
-    (email ? ' The new email address requires confirmation.' : '');
+  const warning = changed ? 'Changing the address replaces this destination and clears its Monitor selections.' +
+    (email ? ' The new email address requires confirmation.' : '') : '';
+  if (impact.textContent !== warning) impact.textContent = warning;
 }
 function closeDestinationForm(focus = false) {
   const id = editingDestination;
@@ -1093,8 +1097,11 @@ destinationForm.addEventListener('submit', async event => {
   event.preventDefault();
   if (byId('save-destination').disabled) return;
   const id = editingDestination;
-  const value = destinationChannel === 'email' ? { channel: 'email', address: destinationAddress.value } : { url: destinationAddress.value };
-  await run(id ? destinationsPath + '/' + encodeURIComponent(id) : destinationsPath, id ? 'PUT' : 'POST', { ...value, name: destinationName.value }, () => {
+  const saved = destinations.find(destination => destination.id === id);
+  const name = destinationName.value;
+  const address = destinationChannel === 'email' ? { channel: 'email', address: destinationAddress.value } : { url: destinationAddress.value };
+  const value = saved && !addressChanged(saved) ? { name } : { ...address, name };
+  await run(id ? destinationsPath + '/' + encodeURIComponent(id) : destinationsPath, id ? 'PUT' : 'POST', value, () => {
     const add = destinationChannel === 'email' && emailConfigured ? addEmail : addWebhook;
     closeDestinationForm(); queueMicrotask(() => (document.getElementById('edit-' + id) || add).focus());
   });
