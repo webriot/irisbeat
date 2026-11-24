@@ -2,7 +2,7 @@
 import { fulfillView } from './view-response';
 import { expect, test, type WebSocketRoute } from '@playwright/test';
 
-const snapshot = { pageName: 'Private session', destinations: [{ id: 'hook', channel: 'webhook', url: 'https://private.example/hook' }], monitors: [{ id: 'private', name: 'Private Monitor', kind: 'http', url: 'https://private.example', state: 'up', published: false }], incidents: [] };
+const snapshot = { pageName: 'Private session', destinations: [{ id: 'hook', name: 'Private webhook', channel: 'webhook', url: 'https://private.example/hook' }], monitors: [{ id: 'private', name: 'Private Monitor', kind: 'http', url: 'https://private.example', state: 'up', published: false }], incidents: [] };
 async function login(page: import('@playwright/test').Page) {
   await page.goto('/operator'); await page.locator('#secret').fill('ui-test-secret');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();

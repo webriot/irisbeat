@@ -17,6 +17,7 @@ test('operator navigates Settings independently and edits inline through keyboar
     await expect(page.getByRole('table', { name: 'Monitors', exact: true })).toBeHidden();
     await page.getByLabel('Page name', { exact: true }).fill('Independent page');
     await page.getByRole('button', { name: 'Add webhook' }).click();
+    await page.getByLabel('Destination name').fill('Invalid webhook');
     await page.getByLabel('HTTPS webhook URL', { exact: true }).fill('http://invalid.example');
     await page.getByRole('button', { name: 'Save page', exact: true }).click();
     await expect(page.locator('#message')).toHaveText('Saved');

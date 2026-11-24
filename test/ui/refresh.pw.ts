@@ -245,7 +245,7 @@ for (const newerStatus of [200, 503]) {
 
 for (const status of [200, 401, 503]) {
   test(`previous-session ${status} cannot alter a newer sign-in with the same credential`, async ({ page }) => {
-    const data = { pageName: 'Previous session', destinations: [{ id: 'hook', url: 'https://example.com/previous', channel: 'webhook' }], monitors: [], incidents: [] };
+    const data = { pageName: 'Previous session', destinations: [{ id: 'hook', name: 'Previous webhook', url: 'https://example.com/previous', channel: 'webhook' }], monitors: [], incidents: [] };
     await page.route('**/api/operator', route => fulfillView(route, { json: data }));
     await page.goto('/operator');
     await page.locator('#secret').fill('ui-test-secret');
@@ -263,7 +263,7 @@ for (const status of [200, 401, 503]) {
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await expect.poll(() => !!release).toBe(true);
     await page.locator('#logout').click();
-    data.pageName = 'New session'; data.destinations[0].url = 'https://example.com/new';
+    data.pageName = 'New session'; data.destinations[0].name = 'New webhook';
     await page.locator('#secret').fill('ui-test-secret');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
     await expect(page.locator('#pageName')).toHaveValue('New session');
@@ -273,14 +273,14 @@ for (const status of [200, 401, 503]) {
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
     await expect(page.locator('#editor')).toBeVisible();
     await expect(page.locator('#pageName')).toHaveValue('New session');
-    await expect(page.locator('#destination-rows')).toHaveText(/example\.com\/new/);
+    await expect(page.locator('#destination-rows')).toHaveText(/New webhook/);
     await expect(page.locator('#stale')).toBeHidden();
     await expect(page.locator('#message')).toBeEmpty();
   });
 }
 
 test('refreshes unedited Settings and treats saved values as the starting point for new edits', async ({ page }) => {
-  const data = { pageName: 'Original', monitors: [], incidents: [], destinations: [{ id: 'hook', url: 'https://example.com/original', channel: 'webhook' }] };
+  const data = { pageName: 'Original', monitors: [], incidents: [], destinations: [{ id: 'hook', name: 'Original webhook', url: 'https://example.com/original', channel: 'webhook' }] };
   await page.route('**/api/operator', route => fulfillView(route, { json: data }));
   await page.goto('/operator');
   await page.locator('#secret').fill('ui-test-secret');
@@ -312,7 +312,7 @@ test('refreshes unedited Settings and treats saved values as the starting point 
 for (const dirty of [false, true]) {
   test(`reader downgrade clears ${dirty ? 'draft' : 'saved'} webhook destinations before promotion`, async ({ page }) => {
     const privateUrl = 'https://example.com/private';
-    const destination = { id: 'hook', url: privateUrl, channel: 'webhook' };
+    const destination = { id: 'hook', name: 'Private webhook', url: privateUrl, channel: 'webhook' };
     const data = { pageName: 'Hosted', hosted: true, permission: 'editor', destinations: [destination], monitors: [
       { id: 'hosted', name: 'Hosted Monitor', kind: 'heartbeat', state: 'up', destinationIds: ['hook'] },
     ], incidents: [] };
@@ -321,18 +321,18 @@ for (const dirty of [false, true]) {
     await page.locator('#secret').fill('ui-editor');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
     await monitorAction(page, 'Edit Hosted Monitor');
-    await expect(page.getByRole('checkbox', { name: privateUrl })).toBeChecked();
+    await expect(page.getByRole('checkbox', { name: destination.name })).toBeChecked();
     await page.locator('#settings-button').click();
-    const replace = page.getByRole('button', { name: 'Replace ' + privateUrl, exact: true });
-    await expect(replace).toBeVisible();
+    const edit = page.getByRole('button', { name: 'Edit ' + destination.name, exact: true });
+    await expect(edit).toBeVisible();
     if (dirty) {
-      await replace.click();
+      await edit.click();
       await page.getByLabel('HTTPS webhook URL').fill(privateUrl + '-draft');
     }
     data.permission = 'reader'; data.destinations = [];
     if (dirty) {
       await page.route('**/api/operator/destinations/hook', route => route.fulfill({ status: 403, json: { error: 'Forbidden' } }));
-      await page.getByRole('button', { name: 'Replace webhook', exact: true }).click();
+      await page.getByRole('button', { name: 'Save webhook', exact: true }).click();
     } else {
       await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     }
@@ -344,9 +344,9 @@ for (const dirty of [false, true]) {
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await page.locator('#settings-button').click();
     await expect(page.getByText('No destinations', { exact: true }).filter({ visible: true })).toBeVisible();
-    data.destinations = [{ ...destination, id: 'new', url: 'https://example.com/newly-authorized' }];
+    data.destinations = [{ ...destination, id: 'new', name: 'Newly authorized webhook', url: 'https://example.com/newly-authorized' }];
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
-    await expect(page.getByRole('button', { name: 'Replace https://example.com/newly-authorized' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Edit Newly authorized webhook' })).toBeVisible();
   });
 }
 

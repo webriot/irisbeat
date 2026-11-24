@@ -38,13 +38,27 @@ test('Recipients confirm and withdraw a selected inbox from captured mail', asyn
     await add.focus();
     await page.keyboard.press('Enter');
     const address = 'ui+confirm@example.net';
+    const originalName = 'Email alerts';
+    const destinationName = 'Production email';
     const editor = page.getByRole('form', { name: 'Add email', exact: true });
-    await expect(editor.getByLabel('Email address')).toBeFocused();
+    await expect(editor.getByLabel('Destination name')).toBeFocused();
     await expect(editor.getByRole('heading')).toHaveCount(0);
+    await editor.getByLabel('Destination name').fill(originalName);
     await page.getByLabel('Email address').fill(address);
     await page.getByRole('button', { name: 'Save email' }).click();
     await expect(page.getByText('Pending confirmation')).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Resend confirmation ' + address })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Resend confirmation ' + originalName })).toBeVisible();
+    await page.getByRole('button', { name: 'Edit ' + originalName }).click();
+    const edit = page.getByRole('form', { name: 'Edit email' });
+    await expect(edit.getByLabel('Email address')).toHaveValue(address);
+    await expect(edit.getByLabel('Destination name')).toHaveValue(originalName);
+    await edit.getByLabel('Email address').fill('replacement@example.net');
+    await expect(edit.getByText(/The new email address requires confirmation/)).toBeVisible();
+    await edit.getByLabel('Email address').fill('ui+confirm@EXAMPLE.NET');
+    await expect(edit.getByText(/The new email address requires confirmation/)).toBeHidden();
+    await edit.getByLabel('Destination name').fill(destinationName);
+    await edit.getByRole('button', { name: 'Save email' }).click();
+    await expect(page.getByRole('button', { name: 'Resend confirmation ' + destinationName })).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 
     const recipient = await browser.newPage();
@@ -59,7 +73,7 @@ test('Recipients confirm and withdraw a selected inbox from captured mail', asyn
       await expect(recipient.getByRole('heading', { name: 'Confirm email notifications' })).toBeVisible();
       await expect(page.getByText('Pending confirmation')).toBeVisible();
       await page.getByRole('button', { name: 'Monitors', exact: true }).click();
-      const choice = page.getByRole('checkbox', { name: address, exact: true });
+      const choice = page.getByRole('checkbox', { name: destinationName, exact: true });
       await expect(choice).toHaveCount(0);
       await recipient.getByRole('button', { name: 'Confirm email' }).focus();
       await recipient.keyboard.press('Enter');
@@ -94,7 +108,7 @@ test('Recipients confirm and withdraw a selected inbox from captured mail', asyn
       await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
       await expect(choice).toHaveCount(0);
       await page.getByRole('button', { name: 'Settings', exact: true }).click();
-      await expect(page.getByText(address, { exact: true })).toHaveCount(0);
+      await expect(page.getByText(destinationName, { exact: true })).toHaveCount(0);
     } finally {
       await recipient.close();
     }

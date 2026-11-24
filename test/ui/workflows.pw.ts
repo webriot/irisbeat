@@ -86,10 +86,11 @@ test('hosted editor rotates Heartbeat credentials and reader sees a read-only le
     expect((await request.post(origin + '/heartbeat', { headers: { Authorization: authorization! } })).status()).toBe(204);
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     await page.getByRole('button', { name: 'Add webhook' }).click();
+    const destination = 'Hosted alerts';
+    await page.getByLabel('Destination name').fill(destination);
     await page.getByLabel('HTTPS webhook URL').fill('https://alerts.example.invalid/hosted-private-token');
     await page.getByRole('button', { name: 'Save webhook' }).click();
-    const destination = 'https://alerts.example.invalid/hosted-private-token';
-    await expect(page.getByRole('button', { name: 'Replace ' + destination })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Edit ' + destination })).toBeVisible();
     await page.getByRole('button', { name: 'Monitors', exact: true }).click();
     const selection = page.getByRole('checkbox', { name: destination, exact: true });
     await selection.check();

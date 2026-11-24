@@ -173,11 +173,13 @@ above. Keep automatic traces disabled on that Worker because
 Workers Logs still capture sanitized submission failures. `npm run build:delivery`
 dry-runs the bundle and `npm run test:delivery` exercises both Workers locally.
 
-In Operator Settings, choose Add webhook under Notification destinations. Then
-edit each Monitor that should send Incident notifications, check the desired
-destinations, and save the Monitor. Upgraded webhooks retain their address and
-start unselected on every Monitor. Removing a webhook or replacing its address
-clears its selections. Slack-compatible messages include the Monitor
+In Operator Settings, choose **Add webhook** under **Notification destinations**
+and enter a name and URL. Edit each Monitor that should send Incident notifications,
+choose destinations by name, and save the Monitor. Existing destinations receive
+generated names and keep their selections. Use **Edit** to rename a destination
+or change its address. Changing the address or removing the destination clears
+its selections. A replacement email address requires confirmation.
+Slack-compatible messages include the Monitor
 name, the transition and its original UTC time. The monitoring and delivery Workers can run with webhook bindings alone.
 Declare, replace or end per-Monitor Maintenance in its ledger. Checks continue,
 Incident detection and Incident alerts are suppressed, and Incidents are retained.
@@ -339,8 +341,8 @@ installed Worker.
   named `NOTIFICATION_EMAIL` pointing to the delivery Worker's
   `NotificationEmailCapability` entrypoint. The Workers can first be deployed with
   webhooks, then the monitoring Worker can be redeployed with the optional reverse binding.
-- Open Operator Settings and choose **Add email**. The recipient opens the message
-  and clicks **Confirm email** on the confirmation page. The inbox can then be
+- Open Operator Settings, choose **Add email**, and enter a name and email address.
+  The recipient opens the message and clicks **Confirm email**. The inbox can then be
   selected on individual Monitors. Pending inboxes offer **Resend confirmation**.
   Resending replaces the previous link. The five-minute cooldown applies within
   the installation even if the inbox is removed and re-added.

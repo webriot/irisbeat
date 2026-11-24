@@ -62,7 +62,7 @@ for (const floor of [180, 60]) {
     };
     const snapshot = {
       pageName: 'Floor test', minCheckIntervalSeconds: floor, incidents: [], monitors: [monitor],
-      destinations: [{ id: 'webhook', channel: 'webhook', url: 'https://hooks.example/alert' }],
+      destinations: [{ id: 'webhook', name: 'Calendar alerts', channel: 'webhook', url: 'https://hooks.example/alert' }],
     };
     await renderOperatorFixture(page, snapshot, monitor.id);
     await page.route('**/api/operator/schedule-preview', route => {
@@ -78,7 +78,7 @@ for (const floor of [180, 60]) {
     await monitorAction(page, 'Edit Calendar site');
     await expect(page.locator('#schedule-explanation')).toContainText(floor === 180 ? '180 seconds' : 'Calendar preview');
     await page.getByLabel('Monitor name', { exact: true }).fill('Renamed Calendar');
-    await page.getByRole('checkbox', { name: /hooks.example/ }).check();
+    await page.getByRole('checkbox', { name: 'Calendar alerts' }).check();
     const saveRequest = () => page.waitForRequest(request =>
       request.method() === 'PATCH' && request.url().endsWith('/monitors/calendar'), { timeout: 3000 });
     const save = saveRequest();

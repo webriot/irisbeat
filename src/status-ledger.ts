@@ -59,9 +59,9 @@ export function createStatusLedger() {
       }).join('');
     },
     destinationActions(destination: { channel: string; confirmed?: boolean }, emailConfigured: boolean) {
-      if (destination.channel !== 'email') return ['Replace', 'Remove'];
-      if (!emailConfigured) return ['Remove'];
-      return destination.confirmed ? ['Replace', 'Remove'] : ['Resend confirmation', 'Replace', 'Remove'];
+      return destination.channel === 'email' && emailConfigured && !destination.confirmed
+        ? ['Resend confirmation', 'Edit', 'Remove']
+        : ['Edit', 'Remove'];
     },
     submissionLabel(result: { status: string; reason?: string }) {
       const reasons: Record<string, string> = {

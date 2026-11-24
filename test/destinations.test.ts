@@ -32,6 +32,40 @@ const destinations = "/api/operator/destinations";
 const monitors = "/api/operator/monitors";
 afterEach(async () => { await reset(); });
 
+it("validates names and keeps them across restarts and older address replacements", async () => {
+  const url = "https://hooks.example/alerts";
+  for (const name of [" ", "a".repeat(121), "Ops\nAlerts", null]) {
+    expect((await api(destinations, "POST", { url, name })).status).toBe(400);
+  }
+  const [named] = (await status(api(destinations, "POST", { url, name: "  WEBHOOK 1  " }), 201)).destinations!;
+  expect(named).toMatchObject({ name: "WEBHOOK 1" });
+  expect((await api(destinations, "POST", { url, name: "webhook 1" })).status).toBe(409);
+  const [, generated] = (await status(api(destinations, "POST", { url }), 201)).destinations!;
+  expect(generated).toMatchObject({ name: "Webhook 2" });
+  expect((await api(destinations + "/" + generated.id, "PUT", { url, name: "webhook 1" })).status).toBe(409);
+  await evictDurableObject(env.MONITORING.getByName("personal"));
+  expect((await status(api(destinations))).destinations).toEqual([named, generated]);
+  const replacement = (await status(api(destinations + "/" + generated.id, "PUT", { url: url + "/new" }))).destinations![1];
+  expect(replacement).toMatchObject({ name: "Webhook 2", url: url + "/new" });
+  expect(replacement.id).not.toBe(generated.id);
+  expect((await api(destinations, "POST", { url, name: "σ alerts" })).status).toBe(201);
+  expect((await api(destinations, "POST", { url, name: "ς ALERTS" })).status).toBe(409);
+});
+
+it("accepts long webhook URLs with names and can rename without resubmitting the address", async () => {
+  const url = "https://hooks.example/" + "é".repeat(1950);
+  const name = "運".repeat(120);
+  const [webhook] = (await status(api(destinations, "POST", { url, name }), 201)).destinations!;
+  expect(webhook).toMatchObject({ name, url });
+
+  const discord = "https://discord.com/api/webhooks/123/";
+  const longDiscordUrl = discord.padEnd(2048, "x");
+  const [, saved] = (await status(api(destinations, "POST", { url: longDiscordUrl }), 201)).destinations!;
+  expect(saved).toMatchObject({ url: longDiscordUrl + "/slack" });
+  const renamed = await status(api(destinations + "/" + saved.id, "PUT", { name: "Discord" }));
+  expect(renamed.destinations![1]).toMatchObject({ id: saved.id, url: longDiscordUrl + "/slack", name: "Discord" });
+});
+
 it("stores explicit Monitor selections and clears them on address replacement or removal", async () => {
   const created = await status(api(monitors, "POST", { kind: "heartbeat", name: "Producer" }), 201);
   const monitor = monitors + "/" + created.monitor!.id;
@@ -46,7 +80,11 @@ it("stores explicit Monitor selections and clears them on address replacement or
   expect((await api(monitor, "PATCH", { name: "Rejected", destinationIds: ["missing"] })).status).toBe(400);
   await evictDurableObject(env.MONITORING.getByName("personal"));
   expect((await status(api(destinations))).monitor).toMatchObject({ name: "Producer", destinationIds: selections });
-  const replaced = await status(api(destinations + "/" + discord.id, "PUT", { url: "https://hooks.example/new" }));
+  const renamed = await status(api(destinations + "/" + discord.id, "PUT", { url: discord.channel === "webhook" && discord.url, name: "Discord" }));
+  expect(renamed.destinations![0]).toMatchObject({ id: discord.id, name: "Discord" });
+  expect(renamed.monitor!.destinationIds).toEqual(selections);
+  const replaced = await status(api(destinations + "/" + discord.id, "PUT", { url: "https://hooks.example/new", name: "New webhook" }));
+  expect(replaced.destinations![0]).toMatchObject({ name: "New webhook" });
   expect(replaced.destinations!.map(item => item.id)).not.toContain(discord.id);
   expect(replaced.monitor!.destinationIds).toEqual([slack.id]);
   const removed = await status(api(destinations + "/" + slack.id, "DELETE"));

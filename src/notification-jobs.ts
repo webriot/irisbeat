@@ -7,7 +7,7 @@ export type NewNotificationDestination = {
   address: string;
 };
 
-export type NotificationDestination = { id: string } & (
+export type NotificationDestination = { id: string; name: string } & (
   Extract<NewNotificationDestination, { channel: "webhook" }> |
   (Extract<NewNotificationDestination, { channel: "email" }> & { confirmed: boolean })
 );
@@ -24,6 +24,30 @@ export function parseEmailAddress(value: unknown) {
       !/^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:[.][a-z0-9!#$%&'*+/=?^_`{|}~-]+)*$/i.test(local) ||
       !domain.split(".").every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label))) return null;
   return local + "@" + domain.toLowerCase();
+}
+
+export function parseWebhook(value: unknown): string | null | undefined {
+  if (value === "") return null;
+  if (typeof value !== "string" || value.length > 2048 || /\s/.test(value))
+    return undefined;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password || url.hash)
+      return undefined;
+    const discordPath = url.pathname.match(
+      /^(\/api(?:\/v\d+)?\/webhooks\/[^/]+\/[^/]+)(?:\/slack)?\/?$/,
+    );
+    if (
+      /^(?:(?:canary|ptb)\.)?discord(?:app)?\.com$/.test(url.hostname) &&
+      discordPath
+    ) {
+      url.pathname = discordPath[1] + "/slack";
+      return url.href;
+    }
+    return value;
+  } catch {
+    return undefined;
+  }
 }
 
 export type NotificationSelection = {

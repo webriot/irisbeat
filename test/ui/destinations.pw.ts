@@ -6,9 +6,14 @@ import { monitorAction } from './actions';
 test('webhook ledger and inline Monitor selections require explicit opt-in', async ({ page, request }) => {
   const headers = { Authorization: 'Bearer ui-test-secret' };
   const tag = 'destinations-' + Date.now();
-  const first = 'https://alerts.example.invalid/' + tag + '/first';
+  const discord = 'https://discord.com/api/webhooks/123/' + tag;
+  const first = discord + '/slack';
   const second = 'https://alerts.example.invalid/' + tag + '/second';
-  const replacement = first + '-replacement';
+  const replacement = discord + '-replacement/slack';
+  const firstName = tag + ' First';
+  const secondName = tag + ' Second';
+  const renamed = tag + ' Renamed';
+  const replacementName = tag + ' Replacement';
   const ledger = page.getByRole('list', { name: 'Notification destinations' });
   const snapshot = async () => (await request.get('/api/operator', { headers })).json();
 
@@ -21,16 +26,20 @@ test('webhook ledger and inline Monitor selections require explicit opt-in', asy
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     const add = page.getByRole('button', { name: 'Add webhook' });
     const url = page.getByLabel('HTTPS webhook URL');
-    for (const address of [first, second]) {
+    const name = page.getByLabel('Destination name');
+    for (const [address, label] of [[first, firstName], [second, secondName]]) {
       await add.focus();
       await page.keyboard.press('Enter');
-      await expect(url).toBeFocused();
+      await expect(name).toBeFocused();
+      await expect(name).toHaveAttribute('required', '');
+      await name.fill(label);
       const editor = page.getByRole('form', { name: 'Add webhook', exact: true });
       await expect(editor.getByLabel('HTTPS webhook URL')).toBeVisible();
       await expect(editor.getByRole('heading')).toHaveCount(0);
       await url.fill(address);
       await page.getByRole('button', { name: 'Save webhook' }).click();
-      await expect(ledger.getByText(address, { exact: true })).toBeVisible();
+      await expect(ledger.getByText(label, { exact: true })).toBeVisible();
+      await expect(ledger.getByText(address, { exact: true })).toHaveCount(0);
       await expect(add).toBeFocused();
     }
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
@@ -42,8 +51,8 @@ test('webhook ledger and inline Monitor selections require explicit opt-in', asy
     await page.getByRole('button', { name: 'Save Monitor' }).click();
     await monitorAction(page, 'Edit ' + tag);
     const choices = page.getByRole('group', { name: 'Notification destinations' });
-    const firstChoice = choices.getByRole('checkbox', { name: first, exact: true });
-    const secondChoice = choices.getByRole('checkbox', { name: second, exact: true });
+    const firstChoice = choices.getByRole('checkbox', { name: firstName, exact: true });
+    const secondChoice = choices.getByRole('checkbox', { name: secondName, exact: true });
     await expect(firstChoice).not.toBeChecked();
     await expect(secondChoice).not.toBeChecked();
     await firstChoice.focus();
@@ -56,24 +65,45 @@ test('webhook ledger and inline Monitor selections require explicit opt-in', asy
     await expect(secondChoice).toBeChecked();
 
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
-    await page.getByRole('button', { name: 'Replace ' + first, exact: true }).click();
-    await expect(url).toBeFocused();
-    const editor = page.getByRole('form', { name: 'Replace webhook', exact: true });
-    await expect(editor.getByLabel('HTTPS webhook URL')).toBeVisible();
-    await expect(editor.getByRole('heading')).toHaveCount(0);
-    await url.fill(replacement);
-    await page.getByRole('button', { name: 'Replace webhook' }).click();
-    await expect(ledger.getByText(replacement, { exact: true })).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Replace ' + first, exact: true })).toHaveCount(0);
+    await page.getByRole('button', { name: 'Edit ' + firstName, exact: true }).click();
+    await expect(name).toBeFocused();
+    const editor = page.getByRole('form', { name: 'Edit webhook', exact: true });
+    await expect(editor.getByLabel('HTTPS webhook URL')).toHaveValue(first);
+    await expect(name).toHaveValue(firstName);
+    const warning = editor.getByText(/clears its Monitor selections/);
+    await expect(warning).toBeHidden();
+    await url.fill(discord);
+    await expect(warning).toBeHidden();
+    await name.fill(secondName.toUpperCase());
+    await editor.getByRole('button', { name: 'Save webhook' }).click();
+    await expect(page.getByRole('status').filter({ hasText: 'A destination with this name already exists' })).toBeVisible();
+    await name.fill(renamed);
+    await editor.getByRole('button', { name: 'Save webhook' }).click();
+    const editRenamed = page.getByRole('button', { name: 'Edit ' + renamed, exact: true });
+    await expect(editRenamed).toBeFocused();
     await page.getByRole('button', { name: 'Monitors', exact: true }).click();
-    await expect(choices.getByRole('checkbox', { name: replacement, exact: true })).not.toBeChecked();
+    await expect(choices.getByRole('checkbox', { name: renamed, exact: true })).toBeChecked();
+
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await editRenamed.click();
+    await name.fill(replacementName);
+    await url.fill(replacement);
+    await expect(warning).toBeVisible();
+    await url.fill(first);
+    await expect(warning).toBeHidden();
+    await url.fill(replacement);
+    await editor.getByRole('button', { name: 'Save webhook' }).click();
+    await expect(ledger.getByText(replacementName, { exact: true })).toBeVisible();
+    await expect(editRenamed).toHaveCount(0);
+    await page.getByRole('button', { name: 'Monitors', exact: true }).click();
+    await expect(choices.getByRole('checkbox', { name: replacementName, exact: true })).not.toBeChecked();
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     page.once('dialog', dialog => dialog.dismiss());
-    await page.getByRole('button', { name: 'Remove ' + replacement, exact: true }).click();
-    await expect(page.getByRole('button', { name: 'Remove ' + replacement, exact: true })).toBeFocused();
+    await page.getByRole('button', { name: 'Remove ' + replacementName, exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Remove ' + replacementName, exact: true })).toBeFocused();
     page.once('dialog', dialog => dialog.accept());
-    await page.getByRole('button', { name: 'Remove ' + replacement, exact: true }).click();
-    await expect(ledger.getByText(replacement, { exact: true })).toHaveCount(0);
+    await page.getByRole('button', { name: 'Remove ' + replacementName, exact: true }).click();
+    await expect(ledger.getByText(replacementName, { exact: true })).toHaveCount(0);
 
     await page.getByRole('button', { name: 'Monitors', exact: true }).click();
     await expect(firstChoice).toHaveCount(0);
@@ -97,10 +127,11 @@ test('webhook ledger and inline Monitor selections require explicit opt-in', asy
 test('Monitor selection drafts survive refresh and save failure alongside concurrent selections', async ({ page, request }) => {
   const headers = { Authorization: 'Bearer ui-test-secret' };
   const tag = 'concurrent-' + Date.now();
-  const addresses = ['local', 'remote', 'unseen'].map(part => 'https://alerts.example.invalid/' + tag + '/' + part);
+  const names = ['local', 'remote', 'unseen'].map(part => tag + '-' + part);
   const ids: string[] = [];
-  for (const url of addresses) {
-    const response = await request.post('/api/operator/destinations', { headers, data: { url } });
+  for (const name of names) {
+    const url = 'https://alerts.example.invalid/' + name;
+    const response = await request.post('/api/operator/destinations', { headers, data: { url, name } });
     expect(response.status()).toBe(201);
     ids.push((await response.json()).destinations.find((destination: { url: string }) => destination.url === url).id);
   }
@@ -113,7 +144,7 @@ test('Monitor selection drafts survive refresh and save failure alongside concur
     await page.getByLabel('Installation secret').fill('ui-test-secret');
     await page.getByRole('button', { name: 'Sign in' }).click();
     await monitorAction(page, 'Edit ' + tag);
-    const [local, remote, unseen] = addresses.map(name => page.getByRole('checkbox', { name, exact: true }));
+    const [local, remote, unseen] = names.map(name => page.getByRole('checkbox', { name, exact: true }));
     const name = page.getByLabel('Monitor name', { exact: true });
     await name.fill(tag + ' draft');
     await local.check();
@@ -172,7 +203,7 @@ test('a rejected Monitor save refreshes a destination removed during Live update
     await expect(page.locator('#updates-mode')).toBeHidden();
     await expect(page.locator('#retry')).toBeEnabled();
     await monitorAction(page, 'Edit ' + tag);
-    const choice = page.getByRole('checkbox', { name: url, exact: true });
+    const choice = page.getByRole('checkbox', { name: destination.name, exact: true });
     const name = page.getByLabel('Monitor name', { exact: true });
     const save = page.getByRole('button', { name: 'Save Monitor' });
     await name.fill(tag + ' draft');
@@ -212,7 +243,7 @@ test('Settings preserves webhook and page drafts across independent saves, failu
   const draft = 'https://example.invalid/draft';
   let data = {
     pageName: 'Status',
-    destinations: [{ id: 'original', channel: 'webhook', url: original }],
+    destinations: [{ id: 'original', name: 'Original webhook', channel: 'webhook', url: original }],
     monitors: [],
     incidents: [],
   };
@@ -227,48 +258,54 @@ test('Settings preserves webhook and page drafts across independent saves, failu
   await page.getByRole('button', { name: 'Sign in' }).click();
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
 
-  const originalAction = page.getByRole('button', { name: 'Replace ' + original, exact: true });
+  const originalAction = page.getByRole('button', { name: 'Edit Original webhook', exact: true });
   const pageName = page.getByLabel('Page name');
   const url = page.getByLabel('HTTPS webhook URL');
   const refresh = () => page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await originalAction.focus();
-  data.destinations = [...data.destinations, { id: 'current', channel: 'webhook', url: current }];
+  data.destinations = [...data.destinations, { id: 'current', name: 'Current webhook', channel: 'webhook', url: current }];
   await refresh();
-  const currentAction = page.getByRole('button', { name: 'Replace ' + current, exact: true });
+  const currentAction = page.getByRole('button', { name: 'Edit Current webhook', exact: true });
   await expect(currentAction).toBeVisible();
   await expect(originalAction).toBeFocused();
   await originalAction.click();
+  const name = page.getByLabel('Destination name');
+  await name.fill('Draft webhook');
   await url.fill(draft);
   await pageName.fill('Saved page');
   await page.getByRole('button', { name: 'Save page' }).click();
   await expect(page.getByRole('status').filter({ hasText: /^Saved$/ })).toBeVisible();
   await expect(url).toHaveValue(draft);
+  await expect(name).toHaveValue('Draft webhook');
 
   await pageName.fill('Page draft');
-  const replace = page.getByRole('button', { name: 'Replace webhook', exact: true });
-  await replace.click();
+  const save = page.getByRole('button', { name: 'Save webhook', exact: true });
+  await save.click();
   await expect(page.getByRole('status').filter({ hasText: 'Save unavailable' })).toBeVisible();
-  await expect(replace).toBeFocused();
+  await expect(save).toBeFocused();
   await expect(url).toHaveValue(draft);
+  await expect(name).toHaveValue('Draft webhook');
   await expect(pageName).toHaveValue('Page draft');
 
   data.destinations = data.destinations.filter(destination => destination.id !== 'original');
   await url.focus();
   await refresh();
   await expect(originalAction).toHaveCount(0);
-  await expect(replace).toBeDisabled();
+  await expect(save).toBeDisabled();
   await expect(url).toBeFocused();
   await expect(url).toHaveValue(draft);
+  await expect(name).toHaveValue('Draft webhook');
   await page.getByRole('button', { name: 'Cancel', exact: true }).click();
 
   await page.getByRole('button', { name: 'Add webhook' }).click();
+  await name.fill('Saved webhook');
   await url.fill(draft);
   await page.route('**/api/operator/destinations', route => {
-    data.destinations.push({ id: 'saved', channel: 'webhook', url: route.request().postDataJSON().url });
+    data.destinations.push({ id: 'saved', channel: 'webhook', ...route.request().postDataJSON() });
     return fulfillView(route, { status: 201, json: data });
   });
   await page.getByRole('button', { name: 'Save webhook', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'Replace ' + draft, exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Edit Saved webhook', exact: true })).toBeVisible();
   await expect(pageName).toHaveValue('Page draft');
 });
 
@@ -277,9 +314,9 @@ test('Settings distinguishes provider acceptance, retries and terminal failure',
   await page.route('**/api/operator', route => fulfillView(route, { json: {
     pageName: 'Status', monitors: [], incidents: [],
     destinations: [
-      { id: 'ok', channel: 'webhook', url: 'https://alerts.example/ok', latestSubmission: { status: 'accepted', at } },
-      { id: 'retry', channel: 'webhook', url: 'https://alerts.example/retry', latestSubmission: { status: 'retrying', reason: 'rate_limited', at } },
-      { id: 'failed', channel: 'webhook', url: 'https://alerts.example/failed', latestSubmission: { status: 'failed', reason: 'attempts_exhausted', at } },
+      { id: 'ok', name: 'Accepted', channel: 'webhook', url: 'https://alerts.example/ok', latestSubmission: { status: 'accepted', at } },
+      { id: 'retry', name: 'Retrying', channel: 'webhook', url: 'https://alerts.example/retry', latestSubmission: { status: 'retrying', reason: 'rate_limited', at } },
+      { id: 'failed', name: 'Failed', channel: 'webhook', url: 'https://alerts.example/failed', latestSubmission: { status: 'failed', reason: 'attempts_exhausted', at } },
     ],
   } }));
   await page.setViewportSize({ width: 320, height: 900 });
@@ -288,7 +325,7 @@ test('Settings distinguishes provider acceptance, retries and terminal failure',
   await page.getByRole('button', { name: 'Sign in' }).click();
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   const ledger = page.getByRole('list', { name: 'Notification destinations' });
-  const accepted = ledger.getByRole('listitem').filter({ hasText: 'https://alerts.example/ok' });
+  const accepted = ledger.getByRole('listitem').filter({ has: page.getByRole('button', { name: 'Edit Accepted', exact: true }) });
   await expect(accepted.getByText('Submission accepted', { exact: true })).toBeVisible();
   await expect(accepted.locator('time')).toHaveAttribute('datetime', new Date(at).toISOString());
   await expect(ledger.getByText('Submission failed · Retrying · Provider rate limit', { exact: true })).toBeVisible();
