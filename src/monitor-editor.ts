@@ -198,8 +198,8 @@ export function createMonitorEditor(form: EditorForm, session: EditorSession, fo
         label.setAttribute('data-key', destination.id);
         const input = document.createElement('input');
         input.type = 'checkbox'; input.name = 'destinationId'; input.value = destination.id;
-        const address = document.createElement('span'); address.textContent = destination.channel === 'email' ? destination.address : destination.url;
-        label.append(input, address);
+        const name = document.createElement('span'); name.textContent = destination.name;
+        label.append(input, name);
         return label;
       }));
       for (const input of form.querySelectorAll('[name="destinationId"]')) {

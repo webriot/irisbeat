@@ -165,18 +165,23 @@ results. Keep Workers Logs enabled on the delivery Worker and disable
 automatic traces because fetch spans can include credential-bearing webhook URLs.
 
 Editors manage webhook destinations with `POST /api/operator/destinations` and
-`PUT` or `DELETE /api/operator/destinations/:id`. Provide an HTTPS `{ url }` for
-creates and replacements. The authenticated editor snapshot exposes `destinations`
+`PUT` or `DELETE /api/operator/destinations/:id`. Provide an HTTPS `url` and an
+optional `name` on create and update. Names are trimmed, limited to 120 characters,
+and unique across email and webhook destinations in the context, ignoring case.
+Creates without a name receive a unique generated name. Updates without a name
+keep the existing name. The authenticated editor snapshot exposes `destinations`
 and each Monitor's `destinationIds`. Use `PATCH /api/operator/monitors/:id`
 with `{ destinationIds: [...] }` to replace the list or `{ destinationChanges: { [id]: true | false } }`
 to change individual selections atomically. `true` requires a saved webhook or a confirmed inbox, `false` removes the selection if present, and omitted IDs retain
 their current selection. Use one selection field per request.
-A new Monitor starts with zero selections. The previous webhook setting upgrades
-to an unselected destination and its compatibility endpoint manages that entry.
+A new Monitor starts with zero selections. Existing destinations receive generated
+names and keep their selections. The previous single-webhook setting upgrades to
+an unselected destination and its compatibility endpoint manages that entry.
 
 HTTP, TCP and Heartbeat share post-commit Incident and Maintenance enqueueing. A job carries stable
-event and delivery IDs, original event time and safe rendering data. Address
-changes replace the destination identity and clear prior selections. A failed
+event and delivery IDs, original event time and safe rendering data. Name changes
+preserve destination identity and selections. Address changes replace the
+destination identity and clear prior selections. A failed
 enqueue logs `notification_enqueue_failed` and leaves the change committed.
 Queue acceptance starts durable delivery for webhooks, email confirmations and alert emails.
 The consumer calls the trusted `resolveAlert` RPC for webhook and email alerts.
@@ -255,10 +260,10 @@ from trusted configuration in both request and scheduled resolution. Resolve una
 context. Recipient credentials remain in the link's fragment until the recipient submits the form
 and are excluded from status snapshots and Queue payloads.
 
-Editors use the same destination create and replace routes with
-`{ channel: "email", address }`. Editor snapshots report `emailConfigured: true`
+Editors use the same destination create and update routes with
+`{ channel: "email", address, name }`. Editor snapshots report `emailConfigured: true`
 when email setup is available and expose email destinations as
-`{ id, channel: "email", address, confirmed }`. A pending destination can
+`{ id, channel: "email", name, address, confirmed }`. A pending destination can
 be resent via `POST /api/operator/destinations/:id/confirmation`.
 Removal and replacement clear the original invitation and selections. The
 five-minute cooldown is per inbox within the context. Confirmation requires an

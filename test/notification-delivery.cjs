@@ -401,6 +401,7 @@ async function main(runFixture, emailEnabled = true, upgrade, packageName) {
       });
       for (const host of hosts) {
         const { destinations: [destination] } = await json(host, path, 'POST', { channel: 'email', address }, 201);
+        const { destinations: [, webhook] } = await json(host, path, 'POST', { url: 'https://hooks.example/legacy' }, 201);
         const message = await until(async () => {
           if (completedBatches !== batches.length) return;
           return (await capturedMail()).find(capture => capture.to.includes(address) &&
@@ -415,7 +416,7 @@ async function main(runFixture, emailEnabled = true, upgrade, packageName) {
         const snapshot = await json(host, monitors + '/' + monitor.id, 'PATCH', { destinationIds: [destination.id] });
         assert.equal(snapshot.destinations[0].confirmed, true);
         assert.deepEqual(snapshot.monitor.destinationIds, [destination.id]);
-        selected.push({ destination, monitor, messageId: message.messageId });
+        selected.push({ destination, webhook, monitor, messageId: message.messageId });
       }
       await mf.setOptions(convertV4MiniflareOptions(options));
 
@@ -448,10 +449,21 @@ async function main(runFixture, emailEnabled = true, upgrade, packageName) {
       assert.equal((await recipient(hosted.link)).status, 200);
       assert.equal((await recipient(hosted.link)).status, 400);
       const personalStatus = await json(hosts[0], '/api/operator');
-      assert.equal(personalStatus.destinations[0].confirmed, true);
+      const [email, webhook] = personalStatus.destinations;
+      assert.equal(email.confirmed, true);
+      assert.equal(email.name, 'Email 1');
+      assert.equal(email.id, selected[0].destination.id);
+      assert.equal(webhook.name, 'Webhook 1');
+      assert.equal(webhook.id, selected[0].webhook.id);
       assert.deepEqual(personalStatus.monitor.destinationIds, [selected[0].destination.id]);
+      assert.equal((await request(hosts[0], path, 'POST', { url: 'https://hooks.example/duplicate', name: 'EMAIL 1' })).status, 409);
+      const renamed = await json(hosts[0], path + '/' + email.id, 'PUT', { channel: 'email', address, name: 'Operations' });
+      assert.equal(renamed.destinations[0].name, 'Operations');
+      assert.equal(renamed.destinations[0].confirmed, true);
+      assert.equal(renamed.destinations[0].id, email.id);
+      assert.deepEqual(renamed.monitor.destinationIds, [email.id]);
       const hostedStatus = await json(hosts[1], '/api/operator');
-      assert.deepEqual(hostedStatus.destinations, []);
+      assert.deepEqual(hostedStatus.destinations.map(({ id, name }) => ({ id, name })), [{ id: selected[1].webhook.id, name: 'Webhook 1' }]);
       assert.deepEqual(hostedStatus.monitor.destinationIds, []);
       console.log('PASS confirmation-only Worker upgrade: first Incident email without Operator traffic and context-scoped withdrawal');
       return;
@@ -1208,7 +1220,10 @@ async function main(runFixture, emailEnabled = true, upgrade, packageName) {
       const added = await json('personal.example', path, 'POST', email(inbox), 201);
       assert.equal(added.emailConfigured, true);
       const pending = added.destinations.find(destination => destination.channel === 'email');
+      assert.equal(pending.name, 'Email 1');
       assert.equal(pending.confirmed, false);
+      const renamed = await json('personal.example', path + '/' + pending.id, 'PUT', { ...email(inbox), name: 'Operations inbox' });
+      assert.equal(renamed.destinations.find(destination => destination.id === pending.id).name, 'Operations inbox');
       const { monitor } = await json('personal.example', monitors, 'POST', { name: 'Email opt-in', kind: 'heartbeat' }, 201);
       const monitorPath = monitors + '/' + monitor.id;
       assert.equal((await request('personal.example', monitorPath, 'PATCH', { destinationIds: [pending.id] })).status, 400);
@@ -1235,7 +1250,9 @@ async function main(runFixture, emailEnabled = true, upgrade, packageName) {
       await json('personal.example', monitorPath, 'PATCH', { destinationIds: [pending.id] });
       const replacement = await json('personal.example', path + '/' + pending.id, 'PUT', email('replacement@example.net'));
       assert.deepEqual(replacement.monitor.destinationIds, []);
-      assert.equal(replacement.destinations.find(destination => destination.address === 'replacement@example.net').confirmed, false);
+      const newInbox = replacement.destinations.find(destination => destination.address === 'replacement@example.net');
+      assert.equal(newInbox.confirmed, false);
+      assert.equal(newInbox.name, 'Operations inbox');
       await until(async () => completedBatches === batches.length && (await capturedMail()).length === 2);
 
       const consentHost = 'consent-tenant.example';
@@ -1716,9 +1733,11 @@ async function main(runFixture, emailEnabled = true, upgrade, packageName) {
     assert.equal((await alertMail(secondAddress)).length, beforeStale, 'reselection cannot revive a retrying alert');
     const replacementAddress = 'replacement-alert@example.net';
     await holdTransition(alertHost, async () => {
-      const replacement = await json(alertHost, path + '/' + second.id, 'PUT', { channel: 'email', address: replacementAddress });
+      const replacement = await json(alertHost, path + '/' + second.id, 'PUT', { channel: 'email', address: replacementAddress, name: 'Replacement email' });
       const pending = replacement.destinations.find(destination => destination.address === replacementAddress);
       assert.equal(pending.confirmed, false);
+      assert.equal(pending.name, 'Replacement email');
+      assert.notEqual(pending.id, second.id);
       assert.deepEqual(replacement.monitors.find(item => item.id === emailMonitor.id).destinationIds, []);
       assert.equal((await request(alertHost, emailMonitorPath, 'PATCH', { destinationIds: [pending.id] })).status, 400);
       const oldLink = new URL(secondWithdrawal);

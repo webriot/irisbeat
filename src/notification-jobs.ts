@@ -7,7 +7,7 @@ export type NewNotificationDestination = {
   address: string;
 };
 
-export type NotificationDestination = { id: string } & (
+export type NotificationDestination = { id: string; name: string } & (
   Extract<NewNotificationDestination, { channel: "webhook" }> |
   (Extract<NewNotificationDestination, { channel: "email" }> & { confirmed: boolean })
 );

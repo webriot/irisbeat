@@ -83,11 +83,10 @@ function PublicRow({ monitor }: { monitor: ViewMonitor }) {
 function DestinationRows({ destinations, emailConfigured }: { destinations: NonNullable<Status["destinations"]>; emailConfigured: boolean }) {
   return <>{destinations.map(destination => {
     const email = destination.channel === "email";
-    const value = email ? destination.address : destination.url;
     const submission = destination.latestSubmission;
     return <li data-key={destination.id}>
       <div class="destination-details">
-        <div class="destination-address">{value}</div>
+        <div class="destination-name">{destination.name}</div>
         {email && <div>{destination.confirmed ? "Confirmed" : "Pending confirmation"}</div>}
         {submission && <div class="destination-submission">
           <span>{statusLedger.submissionLabel(submission)}</span>{" · "}
@@ -95,8 +94,8 @@ function DestinationRows({ destinations, emailConfigured }: { destinations: NonN
         </div>}
       </div>
       <div class="destination-actions">{statusLedger.destinationActions(destination, emailConfigured).map(label =>
-        <button type="button" id={label === "Replace" ? `replace-${destination.id}` : undefined} data-action={label}
-          class={label === "Remove" ? "danger" : undefined} aria-label={`${label} ${value}`}>{label}</button>)}</div>
+        <button type="button" id={label === "Edit" ? `edit-${destination.id}` : undefined} data-action={label}
+          class={label === "Remove" ? "danger" : undefined} aria-label={`${label} ${destination.name}`}>{label}</button>)}</div>
     </li>;
   })}</>;
 }
@@ -255,11 +254,12 @@ function Operator({ hosted }: { hosted: boolean }) {
         </section>
         <section aria-labelledby="destinations-heading">
           <div class="operator-heading"><h2 id="destinations-heading">Notification destinations</h2><div class="destination-actions"><button id="add-email" type="button" hidden>Add email</button><button id="add-webhook" type="button">Add webhook</button></div></div>
-          <form id="webhook" hidden aria-label="Add webhook">
+          <form id="destination-form" hidden aria-label="Add webhook">
+            <label for="destination-name">Destination name</label><input id="destination-name" name="name" required maxlength={120} />
             <label for="destination-address" id="destination-address-label">HTTPS webhook URL</label><input id="destination-address" name="address" type="url" required maxlength={2048} autocomplete="off" />
-            <p id="webhook-impact" hidden></p>
+            <p id="destination-impact" role="status" hidden></p>
             <p id="destination-missing" role="status" hidden>This destination was removed or replaced. Copy your draft or cancel.</p>
-            <button id="save-webhook">Save webhook</button><button id="cancel-webhook" type="button">Cancel</button>
+            <button id="save-destination">Save webhook</button><button id="cancel-destination" type="button">Cancel</button>
           </form>
           <p id="no-destinations">No destinations</p>
           <ul id="destination-rows" aria-label="Notification destinations"></ul>
@@ -740,7 +740,7 @@ tbody tr:nth-child(odd) td { padding-bottom: 0; }
 #page-configuration { margin-bottom: 24px; }
 #configuration { margin: 16px 0; }
 form, aside { min-width: 0; }
-#configuration, #maintenance, #webhook, #page-configuration, #login { border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; background: var(--card); }
+#configuration, #maintenance, #destination-form, #page-configuration, #login { border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; background: var(--card); }
 #configuration, #maintenance { background: var(--secondary); }
 #maintenance-dialog { width: min(480px, calc(100% - 32px)); padding: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); color: var(--foreground); }
 #maintenance-dialog::backdrop { background: #0006; }
@@ -759,10 +759,10 @@ button:hover, summary:hover { background: var(--secondary); }
 button:disabled { opacity: .5; cursor: wait; }
 form button { margin-top: 16px; }
 form button + button { margin-left: 8px; }
-#webhook { margin: 12px 0; }
+#destination-form { margin: 12px 0; }
 #destination-rows { list-style: none; padding: 0; margin: 12px 0 28px; }
 #destination-rows li { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 16px; border-top: 1px solid var(--line); padding: 12px 0; }
-.destination-address, #destination-choices label { overflow-wrap: anywhere; }
+.destination-name, #destination-choices label { overflow-wrap: anywhere; }
 .destination-details { min-width: 0; display: grid; gap: 4px; }
 .destination-submission { font-size: .875rem; }
 .destination-actions { display: flex; flex-wrap: wrap; gap: 8px; }
@@ -829,77 +829,76 @@ const login = byId('login');
 const editor = byId('editor');
 const form = byId('configuration');
 const pageForm = byId('page-configuration');
-const webhook = byId('webhook');
+const destinationForm = byId('destination-form');
 const maintenanceForm = byId('maintenance');
 const message = byId('message');
 let savedPageName = '';
 let destinations = [];
-let destinationUses = new Map();
-let replacingDestination = null;
+let editingDestination = null;
 let destinationChannel = 'webhook';
 let emailConfigured = false;
 const destinationsPath = '/api/operator/destinations';
 const destinationRows = byId('destination-rows');
 const addWebhook = byId('add-webhook');
 const addEmail = byId('add-email');
+const destinationName = byId('destination-name');
 const destinationAddress = byId('destination-address');
-function updateWebhook() {
-  const missing = replacingDestination !== null && !destinations.some(destination => destination.id === replacingDestination);
+function updateDestinationForm() {
+  const saved = destinations.find(destination => destination.id === editingDestination);
+  const missing = editingDestination !== null && !saved;
+  const email = destinationChannel === 'email';
+  const changed = saved && destinationAddress.value !== (email ? saved.address : saved.url);
   byId('destination-missing').hidden = !missing;
-  byId('save-webhook').disabled = missing || (destinationChannel === 'email' && !emailConfigured);
-  const count = destinationUses.get(replacingDestination) || 0;
-  const impact = byId('webhook-impact');
-  impact.hidden = !count || webhook.hidden;
-  impact.textContent = count && !webhook.hidden ? count + (count === 1 ? ' Monitor will' : ' Monitors will') + ' lose this selection if the address changes.' : '';
+  byId('save-destination').disabled = missing || (email && !emailConfigured && (!saved || changed));
+  const impact = byId('destination-impact');
+  impact.hidden = !changed;
+  if (changed) impact.textContent = 'Changing the address replaces this destination and clears its Monitor selections.' +
+    (email ? ' The new email address requires confirmation.' : '');
 }
-function closeWebhook(focus = false) {
-  const id = replacingDestination;
+function closeDestinationForm(focus = false) {
+  const id = editingDestination;
   const add = destinationChannel === 'email' && emailConfigured ? addEmail : addWebhook;
-  replacingDestination = null;
-  webhook.reset(); webhook.hidden = true; updateWebhook();
-  if (focus) (document.getElementById('replace-' + id) || add).focus();
+  editingDestination = null;
+  destinationForm.reset(); destinationForm.hidden = true; updateDestinationForm();
+  if (focus) (document.getElementById('edit-' + id) || add).focus();
 }
 function openDestination(channel, destination) {
   const id = destination?.id ?? null;
-  if (!webhook.hidden && replacingDestination === id && destinationChannel === channel) { destinationAddress.focus(); return; }
-  replacingDestination = id;
+  if (!destinationForm.hidden && editingDestination === id && destinationChannel === channel) { destinationName.focus(); return; }
+  editingDestination = id;
   destinationChannel = channel;
   const email = channel === 'email';
+  destinationName.value = destination?.name ?? '';
   destinationAddress.type = email ? 'email' : 'url';
   destinationAddress.maxLength = email ? 254 : 2048;
   destinationAddress.value = (email ? destination?.address : destination?.url) ?? '';
   byId('destination-address-label').textContent = email ? 'Email address' : 'HTTPS webhook URL';
-  webhook.setAttribute('aria-label', (destination ? 'Replace ' : 'Add ') + channel);
-  byId('save-webhook').textContent = destination ? 'Replace ' + channel : email ? 'Save email' : 'Save webhook';
-  webhook.hidden = false; updateWebhook(); destinationAddress.focus();
+  destinationForm.setAttribute('aria-label', (destination ? 'Edit ' : 'Add ') + channel);
+  byId('save-destination').textContent = email ? 'Save email' : 'Save webhook';
+  destinationForm.hidden = false; updateDestinationForm(); destinationName.focus();
 }
 function bindDestinationActions(row, destination) {
   const path = destinationsPath + '/' + encodeURIComponent(destination.id);
-  const value = destination.channel === 'email' ? destination.address : destination.url;
   const actions = {
-    Replace: () => openDestination(destination.channel, destination),
+    Edit: () => openDestination(destination.channel, destination),
     'Resend confirmation': () => run(path + '/confirmation', 'POST'),
     Remove: () => {
-      if (confirm('Remove ' + value + '? Monitors will lose this selection.')) {
+      if (confirm('Remove ' + destination.name + '? Monitors will lose this selection.')) {
         run(path, 'DELETE', undefined, () => queueMicrotask(() => addWebhook.focus()));
       }
     },
   };
   row.querySelectorAll('button').forEach(button => { button.onclick = actions[button.dataset.action]; });
 }
-function renderDestinations(next, monitors, markup) {
+function renderDestinations(next, markup) {
   destinations = next;
-  destinationUses = new Map();
-  for (const monitor of monitors) for (const id of monitor.destinationIds ?? []) {
-    destinationUses.set(id, (destinationUses.get(id) || 0) + 1);
-  }
   const focused = document.activeElement;
   const focusedRow = destinationRows.contains(focused);
   const rows = markup ? [...markup.children] : [];
   rows.forEach((row, index) => bindDestinationActions(row, destinations[index]));
   reconcileNodes(destinationRows, rows);
   byId('no-destinations').hidden = destinations.length !== 0;
-  updateWebhook();
+  updateDestinationForm();
   if (focusedRow && destinationRows.contains(focused) && document.activeElement !== focused) focused.focus();
   else if (focusedRow && !focused.isConnected) addWebhook.focus();
 }
@@ -936,7 +935,7 @@ function clearSession() {
   document.querySelectorAll('button, input, select').forEach(control => { control.disabled = false; });
   monitorIds.clear(); selectedHistoryDays.clear(); byId('stale').hidden = true; byId('sync-announcement').textContent = ''; snapshotPending(false);
   emailConfigured = false; addEmail.hidden = true;
-  savedPageName = ''; monitorEditor.close(); monitorEditor.refreshDestinations([]); renderDestinations([], []); byId('heartbeat-path').textContent = ''; maintenanceForm.reset(); maintenanceForm.removeAttribute('data-monitor-id'); byId('maintenance-heading').textContent = 'Maintenance'; maintenanceForm.hidden = true; pageForm.reset(); closeWebhook(); editor.hidden = true; login.hidden = false;
+  savedPageName = ''; monitorEditor.close(); monitorEditor.refreshDestinations([]); renderDestinations([]); byId('heartbeat-path').textContent = ''; maintenanceForm.reset(); maintenanceForm.removeAttribute('data-monitor-id'); byId('maintenance-heading').textContent = 'Maintenance'; maintenanceForm.hidden = true; pageForm.reset(); closeDestinationForm(); editor.hidden = true; login.hidden = false;
   showSettings(false); byId('operator-navigation').hidden = true;
 
   byId('monitor-rows').replaceChildren(); byId('incidents').replaceChildren();
@@ -979,7 +978,7 @@ function renderOperatorPartials(partials, savedField) {
     else if (scope === 'incidents') reconcile(byId('incidents'), next);
     else if (scope === 'destinations') {
       emailConfigured = data.emailConfigured; addEmail.hidden = !emailConfigured;
-      renderDestinations(data.destinations, data.selections, next);
+      renderDestinations(data.destinations, next);
       monitorEditor.refreshDestinations(destinations, data.selections.find(monitor => monitor.id === monitorEditor.id)?.destinationIds);
     } else {
       monitorFloor = data.minCheckIntervalSeconds ?? 60;
@@ -1012,7 +1011,7 @@ function renderOperatorSnapshot(data, savedField) {
   hosted = data.hosted;
   const canEdit = data.permission === 'editor';
   if (!canEdit) {
-    monitorEditor.close(); closeMaintenance(); closeWebhook(); showSettings(false);
+    monitorEditor.close(); closeMaintenance(); closeDestinationForm(); showSettings(false);
   }
   byId('new-monitor').hidden = !canEdit || !byId('settings').hidden; byId('settings-button').hidden = !canEdit || !byId('settings').hidden;
   renderOperatorPartials(data.partials, initial ? 'pageName' : savedField);
@@ -1040,7 +1039,7 @@ const session = createOperatorSession(liveSnapshots, mergeScopes, {
     message.textContent = ''; byId('maintenance-error').textContent = '';
     return () => {
       disabled.forEach(control => { control.disabled = false; });
-      updateDeleted(); updateWebhook();
+      updateDeleted(); updateDestinationForm();
       if (!editor.hidden && document.activeElement === document.body) {
         if (focused?.matches('button, input, select') && !focused.disabled && !focused.closest('[hidden]')) focused.focus();
         if (document.activeElement === document.body) byId(byId('new-monitor').hidden ? 'operator-title' : 'new-monitor').focus();
@@ -1088,15 +1087,16 @@ byId('maintenance-dialog').addEventListener('cancel', event => { event.preventDe
 byId('end-maintenance').addEventListener('click', () => { if (monitorIds.has(maintenanceForm.dataset.monitorId)) run('/api/operator/monitors/' + encodeURIComponent(maintenanceForm.dataset.monitorId) + '/maintenance', 'DELETE', undefined, closeMaintenance); });
 addWebhook.addEventListener('click', () => openDestination('webhook'));
 addEmail.addEventListener('click', () => openDestination('email'));
-byId('cancel-webhook').addEventListener('click', () => closeWebhook(true));
-webhook.addEventListener('submit', async event => {
+byId('cancel-destination').addEventListener('click', () => closeDestinationForm(true));
+destinationAddress.addEventListener('input', updateDestinationForm);
+destinationForm.addEventListener('submit', async event => {
   event.preventDefault();
-  if (byId('save-webhook').disabled) return;
-  const id = replacingDestination;
+  if (byId('save-destination').disabled) return;
+  const id = editingDestination;
   const value = destinationChannel === 'email' ? { channel: 'email', address: destinationAddress.value } : { url: destinationAddress.value };
-  await run(id ? destinationsPath + '/' + encodeURIComponent(id) : destinationsPath, id ? 'PUT' : 'POST', value, () => {
-    const add = destinationChannel === 'email' ? addEmail : addWebhook;
-    closeWebhook(); queueMicrotask(() => add.focus());
+  await run(id ? destinationsPath + '/' + encodeURIComponent(id) : destinationsPath, id ? 'PUT' : 'POST', { ...value, name: destinationName.value }, () => {
+    const add = destinationChannel === 'email' && emailConfigured ? addEmail : addWebhook;
+    closeDestinationForm(); queueMicrotask(() => (document.getElementById('edit-' + id) || add).focus());
   });
 });
 pageForm.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator', 'PUT', { pageName: byId('pageName').value }); });

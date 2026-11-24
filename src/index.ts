@@ -83,6 +83,13 @@ type StoredContext = {
 };
 type LegacyContext = { webhookUrl?: string | null; monitor: (Monitor & { pageName: string }) | null };
 
+function nextDestinationName(channel: NewNotificationDestination["channel"], used: Set<string>) {
+  const prefix = channel === "email" ? "Email" : "Webhook";
+  let number = 1;
+  while (used.has(`${prefix.toLowerCase()} ${number}`)) number++;
+  return `${prefix} ${number}`;
+}
+
 type OperatorSubscription = { audience: "operator"; origin: string; expiresAt: number } & (
   | { authenticated: false; contextId?: never; permission?: never }
   | { authenticated: true; contextId: string; permission: "reader" | "editor" }
@@ -647,7 +654,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       const now = Date.now();
       const expireThrough = Math.max(at, now);
       stored.monitors = stored.monitors.map(monitor => { monitor.kind ??= "http"; return { ...timingDefaults, scheduleMode: "interval", ...monitor, createdAt: monitor.createdAt ?? 0, lastSeen: monitor.lastSeen ?? null, recoveryReceiptAt: monitor.recoveryReceiptAt ?? null }; });
-      const migrated = this.migrateWebhook(stored);
+      const migrated = this.migrateDestinations(stored);
       const expired = stored.monitors.flatMap(monitor => {
         const window = monitor.maintenance;
         return window && expireThrough >= window.endsAt ? [{ monitor, window, order: 0 }] : [];
@@ -726,7 +733,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       const { pageName: _pageName, ...monitor } = stored.monitor;
       state.monitors.push({ ...timingDefaults, scheduleMode: "interval", ...monitor, createdAt: monitor.createdAt ?? 0, lastSeen: monitor.lastSeen ?? null, recoveryReceiptAt: monitor.recoveryReceiptAt ?? null, published: true });
     }
-    this.migrateWebhook(state);
+    this.migrateDestinations(state);
     this.ctx.storage.transactionSync(() => {
       if (stored.monitor) this.ctx.storage.sql.exec(
         "UPDATE incidents SET monitorName = ? WHERE monitorId = ? AND monitorName IS NULL",
@@ -812,27 +819,48 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return this.monitorConfigurations.create(value, limit);
   }
 
-  private migrateWebhook(state: StoredContext) {
-    if (state.webhookUrl === undefined) return false;
+  private migrateDestinations(state: StoredContext) {
+    let changed = state.webhookUrl !== undefined;
     if (state.webhookUrl) {
       const id = crypto.randomUUID();
       state.legacyDestinationId = id;
-      state.destinations = [{ id, channel: "webhook", url: state.webhookUrl }];
+      state.destinations = [{ id, name: "Webhook 1", channel: "webhook", url: state.webhookUrl }];
     }
     delete state.webhookUrl;
-    return true;
+    const destinations = state.destinations ?? [];
+    if (destinations.some(destination => !destination.name)) {
+      const used = new Set(destinations.flatMap(destination => destination.name ? [destination.name.toLowerCase()] : []));
+      for (const destination of destinations) {
+        if (destination.name) continue;
+        destination.name = nextDestinationName(destination.channel, used);
+        used.add(destination.name.toLowerCase());
+      }
+      changed = true;
+    }
+    return changed;
   }
 
-  async configureDestination(id: string | null, address: NewNotificationDestination | null, legacy = false, origin?: string) {
+  async configureDestination(id: string | null, address: (NewNotificationDestination & { name?: string }) | null, legacy = false, origin?: string) {
     const state = this.read();
     const destinationId = legacy ? state.legacyDestinationId : id;
     const destinations = state.destinations ?? [];
     const existing = destinations.find(destination => destination.id === destinationId);
     if (destinationId && !existing) return null;
+    const name = address?.name;
+    const used = new Set(destinations.filter(destination => destination !== existing).map(destination => destination.name.toLowerCase()));
+    if (name && used.has(name.toLowerCase())) return "duplicate-name" as const;
     if (address?.channel === "webhook" && existing?.channel === "webhook" && existing.url === address.url ||
-        address?.channel === "email" && existing?.channel === "email" && existing.address === address.address) return this.unchangedView("destinations");
+        address?.channel === "email" && existing?.channel === "email" && existing.address === address.address) {
+      if (!name || name === existing.name) return this.unchangedView("destinations");
+      return this.commitViewChanges(() => {
+        existing.name = name;
+        this.ctx.storage.kv.put("context", state);
+        return { editor: ["destinations"] };
+      });
+    }
     const replacement = address && {
       id: crypto.randomUUID(), ...(address.channel === "email" ? { ...address, confirmed: false } : address),
+      name: name ?? existing?.name ?? nextDestinationName(address.channel, used),
     };
     let job: ConfirmationJob | undefined;
     if (replacement?.channel === "email") {
@@ -2031,9 +2059,10 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     if (destination === undefined) return Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
     return destinationResponse(c, await c.get("context").configureDestination(null, destination ? { channel: "webhook", url: destination } : null, true));
   });
-  function destinationResponse(c: Context<HttpEnv<E>>, result: MutationAck | null | "duplicate" | "unconfigured" | "cooldown" | "paused", status = 200) {
+  function destinationResponse(c: Context<HttpEnv<E>>, result: MutationAck | null | "duplicate" | "duplicate-name" | "unconfigured" | "cooldown" | "paused", status = 200) {
     if (result === "unconfigured") return Response.json({ error: "Email sending is unavailable" }, { status: 503 });
     if (result === "duplicate") return Response.json({ error: "This inbox is already a destination" }, { status: 409 });
+    if (result === "duplicate-name") return Response.json({ error: "A destination with this name already exists" }, { status: 409 });
     if (result === "paused") return Response.json({ error: "Confirmation is paused" }, { status: 409 });
     if (result === "cooldown") return Response.json({ error: "Wait five minutes between confirmations for this inbox" }, { status: 429 });
     return result ? operatorMutationResponse(c, result, status) : Response.json({ error: "Destination not found" }, { status: 404 });
@@ -2041,19 +2070,21 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   const saveDestination = async (c: Context<HttpEnv<E>>) => {
     const value = c.get("value");
     const fields = value && typeof value === "object" ? value as Record<string, unknown> : {};
-    let destination: NewNotificationDestination;
+    const name = typeof fields.name === "string" ? fields.name.trim() : undefined;
+    if (fields.name !== undefined && (!name || name.length > 120))
+      return Response.json({ error: "Enter a destination name of up to 120 characters" }, { status: 400 });
+    let destination: NewNotificationDestination & { name?: string };
     let origin: string | undefined;
     if (fields.channel === "email") {
       const address = parseEmailAddress(fields.address);
       if (!address) return Response.json({ error: "Enter an email address" }, { status: 400 });
       origin = await confirmationOrigin(c);
-      if (!origin) return destinationResponse(c, "unconfigured");
-      destination = { channel: "email", address };
+      destination = { channel: "email", address, name };
     } else {
       const url = parseWebhook(fields.url);
       if (!url || (fields.channel !== undefined && fields.channel !== "webhook"))
         return Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
-      destination = { channel: "webhook", url };
+      destination = { channel: "webhook", url, name };
     }
     const creating = c.req.method === "POST";
     const result = await c.get("context").configureDestination(creating ? null : monitorId(c), destination, false, origin);
