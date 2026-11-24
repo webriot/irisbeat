@@ -3,6 +3,7 @@ import { renderViewPartial, renderViewSnapshot, statusJson, statusPage, type Sta
 import type { ViewScope } from "./view-changes";
 
 export type StatusResource = "/" | "/api/status" | "snapshot" | ViewScope;
+export type StatusRequest = StatusResource | ViewScope[];
 export type StatusRender = { body: string; contentType: string };
 export const HTML = "text/html; charset=utf-8";
 
@@ -19,14 +20,21 @@ export function statusWindowEnd(now: number, interval: number) {
   return now - now % interval + interval;
 }
 
-export function renderStatus(resource: StatusResource, data: StatusProjection, revision: number): StatusRender {
+function renderPublicPartial(scope: ViewScope, data: StatusProjection) {
+  if (!scope.startsWith("monitor/")) return renderViewPartial(scope, data, "public", false);
+  const id = scope.slice("monitor/".length);
+  return renderViewPartial(scope, { ...data, monitors: data.monitors.filter(monitor => monitor.id === id) }, "public", false);
+}
+
+export function renderStatus(resource: StatusRequest, data: StatusProjection, revision: number): StatusRender {
   if (resource === "/") return { body: statusPage(data), contentType: HTML };
-  const row = resource.startsWith("monitor/") ? resource.slice("monitor/".length) : null;
+  if (Array.isArray(resource)) return {
+    body: JSON.stringify({ revision, partials: resource.map(scope => ({ scope, ...renderPublicPartial(scope, data) })) }),
+    contentType: "application/json",
+  };
   const body = resource === "/api/status" ? statusJson(data) : resource === "snapshot" ? renderViewSnapshot(data, "public", false) : {
     revision,
-    ...renderViewPartial(resource, row === null ? data : {
-      ...data, monitors: data.monitors.filter(monitor => monitor.id === row),
-    }, "public", false),
+    ...renderPublicPartial(resource, data),
   };
   return { body: JSON.stringify(body), contentType: "application/json" };
 }

@@ -8,7 +8,7 @@ import { parseEmailAddress, type AlertDestination, type ConfirmationIdentity, ty
 import type { NotificationDeliveryIdentity, SubmissionReport } from "./notification-outcomes";
 import { configurationScopes, mergeScopes, monitorScopes, sharedScopes, type ViewAudience, type ViewChanges, type ViewHint, type ViewScope } from "./view-changes";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
-import { cachedRenderResponse, HTML, readEdge, renderResponse, renderStatus, statusRenderInterval, statusWindowEnd, writeEdge, type StatusRender, type StatusResource } from "./status-publication";
+import { cachedRenderResponse, HTML, readEdge, renderResponse, renderStatus, statusRenderInterval, statusWindowEnd, writeEdge, type StatusRender, type StatusRequest, type StatusResource } from "./status-publication";
 import { Availability, availabilityRetryAfter, availabilityWriteLimit, DAY, historyStart, type AvailabilityEnv, type AvailabilityHistory, type HistoryFence } from "./availability-history";
 export type { AvailabilityHistory, AvailabilityQuery, AvailabilityQueryService, AvailabilityRow, HistoryDay } from "./availability-history";
 
@@ -506,12 +506,14 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return { ...input, data: attachAvailability(input.data, resolved) };
   }
 
-  private async retryPublishedHistory(published: PublishedStatus, resource: StatusResource, now: number) {
-    if (!(resource === "/" || resource === "snapshot" || resource === "/api/status" || includesLedger(resource))) return;
-    const row = resource.startsWith("monitor/") ? resource.slice("monitor/".length) : null;
+  private async retryPublishedHistory(published: PublishedStatus, resource: StatusRequest, now: number) {
+    const resources = Array.isArray(resource) ? resource : [resource];
+    const all = resources.some(scope => scope === "/" || scope === "snapshot" || scope === "/api/status" || scope === "monitors");
+    const rows = resources.filter(scope => scope.startsWith("monitor/"));
+    if (!all && !rows.length) return;
     const retry = published.data.monitors.flatMap((monitor, position) => {
       const fence = published.history.get(monitor.id)!;
-      return (row === null || row === monitor.id) && (!monitor.history || monitor.history.stale || monitor.history.pending) &&
+      return (all || rows.includes(`monitor/${monitor.id}`)) && (!monitor.history || monitor.history.stale || monitor.history.pending) &&
         now >= (fence.retryAt ?? 0) ? [{ monitor, position, fence }] : [];
     });
     if (!retry.length) return;
@@ -543,7 +545,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   // Resolve the durable render version before the HTTP Worker looks in its regional cache.
-  async statusPublicationRevision(resource: StatusResource = "/api/status", minimum = 0) {
+  async statusPublicationRevision(resource: StatusRequest = "/api/status", minimum = 0) {
     if (!this.renderInterval) return { revision: this.viewClock().public, generation: 0, cacheSeconds: 0 };
     const now = Date.now();
     const state = this.read(now);
@@ -557,21 +559,26 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   // The synchronous publication hook can read the committed partials directly.
-  readPublishedStatus(resource: StatusResource, minimum: number) {
+  readPublishedStatus(resource: StatusRequest, minimum: number) {
     const published = this.loadPublishedStatus();
     if (!published || published.revision < minimum) return null;
     const { data, renders, revision, generation } = published;
-    const render = renders.get(resource) ?? renderStatus(resource, data, revision);
-    const cacheable = !resource.startsWith("monitor/") || data.monitors.some(monitor => monitor.id === resource.slice("monitor/".length));
-    if (cacheable) renders.set(resource, render);
+    const resources = Array.isArray(resource) ? resource : [resource];
+    const cacheable = resources.every(scope => !scope.startsWith("monitor/") ||
+      data.monitors.some(monitor => monitor.id === scope.slice("monitor/".length)));
+    const existing = typeof resource === "string" ? renders.get(resource) : undefined;
+    const render = existing ?? renderStatus(resource, data, revision);
+    // Keep the in-memory render cache bounded by individual sections.
+    if (!existing && cacheable && typeof resource === "string") renders.set(resource, render);
     return { revision, generation, ...render, cacheable };
   }
 
-  async readLiveStatusRender(resource: StatusResource, minimum: number) {
+  async readLiveStatusRender(resource: StatusRequest, minimum: number) {
     if (resource === "/" || resource === "/api/status" || resource === "snapshot") {
       return renderStatus(resource, await this.status(), 0);
     }
-    const { revision, data } = await this.readView(resource, "public", minimum);
+    const { revision, data } = Array.isArray(resource) ? await this.readViews(resource, "public", minimum)
+      : await this.readView(resource, "public", minimum);
     return revision < minimum ? null : renderStatus(resource, data, revision);
   }
 
@@ -1511,7 +1518,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   private project(state: StoredContext, operator: boolean, secrets: boolean, at: number, scopes?: ViewScope[]) {
     const start = historyStart(at);
-    const publicBanner = !operator && scopes?.includes("banner");
+    const publicBanner = !operator && scopes?.includes("banner") && !scopes.includes("incidents");
     const withIncidents = !scopes || scopes.includes("incidents") || publicBanner;
     const withAllMonitors = withIncidents || scopes?.includes("monitors") || scopes?.includes("destinations");
     const visible = withAllMonitors || scopes?.some(includesLedger)
@@ -1840,9 +1847,10 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   const edgeKey = (c: Context<HttpEnv<E>>, resource: string, version: string) => new Request(new URL(
     `/.irisbeat-cache/v1/${c.get("context").id.toString()}/${encodeURIComponent(resource)}/${encodeURIComponent(version)}`, c.req.url
   ));
-  const publicRender = async (c: Context<HttpEnv<E>>, resource: StatusResource, minimum = 0) => {
+  const publicRender = async (c: Context<HttpEnv<E>>, resource: StatusRequest, minimum = 0) => {
     const context = c.get("context");
-    const keyFor = (revision: number, generation: number) => edgeKey(c, resource,
+    const cacheResource = Array.isArray(resource) ? "batch:" + resource.join(",") : resource;
+    const keyFor = (revision: number, generation: number) => edgeKey(c, cacheResource,
       `${c.env.IRISBEAT_VERSION?.id ?? "source"}:published:${revision}:${generation}`);
     const publication = await context.statusPublicationRevision(resource, minimum);
     if (publication.cacheSeconds && publication.revision < minimum) return c.text("Revision unavailable", 409);
@@ -1934,7 +1942,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   const partial = async (c: Context<HttpEnv<E>>) => {
     const operator = c.req.path.startsWith(operatorPartials);
     const prefix = operator ? operatorPartials : publicPartials;
-    const batch = c.req.path === operatorPartials;
+    const batch = c.req.path === prefix;
     const resources = batch ? c.req.queries("scope") ?? [] : [c.req.path.slice(prefix.length + 1)];
     const audience: ViewAudience = operator ? c.get("permission")! : "public";
     const sections = audience === "editor" ? ["page", "banner", "monitors", "incidents", "destinations"]
@@ -1944,8 +1952,8 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     const minimum = c.req.query("revision") ?? "0";
     if (!/^\d+$/.test(minimum) || !Number.isSafeInteger(Number(minimum))) return c.text("Invalid revision", 400);
     const requested = resources as ViewScope[];
-    if (!operator) return publicRender(c, requested[0], Number(minimum));
     const scopes = batch ? mergeScopes([], requested) : requested;
+    if (!operator) return publicRender(c, batch ? scopes.sort() : scopes[0], Number(minimum));
     const { revision, data } = await c.get("context").readViews(scopes, audience, Number(minimum));
     if (revision < Number(minimum)) return c.text("Revision unavailable", 409);
     const emailConfigured = scopes.includes("destinations") && !!await confirmationOrigin(c);
@@ -1959,7 +1967,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     return batch ? c.json({ revision, permission: audience, partials })
       : c.json({ revision, ...partials[0].data, permission: audience });
   };
-  for (const path of [publicPartials + "/:section", publicPartials + "/monitor/:id", ...operatorPartialPaths]) {
+  for (const path of [publicPartials, publicPartials + "/:section", publicPartials + "/monitor/:id", ...operatorPartialPaths]) {
     app.get(path, getOnly, partial);
   }
   app.get(readinessPath, getOnly, async (c: Context<HttpEnv<E>>) => {
