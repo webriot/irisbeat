@@ -28,7 +28,7 @@ function availabilityTotals({ history }) {
   rmSync('test/consumer/node_modules', { recursive: true, force: true });
   rmSync('test/consumer/package-lock.json', { force: true });
   execFileSync('npm', ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: join(project, 'test/consumer'), stdio: 'inherit' });
-  execFileSync('npm', ['ci', '--ignore-scripts', '--offline', '--no-audit', '--no-fund'], { cwd: join(project, 'test/consumer'), stdio: 'inherit' });
+  execFileSync('npm', ['ci', '--ignore-scripts', '--prefer-offline', '--no-audit', '--no-fund'], { cwd: join(project, 'test/consumer'), stdio: 'inherit' });
   execFileSync(join(project, 'node_modules/.bin/tsc'), ['--noEmit', '--project', 'test/consumer/tsconfig.json'], { stdio: 'inherit' });
   const installed = JSON.parse(readFileSync('test/consumer/node_modules/irisbeat/package.json', 'utf8'));
   assert.equal(installed.version, version);
