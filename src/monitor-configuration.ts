@@ -36,6 +36,7 @@ type Target =
   | { kind: "tcp"; hostname: string; port: number; url?: never }
   | { kind: "heartbeat"; url?: never; hostname?: never; port?: never };
 type MonitorConfiguration = { name: string; published?: boolean } & Target & Partial<Timing> & Schedule;
+type PreparedMonitorCreate = { configuration: MonitorConfiguration; destinationIds?: string[] };
 type ScheduleConfiguration = Pick<MonitorConfiguration, "kind" | "scheduleMode" | "cron" | "timezone" | "graceSeconds">;
 type Configuration = MonitorConfiguration & { pageName: string };
 
@@ -182,21 +183,36 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
       failures: 0, successes: 0, nextDue: configuration.scheduleMode === "calendar" ? calendar(configuration.cron, configuration.timezone).next(Date.now())[0] : 0, createdAt: Date.now(), lastSeen: null, recoveryReceiptAt: null };
   }
 
-  async create(value: unknown, limit?: number) {
+  async prepareCreate(value: unknown): Promise<PreparedMonitorCreate | undefined> {
     const configuration = parseMonitorPatch(value);
     if (!configuration || !this.validInterval(configuration)) return undefined;
+    const fields = value as Record<string, unknown>;
+    const destinationIds = "destinationIds" in fields ? parseDestinationIds(fields.destinationIds) : undefined;
+    if (destinationIds === null) return undefined;
     if (this.scheduleProof(configuration, configuration) && !await this.acceptsProof(configuration)) return undefined;
+    return { configuration, destinationIds };
+  }
+
+  async create(value: unknown, limit?: number) {
+    const prepared = await this.prepareCreate(value);
+    if (!prepared) return undefined;
+    return this.createPrepared(prepared, limit);
+  }
+
+  createPrepared({ configuration, destinationIds }: PreparedMonitorCreate, limit?: number,
+    commit = (state: State, monitor: Monitor) => this.runtime.commit(state, state.pageName, undefined, monitor),
+  ) {
     const state = this.runtime.read();
     // No await between allowance check and synchronous persistence: concurrent RPCs serialize.
     if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0 || state.monitors.length >= limit)) return null;
     const monitor = this.newMonitor(configuration);
-    if (value && typeof value === "object" && "destinationIds" in value) {
-      const selections = replacementSelections(value.destinationIds, state.destinations);
+    if (destinationIds !== undefined) {
+      const selections = replacementSelections(destinationIds, state.destinations);
       if (!Array.isArray(selections)) return selections;
       monitor.notificationSelections = selections;
     }
     state.monitors.push(monitor);
-    const ack = this.runtime.commit(state, state.pageName, undefined, monitor);
+    const ack = commit(state, monitor);
     return { ack, monitor };
   }
 
@@ -231,7 +247,9 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
         monitor.notificationSelections = [...selections.values()];
       }
       if (value && typeof value === "object" && "destinationIds" in value) {
-        const selections = replacementSelections(value.destinationIds, state.destinations, monitor.notificationSelections);
+        const destinationIds = parseDestinationIds(value.destinationIds);
+        if (!destinationIds) return undefined;
+        const selections = replacementSelections(destinationIds, state.destinations, monitor.notificationSelections);
         if (!Array.isArray(selections)) return selections;
         monitor.notificationSelections = selections;
       }
@@ -266,8 +284,13 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
   }
 }
 
-function replacementSelections(ids: unknown, destinations: NotificationDestination[] = [], existing: NotificationSelection[] = []) {
-  if (!Array.isArray(ids) || new Set(ids).size !== ids.length) return undefined;
+function parseDestinationIds(value: unknown) {
+  if (!Array.isArray(value)) return null;
+  const ids = [...value];
+  return ids.every(id => typeof id === "string") && new Set(ids).size === ids.length ? ids : null;
+}
+
+function replacementSelections(ids: string[], destinations: NotificationDestination[] = [], existing: NotificationSelection[] = []) {
   const assigned = ids.map(id => destinations.find(destination => destination.id === id));
   if (!assigned.every(destination => destination !== undefined)) return undefined;
   if (!assigned.every(selectableDestination)) return destinationPendingConfirmation;

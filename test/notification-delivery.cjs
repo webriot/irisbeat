@@ -188,6 +188,7 @@ async function main(runFixture, emailEnabled = true, upgrade, packageName) {
   const confirmationFaults = new Map();
   const confirmationReports = [];
   const emailFaults = new Map();
+  const emailSendGates = new Map();
   const emailCalls = [];
   const resolveFaults = new Map();
   const resolutionGates = new Map();
@@ -234,6 +235,7 @@ async function main(runFixture, emailEnabled = true, upgrade, packageName) {
     if (path === '/email-send') {
       const address = await request.json();
       emailCalls.push(address);
+      await emailSendGates.get(address);
       const code = emailFaults.get(address);
       emailFaults.delete(address);
       return code ? new Response(code, { status: 503 }) : new Response(null, { status: 204 });
@@ -1435,6 +1437,29 @@ async function main(runFixture, emailEnabled = true, upgrade, packageName) {
       assert.equal(emailCalls.filter(to => to === rejected).length, 1);
       assert.equal((await capturedMail()).length, beforeMail + 1);
       assert.equal((await json(host, path)).destinations.find(destination => destination.address === rejected).latestSubmission.reason, 'provider_rejected');
+
+      const duplicateInbox = 'duplicate-confirmation@example.net';
+      const duplicateCalls = () => emailCalls.filter(to => to === duplicateInbox).length;
+      let releaseSend;
+      emailSendGates.set(duplicateInbox, new Promise(resolve => { releaseSend = resolve; }));
+      const beforeDuplicate = completedBatches;
+      try {
+        const destination = await json('personal.example', '/api/v1/destinations', 'POST',
+          { channel: 'email', address: duplicateInbox }, 201, { 'Idempotency-Key': 'duplicate-confirmation' });
+        await until(() => duplicateCalls() === 1);
+        const [original] = batches.at(-1);
+        assert.equal(original.destinationId, destination.id);
+        controls.set(original.deliveryId, { attempts: 1 });
+        const duplicateProducer = await mf.getQueueProducer('FINAL_QUEUE', 'monitoring');
+        await duplicateProducer.send(original);
+        await until(() => completedBatches > beforeDuplicate || duplicateCalls() > 1);
+      } finally {
+        releaseSend();
+        emailSendGates.delete(duplicateInbox);
+      }
+      await until(() => completedBatches >= beforeDuplicate + 2);
+      assert.equal(duplicateCalls(), 1, 'duplicate Queue messages share one in-flight confirmation submission');
+      assert.equal((await capturedMail()).filter(message => message.to.includes(duplicateInbox)).length, 1);
       console.log('PASS confirmation transport recovery: readiness backoff, one acceptance through mark failure, and safe recovery');
     }
 

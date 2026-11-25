@@ -81,6 +81,8 @@ export class NotificationRecovery extends DurableObject<DeliveryBindings> {
 
     const at = Date.now();
     if (superseded()) return null;
+    // A recovered handoff can place another copy of the same invitation on the Queue.
+    if (confirmation && brokerAttempt < LAST_BROKER_DELIVERY && this.submitting.size) return 5;
     const queuedAt = kv.get<number>("queued-at") ?? timestamp;
     const expiresAt = queuedAt + MAX_AGE;
     const previous = kv.get<number>("attempt") ?? 0;

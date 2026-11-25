@@ -213,6 +213,32 @@ it('rejects a destination removed during Calendar validation and preserves the c
   expect(await (await request(path)).json()).toEqual(afterRemoval);
 });
 
+it('resolves create assignments against the destinations present at commit', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(Date.UTC(2026, 10, 13));
+  const destinationId = await createWebhook('primary');
+  const format = Intl.DateTimeFormat.prototype.formatToParts;
+  let calls = 0;
+  let finished = false;
+  vi.spyOn(Intl.DateTimeFormat.prototype, 'formatToParts').mockImplementation(function (this: Intl.DateTimeFormat, at) {
+    calls++;
+    return format.call(this, at);
+  });
+  const pending = request(monitors, 'POST', {
+    name: 'Backup', kind: 'heartbeat', scheduleMode: 'calendar',
+    cron: '0-28/2,31-57/2 * * * *', timezone: 'Australia/Lord_Howe', graceSeconds: 60,
+    destinationIds: [destinationId],
+  }).finally(() => { finished = true; });
+  for (let yields = 0; calls < 1024 && yields < 100; yields++) await scheduler.wait(0);
+  expect(calls).toBeGreaterThanOrEqual(1024);
+  expect(finished).toBe(false);
+  expect((await request('/api/v1/destinations/' + destinationId, 'DELETE')).status).toBe(204);
+  expect(finished).toBe(false);
+  const rejected = await pending;
+  expect(rejected.status).toBe(400);
+  expect(await rejected.json()).toEqual({ error: 'Invalid Monitor configuration' });
+  expect(await (await request('/api/v1/status')).json()).toMatchObject({ monitors: [] });
+});
+
 it('deletes a Heartbeat Monitor while preserving its Incident for Operators', async () => {
   const start = Date.UTC(2026, 10, 13);
   vi.spyOn(Date, 'now').mockReturnValue(start);

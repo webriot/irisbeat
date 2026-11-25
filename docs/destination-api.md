@@ -29,7 +29,7 @@ Create, read, and edit return a single JSON object with the saved destination.
 
 ## Create a destination
 
-`POST /api/v1/destinations` returns `201`.
+`POST /api/v1/destinations` returns `201`. Use an [idempotency key](api-v1.md#retrying-creates) to safely retry creation.
 
 Send an `application/json` object in one of these forms.
 

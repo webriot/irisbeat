@@ -15,6 +15,8 @@ shared authentication response format.
 | `PATCH /api/v1/monitors/:id` | `200` | Updated Monitor |
 | `DELETE /api/v1/monitors/:id` | `204` | Empty body |
 
+Use an [idempotency key](api-v1.md#retrying-creates) to safely retry creation.
+
 Monitor IDs are opaque and remain fixed throughout updates. Unknown and
 deleted IDs return `404`. Deletion stops checks and preserves the Monitor's
 Incidents in the Operator view. Unsupported methods return `405` with an
