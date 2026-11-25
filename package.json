@@ -21,7 +21,9 @@
     "test:release": "node test/release.cjs",
     "test:deployment": "node test/deployment.cjs",
     "release:verify": "npm run check && npm test && npm run test:delivery && npm run build && npm run build:delivery && npm run test:release && npm run test:consumer -- --prepared && npm run test:deployment",
-    "test:ui": "tsc -p test/ui && playwright test"
+    "test:ui": "tsc -p test/ui && playwright test",
+    "prototype:112": "wrangler dev test/ui/worker.ts --ip 127.0.0.1 --port 8792 --persist-to .tmp/ui-prototype-112 --var INSTALLATION_SECRET:ui-test-secret --var STATUS_RENDER_INTERVAL_SECONDS:0",
+    "prototype:112:capture": "esbuild test/ui/capture-api-key-prototype.ts --bundle --platform=node --format=esm --outfile=.tmp/capture-api-key-prototype.mjs && node .tmp/capture-api-key-prototype.mjs > test/ui/api-key-settings-prototype.html"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.8.2",
