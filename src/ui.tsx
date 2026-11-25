@@ -4,6 +4,7 @@
 import type { MonitoringContext, Status } from "./index";
 import { createOperatorSession } from "./operator-session";
 import { createMonitorEditor } from "./monitor-editor";
+import { ApiKeySettings, apiKeySettingsScript, apiKeySettingsStyles } from "./api-key-settings";
 import { parseEmailAddress, parseWebhook } from "./notification-jobs";
 import type { Child } from "hono/jsx";
 import { raw } from "hono/html";
@@ -211,7 +212,7 @@ function Operator({ hosted }: { hosted: boolean }) {
       <div id="workspace">
         <div id="new-monitor-panel"></div>
       <table aria-label="Monitors"><colgroup><col class="monitor-column" /><col class="state-column" /><col class="schedule-column" /><col class="publication-column" /><col class="actions-column" /></colgroup><thead><tr><th scope="col">Monitor</th><th scope="col">State</th><th scope="col">Schedule</th><th scope="col">Publication</th><th scope="col">Actions</th></tr></thead><tbody id="monitor-rows"></tbody></table>
-      <dialog id="maintenance-dialog" aria-labelledby="maintenance-heading"><form id="maintenance" hidden aria-labelledby="maintenance-heading">
+      <dialog id="maintenance-dialog" class="operator-dialog" aria-labelledby="maintenance-heading"><form id="maintenance" hidden aria-labelledby="maintenance-heading">
         <h2 id="maintenance-heading">Maintenance</h2>
         <label for="maintenance-end">End time</label><input id="maintenance-end" type="datetime-local" required />
         <p id="maintenance-deleted" role="status" hidden>This Monitor was deleted. Copy your draft or cancel.</p><p id="maintenance-error" role="status"></p><button id="save-maintenance">Start Maintenance</button><button id="end-maintenance" type="button" class="danger" hidden>End Maintenance</button><button id="cancel-maintenance" type="button">Cancel</button>
@@ -265,6 +266,7 @@ function Operator({ hosted }: { hosted: boolean }) {
           <p id="no-destinations">No destinations</p>
           <ul id="destination-rows" aria-label="Notification destinations"></ul>
         </section>
+        {!hosted && <ApiKeySettings />}
       </section>
       <div class="actions"><span id="updates-mode" role="status">Polling</span><button id="logout" type="button">Sign out</button></div>
     </section>
@@ -743,8 +745,8 @@ tbody tr:nth-child(odd) td { padding-bottom: 0; }
 form, aside { min-width: 0; }
 #configuration, #maintenance, #destination-form, #page-configuration, #login { border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; background: var(--card); }
 #configuration, #maintenance { background: var(--secondary); }
-#maintenance-dialog { width: min(480px, calc(100% - 32px)); padding: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); color: var(--foreground); }
-#maintenance-dialog::backdrop { background: #0006; }
+.operator-dialog { width: min(480px, calc(100% - 32px)); padding: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); color: var(--foreground); }
+.operator-dialog::backdrop { background: #0006; }
 #maintenance { border: 0; }
 #maintenance-error:empty { display: none; }
 fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
@@ -821,6 +823,7 @@ h1 { margin: 24px 0 20px; font-size: 24px; }
   tbody tr:nth-child(even) td { padding-bottom: 16px; }
   footer { align-items: flex-start; }
 }
+${apiKeySettingsStyles}
 `;
 
 export const operatorScript = `
@@ -829,6 +832,7 @@ const createMonitorEditor = ${createMonitorEditor.toString()};
 const parseEmailAddress = ${parseEmailAddress.toString()};
 const parseWebhook = ${parseWebhook.toString()};
 const byId = id => document.getElementById(id);
+${apiKeySettingsScript}
 const login = byId('login');
 const editor = byId('editor');
 const form = byId('configuration');
@@ -915,6 +919,10 @@ function renderDestinations(next, markup) {
 }
 
 let hosted = false;
+let canEditSettings = false;
+function syncApiKeySettings() {
+  apiKeySettings?.setActive(canEditSettings && !hosted && !byId('settings').hidden);
+}
 let monitorIds = new Set();
 function updateDeleted() {
   monitorEditor.update(monitorIds);
@@ -944,6 +952,8 @@ function closeMaintenance() { byId('maintenance-dialog').close(); maintenanceFor
 function clearSession() {
   byId('maintenance-dialog').close();
   document.querySelectorAll('button, input, select').forEach(control => { control.disabled = false; });
+  canEditSettings = false;
+  apiKeySettings?.reset();
   monitorIds.clear(); selectedHistoryDays.clear(); byId('stale').hidden = true; byId('sync-announcement').textContent = ''; snapshotPending(false);
   emailConfigured = false; addEmail.hidden = true;
   savedPageName = ''; monitorEditor.close(); monitorEditor.refreshDestinations([]); renderDestinations([]); byId('heartbeat-path').textContent = ''; maintenanceForm.reset(); maintenanceForm.removeAttribute('data-monitor-id'); byId('maintenance-heading').textContent = 'Maintenance'; maintenanceForm.hidden = true; pageForm.reset(); closeDestinationForm(); editor.hidden = true; login.hidden = false;
@@ -1020,11 +1030,12 @@ function renderOperatorSnapshot(data, savedField) {
   const focused = document.activeElement;
   login.hidden = true; editor.hidden = false; byId('operator-navigation').hidden = false;
   hosted = data.hosted;
-  const canEdit = data.permission === 'editor';
+  const canEdit = canEditSettings = data.permission === 'editor';
   if (!canEdit) {
     monitorEditor.close(); closeMaintenance(); closeDestinationForm(); showSettings(false);
   }
   byId('new-monitor').hidden = !canEdit || !byId('settings').hidden; byId('settings-button').hidden = !canEdit || !byId('settings').hidden;
+  syncApiKeySettings();
   renderOperatorPartials(data.partials, initial ? 'pageName' : savedField);
   restoreOperatorFocus(focused);
 }
@@ -1066,6 +1077,9 @@ const session = createOperatorSession(liveSnapshots, mergeScopes, {
 });
 const run = session.run;
 const monitorEditor = createMonitorEditor(form, session, focusActions, reconcileNodes);
+const apiKeySettings = createApiKeySettings(session);
+window.addEventListener('pagehide', () => apiKeySettings?.setActive(false));
+window.addEventListener('pageshow', syncApiKeySettings);
 login.addEventListener('submit', async event => {
   event.preventDefault();
   await session.signIn(byId('secret').value); byId('secret').value = '';
@@ -1116,6 +1130,7 @@ destinationForm.addEventListener('submit', async event => {
 pageForm.addEventListener('submit', async event => { event.preventDefault(); await run('/api/operator', 'PUT', { pageName: byId('pageName').value }); });
 function showSettings(settings) {
   byId('settings').hidden = !settings; byId('workspace').hidden = settings;
+  syncApiKeySettings();
   byId('operator-title').textContent = settings ? 'Settings' : 'Monitors';
   byId('new-monitor').hidden = settings; byId('settings-button').hidden = settings; byId('back-monitors').hidden = !settings;
   message.textContent = '';
