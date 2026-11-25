@@ -83,6 +83,17 @@ type StoredContext = {
 };
 type LegacyContext = { webhookUrl?: string | null; monitor: (Monitor & { pageName: string }) | null };
 type DestinationUpdate = (NewNotificationDestination & { name?: string }) | { name: string };
+type ApiKeyRole = "read" | "write";
+type ApiKey = { id: string; name: string; role: ApiKeyRole; createdAt: number; expiresAt: number | null };
+const apiKeyPrefix = "irb_";
+
+function canonicalBearer(authorization: string | undefined) {
+  return authorization?.replace(/^Bearer +/i, "Bearer ");
+}
+
+function credentialDigest(authorization: string) {
+  return crypto.subtle.digest("SHA-256", new TextEncoder().encode(authorization));
+}
 
 function nextDestinationName(channel: NewNotificationDestination["channel"], used: Set<string>) {
   const prefix = channel === "email" ? "Email" : "Webhook";
@@ -139,6 +150,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   constructor(ctx: DurableObjectState, env: E) {
     super(ctx, env);
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS api_keys (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, createdAt INTEGER NOT NULL,
+      expiresAt INTEGER, digest BLOB NOT NULL UNIQUE
+    )`);
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS notification_completions (
       deliveryId TEXT PRIMARY KEY, expiresAt INTEGER NOT NULL
     )`);
@@ -177,6 +192,44 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       ctx.storage.sql.exec("ALTER TABLE incidents ADD COLUMN monitorName TEXT");
     }
   }
+
+  listApiKeys() {
+    return this.ctx.storage.sql.exec<ApiKey>(
+      "SELECT id, name, role, createdAt, expiresAt FROM api_keys ORDER BY createdAt DESC, id",
+    ).toArray();
+  }
+
+  async issueApiKey(value: unknown) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const input = value as Record<string, unknown>;
+    const name = typeof input.name === "string" ? input.name.trim() : "";
+    const { role, expiresAt } = input;
+    if (!name || name.length > 120 || (role !== "read" && role !== "write")) return null;
+    const secret = apiKeyPrefix + Array.from(crypto.getRandomValues(new Uint8Array(32)), byte =>
+      byte.toString(16).padStart(2, "0")).join("");
+    const digest = await credentialDigest(`Bearer ${secret}`);
+    const createdAt = Date.now();
+    if (expiresAt !== undefined && (typeof expiresAt !== "number" || !Number.isSafeInteger(expiresAt) || expiresAt <= createdAt))
+      return null;
+    const key: ApiKey = { id: crypto.randomUUID(), name, role, createdAt, expiresAt: expiresAt ?? null };
+    this.ctx.storage.sql.exec(
+      "INSERT INTO api_keys (id, name, role, createdAt, expiresAt, digest) VALUES (?, ?, ?, ?, ?, ?)",
+      key.id, key.name, key.role, key.createdAt, key.expiresAt, digest,
+    );
+    return { key, secret };
+  }
+
+  revokeApiKey(id: string) {
+    return this.ctx.storage.sql.exec("DELETE FROM api_keys WHERE id = ?", id).rowsWritten > 0;
+  }
+
+  apiKeyRole(digest: ArrayBuffer) {
+    const [key] = this.ctx.storage.sql.exec<{ role: ApiKeyRole }>(
+      "SELECT role FROM api_keys WHERE digest = ? AND (expiresAt IS NULL OR expiresAt > ?)", digest, Date.now(),
+    ).toArray();
+    return key?.role;
+  }
+
   issueSubscriptionTicket(contextId: string, origin: string, permission: "reader" | "editor") {
     const now = Date.now();
     this.ctx.storage.sql.exec("DELETE FROM subscription_tickets WHERE expiresAt <= ?", now);
@@ -452,7 +505,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   private capturePublicationInput(state: StoredContext, revision: number, at: number): PublicationInput {
-    const data = this.project(state, false, false, at);
+    const data = this.project(state, "public", false, at);
     const history = new Map(state.monitors.filter(monitor => monitor.published).map(monitor => [monitor.id, this.historyFence(monitor)]));
     return { revision, at, loggedBefore: Math.floor(at / 1000), data, history };
   }
@@ -1494,10 +1547,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return state.monitors.filter(monitor => selected.has(monitor.id));
   }
 
-  private readAvailability(state: StoredContext, projection: StatusProjection, at: number, operator: boolean) {
+  private readAvailability(state: StoredContext, projection: StatusProjection, at: number, includePrivate: boolean) {
     return this.availability.read(this.projectedMonitors(state, projection), at, () => {
       const state = this.ctx.storage.kv.get<StoredContext>("context");
-      return new Map(state?.monitors.filter(monitor => operator || monitor.published)
+      return new Map(state?.monitors.filter(monitor => includePrivate || monitor.published)
         .map(monitor => [monitor.id, monitor.historyRevision]));
     });
   }
@@ -1519,15 +1572,22 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   snapshot(operator = false, secrets = operator) {
     const at = Date.now();
     const state = this.read(at);
-    const data = this.project(state, operator, secrets, at);
+    const data = this.project(state, operator ? "operator" : "public", secrets, at);
     return attachAvailability(data, this.availability.cached(this.projectedMonitors(state, data), at));
   }
 
   async status(operator = false, secrets = operator): Promise<StatusProjection> {
     const at = Date.now();
     const state = this.read(at);
-    const data = this.project(state, operator, secrets, at);
+    const data = this.project(state, operator ? "operator" : "public", secrets, at);
     return attachAvailability(data, await this.readAvailability(state, data, at, operator));
+  }
+
+  async versionedStatus() {
+    const at = Date.now();
+    const state = this.read(at);
+    const data = this.project(state, "versioned", false, at);
+    return statusJson(attachAvailability(data, await this.readAvailability(state, data, at, true)));
   }
 
   async readView(scope: ViewScope, audience: ViewAudience, minimum = 0) {
@@ -1539,7 +1599,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const state = this.read(at);
     const revision = this.viewClock()[audience];
     const operator = audience !== "public";
-    const data = this.project(state, operator, audience === "editor", at, scopes);
+    const data = this.project(state, operator ? "operator" : "public", audience === "editor", at, scopes);
     if (revision < minimum || !scopes.some(includesLedger)) return { revision, data };
     const monitors = scopes.includes("monitors") ? data.monitors
       : data.monitors.filter(monitor => scopes.includes(`monitor/${monitor.id}`));
@@ -1548,13 +1608,14 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return { revision, data: attachAvailability(data, history) };
   }
 
-  private project(state: StoredContext, operator: boolean, secrets: boolean, at: number, scopes?: ViewScope[]) {
+  private project(state: StoredContext, audience: "public" | "operator" | "versioned", secrets: boolean, at: number, scopes?: ViewScope[]) {
+    const operator = audience === "operator";
     const start = historyStart(at);
     const publicBanner = !operator && scopes?.includes("banner") && !scopes.includes("incidents");
     const withIncidents = !scopes || scopes.includes("incidents") || publicBanner;
     const withAllMonitors = withIncidents || scopes?.includes("monitors") || scopes?.includes("destinations");
     const visible = withAllMonitors || scopes?.some(includesLedger)
-      ? state.monitors.filter(monitor => (operator || monitor.published) &&
+      ? state.monitors.filter(monitor => (audience !== "public" || monitor.published) &&
         (withAllMonitors || scopes?.includes(`monitor/${monitor.id}`))) : [];
     const monitors = visible.map(monitor => ({
       ...publicMonitor(monitor, !!state.paused),
@@ -1611,15 +1672,11 @@ function attachAvailability(status: StatusProjection, history: Map<string, Avail
   return { ...status, monitors, monitor: monitors[0] ?? null };
 }
 
-async function authorized(request: Request, secret: string | undefined) {
+async function authorized(authorization: string | undefined, secret: string | undefined) {
   if (!secret) return false;
-  const encoder = new TextEncoder();
   const [actual, expected] = await Promise.all([
-    crypto.subtle.digest(
-      "SHA-256",
-      encoder.encode(request.headers.get("Authorization") ?? ""),
-    ),
-    crypto.subtle.digest("SHA-256", encoder.encode(`Bearer ${secret}`)),
+    credentialDigest(authorization ?? ""),
+    credentialDigest(`Bearer ${secret}`),
   ]);
   return crypto.subtle.timingSafeEqual(actual, expected);
 }
@@ -1839,7 +1896,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   });
   app.all("/heartbeat/*", async (c: Context<HttpEnv<E>>) => {
     if (c.get("resolved")) return new Response(null, { status: 404 });
-    if (!(await authorized(c.req.raw, c.env.INSTALLATION_SECRET)))
+    if (!(await authorized(c.req.header("Authorization"), c.env.INSTALLATION_SECRET)))
       return Response.json({ error: "Unauthorized" }, { status: 401 });
     if (c.req.method !== "POST") return methodNotAllowed("POST");
     const accepted = await c.get("context").heartbeat(c.req.path.slice("/heartbeat/".length), Date.now());
@@ -1879,6 +1936,21 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   app.get("/", getOnly, (c: Context<HttpEnv<E>>) => publicRender(c, "/"));
   app.get("/api/status", getOnly, (c: Context<HttpEnv<E>>) =>
     publicRender(c, c.req.header("Accept") === viewMediaType ? "snapshot" : "/api/status"));
+  const versionedAuthorization = (required: ApiKeyRole): MiddlewareHandler<HttpEnv<E>> => async (c, next) => {
+    if (c.get("resolved")) return c.notFound();
+    const authorization = canonicalBearer(c.req.header("Authorization"));
+    if (!(await authorized(authorization, c.env.INSTALLATION_SECRET))) {
+      const role = authorization?.startsWith("Bearer " + apiKeyPrefix)
+        ? await c.get("context").apiKeyRole(await credentialDigest(authorization)) : undefined;
+      if (!role) return Response.json({ error: "Unauthorized" }, { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
+      if (required === "write" && role !== "write") return Response.json({ error: "Forbidden" }, { status: 403 });
+    }
+    await next();
+  };
+  const versionedStatusPath = "/api/v1/status";
+  app.use(versionedStatusPath, versionedAuthorization("read"));
+  app.all(versionedStatusPath, async c => c.req.method === "GET"
+    ? c.json(await c.get("context").versionedStatus()) : methodNotAllowed("GET"));
   const asset = (render: StatusRender): MiddlewareHandler<HttpEnv<E>> => async c => {
     const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(render.body));
     const version = Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, "0")).join("");
@@ -1930,17 +2002,25 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   const previewPath = "/api/operator/schedule-preview";
   const ticketPath = "/api/operator/events/ticket";
   const destinationsPath = "/api/operator/destinations";
+  const apiKeysPath = "/api/operator/api-keys";
+  const apiKeyPath = apiKeysPath + "/:id";
   const destinationPath = destinationsPath + "/:id";
   const resendPath = destinationPath + "/confirmation";
   const readinessPath = "/api/operator/history/readiness";
   const publicPartials = "/api/status/partials";
   const operatorPartials = "/api/operator/partials";
   const operatorPartialPaths = [operatorPartials, operatorPartials + "/:section", operatorPartials + "/monitor/:id"];
+  for (const path of [apiKeysPath, apiKeyPath]) app.use(path, async (c, next) => {
+    if (c.get("resolved")) return c.notFound();
+    if (!(await authorized(canonicalBearer(c.req.header("Authorization")), c.env.INSTALLATION_SECRET)))
+      return Response.json({ error: "Unauthorized" }, { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
+    await next();
+  });
   const operatorPaths = [readinessPath, ...operatorPartialPaths, ticketPath, previewPath, destinationsPath, destinationPath, resendPath, "/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
   for (const path of operatorPaths) app.use(path, async (c, next) => {
     const resolved = c.get("resolved");
     if (path === rotationPath && !resolved) return c.notFound();
-    const permission = resolved ? resolved.permission : await authorized(c.req.raw, c.env.INSTALLATION_SECRET) ? "editor" : null;
+    const permission = resolved ? resolved.permission : await authorized(c.req.header("Authorization"), c.env.INSTALLATION_SECRET) ? "editor" : null;
     if (!permission) return Response.json({ error: "Unauthorized" }, { status: 401 });
     if (permission !== "editor" && c.req.method !== "GET" && path !== ticketPath) return Response.json({ error: "Forbidden" }, { status: 403 });
     c.set("permission", permission);
@@ -2012,6 +2092,18 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     c.set("value", value);
     await next();
   };
+  app.get(apiKeysPath, async c => c.req.method === "GET"
+    ? c.json({ keys: await c.get("context").listApiKeys() }) : methodNotAllowed("GET, POST"));
+  app.post(apiKeysPath, readBody, async (c: Context<HttpEnv<E>>) => {
+    const issued = await c.get("context").issueApiKey(c.get("value"));
+    return issued ? c.json(issued, 201) : c.json({ error: "Invalid API key name, role or expiry" }, 400);
+  });
+  app.delete(apiKeyPath, async c => {
+    const revoked = await c.get("context").revokeApiKey(c.req.path.slice(apiKeysPath.length + 1));
+    return revoked ? new Response(null, { status: 204 }) : c.json({ error: "API key not found" }, 404);
+  });
+  app.all(apiKeysPath, () => methodNotAllowed("GET, POST"));
+  app.all(apiKeyPath, () => methodNotAllowed("DELETE"));
   // IDs are opaque: read the original path rather than Hono's decoded params.
   const monitorId = (c: Context<HttpEnv<E>>) => c.req.path.split("/")[4];
   for (const path of ["/api/operator", "/api/operator/webhook", "/api/operator/monitors", destinationsPath]) {
