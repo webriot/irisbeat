@@ -17,6 +17,14 @@ Send the credential in the `Authorization: Bearer <credential>` header. API keys
 
 Versioned routes return `401` with `{"error":"Unauthorized"}` and a `WWW-Authenticate: Bearer` header for missing, invalid, expired, or revoked credentials. A valid Read key on a route requiring Write returns `403` with `{"error":"Forbidden"}`. Successful JSON responses use `application/json`. Responses use `Cache-Control: no-store`.
 
+## Retrying creates
+
+Send an optional `Idempotency-Key` with `POST /api/v1/monitors` or `POST /api/v1/destinations`. Use one header value of 1–128 visible ASCII characters, excluding commas and spaces. Length and characters are checked after HTTP header parsing. Keys are case-sensitive and an invalid value returns `400`. A UUID is a suitable key.
+
+Keep the key and the serialized JSON body until you receive the result. Irisbeat compares the UTF-8-decoded body text, so JSON whitespace, property order, and escape spelling must match. Each installation and create endpoint has its own key space. Irisbeat checks Write access on every request, including retries after credential rotation.
+
+For 24 hours from a successful create's commit, the same key and body return the original `201`, JSON body, and response headers, even after the resource is edited or deleted. Concurrent identical requests create one resource. Reusing the key with different body text during that window returns `409`. A replay leaves the expiry unchanged and skips creation effects such as sending an email confirmation. Requests that never commit leave the key available. After expiry, the key can start a new create subject to the endpoint's usual validation.
+
 ## Monitor status
 
 `GET /api/v1/status` returns `200` with these fields.

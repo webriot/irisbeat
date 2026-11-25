@@ -182,10 +182,22 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
       failures: 0, successes: 0, nextDue: configuration.scheduleMode === "calendar" ? calendar(configuration.cron, configuration.timezone).next(Date.now())[0] : 0, createdAt: Date.now(), lastSeen: null, recoveryReceiptAt: null };
   }
 
-  async create(value: unknown, limit?: number) {
+  async validateCreate(value: unknown) {
     const configuration = parseMonitorPatch(value);
     if (!configuration || !this.validInterval(configuration)) return undefined;
     if (this.scheduleProof(configuration, configuration) && !await this.acceptsProof(configuration)) return undefined;
+    return configuration;
+  }
+
+  async create(value: unknown, limit?: number) {
+    const configuration = await this.validateCreate(value);
+    if (!configuration) return undefined;
+    return this.createValidated(value, configuration, limit);
+  }
+
+  createValidated(value: unknown, configuration: MonitorConfiguration, limit?: number,
+    commit = (state: State, monitor: Monitor) => this.runtime.commit(state, state.pageName, undefined, monitor),
+  ) {
     const state = this.runtime.read();
     // No await between allowance check and synchronous persistence: concurrent RPCs serialize.
     if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0 || state.monitors.length >= limit)) return null;
@@ -196,7 +208,7 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
       monitor.notificationSelections = selections;
     }
     state.monitors.push(monitor);
-    const ack = this.runtime.commit(state, state.pageName, undefined, monitor);
+    const ack = commit(state, monitor);
     return { ack, monitor };
   }
 
