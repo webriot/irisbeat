@@ -152,9 +152,11 @@ function allowedSubscriptionOrigin(request: Request, requireOrigin: boolean) {
 
 const monitorCollection = "/api/v1/monitors";
 const versionedDestinationsPath = "/api/v1/destinations";
+const createResultCleanupLimit = 100;
 type CreateEndpoint = typeof monitorCollection | typeof versionedDestinationsPath;
 type IdempotencyRequest = { key: string; digest: ArrayBuffer };
 type CreateResult = { status: number; body: string; headers: Record<string, string> };
+type SavedCreateResult = CreateResult & { confirmation?: ConfirmationJob };
 
 function createdResource(resource: { id: string }, collection?: CreateEndpoint): CreateResult {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -173,6 +175,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   private publishedStatus?: PublishedStatus;
   private publicationRetryAt = 0;
   private subscriptionAlarmCheck?: Promise<void>;
+  private readonly confirmationHandoffs = new Set<string>();
 
   constructor(ctx: DurableObjectState, env: E) {
     super(ctx, env);
@@ -917,16 +920,23 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return monitor ? monitorResource(monitor) : null;
   }
 
-  lookupCreateResult(endpoint: CreateEndpoint, request?: IdempotencyRequest) {
+  private lookupCreateResult(endpoint: CreateEndpoint, request?: IdempotencyRequest) {
     if (!request) return;
     const [saved] = this.ctx.storage.sql.exec<{ result: string | null }>(
       "SELECT CASE WHEN digest = ? THEN result END AS result FROM create_results WHERE endpoint = ? AND key = ? AND expiresAt > ?",
       request.digest, endpoint, request.key, Date.now(),
     ).toArray();
-    if (saved) return saved.result === null ? "idempotency-conflict" as const : JSON.parse(saved.result) as CreateResult;
+    if (saved) return saved.result === null ? "idempotency-conflict" as const : JSON.parse(saved.result) as SavedCreateResult;
   }
 
-  private recordCreateResult(endpoint: CreateEndpoint, request: IdempotencyRequest, result: CreateResult) {
+  replayCreateResult(endpoint: CreateEndpoint, request: IdempotencyRequest) {
+    const saved = this.lookupCreateResult(endpoint, request);
+    return saved && saved !== "idempotency-conflict" && saved.confirmation
+      ? this.handoffCreateConfirmation(request.key, saved.confirmation).then(() => saved)
+      : saved;
+  }
+
+  private recordCreateResult(endpoint: CreateEndpoint, request: IdempotencyRequest, result: SavedCreateResult) {
     const now = Date.now();
     this.ctx.storage.sql.exec(
       "INSERT OR REPLACE INTO create_results (endpoint, key, digest, expiresAt, result) VALUES (?, ?, ?, ?, ?)",
@@ -935,13 +945,13 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   async createMonitorResource(value: unknown, request?: IdempotencyRequest) {
-    const configuration = await this.monitorConfigurations.validateCreate(value);
+    const prepared = await this.monitorConfigurations.prepareCreate(value);
     // Check again after Calendar validation, which can yield.
     const concurrent = this.lookupCreateResult(monitorCollection, request);
     if (concurrent) return concurrent;
-    if (!configuration) return;
+    if (!prepared) return;
     let response: CreateResult | undefined;
-    const result = this.monitorConfigurations.createValidated(value, configuration, undefined, (state, current) => {
+    const result = this.monitorConfigurations.createPrepared(prepared, undefined, (state, current) => {
       const created = createdResource(monitorResource(current), monitorCollection);
       response = created;
       return this.commitMonitorConfiguration(state, state.pageName, undefined, current, request
@@ -983,14 +993,18 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   async createDestinationResource(update: DestinationUpdate, origin?: string, request?: IdempotencyRequest) {
-    const saved = this.lookupCreateResult(versionedDestinationsPath, request);
+    const saved = request && this.replayCreateResult(versionedDestinationsPath, request);
     if (saved) return saved;
-    let response: CreateResult | undefined;
-    const result = await this.changeDestination(null, update, false, origin, destination => {
-      response = createdResource(destination);
-      if (request) this.recordCreateResult(versionedDestinationsPath, request, response);
-    });
-    return result && typeof result === "object" ? response ?? null : result;
+    let committed: SavedCreateResult | undefined;
+    const result = await this.changeDestination(null, update, false, origin, request ? (destination, confirmation) => {
+      committed = { ...createdResource(destination), confirmation };
+      this.recordCreateResult(versionedDestinationsPath, request, committed);
+    } : undefined);
+    if (committed?.confirmation && request) {
+      await this.handoffCreateConfirmation(request.key, committed.confirmation);
+    }
+    return committed ?? (result && typeof result === "object"
+      ? result.destination && createdResource(result.destination) : result);
   }
 
   versionedDestination(id: string) {
@@ -999,7 +1013,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   private async changeDestination(id: string | null, update: DestinationUpdate | null, legacy: boolean, origin?: string,
-    record?: (destination: NotificationDestination) => void,
+    recordCreate?: (destination: NotificationDestination, confirmation?: ConfirmationJob) => void,
   ) {
     const state = this.read();
     const destinationId = legacy ? state.legacyDestinationId : id;
@@ -1055,10 +1069,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const destination = replacement ? destinationResource(replacement) : null;
     const ack = this.commitViewChanges(() => {
       this.ctx.storage.kv.put("context", state);
-      if (destination) record?.(destination);
+      if (destination) recordCreate?.(destination, job);
       return replacement || existing ? { editor: editorScopes } : {};
     });
-    if (job) await this.enqueueConfirmation(job);
+    if (job && !recordCreate) await this.enqueueConfirmation(job);
     return { ack, destination };
   }
 
@@ -1094,8 +1108,26 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     try {
       if (!this.env.NOTIFICATION_QUEUE) throw new Error("Queue binding unavailable");
       await this.env.NOTIFICATION_QUEUE.sendBatch([{ body: job }]);
+      return true;
     } catch {
       console.error(JSON.stringify({ event: "notification_enqueue_failed", kind: job.kind }));
+      return false;
+    }
+  }
+
+  private async handoffCreateConfirmation(key: string, job: ConfirmationJob) {
+    if (this.confirmationHandoffs.has(job.deliveryId)) return;
+    this.confirmationHandoffs.add(job.deliveryId);
+    try {
+      const state = this.ctx.storage.kv.get<StoredContext>("context");
+      if (state && this.currentConfirmation(state, job) && !await this.enqueueConfirmation(job)) return;
+      this.ctx.storage.sql.exec(
+        `UPDATE create_results SET result = json_remove(result, '$.confirmation')
+         WHERE endpoint = ? AND key = ? AND json_extract(result, '$.confirmation.deliveryId') = ?`,
+        versionedDestinationsPath, key, job.deliveryId,
+      );
+    } finally {
+      this.confirmationHandoffs.delete(job.deliveryId);
     }
   }
 
@@ -1274,7 +1306,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   async check(at: number, writeLimit = availabilityWriteLimit) {
-    this.ctx.storage.sql.exec("DELETE FROM create_results WHERE expiresAt <= ?", Date.now());
+    this.ctx.storage.sql.exec(
+      `DELETE FROM create_results WHERE rowid IN (
+        SELECT rowid FROM create_results WHERE expiresAt <= ? ORDER BY expiresAt LIMIT ?
+      )`,
+      Date.now(), createResultCleanupLimit,
+    );
     const pending: Promise<void>[] = [];
     const { monitors } = this.read(Math.max(at, Date.now()), { pending });
     const calendarPolicy = this.prepareOutboundCalendars();
@@ -1957,20 +1994,19 @@ function operatorMutationResponse<E extends EngineEnv>(c: Context<HttpEnv<E>>, a
 async function readBoundedBody(request: Request, maxBytes = 4096) {
   if (Number(request.headers.get("Content-Length")) > maxBytes) return null;
   const reader = request.body?.getReader();
-  if (!reader) return "";
-  const decoder = new TextDecoder();
-  let body = "";
+  if (!reader) return new Uint8Array(0);
+  const body = new Uint8Array(maxBytes);
   let bytes = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) return body + decoder.decode();
-      bytes += value.length;
-      if (bytes > maxBytes) {
+      if (done) return body.subarray(0, bytes);
+      if (bytes + value.length > maxBytes) {
         await reader.cancel();
         return null;
       }
-      body += decoder.decode(value, { stream: true });
+      body.set(value, bytes);
+      bytes += value.length;
     }
   } finally {
     reader.releaseLock();
@@ -2103,7 +2139,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
       if (c.req.header("Content-Type")?.split(";")[0] !== "application/x-www-form-urlencoded") return new Response(null, { status: 415 });
       const body = await readBoundedBody(c.req.raw);
       if (body === null) return new Response(null, { status: 413 });
-      const tokens = new URLSearchParams(body).getAll("token");
+      const tokens = new URLSearchParams(new TextDecoder().decode(body)).getAll("token");
       const [token] = tokens;
       const context = c.get("context");
       const origin = new URL(c.req.url).origin;
@@ -2214,16 +2250,16 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
       if (key !== undefined) {
         if (key.includes(",") || !/^[!-~]{1,128}$/.test(key))
           return Response.json({ error: "Invalid Idempotency-Key" }, { status: 400 });
-        const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body));
+        const digest = await crypto.subtle.digest("SHA-256", body);
         const idempotency = { key, digest };
-        const saved = await c.get("context").lookupCreateResult(endpoint, idempotency);
+        const saved = await c.get("context").replayCreateResult(endpoint, idempotency);
         if (saved) return createResponse(saved);
         c.set("idempotency", idempotency);
       }
     }
     let value: unknown;
     try {
-      value = JSON.parse(body);
+      value = JSON.parse(new TextDecoder().decode(body));
     } catch {
       return Response.json({ error: "Invalid JSON" }, { status: 400 });
     }
