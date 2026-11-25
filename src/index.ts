@@ -2,7 +2,7 @@
 import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, renderViewPartial, renderViewSnapshot, statusJson, styleSheet, themeScript, type StatusProjection } from "./ui";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
-import { minimumCheckIntervalSeconds, MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
+import { minimumCheckIntervalSeconds, MonitorConfigurations, monitorResource, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
 import { connect } from "cloudflare:sockets";
 import { parseEmailAddress, parseWebhook, type AlertDestination, type ConfirmationIdentity, type ConfirmationJob, type NewNotificationDestination, type NotificationDestination, type NotificationEligibility, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
 import type { NotificationDeliveryIdentity, SubmissionReport } from "./notification-outcomes";
@@ -865,7 +865,22 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   async create(value: unknown, limit?: number) {
-    return this.monitorConfigurations.create(value, limit);
+    const result = await this.monitorConfigurations.create(value, limit);
+    return result ? result.ack : result;
+  }
+
+  listMonitorResources() {
+    return this.read().monitors.map(monitorResource);
+  }
+
+  readMonitorResource(id: string) {
+    const monitor = this.read().monitors.find(monitor => monitor.id === id);
+    return monitor ? monitorResource(monitor) : null;
+  }
+
+  async createMonitorResource(value: unknown) {
+    const result = await this.monitorConfigurations.create(value);
+    return result ? monitorResource(result.monitor) : undefined;
   }
 
   private migrateDestinations(state: StoredContext) {
@@ -1044,7 +1059,13 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   async edit(id: string, value: unknown) {
-    return this.monitorConfigurations.edit(id, value);
+    const result = await this.monitorConfigurations.edit(id, value);
+    return result ? result.ack : result;
+  }
+
+  async editMonitorResource(id: string, value: unknown) {
+    const result = await this.monitorConfigurations.edit(id, value);
+    return result ? monitorResource(result.monitor) : result;
   }
 
   private endMaintenance(monitor: Monitor) {
@@ -2101,6 +2122,42 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   app.all(apiKeyPath, () => methodNotAllowed("DELETE"));
   // IDs are opaque: read the original path rather than Hono's decoded params.
   const monitorId = (c: Context<HttpEnv<E>>) => c.req.path.split("/")[4];
+  const monitorCollection = "/api/v1/monitors";
+  const monitorResourcePath = monitorCollection + "/:id";
+  for (const path of [monitorCollection, monitorResourcePath]) app.use(path, versionedAuthorization("write"));
+  const invalidMonitor = () => Response.json({ error: "Invalid Monitor configuration" }, { status: 400 });
+  const missingMonitor = () => Response.json({ error: "Monitor not found" }, { status: 404 });
+  const configurationOnly: MiddlewareHandler<HttpEnv<E>> = async (c, next) => {
+    const value = c.get("value");
+    if (value && typeof value === "object" && ("destinationIds" in value || "destinationChanges" in value))
+      return invalidMonitor();
+    await next();
+  };
+  app.get(monitorCollection, async c => {
+    if (c.req.method !== "GET") return methodNotAllowed("GET, POST");
+    return Response.json({ monitors: await c.get("context").listMonitorResources() });
+  });
+  app.get(monitorResourcePath, async c => {
+    if (c.req.method !== "GET") return methodNotAllowed("GET, PATCH, DELETE");
+    const monitor = await c.get("context").readMonitorResource(monitorId(c));
+    return monitor ? Response.json(monitor) : missingMonitor();
+  });
+  app.post(monitorCollection, readBody, configurationOnly, async (c: Context<HttpEnv<E>>) => {
+    const monitor = await c.get("context").createMonitorResource(c.get("value"));
+    return monitor ? Response.json(monitor, { status: 201, headers: { Location: monitorCollection + "/" + monitor.id } }) : invalidMonitor();
+  });
+  app.patch(monitorResourcePath, readBody, configurationOnly, async (c: Context<HttpEnv<E>>) => {
+    const monitor = await c.get("context").editMonitorResource(monitorId(c), c.get("value"));
+    if (monitor === undefined) return invalidMonitor();
+    return monitor ? Response.json(monitor) : missingMonitor();
+  });
+  app.delete(monitorResourcePath, async c => {
+    const removed = await c.get("context").remove(monitorId(c));
+    return removed ? new Response(null, { status: 204 }) : missingMonitor();
+  });
+  app.all(monitorCollection, () => methodNotAllowed("GET, POST"));
+  app.all(monitorResourcePath, () => methodNotAllowed("GET, PATCH, DELETE"));
+
   for (const path of ["/api/operator", "/api/operator/webhook", "/api/operator/monitors", destinationsPath]) {
     app.get(path, async (c: Context<HttpEnv<E>>) => {
       if (c.req.method !== "GET")
