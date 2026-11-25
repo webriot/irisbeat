@@ -3,19 +3,26 @@ import worker, { createHostedWorker } from '../src/index';
 import { env } from 'cloudflare:workers';
 import { createScheduledController, reset } from 'cloudflare:test';
 import { afterEach, expect, it, vi } from 'vitest';
+import { captureNotifications } from './notification-queue';
 
 const monitors = '/api/v1/monitors';
 const operatorMonitors = '/api/operator/monitors';
 const installationSecret = 'test-installation-secret';
+const origin = 'https://irisbeat.example';
+const bindings = {
+  ...env,
+  NOTIFICATION_PUBLIC_ORIGIN: origin,
+  NOTIFICATION_EMAIL: { async isConfigured() { return true; } },
+};
 const request = (path: string, method = 'GET', body?: unknown, secret: string | null = installationSecret) => worker.fetch(
-  new Request('https://irisbeat.example' + path, {
+  new Request(origin + path, {
     method,
     headers: {
       ...(secret === null ? {} : { authorization: 'Bearer ' + secret }),
       ...(body === undefined ? {} : { 'content-type': 'application/json' }),
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-  }), env,
+  }), bindings,
 );
 afterEach(async () => { vi.restoreAllMocks(); await reset(); });
 
@@ -45,6 +52,25 @@ it('creates and imports a private HTTP Monitor using only its saved configuratio
   expect(await (await request('/api/status', 'GET', undefined, null)).json()).toMatchObject({ monitors: [] });
 });
 
+it('creates and imports a Monitor with assignments using a Write API key', async () => {
+  const destinationId = await createWebhook('primary');
+  const { secret } = await issueApiKey('write');
+  const response = await request(monitors, 'POST', {
+    name: 'Backup', kind: 'heartbeat', destinationIds: [destinationId],
+  }, secret);
+  expect(response.status).toBe(201);
+  const saved = await response.json<{ id: string; destinationIds: string[] }>();
+  expect(saved.destinationIds).toEqual([destinationId]);
+  expect(await (await request(monitors + '/' + saved.id, 'GET', undefined, secret)).json()).toEqual(saved);
+});
+
+async function createWebhook(name: string) {
+  const response = await request('/api/operator/destinations', 'POST', { name, url: 'https://hooks.example/' + name });
+  expect(response.status).toBe(201);
+  const { destinations } = await response.json<{ destinations: { id: string; name: string }[] }>();
+  return destinations.find(destination => destination.name === name)!.id;
+}
+
 it('imports a TCP Monitor after an Operator edit and preserves assignments on a partial update', async () => {
   const created = await request(monitors, 'POST', { name: 'Service', kind: 'tcp', hostname: 'ORIGIN.example', port: 443 });
   expect(created.status).toBe(201);
@@ -68,6 +94,123 @@ it('imports a TCP Monitor after an Operator edit and preserves assignments on a 
   expect(await updated.json()).toEqual({ ...imported, name: 'Edge', published: false });
   expect(await (await request(path)).json()).toEqual({ ...imported, name: 'Edge', published: false });
   expect(await (await request('/api/status', 'GET', undefined, null)).json()).toMatchObject({ monitors: [] });
+});
+
+it('replaces and clears assignments with assignment-only patches', async () => {
+  const primary = await createWebhook('primary');
+  const secondary = await createWebhook('secondary');
+  const created = await request(monitors, 'POST', {
+    name: 'Backup', kind: 'heartbeat', published: false, scheduleMode: 'calendar',
+    cron: '0 3 * * *', graceSeconds: 120, destinationIds: [primary],
+  });
+  expect(created.status).toBe(201);
+  const saved = await created.json<{ id: string }>();
+  const path = monitors + '/' + saved.id;
+  for (const destinationIds of [[secondary], []]) {
+    const updated = await request(path, 'PATCH', { destinationIds });
+    expect(updated.status).toBe(200);
+    expect(await updated.json()).toEqual({ ...saved, destinationIds });
+    expect(await (await request(path)).json()).toEqual({ ...saved, destinationIds });
+  }
+});
+
+it('rejects invalid assignments without creating or changing a Monitor', async () => {
+  const primary = await createWebhook('primary');
+  const secondary = await createWebhook('secondary');
+  const body = { name: 'Backup', kind: 'heartbeat', destinationIds: [primary] };
+  const created = await request(monitors, 'POST', body);
+  expect(created.status).toBe(201);
+  const saved = await created.json<{ id: string }>();
+  const path = monitors + '/' + saved.id;
+
+  for (const destinationIds of [[secondary, 'missing'], [secondary, secondary], [secondary, 42], secondary, null]) {
+    for (const [route, method] of [[monitors, 'POST'], [path, 'PATCH']]) {
+      const rejected = await request(route, method, { ...body, name: 'Rejected', destinationIds });
+      expect(rejected.status).toBe(400);
+      expect(await rejected.json()).toEqual({ error: 'Invalid Monitor configuration' });
+      expect(await (await request(path)).json()).toEqual(saved);
+    }
+  }
+  expect(await (await request('/api/v1/status')).json()).toMatchObject({ monitors: [{ id: saved.id }] });
+});
+
+it('rejects pending email assignments atomically and accepts the same requests after confirmation', async () => {
+  const notifications = await captureNotifications();
+  const primary = await createWebhook('primary');
+  const email = await request('/api/operator/destinations', 'POST', { channel: 'email', address: 'alerts@example.org' });
+  expect(email.status).toBe(201);
+  const { destinations: [, pending] } = await email.json<{ destinations: { id: string; confirmed?: boolean }[] }>();
+  expect(pending.confirmed).toBe(false);
+
+  const original = await request(monitors, 'POST', { name: 'Backup', kind: 'heartbeat', destinationIds: [primary] });
+  expect(original.status).toBe(201);
+  const saved = await original.json<{ id: string }>();
+  const path = monitors + '/' + saved.id;
+  const destinationIds = [pending.id, primary];
+  const create = () => request(monitors, 'POST', { name: 'New job', kind: 'heartbeat', destinationIds });
+  const update = () => request(path, 'PATCH', { name: 'Renamed', destinationIds });
+  for (const change of [create, update]) {
+    const rejected = await change();
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toEqual({
+      error: 'An email destination is awaiting confirmation', code: 'destination_pending_confirmation',
+    });
+    expect(await (await request(path)).json()).toEqual(saved);
+  }
+  expect(await (await request('/api/v1/status')).json()).toMatchObject({ monitors: [{ id: saved.id }] });
+
+  // Resolve the queued invitation as the delivery Worker does.
+  const [job] = await notifications.confirmationJobs();
+  const invitation = await env.MONITORING.get(env.MONITORING.idFromString(job.contextId)).resolveConfirmation(job);
+  expect(invitation).toMatchObject({ address: 'alerts@example.org' });
+  const link = new URL(invitation!.url);
+  const token = link.hash.slice(1);
+  link.hash = '';
+  const confirmed = await worker.fetch(new Request(link, {
+    method: 'POST', body: new URLSearchParams({ token }),
+  }), bindings);
+  expect(confirmed.status).toBe(200);
+
+  const created = await create();
+  expect(created.status).toBe(201);
+  expect(await created.json()).toMatchObject({ name: 'New job', destinationIds });
+  const updated = await update();
+  expect(updated.status).toBe(200);
+  expect(await updated.json()).toEqual({ ...saved, name: 'Renamed', destinationIds });
+});
+
+it('rejects a destination removed during Calendar validation and preserves the concurrent change', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(Date.UTC(2026, 10, 13));
+  const primary = await createWebhook('primary');
+  const created = await request(monitors, 'POST', {
+    name: 'Backup', kind: 'heartbeat', scheduleMode: 'calendar', cron: '*/5 * * * *', destinationIds: [primary],
+  });
+  expect(created.status).toBe(201);
+  const saved = await created.json<{ id: string }>();
+  const path = monitors + '/' + saved.id;
+  const format = Intl.DateTimeFormat.prototype.formatToParts;
+  let calls = 0;
+  let finished = false;
+  vi.spyOn(Intl.DateTimeFormat.prototype, 'formatToParts').mockImplementation(function (this: Intl.DateTimeFormat, at) {
+    calls++;
+    return format.call(this, at);
+  });
+  const pending = request(path, 'PATCH', {
+    name: 'Rejected', cron: '0-28/2,31-57/2 * * * *', timezone: 'Australia/Lord_Howe', graceSeconds: 60,
+    destinationIds: [primary],
+  }).finally(() => { finished = true; });
+  for (let yields = 0; calls < 1024 && yields < 100; yields++) await scheduler.wait(0);
+  expect(calls).toBeGreaterThanOrEqual(1024);
+  expect(finished).toBe(false);
+  const removed = await request('/api/operator/destinations/' + primary, 'DELETE');
+  expect(removed.status).toBe(200);
+  const afterRemoval = await (await request(path)).json();
+  expect(afterRemoval).toEqual({ ...saved, destinationIds: [] });
+  expect(finished).toBe(false);
+  const rejected = await pending;
+  expect(rejected.status).toBe(400);
+  expect(await rejected.json()).toEqual({ error: 'Invalid Monitor configuration' });
+  expect(await (await request(path)).json()).toEqual(afterRemoval);
 });
 
 it('deletes a Heartbeat Monitor while preserving its Incident for Operators', async () => {
@@ -99,7 +242,7 @@ it('deletes a Heartbeat Monitor while preserving its Incident for Operators', as
   });
 });
 
-it('accepts Calendar timing and rejects invalid or assignment changes atomically', async () => {
+it('accepts Calendar timing and rejects invalid configuration changes atomically', async () => {
   const response = await request(monitors, 'POST', {
     name: 'Backup', kind: 'heartbeat', scheduleMode: 'calendar', cron: '0 3 * * *', graceSeconds: 120,
   });
@@ -116,12 +259,10 @@ it('accepts Calendar timing and rejects invalid or assignment changes atomically
     { kind: 'http', url: 'https://example.org' },
     { cron: 'bad schedule' },
     { silenceSeconds: 90 },
-    { name: 'Unexpected', destinationIds: [] },
     { name: 'Unexpected', destinationChanges: {} },
   ]) expect((await request(path, 'PATCH', body)).status).toBe(400);
   expect(await (await request(path)).json()).toEqual(configuration);
   expect((await request(monitors, 'POST', { name: 'Invalid', url: 'ftp://example.org' })).status).toBe(400);
-  expect((await request(monitors, 'POST', { name: 'Unexpected', kind: 'heartbeat', destinationIds: [] })).status).toBe(400);
   expect(await (await request('/api/v1/status')).json()).toMatchObject({ monitors: [{ id }] });
 });
 
@@ -170,7 +311,7 @@ it('requires credentials, limits methods and keeps Monitor routes self-hosted', 
 it('allows Write API keys to reconcile configuration and forbids Read keys on every Monitor route', async () => {
   const read = await issueApiKey('read');
   const write = await issueApiKey('write');
-  const body = { name: 'Private job', kind: 'heartbeat', published: false };
+  const body = { name: 'Private job', kind: 'heartbeat', published: false, destinationIds: [] };
   const created = await request(monitors, 'POST', body, write.secret);
   expect(created.status).toBe(201);
   const { id } = await created.json<{ id: string }>();

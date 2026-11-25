@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { exports } from "cloudflare:workers";
 import { expect } from "vitest";
-import type { NotificationJob } from "../src";
+import type { ConfirmationJob, NotificationJob, NotificationQueueJob } from "../src";
 
 const queue = "https://irisbeat.example/__test-notification-queue";
 
 export async function captureNotifications(unavailable = false) {
   await exports.default.fetch(queue + (unavailable ? "?unavailable" : ""), { method: "DELETE" });
+  const queued = async () => (await exports.default.fetch(queue)).json<NotificationQueueJob[]>();
   return {
-    jobs: async () => (await exports.default.fetch(queue)).json<NotificationJob[]>(),
+    jobs: async () => (await queued()).filter((job): job is NotificationJob => "event" in job),
+    confirmationJobs: async () => (await queued()).filter((job): job is ConfirmationJob => "kind" in job),
     async summaries() {
       return (await this.jobs()).filter(({ event }) => event.kind.startsWith("incident.")).map(({ event }) =>
         event.monitorName.replace(/\s+/g, " ") + ": Incident " + event.kind.split(".")[1]);
