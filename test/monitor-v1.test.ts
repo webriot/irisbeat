@@ -49,7 +49,6 @@ it('creates and imports a private HTTP Monitor using only its saved configuratio
   const imported = await request(monitors + '/' + id);
   expect(imported.status).toBe(200);
   expect(await imported.json()).toEqual(configuration);
-  expect(await (await request(monitors)).json()).toEqual({ monitors: [configuration] });
   expect(await (await request('/api/status', 'GET', undefined, null)).json()).toMatchObject({ monitors: [] });
 });
 
@@ -131,7 +130,7 @@ it('rejects invalid assignments without creating or changing a Monitor', async (
       expect(await rejected.json()).toEqual({ error: 'Invalid Monitor configuration' });
     }
   }
-  expect(await (await request(monitors)).json()).toEqual({ monitors: [saved] });
+  expect(await (await request('/api/v1/status')).json()).toMatchObject({ monitors: [{ id: saved.id }] });
 });
 
 it('rejects pending email assignments atomically and accepts the same requests after confirmation', async () => {
@@ -155,7 +154,7 @@ it('rejects pending email assignments atomically and accepts the same requests a
       error: 'An email destination is awaiting confirmation', code: 'destination_pending_confirmation',
     });
   }
-  expect(await (await request(monitors)).json()).toEqual({ monitors: [saved] });
+  expect(await (await request('/api/v1/status')).json()).toMatchObject({ monitors: [{ id: saved.id }] });
 
   // Resolve the queued invitation as the delivery Worker does.
   const [job] = await notifications.confirmationJobs();
@@ -200,7 +199,6 @@ it('deletes a Heartbeat Monitor while preserving its Incident for Operators', as
   expect(await deleted.text()).toBe('');
   for (const [method, body] of [['GET'], ['PATCH', { name: 'Unknown' }], ['DELETE']] as const)
     expect((await request(path, method, body)).status).toBe(404);
-  expect(await (await request(monitors)).json()).toEqual({ monitors: [] });
   expect((await request('/heartbeat/' + id, 'POST')).status).toBe(404);
   expect(await (await request('/api/operator')).json()).toMatchObject({
     monitors: [], incidents: [{ monitorId: id, monitorName: 'Nightly job', openedAt }],
@@ -228,22 +226,33 @@ it('accepts Calendar timing and rejects invalid configuration changes atomically
   ]) expect((await request(path, 'PATCH', body)).status).toBe(400);
   expect(await (await request(path)).json()).toEqual(configuration);
   expect((await request(monitors, 'POST', { name: 'Invalid', url: 'ftp://example.org' })).status).toBe(400);
-  expect(await (await request(monitors)).json()).toEqual({ monitors: [configuration] });
+  expect(await (await request('/api/v1/status')).json()).toMatchObject({ monitors: [{ id }] });
+});
+
+it('accepts JSON media types with parameters and rejects lookalike types', async () => {
+  const create = (contentType: string) => worker.fetch(new Request('https://irisbeat.example' + monitors, {
+    method: 'POST',
+    headers: { authorization: 'Bearer ' + installationSecret, 'content-type': contentType },
+    body: JSON.stringify({ name: 'Nightly job', kind: 'heartbeat' }),
+  }), env);
+  expect((await create('application/jsonp')).status).toBe(415);
+  expect((await create('Application/JSON; charset=UTF-8')).status).toBe(201);
 });
 
 it('requires credentials, limits methods and keeps Monitor routes self-hosted', async () => {
   const resource = monitors + '/missing';
   for (const [path, method] of [
-    [monitors, 'GET'], [monitors, 'POST'], [resource, 'GET'], [resource, 'PATCH'], [resource, 'DELETE'],
+    [monitors, 'POST'], [resource, 'GET'], [resource, 'PATCH'], [resource, 'DELETE'],
   ]) {
     expect((await request(path, method, undefined, null)).status).toBe(401);
     expect((await request(path, method, undefined, 'invalid')).status).toBe(401);
   }
-  for (const [path, allow] of [[monitors, 'GET, POST'], [resource, 'GET, PATCH, DELETE']]) {
+  for (const [path, allow] of [[monitors, 'POST'], [resource, 'GET, PATCH, DELETE']]) {
     const response = await request(path, 'PUT');
     expect(response.status).toBe(405);
     expect(response.headers.get('Allow')).toBe(allow);
   }
+  expect((await request(monitors)).status).toBe(405);
   expect((await request(resource)).status).toBe(404);
   expect((await request(resource + '/')).status).toBe(404);
   expect((await request(monitors, 'POST')).status).toBe(415);
@@ -273,16 +282,13 @@ it('allows Write API keys to reconcile configuration and forbids Read keys on ev
 
   expect((await request('/api/v1/status', 'GET', undefined, read.secret)).status).toBe(200);
   for (const [route, method] of [
-    [monitors, 'GET'], [monitors, 'POST'], [path, 'GET'], [path, 'PATCH'], [path, 'DELETE'],
+    [monitors, 'POST'], [path, 'GET'], [path, 'PATCH'], [path, 'DELETE'],
   ]) {
     const response = await request(route, method, undefined, read.secret);
     expect(response.status).toBe(403);
     expect(await response.json()).toEqual({ error: 'Forbidden' });
   }
 
-  expect(await (await request(monitors, 'GET', undefined, write.secret)).json()).toMatchObject({
-    monitors: [{ id, ...body }],
-  });
   expect(await (await request(path, 'GET', undefined, write.secret)).json()).toMatchObject({ id, ...body });
   expect(await (await request(path, 'PATCH', { name: 'Renamed' }, write.secret)).json()).toMatchObject({
     id, name: 'Renamed',

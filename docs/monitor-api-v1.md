@@ -2,7 +2,7 @@
 
 On a self-hosted installation, send `Authorization: Bearer <write API key>`
 or use the installation secret as the Bearer credential. Every Monitor
-configuration operation requires Write access, including list and read by ID.
+configuration operation requires Write access, including read by ID.
 The routes return `401` for missing, invalid, expired, or revoked credentials
 and `403` for Read API keys. Hosted Workers return `404` for these routes.
 See the [automation API overview](api-v1.md) for key administration and the
@@ -10,7 +10,6 @@ shared authentication response format.
 
 | Method and path | Success | Response |
 | --- | --- | --- |
-| `GET /api/v1/monitors` | `200` | `{ "monitors": [...] }` with all active Monitor configurations in creation order, including private Monitors |
 | `POST /api/v1/monitors` | `201` | Created Monitor and a relative `Location` header containing its resource path |
 | `GET /api/v1/monitors/:id` | `200` | Saved Monitor, including changes made in the Operator |
 | `PATCH /api/v1/monitors/:id` | `200` | Updated Monitor |
@@ -66,6 +65,8 @@ Heartbeats have no target. Calendar requires a `cron` expression and defaults
 PATCH requires at least one field, which can be `destinationIds`. Omitted fields keep
 their saved values. An unchanged `kind` is accepted. To switch back to Interval,
 send `{ "scheduleMode": "interval" }` and leave out `cron` and `timezone`.
+If the saved interval of an HTTP or TCP Monitor is below the installation's
+check floor, also supply an `intervalSeconds` value at or above the floor.
 When switching to Calendar, include the cron expression and optionally a
 timezone. `id` and `destinationChanges` are rejected in request bodies.
 

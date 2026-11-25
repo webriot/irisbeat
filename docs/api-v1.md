@@ -3,7 +3,7 @@
 | Method and path | Access | Reference |
 | --- | --- | --- |
 | `GET /api/v1/status` | Read or Write API key, or installation secret | [Monitor status](#monitor-status) |
-| `GET, POST /api/v1/monitors` | Write API key or installation secret | [Monitor configuration](monitor-api-v1.md) |
+| `POST /api/v1/monitors` | Write API key or installation secret | [Monitor configuration](monitor-api-v1.md) |
 | `GET, PATCH, DELETE /api/v1/monitors/:id` | Write API key or installation secret | [Monitor configuration](monitor-api-v1.md) |
 | `GET /api/operator/api-keys` | Installation secret | [List keys](#list-keys) |
 | `POST /api/operator/api-keys` | Installation secret | [Issue a key](#issue-a-key) |
