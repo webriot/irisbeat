@@ -101,6 +101,18 @@ it('returns public fields and availability for active private Monitors without e
   expect(data.incidents.map(incident => incident.monitorId).sort()).toEqual([publishedId, privateId].sort());
 });
 
+it('accepts case-insensitive Bearer schemes and multiple separator spaces on the new routes', async () => {
+  const { secret } = await issue({ name: 'Dashboard', role: 'read' });
+  const withHeader = (path: string, authorization: string) => worker.fetch(
+    new Request('https://irisbeat.example' + path, { headers: { authorization } }), env,
+  );
+  expect((await withHeader(statusPath, 'bearer   ' + secret)).status).toBe(200);
+  expect((await withHeader(statusPath, 'bEaReR  ' + installation)).status).toBe(200);
+  expect((await withHeader(keyPath, 'bearer  ' + installation)).status).toBe(200);
+  expect((await withHeader(statusPath, 'bearer  ' + secret.toUpperCase())).status).toBe(401);
+  expect((await withHeader(keyPath, 'bearer  ' + secret)).status).toBe(401);
+});
+
 it('keeps API keys out of Operator, Heartbeat and hosted authorization', async () => {
   const heartbeat = await request('/api/operator/monitors', installation, 'POST', { name: 'Job', kind: 'heartbeat' });
   expect(heartbeat.status).toBe(201);

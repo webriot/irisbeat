@@ -27,6 +27,7 @@ To try Irisbeat on your computer, follow the [local setup](development.md).
 ## API and integration references
 
 - [Versioned automation API and API keys](api-v1.md)
+- [Versioned Monitor configuration API](monitor-api-v1.md)
 - [Notification destination API](destination-api.md)
 - [Monitor API and scheduling](monitor-api.md)
 - [TCP Monitor setup](tcp-monitoring.md)

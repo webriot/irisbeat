@@ -2,7 +2,7 @@
 import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, renderViewPartial, renderViewSnapshot, statusJson, styleSheet, themeScript, type StatusProjection } from "./ui";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
-import { minimumCheckIntervalSeconds, MonitorConfigurations, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
+import { destinationPendingConfirmation, minimumCheckIntervalSeconds, MonitorConfigurations, monitorResource, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
 import { connect } from "cloudflare:sockets";
 import { parseEmailAddress, parseWebhook, type AlertDestination, type ConfirmationIdentity, type ConfirmationJob, type NewNotificationDestination, type NotificationDestination, type NotificationEligibility, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
 import type { NotificationDeliveryIdentity, SubmissionReport } from "./notification-outcomes";
@@ -93,6 +93,11 @@ function destinationResource(destination: NotificationDestination): Notification
 
 type ApiKeyRole = "read" | "write";
 type ApiKey = { id: string; name: string; role: ApiKeyRole; createdAt: number; expiresAt: number | null };
+const apiKeyPrefix = "irb_";
+
+function canonicalBearer(authorization: string | undefined) {
+  return authorization?.replace(/^Bearer +/i, "Bearer ");
+}
 
 function credentialDigest(authorization: string) {
   return crypto.subtle.digest("SHA-256", new TextEncoder().encode(authorization));
@@ -208,7 +213,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const name = typeof input.name === "string" ? input.name.trim() : "";
     const { role, expiresAt } = input;
     if (!name || name.length > 120 || (role !== "read" && role !== "write")) return null;
-    const secret = "irb_" + Array.from(crypto.getRandomValues(new Uint8Array(32)), byte =>
+    const secret = apiKeyPrefix + Array.from(crypto.getRandomValues(new Uint8Array(32)), byte =>
       byte.toString(16).padStart(2, "0")).join("");
     const digest = await credentialDigest(`Bearer ${secret}`);
     const createdAt = Date.now();
@@ -873,7 +878,22 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   async create(value: unknown, limit?: number) {
-    return this.monitorConfigurations.create(value, limit);
+    if (value && typeof value === "object" && "destinationIds" in value &&
+        (!Array.isArray(value.destinationIds) || value.destinationIds.length)) return undefined;
+    const result = await this.monitorConfigurations.create(value, limit);
+    if (result === destinationPendingConfirmation) return undefined;
+    return result ? result.ack : result;
+  }
+
+  readMonitorResource(id: string) {
+    const monitor = this.read().monitors.find(monitor => monitor.id === id);
+    return monitor ? monitorResource(monitor) : null;
+  }
+
+  async createMonitorResource(value: unknown) {
+    const result = await this.monitorConfigurations.create(value);
+    if (result === destinationPendingConfirmation) return result;
+    return result ? monitorResource(result.monitor) : undefined;
   }
 
   private migrateDestinations(state: StoredContext) {
@@ -1067,7 +1087,15 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   async edit(id: string, value: unknown) {
-    return this.monitorConfigurations.edit(id, value);
+    const result = await this.monitorConfigurations.edit(id, value);
+    if (result === destinationPendingConfirmation) return undefined;
+    return result ? result.ack : result;
+  }
+
+  async editMonitorResource(id: string, value: unknown) {
+    const result = await this.monitorConfigurations.edit(id, value);
+    if (result === destinationPendingConfirmation) return result;
+    return result ? monitorResource(result.monitor) : result;
   }
 
   private endMaintenance(monitor: Monitor) {
@@ -1690,10 +1718,10 @@ function attachAvailability(status: StatusProjection, history: Map<string, Avail
   return { ...status, monitors, monitor: monitors[0] ?? null };
 }
 
-async function authorized(request: Request, secret: string | undefined) {
+async function authorized(authorization: string | undefined, secret: string | undefined) {
   if (!secret) return false;
   const [actual, expected] = await Promise.all([
-    credentialDigest(request.headers.get("Authorization") ?? ""),
+    credentialDigest(authorization ?? ""),
     credentialDigest(`Bearer ${secret}`),
   ]);
   return crypto.subtle.timingSafeEqual(actual, expected);
@@ -1914,7 +1942,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   });
   app.all("/heartbeat/*", async (c: Context<HttpEnv<E>>) => {
     if (c.get("resolved")) return new Response(null, { status: 404 });
-    if (!(await authorized(c.req.raw, c.env.INSTALLATION_SECRET)))
+    if (!(await authorized(c.req.header("Authorization"), c.env.INSTALLATION_SECRET)))
       return Response.json({ error: "Unauthorized" }, { status: 401 });
     if (c.req.method !== "POST") return methodNotAllowed("POST");
     const accepted = await c.get("context").heartbeat(c.req.path.slice("/heartbeat/".length), Date.now());
@@ -1956,9 +1984,9 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     publicRender(c, c.req.header("Accept") === viewMediaType ? "snapshot" : "/api/status"));
   const versionedAuthorization = (required: ApiKeyRole): MiddlewareHandler<HttpEnv<E>> => async (c, next) => {
     if (c.get("resolved")) return c.notFound();
-    if (!(await authorized(c.req.raw, c.env.INSTALLATION_SECRET))) {
-      const authorization = c.req.header("Authorization") ?? "";
-      const role = authorization.startsWith("Bearer irb_")
+    const authorization = canonicalBearer(c.req.header("Authorization"));
+    if (!(await authorized(authorization, c.env.INSTALLATION_SECRET))) {
+      const role = authorization?.startsWith("Bearer " + apiKeyPrefix)
         ? await c.get("context").apiKeyRole(await credentialDigest(authorization)) : undefined;
       if (!role) return Response.json({ error: "Unauthorized" }, { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
       if (required === "write" && role !== "write") return Response.json({ error: "Forbidden" }, { status: 403 });
@@ -2033,7 +2061,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   const operatorPartialPaths = [operatorPartials, operatorPartials + "/:section", operatorPartials + "/monitor/:id"];
   for (const path of [apiKeysPath, apiKeyPath]) app.use(path, async (c, next) => {
     if (c.get("resolved")) return c.notFound();
-    if (!(await authorized(c.req.raw, c.env.INSTALLATION_SECRET)))
+    if (!(await authorized(canonicalBearer(c.req.header("Authorization")), c.env.INSTALLATION_SECRET)))
       return Response.json({ error: "Unauthorized" }, { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
     await next();
   });
@@ -2041,7 +2069,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   for (const path of operatorPaths) app.use(path, async (c, next) => {
     const resolved = c.get("resolved");
     if (path === rotationPath && !resolved) return c.notFound();
-    const permission = resolved ? resolved.permission : await authorized(c.req.raw, c.env.INSTALLATION_SECRET) ? "editor" : null;
+    const permission = resolved ? resolved.permission : await authorized(c.req.header("Authorization"), c.env.INSTALLATION_SECRET) ? "editor" : null;
     if (!permission) return Response.json({ error: "Unauthorized" }, { status: 401 });
     if (permission !== "editor" && c.req.method !== "GET" && path !== ticketPath) return Response.json({ error: "Forbidden" }, { status: 403 });
     c.set("permission", permission);
@@ -2092,7 +2120,11 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   });
   const readBody: MiddlewareHandler<HttpEnv<E>> = async (c: Context<HttpEnv<E>>, next) => {
     const request = c.req.raw;
-    if (!request.headers.get("Content-Type")?.startsWith("application/json"))
+    const contentType = request.headers.get("Content-Type");
+    const json = c.req.path.startsWith("/api/v1/")
+      ? contentType?.split(";", 1)[0].trim().toLowerCase() === "application/json"
+      : contentType?.startsWith("application/json");
+    if (!json)
       return Response.json(
         { error: "Use application/json" },
         { status: 415 },
@@ -2128,6 +2160,40 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   app.all(apiKeyPath, () => methodNotAllowed("DELETE"));
   // IDs are opaque: read the original path rather than Hono's decoded params.
   const monitorId = (c: Context<HttpEnv<E>>) => c.req.path.split("/")[4];
+  const monitorCollection = "/api/v1/monitors";
+  const monitorResourcePath = monitorCollection + "/:id";
+  for (const path of [monitorCollection, monitorResourcePath]) app.use(path, versionedAuthorization("write"));
+  const invalidMonitor = () => Response.json({ error: "Invalid Monitor configuration" }, { status: 400 });
+  const pendingAssignment = () => Response.json({
+    error: "An email destination is awaiting confirmation",
+    code: destinationPendingConfirmation,
+  }, { status: 400 });
+  const missingMonitor = () => Response.json({ error: "Monitor not found" }, { status: 404 });
+  app.get(monitorResourcePath, async c => {
+    if (c.req.method !== "GET") return methodNotAllowed("GET, PATCH, DELETE");
+    const monitor = await c.get("context").readMonitorResource(monitorId(c));
+    return monitor ? Response.json(monitor) : missingMonitor();
+  });
+  app.post(monitorCollection, readBody, async (c: Context<HttpEnv<E>>) => {
+    const monitor = await c.get("context").createMonitorResource(c.get("value"));
+    if (monitor === destinationPendingConfirmation) return pendingAssignment();
+    return monitor ? Response.json(monitor, { status: 201, headers: { Location: monitorCollection + "/" + monitor.id } }) : invalidMonitor();
+  });
+  app.patch(monitorResourcePath, readBody, async (c: Context<HttpEnv<E>>) => {
+    const value = c.get("value");
+    if (value && typeof value === "object" && "destinationChanges" in value) return invalidMonitor();
+    const monitor = await c.get("context").editMonitorResource(monitorId(c), value);
+    if (monitor === destinationPendingConfirmation) return pendingAssignment();
+    if (monitor === undefined) return invalidMonitor();
+    return monitor ? Response.json(monitor) : missingMonitor();
+  });
+  app.delete(monitorResourcePath, async c => {
+    const removed = await c.get("context").remove(monitorId(c));
+    return removed ? new Response(null, { status: 204 }) : missingMonitor();
+  });
+  app.all(monitorCollection, () => methodNotAllowed("POST"));
+  app.all(monitorResourcePath, () => methodNotAllowed("GET, PATCH, DELETE"));
+
   for (const path of ["/api/operator", "/api/operator/webhook", "/api/operator/monitors", destinationsPath]) {
     app.get(path, async (c: Context<HttpEnv<E>>) => {
       if (c.req.method !== "GET")

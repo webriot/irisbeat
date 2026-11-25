@@ -2,7 +2,7 @@
 import { env } from "cloudflare:workers";
 import { reset } from "cloudflare:test";
 import { afterEach, expect, it } from "vitest";
-import worker, { createHostedWorker, type ConfirmationJob, type EngineEnv, type NotificationDestination, type Status } from "../src/index";
+import worker, { createHostedWorker, type EngineEnv, type NotificationDestination, type Status } from "../src/index";
 import { captureNotifications } from "./notification-queue";
 
 const installation = "test-installation-secret";
@@ -94,7 +94,7 @@ it("keeps email destinations pending until recipient consent and requires fresh 
   const monitorPath = monitors + "/" + (await monitor.json<Status>()).monitor!.id;
   expect((await request(monitorPath, "PATCH", { destinationIds: [pending.id] })).status).toBe(400);
 
-  const [job] = await notifications.jobs<ConfirmationJob>();
+  const [job] = await notifications.confirmationJobs();
   expect(job).toMatchObject({ kind: "email.confirmation", destinationId: pending.id });
   // Resolve the link at the same engine boundary used by the delivery Worker.
   const message = await env.MONITORING.get(env.MONITORING.idFromString(job.contextId)).resolveConfirmation(job);
@@ -113,7 +113,7 @@ it("keeps email destinations pending until recipient consent and requires fresh 
   expect((await request(path)).status).toBe(404);
   const snapshot = await (await request("/api/operator")).json<Status>();
   expect(snapshot.monitor!.destinationIds).toEqual([]);
-  expect(await notifications.jobs<ConfirmationJob>()).toMatchObject([job, { kind: "email.confirmation", destinationId: replacement.id }]);
+  expect(await notifications.confirmationJobs()).toMatchObject([job, { kind: "email.confirmation", destinationId: replacement.id }]);
   const replacementPath = destinations + "/" + replacement.id;
   expect((await request(replacementPath, "DELETE")).status).toBe(204);
   expect((await request(replacementPath)).status).toBe(404);

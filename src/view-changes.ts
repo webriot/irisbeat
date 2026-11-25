@@ -26,7 +26,7 @@ export function configurationScopes(previous: Monitor | undefined, current: Moni
     return {
       public: monitor.published ? [...page, "monitors", "banner", "incidents"] : page,
       reader: operator,
-      editor: previous?.notificationSelections?.length ? [...operator, "destinations"] : operator,
+      editor: monitor.notificationSelections?.length ? [...operator, "destinations"] : operator,
     };
   }
   const renamed = current.name !== previous.name;
