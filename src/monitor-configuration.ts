@@ -226,7 +226,7 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
         const selections = new Map(monitor.notificationSelections?.map(selection => [selection.destinationId, selection]));
         for (const [destinationId, selected] of entries) {
           if (!selected) selections.delete(destinationId);
-          else if (!selections.has(destinationId)) selections.set(destinationId, { destinationId, generation: crypto.randomUUID() });
+          else if (!selections.has(destinationId)) selections.set(destinationId, newSelection(destinationId));
         }
         monitor.notificationSelections = [...selections.values()];
       }
@@ -273,7 +273,11 @@ function replacementSelections(ids: unknown, destinations: NotificationDestinati
   if (!assigned.every(selectableDestination)) return destinationPendingConfirmation;
   return assigned.map(({ id: destinationId }) =>
     existing.find(selection => selection.destinationId === destinationId) ??
-    { destinationId, generation: crypto.randomUUID() });
+    newSelection(destinationId));
+}
+
+function newSelection(destinationId: string): NotificationSelection {
+  return { destinationId, generation: crypto.randomUUID() };
 }
 
 function parseConfiguration(value: unknown, existingKind: Configuration["kind"] = "http", current?: MonitorConfiguration): Configuration | null {
