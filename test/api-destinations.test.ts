@@ -37,6 +37,25 @@ it("creates a webhook and returns its exact saved resource", async () => {
   });
 });
 
+it("round-trips a normalized Discord URL at the input limit without replacing the destination", async () => {
+  const prefix = "https://discord.com/api/v10/webhooks/123/";
+  const url = prefix + "x".repeat(2048 - prefix.length);
+  const created = await resource(request(destinations, "POST", { url }), 201);
+  const path = destinations + "/" + created.id;
+  const saved = await resource(request(path));
+  expect(saved).toEqual({ ...created, url: url + "/slack" });
+
+  const monitor = await request("/api/v1/monitors", "POST", {
+    kind: "heartbeat", name: "Producer", destinationIds: [created.id],
+  });
+  expect(monitor.status).toBe(201);
+  const { id } = await monitor.json<{ id: string }>();
+  const renamed = await resource(request(path, "PATCH", { ...saved, name: "Renamed" }));
+  expect(renamed).toEqual({ ...saved, name: "Renamed" });
+  expect((await request(path, "PATCH", { url: url + "y" })).status).toBe(400);
+  expect(await (await request("/api/v1/monitors/" + id)).json()).toMatchObject({ destinationIds: [created.id] });
+});
+
 it("reads Operator edits and preserves assignments until address replacement or deletion", async () => {
   const created = await resource(request(destinations, "POST", { url: "https://hooks.example/secret" }), 201);
   const path = destinations + "/" + created.id;

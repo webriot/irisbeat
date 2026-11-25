@@ -2231,7 +2231,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   function destinationResponse(c: Context<HttpEnv<E>>, result: MutationAck | DestinationError | null, status = 200) {
     return result && typeof result === "object" ? operatorMutationResponse(c, result, status) : destinationError(result);
   }
-  function parseDestinationUpdate(value: unknown, creating: boolean): DestinationUpdate | Response {
+  async function parseDestinationUpdate(value: unknown, creating: boolean, readSaved?: () => Promise<NotificationDestination | null>): Promise<DestinationUpdate | Response> {
     const fields = value && typeof value === "object" ? value as Record<string, unknown> : {};
     const name = typeof fields.name === "string" ? fields.name.trim() : undefined;
     if (fields.name !== undefined && (!name || name.length > 120 || /[\r\n]/.test(name)))
@@ -2243,13 +2243,17 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
       if (!address) return Response.json({ error: "Enter an email address" }, { status: 400 });
       return { channel: "email", address, name };
     }
-    const url = parseWebhook(fields.url);
-    if (!url || (fields.channel !== undefined && fields.channel !== "webhook"))
-      return Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
-    return { channel: "webhook", url, name };
+    const invalidWebhook = () => Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
+    if (fields.channel !== undefined && fields.channel !== "webhook") return invalidWebhook();
+    const normalized = parseWebhook(fields.url);
+    // A saved webhook can exceed the input limit after Discord normalization.
+    const saved = readSaved && typeof fields.url === "string" && normalized !== fields.url ? await readSaved() : null;
+    const url = saved?.channel === "webhook" && saved.url === fields.url ? saved.url : normalized;
+    return url ? { channel: "webhook", url, name } : invalidWebhook();
   }
-  const prepareDestination = async (c: Context<HttpEnv<E>>, creating: boolean) => {
-    const destination = parseDestinationUpdate(c.get("value"), creating);
+  const prepareDestination = async (c: Context<HttpEnv<E>>, creating: boolean, versionedId?: string) => {
+    const destination = await parseDestinationUpdate(c.get("value"), creating,
+      versionedId === undefined ? undefined : () => c.get("context").versionedDestination(versionedId));
     if (destination instanceof Response) return destination;
     const origin = "channel" in destination && destination.channel === "email" ? await confirmationOrigin(c) : undefined;
     return { destination, origin };
@@ -2263,7 +2267,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     return destinationResponse(c, result, creating ? 201 : 200);
   };
   const saveVersionedDestination = async (c: Context<HttpEnv<E>>, id: string | null) => {
-    const prepared = await prepareDestination(c, id === null);
+    const prepared = await prepareDestination(c, id === null, id ?? undefined);
     if (prepared instanceof Response) return prepared;
     const { destination, origin } = prepared;
     const result = await c.get("context").saveVersionedDestination(id, destination, origin);

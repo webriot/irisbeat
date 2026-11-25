@@ -56,7 +56,7 @@ New email destinations start pending and require [email delivery and recipient c
 | Set a webhook URL | `{channel?: "webhook", url, name?}` |
 | Set an email address | `{channel: "email", address, name?}` |
 
-The same name and address validation applies as on create. Omitting `name` preserves the saved name. Renaming or resubmitting an address that resolves to the same saved value preserves the ID and Monitor assignments. Changing the saved address or channel returns a replacement with a new ID and clears the previous ID's Monitor assignments. The previous ID returns `404` after replacement. A replacement email destination requires fresh recipient confirmation.
+The same name and address validation applies as on create. An exact saved webhook URL is also accepted if normalization previously increased it beyond the input limit. Omitting `name` preserves the saved name. Renaming or resubmitting an address that resolves to the same saved value preserves the ID and Monitor assignments. Changing the saved address or channel returns a replacement with a new ID and clears the previous ID's Monitor assignments. The previous ID returns `404` after replacement. A replacement email destination requires fresh recipient confirmation.
 
 Create and edit use the documented request fields. Extra fields are ignored. In particular, sending `id` or `confirmed` does not set those values.
 
