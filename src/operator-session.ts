@@ -222,9 +222,13 @@ export function createOperatorSession(liveSnapshots: LiveSnapshots, mergeViewSco
       if (started !== generation || signal.aborted) return;
       if (response.status === 401 || response.status === 403) { lifecycle.unauthorized(); return; }
       if (response.status === 204) return null;
-      const data = await response.json() as T & { error?: string };
+      if (!response.ok) {
+        const data = await response.json().catch(() => undefined) as { error?: string } | undefined;
+        if (started !== generation || signal.aborted) return;
+        throw Object.assign(new Error(data?.error || 'Request failed'), { status: response.status });
+      }
+      const data = await response.json() as T;
       if (started !== generation || signal.aborted) return;
-      if (!response.ok) throw new Error(data.error || 'Request failed');
       return data;
     },
     cancelPreview() {

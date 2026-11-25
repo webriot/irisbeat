@@ -25,7 +25,7 @@ test('Operator Settings lists, issues, copies and revokes API keys', async ({ pa
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
 
     const inventory = page.getByRole('list', { name: 'API keys' });
-    const oldKey = inventory.getByRole('listitem').filter({ hasText: name }).filter({ hasNotText: 'replacement' });
+    const oldKey = inventory.getByRole('listitem').filter({ has: page.getByRole('button', { name: 'Revoke ' + name, exact: true }) });
     await expect(oldKey).toContainText('Read');
     await expect(oldKey).toContainText('No expiry');
     await expect(page.locator('body')).not.toContainText(previous.secret);
@@ -91,6 +91,7 @@ test('Operator Settings lists, issues, copies and revokes API keys', async ({ pa
     await page.getByRole('button', { name: 'Sign in' }).click();
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     await expect(newRow).toBeVisible();
+    await expect(oldKey).toHaveCount(0);
     await expect(secret).toHaveValue('');
     await page.getByRole('button', { name: 'Sign out' }).click();
     await expect(page.getByLabel('Installation secret')).toBeFocused();
@@ -110,6 +111,102 @@ test('Operator Settings lists, issues, copies and revokes API keys', async ({ pa
     await expect(page.getByRole('heading', { name: 'API keys', includeHidden: true })).toHaveCount(0);
     expect(hostedKeyRequests).toEqual([]);
   } finally {
+    const { keys } = await (await request.get(path, { headers })).json() as { keys: { id: string; name: string }[] };
+    for (const key of keys.filter(key => key.name.startsWith(name))) await request.delete(path + '/' + key.id, { headers });
+  }
+});
+
+test('Operator Settings reconciles uncertain issuance and concurrent revocation', async ({ page, request }) => {
+  const path = '/api/operator/api-keys';
+  const headers = { Authorization: 'Bearer ui-test-secret' };
+  const name = 'Recovery ' + crypto.randomUUID();
+  const data = { name, role: 'read' };
+  const initial = await request.post(path, { headers, data });
+  expect(initial.status()).toBe(201);
+  const original = await initial.json();
+  let loseResponse!: () => void;
+  const lostResponse = new Promise<void>(resolve => { loseResponse = resolve; });
+  let finishRevoke!: () => void;
+  const revoking = new Promise<void>(resolve => { finishRevoke = resolve; });
+  let failRefresh = false;
+  let posts = 0;
+  await page.route('**' + path, async route => {
+    if (route.request().method() === 'POST') {
+      posts++;
+      const result = await route.fetch();
+      expect(result.status()).toBe(201);
+      expect((await request.post(path, { headers, data })).status()).toBe(201);
+      await lostResponse;
+      failRefresh = true;
+      await route.abort('timedout');
+    } else if (failRefresh) {
+      failRefresh = false;
+      await route.fulfill({ status: 503 });
+    } else {
+      await route.continue();
+    }
+  });
+  const revokePath = path + '/' + original.key.id;
+  await page.route('**' + revokePath, async route => {
+    await revoking;
+    await route.continue();
+  });
+  try {
+    await page.goto('/operator');
+    await page.getByLabel('Installation secret').fill('ui-test-secret');
+    await page.getByRole('button', { name: 'Sign in' }).click();
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    const newKey = page.getByRole('button', { name: 'New API key' });
+    await newKey.click();
+    const issue = page.getByRole('dialog', { name: 'New API key' });
+    await issue.getByLabel('Key name').fill(name);
+    await issue.getByRole('button', { name: 'Issue API key' }).click();
+    await expect(issue.getByRole('status')).toHaveText('Issuing API key…');
+    await expect(issue.getByRole('status')).toBeFocused();
+    await expect(issue.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+    for (const label of ['Key name', 'Role', 'Expires on']) await expect(issue.getByLabel(label)).toBeDisabled();
+    await page.keyboard.press('Tab');
+    await page.keyboard.press('Escape');
+    await expect(issue.getByRole('status')).toBeFocused();
+    loseResponse();
+
+    const refresh = page.getByRole('button', { name: 'Retry API key refresh' });
+    await expect(refresh).toBeFocused();
+    await expect(issue).toBeHidden();
+    await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible();
+    await expect(newKey).toBeDisabled();
+    await expect(page.getByLabel('API key secret')).toHaveValue('');
+    await refresh.press('Enter');
+    const recovery = page.getByRole('status').filter({ hasText: 'Issuance could not be confirmed' });
+    await expect(recovery).toBeFocused();
+    const rows = page.getByRole('list', { name: 'API keys' }).getByRole('listitem').filter({ hasText: name });
+    const matches = rows.filter({ hasText: 'Possible match' });
+    await expect(matches).toHaveCount(2);
+    const existing = rows.filter({ hasNotText: 'Possible match' });
+    await expect(existing).toHaveCount(1);
+    await expect(matches.first().getByRole('button', { name: 'Revoke ' + name })).toBeEnabled();
+    expect(posts).toBe(1);
+
+    await existing.getByRole('button', { name: 'Revoke ' + name }).click();
+    const revoke = page.getByRole('dialog', { name: 'Revoke ' + name + '?' });
+    await revoke.getByRole('button', { name: 'Revoke key' }).click();
+    await expect(revoke.getByRole('status')).toHaveText('Revoking API key…');
+    await expect(revoke.getByRole('status')).toBeFocused();
+    await expect(revoke.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+    await page.keyboard.press('Escape');
+    await expect(revoke.getByRole('status')).toBeFocused();
+    expect((await request.delete(revokePath, { headers })).status()).toBe(204);
+    expect((await request.post(path, { headers, data: { name: name + ' concurrent', role: 'write' } })).status()).toBe(201);
+    const staleRevoke = page.waitForResponse(response => new URL(response.url()).pathname === revokePath);
+    finishRevoke();
+    expect((await staleRevoke).status()).toBe(404);
+    await expect(revoke).toBeHidden();
+    await expect(rows).toHaveCount(3);
+    await expect(rows.filter({ hasText: name + ' concurrent' })).toBeVisible();
+    await expect(newKey).toBeFocused();
+  } finally {
+    loseResponse();
+    finishRevoke();
     const { keys } = await (await request.get(path, { headers })).json() as { keys: { id: string; name: string }[] };
     for (const key of keys.filter(key => key.name.startsWith(name))) await request.delete(path + '/' + key.id, { headers });
   }
