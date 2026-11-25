@@ -54,8 +54,7 @@ history.
 Send a JSON object with `Content-Type: application/json`. The request body
 limit is 4 KiB. Unsupported media types return `415`. Larger bodies return
 `413` with an empty body. Malformed JSON and invalid configuration return
-`400` and leave configuration intact. Body errors have the JSON shape
-`{ "error": "message" }`, except for `413`.
+`400` and leave configuration intact. JSON errors include an `error` message.
 
 Creation requires a nonblank `name` of at most 120 characters. `kind` defaults
 to `"http"`, `published` to `true`, and `scheduleMode` to `"interval"`.
@@ -64,12 +63,11 @@ name or IP `hostname` and an integer `port` from 1 to 65,535 for TCP.
 Heartbeats have no target. Calendar requires a `cron` expression and defaults
 `timezone` to `"UTC"`.
 
-PATCH requires at least one configuration field. Omitted fields generally keep
+PATCH requires at least one field, which can be `destinationIds`. Omitted fields keep
 their saved values. An unchanged `kind` is accepted. To switch back to Interval,
 send `{ "scheduleMode": "interval" }` and leave out `cron` and `timezone`.
 When switching to Calendar, include the cron expression and optionally a
-timezone. `id`, `destinationIds`, and `destinationChanges` are rejected in
-request bodies. Use the Operator to change assignments.
+timezone. `id` and `destinationChanges` are rejected in request bodies.
 
 See the [HTTP and TCP timing rules](monitor-api.md#http-and-tcp-checks),
 [Calendar rules](monitor-api.md#http-and-tcp-calendar-schedules),
@@ -77,3 +75,18 @@ See the [HTTP and TCP timing rules](monitor-api.md#http-and-tcp-checks),
 [Heartbeat timing rules](heartbeat-api.md#configure-a-heartbeat) for accepted
 values and defaults. The API returns normalized saved values. For example,
 HTTP URL fragments are dropped and TCP DNS names are lowercased.
+
+## Destination assignments
+
+POST and PATCH accept `destinationIds`, an array of unique destination ID
+strings. An explicit array replaces the complete assignment set, and `[]`
+clears it. Omitting the array creates an unassigned Monitor on POST and
+preserves assignments on PATCH. Monitor responses include the saved IDs.
+Use the Operator to manage destinations.
+
+Every supplied ID must refer to an existing webhook or confirmed email
+destination. Invalid arrays and unknown IDs return `400`. If a listed email
+destination is awaiting confirmation, the API returns `400` with
+`{ "error": "An email destination is awaiting confirmation", "code": "destination_pending_confirmation" }`.
+The entire write is rejected, including any other configuration changes.
+Retry the same request after the recipient confirms their email address.

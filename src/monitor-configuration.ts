@@ -2,6 +2,8 @@
 import { calendar, type Schedule } from "./calendar";
 import { selectableDestination, type NotificationDestination, type NotificationSelection } from "./notification-jobs";
 
+export const destinationPendingConfirmation = "destination_pending_confirmation";
+
 export const timingDefaults = {
   intervalSeconds: 60,
   timeoutSeconds: 10,
@@ -181,8 +183,6 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
   }
 
   async create(value: unknown, limit?: number) {
-    if (value && typeof value === "object" && "destinationIds" in value &&
-        (!Array.isArray(value.destinationIds) || value.destinationIds.length)) return undefined;
     const configuration = parseMonitorPatch(value);
     if (!configuration || !this.validInterval(configuration)) return undefined;
     if (this.scheduleProof(configuration, configuration) && !await this.acceptsProof(configuration)) return undefined;
@@ -190,6 +190,11 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
     // No await between allowance check and synchronous persistence: concurrent RPCs serialize.
     if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0 || state.monitors.length >= limit)) return null;
     const monitor = this.newMonitor(configuration);
+    if (value && typeof value === "object" && "destinationIds" in value) {
+      const selections = replacementSelections(value.destinationIds, state.destinations);
+      if (!Array.isArray(selections)) return selections;
+      monitor.notificationSelections = selections;
+    }
     state.monitors.push(monitor);
     const ack = this.runtime.commit(state, state.pageName, undefined, monitor);
     return { ack, monitor };
@@ -226,13 +231,9 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
         monitor.notificationSelections = [...selections.values()];
       }
       if (value && typeof value === "object" && "destinationIds" in value) {
-        const ids = value.destinationIds;
-        if (!Array.isArray(ids) || ids.some(id => !state.destinations?.some(destination => destination.id === id && selectableDestination(destination))) ||
-            new Set(ids).size !== ids.length) return undefined;
-        const existing = monitor.notificationSelections ?? [];
-        monitor.notificationSelections = ids.map(destinationId =>
-          existing.find(selection => selection.destinationId === destinationId) ??
-          { destinationId, generation: crypto.randomUUID() });
+        const selections = replacementSelections(value.destinationIds, state.destinations, monitor.notificationSelections);
+        if (!Array.isArray(selections)) return selections;
+        monitor.notificationSelections = selections;
       }
       this.applyEdit(monitor, patch, proof !== null);
       const ack = this.runtime.commit(state, state.pageName, previous, monitor);
@@ -263,6 +264,16 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
       monitor.nextDue += (patch.intervalSeconds - monitor.intervalSeconds) * 1000;
     Object.assign(monitor, patch);
   }
+}
+
+function replacementSelections(ids: unknown, destinations: NotificationDestination[] = [], existing: NotificationSelection[] = []) {
+  if (!Array.isArray(ids) || new Set(ids).size !== ids.length) return undefined;
+  const assigned = ids.map(id => destinations.find(destination => destination.id === id));
+  if (!assigned.every(destination => destination !== undefined)) return undefined;
+  if (!assigned.every(selectableDestination)) return destinationPendingConfirmation;
+  return assigned.map(({ id: destinationId }) =>
+    existing.find(selection => selection.destinationId === destinationId) ??
+    { destinationId, generation: crypto.randomUUID() });
 }
 
 function parseConfiguration(value: unknown, existingKind: Configuration["kind"] = "http", current?: MonitorConfiguration): Configuration | null {

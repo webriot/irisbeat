@@ -2,7 +2,7 @@
 import { operatorPage, operatorScript, recipientAction, recipientPage, recipientScript, renderViewPartial, renderViewSnapshot, statusJson, styleSheet, themeScript, type StatusProjection } from "./ui";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { calendar } from "./calendar";
-import { minimumCheckIntervalSeconds, MonitorConfigurations, monitorResource, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
+import { destinationPendingConfirmation, minimumCheckIntervalSeconds, MonitorConfigurations, monitorResource, timingDefaults, type Monitor, type MaintenanceWindow } from "./monitor-configuration";
 import { connect } from "cloudflare:sockets";
 import { parseEmailAddress, parseWebhook, type AlertDestination, type ConfirmationIdentity, type ConfirmationJob, type NewNotificationDestination, type NotificationDestination, type NotificationEligibility, type NotificationJob, type NotificationQueueJob } from "./notification-jobs";
 import type { NotificationDeliveryIdentity, SubmissionReport } from "./notification-outcomes";
@@ -865,7 +865,10 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   async create(value: unknown, limit?: number) {
+    if (value && typeof value === "object" && "destinationIds" in value &&
+        (!Array.isArray(value.destinationIds) || value.destinationIds.length)) return undefined;
     const result = await this.monitorConfigurations.create(value, limit);
+    if (result === destinationPendingConfirmation) return undefined;
     return result ? result.ack : result;
   }
 
@@ -880,6 +883,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   async createMonitorResource(value: unknown) {
     const result = await this.monitorConfigurations.create(value);
+    if (result === destinationPendingConfirmation) return result;
     return result ? monitorResource(result.monitor) : undefined;
   }
 
@@ -1060,11 +1064,13 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
 
   async edit(id: string, value: unknown) {
     const result = await this.monitorConfigurations.edit(id, value);
+    if (result === destinationPendingConfirmation) return undefined;
     return result ? result.ack : result;
   }
 
   async editMonitorResource(id: string, value: unknown) {
     const result = await this.monitorConfigurations.edit(id, value);
+    if (result === destinationPendingConfirmation) return result;
     return result ? monitorResource(result.monitor) : result;
   }
 
@@ -2126,13 +2132,11 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   const monitorResourcePath = monitorCollection + "/:id";
   for (const path of [monitorCollection, monitorResourcePath]) app.use(path, versionedAuthorization("write"));
   const invalidMonitor = () => Response.json({ error: "Invalid Monitor configuration" }, { status: 400 });
+  const pendingAssignment = () => Response.json({
+    error: "An email destination is awaiting confirmation",
+    code: destinationPendingConfirmation,
+  }, { status: 400 });
   const missingMonitor = () => Response.json({ error: "Monitor not found" }, { status: 404 });
-  const configurationOnly: MiddlewareHandler<HttpEnv<E>> = async (c, next) => {
-    const value = c.get("value");
-    if (value && typeof value === "object" && ("destinationIds" in value || "destinationChanges" in value))
-      return invalidMonitor();
-    await next();
-  };
   app.get(monitorCollection, async c => {
     if (c.req.method !== "GET") return methodNotAllowed("GET, POST");
     return Response.json({ monitors: await c.get("context").listMonitorResources() });
@@ -2142,12 +2146,16 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     const monitor = await c.get("context").readMonitorResource(monitorId(c));
     return monitor ? Response.json(monitor) : missingMonitor();
   });
-  app.post(monitorCollection, readBody, configurationOnly, async (c: Context<HttpEnv<E>>) => {
+  app.post(monitorCollection, readBody, async (c: Context<HttpEnv<E>>) => {
     const monitor = await c.get("context").createMonitorResource(c.get("value"));
+    if (monitor === destinationPendingConfirmation) return pendingAssignment();
     return monitor ? Response.json(monitor, { status: 201, headers: { Location: monitorCollection + "/" + monitor.id } }) : invalidMonitor();
   });
-  app.patch(monitorResourcePath, readBody, configurationOnly, async (c: Context<HttpEnv<E>>) => {
-    const monitor = await c.get("context").editMonitorResource(monitorId(c), c.get("value"));
+  app.patch(monitorResourcePath, readBody, async (c: Context<HttpEnv<E>>) => {
+    const value = c.get("value");
+    if (value && typeof value === "object" && "destinationChanges" in value) return invalidMonitor();
+    const monitor = await c.get("context").editMonitorResource(monitorId(c), value);
+    if (monitor === destinationPendingConfirmation) return pendingAssignment();
     if (monitor === undefined) return invalidMonitor();
     return monitor ? Response.json(monitor) : missingMonitor();
   });
