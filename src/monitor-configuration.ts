@@ -62,6 +62,36 @@ export type Monitor = MonitorConfiguration & Timing & {
   notificationSelections?: NotificationSelection[];
 };
 
+export function monitorResource(monitor: Monitor) {
+  const common = {
+    id: monitor.id,
+    name: monitor.name,
+    published: monitor.published,
+    scheduleMode: monitor.scheduleMode ?? "interval",
+    recoveryThreshold: monitor.recoveryThreshold,
+    destinationIds: (monitor.notificationSelections ?? []).map(selection => selection.destinationId),
+    ...(monitor.scheduleMode === "calendar"
+      ? { cron: monitor.cron, timezone: monitor.timezone ?? "UTC" } : {}),
+  };
+  if (monitor.kind === "heartbeat") {
+    return {
+      ...common, kind: monitor.kind,
+      ...(monitor.scheduleMode === "calendar" ? { graceSeconds: monitor.graceSeconds } : {
+        intervalSeconds: monitor.intervalSeconds,
+        silenceSeconds: monitor.silenceSeconds,
+        recoverySpacingSeconds: monitor.recoverySpacingSeconds,
+      }),
+    };
+  }
+  const outbound = {
+    ...common, intervalSeconds: monitor.intervalSeconds,
+    timeoutSeconds: monitor.timeoutSeconds, failureThreshold: monitor.failureThreshold,
+  };
+  return monitor.kind === "tcp"
+    ? { ...outbound, kind: monitor.kind, hostname: monitor.hostname, port: monitor.port }
+    : { ...outbound, kind: monitor.kind, url: monitor.url };
+}
+
 // Internal synchronous operations owned by MonitoringContext. Only Calendar validation may yield.
 type ConfigurationRuntime<State, Result> = {
   minimumCheckIntervalSeconds(): number;
@@ -161,7 +191,8 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
     if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0 || state.monitors.length >= limit)) return null;
     const monitor = this.newMonitor(configuration);
     state.monitors.push(monitor);
-    return this.runtime.commit(state, state.pageName, undefined, monitor);
+    const ack = this.runtime.commit(state, state.pageName, undefined, monitor);
+    return { ack, monitor };
   }
 
   async edit(id: string, value: unknown) {
@@ -204,7 +235,8 @@ export class MonitorConfigurations<State extends { pageName: string; monitors: M
           { destinationId, generation: crypto.randomUUID() });
       }
       this.applyEdit(monitor, patch, proof !== null);
-      return this.runtime.commit(state, state.pageName, previous, monitor);
+      const ack = this.runtime.commit(state, state.pageName, previous, monitor);
+      return { ack, monitor };
     }
   }
 
