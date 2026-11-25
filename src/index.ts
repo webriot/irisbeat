@@ -2182,18 +2182,24 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
       return Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
     return { channel: "webhook", url, name };
   }
-  const saveDestination = async (c: Context<HttpEnv<E>>) => {
-    const creating = c.req.method === "POST";
+  const prepareDestination = async (c: Context<HttpEnv<E>>, creating: boolean) => {
     const destination = parseDestinationUpdate(c.get("value"), creating);
     if (destination instanceof Response) return destination;
     const origin = "channel" in destination && destination.channel === "email" ? await confirmationOrigin(c) : undefined;
+    return { destination, origin };
+  };
+  const saveDestination = async (c: Context<HttpEnv<E>>) => {
+    const creating = c.req.method === "POST";
+    const prepared = await prepareDestination(c, creating);
+    if (prepared instanceof Response) return prepared;
+    const { destination, origin } = prepared;
     const result = await c.get("context").configureDestination(creating ? null : monitorId(c), destination, false, origin);
     return destinationResponse(c, result, creating ? 201 : 200);
   };
   const saveVersionedDestination = async (c: Context<HttpEnv<E>>, id: string | null) => {
-    const destination = parseDestinationUpdate(c.get("value"), id === null);
-    if (destination instanceof Response) return destination;
-    const origin = "channel" in destination && destination.channel === "email" ? await confirmationOrigin(c) : undefined;
+    const prepared = await prepareDestination(c, id === null);
+    if (prepared instanceof Response) return prepared;
+    const { destination, origin } = prepared;
     const result = await c.get("context").saveVersionedDestination(id, destination, origin);
     return result && typeof result === "object" ? c.json(result, id === null ? 201 : 200) : destinationError(result);
   };
