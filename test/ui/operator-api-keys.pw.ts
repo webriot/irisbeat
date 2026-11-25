@@ -128,7 +128,7 @@ test('Operator Settings reconciles uncertain issuance and concurrent revocation'
   const lostResponse = new Promise<void>(resolve => { loseResponse = resolve; });
   let finishRevoke!: () => void;
   const revoking = new Promise<void>(resolve => { finishRevoke = resolve; });
-  let failRefresh = false;
+  let remainingRefreshFailures = 0;
   let posts = 0;
   await page.route('**' + path, async route => {
     if (route.request().method() === 'POST') {
@@ -137,10 +137,10 @@ test('Operator Settings reconciles uncertain issuance and concurrent revocation'
       expect(result.status()).toBe(201);
       expect((await request.post(path, { headers, data })).status()).toBe(201);
       await lostResponse;
-      failRefresh = true;
+      remainingRefreshFailures = 2;
       await route.abort('timedout');
-    } else if (failRefresh) {
-      failRefresh = false;
+    } else if (remainingRefreshFailures) {
+      remainingRefreshFailures--;
       await route.fulfill({ status: 503 });
     } else {
       await route.continue();
@@ -176,6 +176,9 @@ test('Operator Settings reconciles uncertain issuance and concurrent revocation'
     await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible();
     await expect(newKey).toBeDisabled();
     await expect(page.getByLabel('API key secret')).toHaveValue('');
+    await page.getByRole('button', { name: 'Monitors', exact: true }).click();
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await expect(refresh).toBeVisible();
     await refresh.press('Enter');
     const recovery = page.getByRole('status').filter({ hasText: 'Issuance could not be confirmed' });
     await expect(recovery).toBeFocused();
@@ -204,6 +207,12 @@ test('Operator Settings reconciles uncertain issuance and concurrent revocation'
     await expect(rows).toHaveCount(3);
     await expect(rows.filter({ hasText: name + ' concurrent' })).toBeVisible();
     await expect(newKey).toBeFocused();
+    await page.getByRole('button', { name: 'Sign out' }).click();
+    await page.getByLabel('Installation secret').fill('ui-test-secret');
+    await page.getByRole('button', { name: 'Sign in' }).click();
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await expect(rows).toHaveCount(3);
+    await expect(matches).toHaveCount(0);
   } finally {
     loseResponse();
     finishRevoke();

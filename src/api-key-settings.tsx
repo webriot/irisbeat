@@ -220,11 +220,15 @@ function createApiKeySettings(session) {
       closeIssue();
       closeRevoke();
       keys = [];
-      uncertainIssue = undefined;
       rows.replaceChildren();
       listStatus.textContent = '';
       byId('no-api-keys').hidden = retry.hidden = true;
     }
+  }
+
+  function reset() {
+    setActive(false);
+    uncertainIssue = undefined;
   }
 
   async function pending(status, message, signal, action) {
@@ -352,6 +356,6 @@ function createApiKeySettings(session) {
     });
     if (!signal.aborted && revoke.open) byId('revoke-api-key').focus();
   };
-  return { setActive };
+  return { setActive, reset };
 }
 `;

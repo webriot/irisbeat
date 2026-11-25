@@ -953,6 +953,7 @@ function clearSession() {
   byId('maintenance-dialog').close();
   document.querySelectorAll('button, input, select').forEach(control => { control.disabled = false; });
   canEditSettings = false;
+  apiKeySettings?.reset();
   monitorIds.clear(); selectedHistoryDays.clear(); byId('stale').hidden = true; byId('sync-announcement').textContent = ''; snapshotPending(false);
   emailConfigured = false; addEmail.hidden = true;
   savedPageName = ''; monitorEditor.close(); monitorEditor.refreshDestinations([]); renderDestinations([]); byId('heartbeat-path').textContent = ''; maintenanceForm.reset(); maintenanceForm.removeAttribute('data-monitor-id'); byId('maintenance-heading').textContent = 'Maintenance'; maintenanceForm.hidden = true; pageForm.reset(); closeDestinationForm(); editor.hidden = true; login.hidden = false;
