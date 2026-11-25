@@ -874,10 +874,6 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     return result ? result.ack : result;
   }
 
-  listMonitorResources() {
-    return this.read().monitors.map(monitorResource);
-  }
-
   readMonitorResource(id: string) {
     const monitor = this.read().monitors.find(monitor => monitor.id === id);
     return monitor ? monitorResource(monitor) : null;
@@ -2092,7 +2088,11 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   });
   const readBody: MiddlewareHandler<HttpEnv<E>> = async (c: Context<HttpEnv<E>>, next) => {
     const request = c.req.raw;
-    if (!request.headers.get("Content-Type")?.startsWith("application/json"))
+    const contentType = request.headers.get("Content-Type");
+    const json = c.req.path.startsWith("/api/v1/")
+      ? contentType?.split(";", 1)[0].trim().toLowerCase() === "application/json"
+      : contentType?.startsWith("application/json");
+    if (!json)
       return Response.json(
         { error: "Use application/json" },
         { status: 415 },
@@ -2138,10 +2138,6 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
       return invalidMonitor();
     await next();
   };
-  app.get(monitorCollection, async c => {
-    if (c.req.method !== "GET") return methodNotAllowed("GET, POST");
-    return Response.json({ monitors: await c.get("context").listMonitorResources() });
-  });
   app.get(monitorResourcePath, async c => {
     if (c.req.method !== "GET") return methodNotAllowed("GET, PATCH, DELETE");
     const monitor = await c.get("context").readMonitorResource(monitorId(c));
@@ -2160,7 +2156,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     const removed = await c.get("context").remove(monitorId(c));
     return removed ? new Response(null, { status: 204 }) : missingMonitor();
   });
-  app.all(monitorCollection, () => methodNotAllowed("GET, POST"));
+  app.all(monitorCollection, () => methodNotAllowed("POST"));
   app.all(monitorResourcePath, () => methodNotAllowed("GET, PATCH, DELETE"));
 
   for (const path of ["/api/operator", "/api/operator/webhook", "/api/operator/monitors", destinationsPath]) {
