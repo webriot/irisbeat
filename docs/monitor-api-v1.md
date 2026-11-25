@@ -1,10 +1,12 @@
 # Monitor configuration API v1
 
 On a self-hosted installation, send `Authorization: Bearer <write API key>`
-or use the installation secret as the Bearer credential. Every Monitor
-configuration operation requires Write access, including read by ID.
-The routes return `401` for missing, invalid, expired, or revoked credentials
-and `403` for Read API keys. Hosted Workers return `404` for these routes.
+or use the installation secret as the Bearer credential. On a hosted Product
+tenant, send that tenant's Write key. The installation secret does not
+authorize these routes there. Every Monitor configuration operation requires
+Write access, including read by ID. The routes return `401` for missing,
+invalid, expired, or revoked credentials and `403` for Read API keys.
+Creating past the hosted Monitor allowance returns `409`.
 See the [automation API overview](api-v1.md) for key administration and the
 shared authentication response format.
 

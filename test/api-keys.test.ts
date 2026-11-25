@@ -113,7 +113,7 @@ it('accepts case-insensitive Bearer schemes and multiple separator spaces on the
   expect((await withHeader(keyPath, 'bearer  ' + secret)).status).toBe(401);
 });
 
-it('keeps API keys out of Operator, Heartbeat and hosted authorization', async () => {
+it('keeps API keys out of Operator and Heartbeat authorization', async () => {
   const heartbeat = await request('/api/operator/monitors', installation, 'POST', { name: 'Job', kind: 'heartbeat' });
   expect(heartbeat.status).toBe(201);
   const receiptPath = '/heartbeat/' + (await heartbeat.json<Status>()).monitor!.id;
@@ -138,17 +138,108 @@ it('keeps API keys out of Operator, Heartbeat and hosted authorization', async (
   const hosted = createHostedWorker({
     contractVersion: '1',
     resolve: request => ({
-      id: 'personal', monitorLimit: 1,
+      id: 'hosted-keys', monitorLimit: 1,
       permission: request.headers.get('Authorization') === 'Bearer hosted-editor' ? 'editor' : null,
     }),
-    contexts: () => ['personal'],
+    contexts: () => ['hosted-keys'],
   });
-  for (const token of [installation, read.secret, write.secret, 'hosted-editor']) {
-    expect((await request(statusPath, token, 'GET', undefined, hosted)).status).toBe(404);
-    expect((await request(keyPath, token, 'GET', undefined, hosted)).status).toBe(404);
+  for (const token of [installation, read.secret, write.secret]) {
+    expect((await request(statusPath, token, 'GET', undefined, hosted)).status).toBe(401);
+    expect((await request(keyPath, token, 'GET', undefined, hosted)).status).toBe(401);
   }
+  expect((await request(statusPath, 'hosted-editor', 'GET', undefined, hosted)).status).toBe(401);
+  expect(await (await request(keyPath, 'hosted-editor', 'GET', undefined, hosted)).json()).toEqual({ keys: [] });
   expect((await request('/api/operator', write.secret, 'GET', undefined, hosted)).status).toBe(401);
   expect((await request('/api/operator', 'hosted-editor', 'GET', undefined, hosted)).status).toBe(200);
+});
+
+it('lets a hosted editor manage one Product tenant’s Monitors with a Write key', async () => {
+  const tenants = { 'a.example': 'tenant-a', 'b.example': 'tenant-b' } as const;
+  const hosted = createHostedWorker({
+    contractVersion: '1',
+    resolve: incoming => {
+      const id = tenants[new URL(incoming.url).hostname as keyof typeof tenants];
+      if (!id) return null;
+      const authorization = incoming.headers.get('Authorization');
+      const permission = authorization === 'Bearer editor' ? 'editor' as const
+        : authorization === 'Bearer reader' ? 'reader' as const : null;
+      return { id, permission, monitorLimit: 1 };
+    },
+    contexts: () => [],
+  });
+  const call = (host: string, path: string, token: string | null, method = 'GET', body?: unknown, headers?: Record<string, string>) =>
+    hosted.fetch(new Request(`https://${host}${path}`, {
+      method,
+      headers: {
+        ...(token === null ? {} : { authorization: 'Bearer ' + token }),
+        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+        ...headers,
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    }), env);
+
+  expect((await call('a.example', keyPath, 'reader')).status).toBe(403);
+  expect((await call('a.example', keyPath, 'reader', 'POST', { name: 'Denied', role: 'write' })).status).toBe(403);
+  expect((await call('a.example', keyPath, null)).status).toBe(401);
+  const issued = await call('a.example', keyPath, 'editor', 'POST', { name: ' Automation ', role: 'write' });
+  expect(issued.status).toBe(201);
+  const write = await issued.json<IssuedKey>();
+  expect(write).toMatchObject({ key: { name: 'Automation', role: 'write', expiresAt: null }, secret: expect.stringMatching(/^irb_[0-9a-f]{64}$/) });
+  const inventory = await (await call('a.example', keyPath, 'editor')).json<{ keys: IssuedKey['key'][] }>();
+  expect(inventory).toEqual({ keys: [write.key] });
+  expect(JSON.stringify(inventory)).not.toContain(write.secret);
+  const read = await (await call('a.example', keyPath, 'editor', 'POST', { name: 'Dashboard', role: 'read' })).json<IssuedKey>();
+
+  const calendar = {
+    name: 'Nightly', kind: 'heartbeat' as const, published: false, scheduleMode: 'calendar' as const,
+    cron: '15 4 * * *', timezone: 'America/New_York', graceSeconds: 120,
+  };
+  const monitors = '/api/v1/monitors';
+  const created = await call('a.example', monitors, write.secret, 'POST', calendar, { 'Idempotency-Key': 'nightly-1' });
+  expect(created.status).toBe(201);
+  const monitor = await created.json<{ id: string }>();
+  expect(monitor).toMatchObject(calendar);
+  const replay = await call('a.example', monitors, write.secret, 'POST', calendar, { 'Idempotency-Key': 'nightly-1' });
+  expect(replay.status).toBe(201);
+  expect(await replay.json()).toEqual(monitor);
+  expect((await call('a.example', monitors, write.secret, 'POST', { ...calendar, name: 'Other' }, { 'Idempotency-Key': 'nightly-1' })).status).toBe(409);
+
+  const path = monitors + '/' + monitor.id;
+  expect((await call('a.example', statusPath, read.secret)).status).toBe(200);
+  expect(await (await call('a.example', statusPath, read.secret)).json()).toMatchObject({
+    monitors: [{ id: monitor.id, kind: 'heartbeat', name: 'Nightly' }],
+  });
+  expect((await call('a.example', path, read.secret, 'PATCH', { name: 'Changed' })).status).toBe(403);
+  expect((await call('a.example', monitors, read.secret, 'POST', calendar)).status).toBe(403);
+  const updated = await call('a.example', path, write.secret, 'PATCH', { graceSeconds: 90 });
+  expect(updated.status).toBe(200);
+  expect(await updated.json()).toMatchObject({
+    id: monitor.id, graceSeconds: 90, cron: calendar.cron, timezone: calendar.timezone, published: false,
+  });
+
+  expect((await call('b.example', path, write.secret, 'GET', undefined, { 'x-context-id': 'tenant-a' })).status).toBe(401);
+  expect((await call('b.example', statusPath, read.secret)).status).toBe(401);
+  expect(await (await call('b.example', keyPath, 'editor')).json()).toEqual({ keys: [] });
+  expect((await call('a.example', monitors, installation, 'POST', calendar)).status).toBe(401);
+  expect((await call('a.example', monitors, write.secret, 'POST', { ...calendar, name: 'Second' })).status).toBe(409);
+  expect((await call('a.example', '/api/v1/destinations', write.secret, 'POST', { url: 'https://hooks.example/a' })).status).toBe(404);
+  expect((await call('a.example', keyPath, write.secret, 'POST', { name: 'Nested', role: 'write' })).status).toBe(401);
+
+  const rotated = await call('a.example', '/api/operator/monitors/' + monitor.id + '/heartbeat-secret', 'editor', 'POST');
+  expect(rotated.status).toBe(200);
+  const { secret } = await rotated.json<{ secret: string }>();
+  for (const token of [installation, write.secret, read.secret]) {
+    expect((await call('a.example', '/heartbeat', token, 'POST')).status).toBe(401);
+  }
+  expect((await call('a.example', '/heartbeat', secret, 'POST')).status).toBe(204);
+  expect((await call('b.example', '/heartbeat', secret, 'POST')).status).toBe(401);
+
+  expect((await call('a.example', path, write.secret, 'DELETE')).status).toBe(204);
+  expect((await call('a.example', path, write.secret)).status).toBe(404);
+  expect((await call('a.example', keyPath + '/' + write.key.id, 'editor', 'DELETE')).status).toBe(204);
+  expect((await call('a.example', statusPath, write.secret)).status).toBe(401);
+  expect(await (await call('a.example', keyPath, 'editor')).json()).toEqual({ keys: [read.key] });
+  expect((await call('a.example', keyPath + '/' + read.key.id, 'reader', 'DELETE')).status).toBe(403);
 });
 
 it('rejects invalid key creation without changing the inventory', async () => {

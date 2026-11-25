@@ -108,8 +108,24 @@ test('Operator Settings lists, issues, copies and revokes API keys', async ({ pa
     await page.getByRole('button', { name: 'Sign in' }).click();
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Notification destinations' })).toBeVisible();
-    await expect(page.getByRole('heading', { name: 'API keys', includeHidden: true })).toHaveCount(0);
-    expect(hostedKeyRequests).toEqual([]);
+    const hostedName = 'Hosted writer';
+    await page.getByRole('button', { name: 'New API key' }).click();
+    await page.getByRole('textbox', { name: 'Key name' }).fill(hostedName);
+    await page.getByLabel('Role', { exact: true }).selectOption('write');
+    const hostedIssued = page.waitForResponse(response => new URL(response.url()).pathname === path && response.request().method() === 'POST');
+    await page.getByRole('button', { name: 'Issue API key' }).click();
+    const hostedKey = await (await hostedIssued).json();
+    const hostedSecret = page.getByLabel('API key secret');
+    await expect(hostedSecret).toHaveValue(hostedKey.secret);
+    await page.getByRole('button', { name: 'Done' }).click();
+    await expect(hostedSecret).toHaveValue('');
+    await expect(page.locator('body')).not.toContainText(hostedKey.secret);
+    const hostedRow = page.getByRole('list', { name: 'API keys' }).getByRole('listitem').filter({ hasText: hostedName });
+    await expect(hostedRow).toContainText('Write');
+    await hostedRow.getByRole('button', { name: 'Revoke ' + hostedName, exact: true }).click();
+    await page.getByRole('button', { name: 'Revoke key' }).click();
+    await expect(hostedRow).toHaveCount(0);
+    expect(hostedKeyRequests.length).toBeGreaterThan(0);
   } finally {
     const { keys } = await (await request.get(path, { headers })).json() as { keys: { id: string; name: string }[] };
     for (const key of keys.filter(key => key.name.startsWith(name))) await request.delete(path + '/' + key.id, { headers });

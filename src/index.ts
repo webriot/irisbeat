@@ -944,20 +944,20 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     );
   }
 
-  async createMonitorResource(value: unknown, request?: IdempotencyRequest) {
+  async createMonitorResource(value: unknown, request?: IdempotencyRequest, limit?: number) {
     const prepared = await this.monitorConfigurations.prepareCreate(value);
     // Check again after Calendar validation, which can yield.
     const concurrent = this.lookupCreateResult(monitorCollection, request);
     if (concurrent) return concurrent;
     if (!prepared) return;
     let response: CreateResult | undefined;
-    const result = this.monitorConfigurations.createPrepared(prepared, undefined, (state, current) => {
+    const result = this.monitorConfigurations.createPrepared(prepared, limit, (state, current) => {
       const created = createdResource(monitorResource(current), monitorCollection);
       response = created;
       return this.commitMonitorConfiguration(state, state.pageName, undefined, current, request
         ? () => this.recordCreateResult(monitorCollection, request, created) : undefined);
     });
-    if (result === destinationPendingConfirmation) return result;
+    if (result === destinationPendingConfirmation || result === null) return result;
     return response;
   }
 
@@ -2090,19 +2090,23 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   app.get("/", getOnly, (c: Context<HttpEnv<E>>) => publicRender(c, "/"));
   app.get("/api/status", getOnly, (c: Context<HttpEnv<E>>) =>
     publicRender(c, c.req.header("Accept") === viewMediaType ? "snapshot" : "/api/status"));
-  const versionedAuthorization = (required: ApiKeyRole): MiddlewareHandler<HttpEnv<E>> => async (c, next) => {
-    if (c.get("resolved")) return c.notFound();
+  const versionedAuthorization = (required: ApiKeyRole, hosted = false): MiddlewareHandler<HttpEnv<E>> => async (c, next) => {
+    const resolved = c.get("resolved");
+    if (resolved && !hosted) return c.notFound();
     const authorization = canonicalBearer(c.req.header("Authorization"));
-    if (!(await authorized(authorization, c.env.INSTALLATION_SECRET))) {
-      const role = authorization?.startsWith("Bearer " + apiKeyPrefix)
-        ? await c.get("context").apiKeyRole(await credentialDigest(authorization)) : undefined;
-      if (!role) return Response.json({ error: "Unauthorized" }, { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
-      if (required === "write" && role !== "write") return Response.json({ error: "Forbidden" }, { status: 403 });
+    // A hosted Product tenant accepts only keys stored for that tenant. The installation secret stays on the personal Worker.
+    if (!resolved && await authorized(authorization, c.env.INSTALLATION_SECRET)) {
+      await next();
+      return;
     }
+    const role = authorization?.startsWith("Bearer " + apiKeyPrefix)
+      ? await c.get("context").apiKeyRole(await credentialDigest(authorization)) : undefined;
+    if (!role) return Response.json({ error: "Unauthorized" }, { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
+    if (required === "write" && role !== "write") return Response.json({ error: "Forbidden" }, { status: 403 });
     await next();
   };
   const versionedStatusPath = "/api/v1/status";
-  app.use(versionedStatusPath, versionedAuthorization("read"));
+  app.use(versionedStatusPath, versionedAuthorization("read", true));
   app.all(versionedStatusPath, async c => c.req.method === "GET"
     ? c.json(await c.get("context").versionedStatus()) : methodNotAllowed("GET"));
   const asset = (render: StatusRender): MiddlewareHandler<HttpEnv<E>> => async c => {
@@ -2167,7 +2171,13 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   const operatorPartials = "/api/operator/partials";
   const operatorPartialPaths = [operatorPartials, operatorPartials + "/:section", operatorPartials + "/monitor/:id"];
   for (const path of [apiKeysPath, apiKeyPath]) app.use(path, async (c, next) => {
-    if (c.get("resolved")) return c.notFound();
+    const resolved = c.get("resolved");
+    if (resolved) {
+      if (resolved.permission !== "editor")
+        return Response.json({ error: resolved.permission ? "Forbidden" : "Unauthorized" }, { status: resolved.permission ? 403 : 401 });
+      await next();
+      return;
+    }
     if (!(await authorized(canonicalBearer(c.req.header("Authorization")), c.env.INSTALLATION_SECRET)))
       return Response.json({ error: "Unauthorized" }, { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
     await next();
@@ -2281,7 +2291,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   // IDs are opaque: read the original path rather than Hono's decoded params.
   const monitorId = (c: Context<HttpEnv<E>>) => c.req.path.split("/")[4];
   const monitorResourcePath = monitorCollection + "/:id";
-  for (const path of [monitorCollection, monitorResourcePath]) app.use(path, versionedAuthorization("write"));
+  for (const path of [monitorCollection, monitorResourcePath]) app.use(path, versionedAuthorization("write", true));
   const invalidMonitor = () => Response.json({ error: "Invalid Monitor configuration" }, { status: 400 });
   const pendingAssignment = () => Response.json({
     error: "An email destination is awaiting confirmation",
@@ -2294,8 +2304,9 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     return monitor ? Response.json(monitor) : missingMonitor();
   });
   app.post(monitorCollection, readBody, async (c: Context<HttpEnv<E>>) => {
-    const monitor = await c.get("context").createMonitorResource(c.get("value"), c.get("idempotency"));
+    const monitor = await c.get("context").createMonitorResource(c.get("value"), c.get("idempotency"), c.get("resolved")?.monitorLimit);
     if (monitor === destinationPendingConfirmation) return pendingAssignment();
+    if (monitor === null) return Response.json({ error: "Monitor allowance reached" }, { status: 409 });
     return monitor ? createResponse(monitor) : invalidMonitor();
   });
   app.patch(monitorResourcePath, readBody, async (c: Context<HttpEnv<E>>) => {

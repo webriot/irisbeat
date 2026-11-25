@@ -2,18 +2,18 @@
 
 | Method and path | Access | Reference |
 | --- | --- | --- |
-| `GET /api/v1/status` | Read or Write API key, or installation secret | [Monitor status](#monitor-status) |
-| `POST /api/v1/monitors` | Write API key or installation secret | [Monitor configuration](monitor-api-v1.md) |
-| `GET, PATCH, DELETE /api/v1/monitors/:id` | Write API key or installation secret | [Monitor configuration](monitor-api-v1.md) |
+| `GET /api/v1/status` | Read or Write API key, or the self-hosted installation secret | [Monitor status](#monitor-status) |
+| `POST /api/v1/monitors` | Write API key, or the self-hosted installation secret | [Monitor configuration](monitor-api-v1.md) |
+| `GET, PATCH, DELETE /api/v1/monitors/:id` | Write API key, or the self-hosted installation secret | [Monitor configuration](monitor-api-v1.md) |
 | `POST /api/v1/destinations` | Write API key or installation secret | [Create a destination](destination-api.md#create-a-destination) |
 | `GET /api/v1/destinations/:id` | Write API key or installation secret | [Read a destination](destination-api.md#read-a-destination) |
 | `PATCH /api/v1/destinations/:id` | Write API key or installation secret | [Edit a destination](destination-api.md#edit-a-destination) |
 | `DELETE /api/v1/destinations/:id` | Write API key or installation secret | [Delete a destination](destination-api.md#delete-a-destination) |
-| `GET /api/operator/api-keys` | Installation secret | [List keys](#list-keys) |
-| `POST /api/operator/api-keys` | Installation secret | [Issue a key](#issue-a-key) |
-| `DELETE /api/operator/api-keys/:id` | Installation secret | [Revoke a key](#revoke-a-key) |
+| `GET /api/operator/api-keys` | Installation secret, or a hosted editor | [List keys](#list-keys) |
+| `POST /api/operator/api-keys` | Installation secret, or a hosted editor | [Issue a key](#issue-a-key) |
+| `DELETE /api/operator/api-keys/:id` | Installation secret, or a hosted editor | [Revoke a key](#revoke-a-key) |
 
-Send the credential in the `Authorization: Bearer <credential>` header. API keys are scoped to one self-hosted installation. A Read key grants status access. A Write key includes that access and is the role for versioned configuration routes. The installation secret grants access to every versioned operation plus key administration, Operator sign-in and actions, and personal Heartbeat receipts. Hosted Workers use their trusted adapter for existing operations and return `404` for these routes.
+Send the credential in the `Authorization: Bearer <credential>` header. A self-hosted API key is scoped to that installation. A hosted API key is scoped to one Product tenant: the trusted adapter selects the tenant, and a key issued there is rejected on every other tenant of the same Installation. A Read key grants status access. A Write key includes that access and is the role for versioned Monitor routes. The installation secret grants access to every self-hosted versioned operation plus key administration, Operator sign-in and actions, and personal Heartbeat receipts. It does not authorize hosted Monitor routes, hosted key administration, or hosted Heartbeat receipts. On a hosted Product tenant, the editor session identified by the trusted adapter issues and revokes keys; a reader cannot. Versioned destination routes stay on the self-hosted Worker and return `404` on a hosted Worker.
 
 Versioned routes return `401` with `{"error":"Unauthorized"}` and a `WWW-Authenticate: Bearer` header for missing, invalid, expired, or revoked credentials. A valid Read key on a route requiring Write returns `403` with `{"error":"Forbidden"}`. Successful JSON responses use `application/json`. Responses use `Cache-Control: no-store`.
 
@@ -21,7 +21,7 @@ Versioned routes return `401` with `{"error":"Unauthorized"}` and a `WWW-Authent
 
 Send an optional `Idempotency-Key` with `POST /api/v1/monitors` or `POST /api/v1/destinations`. Use one header value of 1–128 visible ASCII characters, excluding commas and spaces. Length and characters are checked after HTTP header parsing. Keys are case-sensitive and an invalid value returns `400`. A UUID is a suitable key.
 
-Keep the key and the exact serialized JSON bytes until you receive the result. Irisbeat hashes the request body bytes before UTF-8 decoding or JSON parsing, including any byte-order mark, whitespace, property order, and escape spelling. Each installation and create endpoint has its own key space. Irisbeat checks Write access on every request, including retries after credential rotation.
+Keep the key and the exact serialized JSON bytes until you receive the result. Irisbeat hashes the request body bytes before UTF-8 decoding or JSON parsing, including any byte-order mark, whitespace, property order, and escape spelling. Each installation and create endpoint has its own key space. A hosted Product tenant has its own key space, separate from every other tenant. Irisbeat checks Write access on every request, including retries after credential rotation.
 
 For 24 hours from a successful create's commit, the same key and body return the original `201`, JSON body, and response headers, even after the resource is edited or deleted. Concurrent identical requests create one resource. Reusing the key with different body bytes during that window returns `409`. A replay leaves the expiry unchanged and can recover an interrupted Queue handoff for the original email invitation. Requests that never commit leave the key available. After expiry, the key can start a new create subject to the endpoint's usual validation.
 
@@ -79,4 +79,4 @@ Metadata timestamps are Unix epoch milliseconds. A `null` expiry denotes a key w
 
 ## Adding versioned configuration routes
 
-In `createApp` in `src/index.ts`, register `app.use(path, versionedAuthorization("write"))` for each versioned configuration path before its method handlers. Apply the gate to configuration reads as well as mutations, before reading a request body or looking up an idempotency result. The gate accepts the installation secret and active Write keys, and leaves engine access available through `c.get("context")`. Keep the Operator and Heartbeat middleware on their existing routes.
+In `createApp` in `src/index.ts`, register `app.use(path, versionedAuthorization("write"))` for each versioned configuration path before its method handlers. Pass `true` as the second argument when that route is also available to a hosted Product tenant's keys. Apply the gate to configuration reads as well as mutations, before reading a request body or looking up an idempotency result. On a self-hosted Worker the gate accepts the installation secret and active Write keys. On a hosted Worker it accepts only active keys stored for the resolved Product tenant. The gate leaves engine access available through `c.get("context")`. Keep the Operator and Heartbeat middleware on their existing routes.

@@ -9,6 +9,7 @@ and notification delivery Workers.
 - [Resolve tenants and permissions](#trusted-adapter)
 - [Read availability history](#availability-history)
 - [Issue and rotate Heartbeat credentials](#heartbeat-credentials)
+- [Issue Product tenant API keys](#product-tenant-api-keys)
 - [Deliver notifications](#incident-notifications) and [manage email consent](#email-consent)
 - [Pause and resume monitoring](#pause-and-resume)
 - [Subscribe to public updates](#public-subscriptions) and [Operator updates](#operator-subscriptions)
@@ -83,9 +84,10 @@ include the effective Interval or Calendar suspension details. [Monitor API](mon
 Creation passes the adapter's allowance into the same synchronous DO operation
 that checks the active collection and saves the new Monitor. Private Monitors
 count; deleted ones release capacity. Lowering the allowance does not delete
-existing configuration or prevent edits/checking. Hosted callers must create via
-`POST /api/operator/monitors`; legacy single-Monitor saves are rejected with 400
-so they cannot bypass the allowance. Page-only `PUT /api/operator` still works.
+existing configuration or prevent edits/checking. Hosted callers create via
+`POST /api/operator/monitors` or `POST /api/v1/monitors`; both pass the allowance.
+Legacy single-Monitor saves are rejected with 400 so they cannot bypass it.
+Page-only `PUT /api/operator` still works.
 The personal default export retains its complete existing interface and unlimited
 creation with the installation secret.
 
@@ -146,6 +148,24 @@ revokes the old value before returning; receipt matching rereads after hashing
 and commits synchronously before any delivery awaits. A receipt already committed
 before rotation is retained. Personal `/heartbeat/:id` continues using the
 installation secret and ignores bodies.
+
+## Product tenant API keys
+
+An editor uses the existing Operator key routes, `GET`, `POST`, and
+`DELETE /api/operator/api-keys`, with the same session the trusted adapter
+already resolved. The secret is returned once. A later list contains metadata
+only. A reader receives `403` and cannot issue or revoke keys. Keys are stored
+with that Product tenant and do not authorize another tenant of the same
+Installation.
+
+`GET /api/v1/status` accepts that tenant's Read or Write key. `POST`, `GET`,
+`PATCH`, and `DELETE /api/v1/monitors` accept its Write key, including an
+unpublished Calendar Heartbeat with cron, timezone, and grace. Create uses the
+same idempotency rules as a self-hosted installation and the same Monitor
+allowance as `POST /api/operator/monitors`. The installation secret and a key
+from another tenant receive `401`. A Read key on a Monitor route receives
+`403`. Versioned destination routes remain self-hosted. `POST /heartbeat`
+still requires that Monitor's own secret.
 
 ## Incident notifications
 

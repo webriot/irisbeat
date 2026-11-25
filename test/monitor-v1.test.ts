@@ -302,7 +302,7 @@ it('accepts JSON media types with parameters and rejects lookalike types', async
   expect((await create('Application/JSON; charset=UTF-8')).status).toBe(201);
 });
 
-it('requires credentials, limits methods and keeps Monitor routes self-hosted', async () => {
+it('requires credentials, limits methods and rejects another tenant’s credentials on hosted Monitor routes', async () => {
   const resource = monitors + '/missing';
   for (const [path, method] of [
     [monitors, 'POST'], [resource, 'GET'], [resource, 'PATCH'], [resource, 'DELETE'],
@@ -330,7 +330,7 @@ it('requires credentials, limits methods and keeps Monitor routes self-hosted', 
   const { secret: writeSecret } = await issueApiKey('write');
   for (const secret of ['editor', installationSecret, writeSecret]) {
     const response = await hosted.fetch(new Request(url, { headers: { authorization: 'Bearer ' + secret } }), env);
-    expect(response.status).toBe(404);
+    expect(response.status).toBe(401);
   }
 });
 

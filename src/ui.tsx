@@ -266,7 +266,7 @@ function Operator({ hosted }: { hosted: boolean }) {
           <p id="no-destinations">No destinations</p>
           <ul id="destination-rows" aria-label="Notification destinations"></ul>
         </section>
-        {!hosted && <ApiKeySettings />}
+        <ApiKeySettings />
       </section>
       <div class="actions"><span id="updates-mode" role="status">Polling</span><button id="logout" type="button">Sign out</button></div>
     </section>
@@ -921,7 +921,7 @@ function renderDestinations(next, markup) {
 let hosted = false;
 let canEditSettings = false;
 function syncApiKeySettings() {
-  apiKeySettings?.setActive(canEditSettings && !hosted && !byId('settings').hidden);
+  apiKeySettings?.setActive(canEditSettings && !byId('settings').hidden);
 }
 let monitorIds = new Set();
 function updateDeleted() {
