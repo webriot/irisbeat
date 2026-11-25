@@ -5,6 +5,10 @@
 | `GET /api/v1/status` | Read or Write API key, or installation secret | [Monitor status](#monitor-status) |
 | `POST /api/v1/monitors` | Write API key or installation secret | [Monitor configuration](monitor-api-v1.md) |
 | `GET, PATCH, DELETE /api/v1/monitors/:id` | Write API key or installation secret | [Monitor configuration](monitor-api-v1.md) |
+| `POST /api/v1/destinations` | Write API key or installation secret | [Create a destination](destination-api.md#create-a-destination) |
+| `GET /api/v1/destinations/:id` | Write API key or installation secret | [Read a destination](destination-api.md#read-a-destination) |
+| `PATCH /api/v1/destinations/:id` | Write API key or installation secret | [Edit a destination](destination-api.md#edit-a-destination) |
+| `DELETE /api/v1/destinations/:id` | Write API key or installation secret | [Delete a destination](destination-api.md#delete-a-destination) |
 | `GET /api/operator/api-keys` | Installation secret | [List keys](#list-keys) |
 | `POST /api/operator/api-keys` | Installation secret | [Issue a key](#issue-a-key) |
 | `DELETE /api/operator/api-keys/:id` | Installation secret | [Revoke a key](#revoke-a-key) |

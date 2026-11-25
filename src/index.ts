@@ -83,6 +83,14 @@ type StoredContext = {
 };
 type LegacyContext = { webhookUrl?: string | null; monitor: (Monitor & { pageName: string }) | null };
 type DestinationUpdate = (NewNotificationDestination & { name?: string }) | { name: string };
+type DestinationError = "duplicate" | "duplicate-name" | "unconfigured" | "cooldown" | "paused";
+
+function destinationResource(destination: NotificationDestination): NotificationDestination {
+  const { id, name, channel } = destination;
+  return channel === "webhook" ? { id, name, channel, url: destination.url }
+    : { id, name, channel, address: destination.address, confirmed: destination.confirmed };
+}
+
 type ApiKeyRole = "read" | "write";
 type ApiKey = { id: string; name: string; role: ApiKeyRole; createdAt: number; expiresAt: number | null };
 const apiKeyPrefix = "irb_";
@@ -910,6 +918,21 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
   }
 
   async configureDestination(id: string | null, update: DestinationUpdate | null, legacy = false, origin?: string) {
+    const result = await this.changeDestination(id, update, legacy, origin);
+    return result && typeof result === "object" ? result.ack : result;
+  }
+
+  async saveVersionedDestination(id: string | null, update: DestinationUpdate, origin?: string) {
+    const result = await this.changeDestination(id, update, false, origin);
+    return result && typeof result === "object" ? result.destination : result;
+  }
+
+  versionedDestination(id: string) {
+    const destination = this.read().destinations?.find(candidate => candidate.id === id);
+    return destination ? destinationResource(destination) : null;
+  }
+
+  private async changeDestination(id: string | null, update: DestinationUpdate | null, legacy: boolean, origin?: string) {
     const state = this.read();
     const destinationId = legacy ? state.legacyDestinationId : id;
     const destinations = state.destinations ?? [];
@@ -923,12 +946,12 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     const sameAddress = address?.channel === "webhook" && existing?.channel === "webhook" && existing.url === address.url ||
       address?.channel === "email" && existing?.channel === "email" && existing.address === address.address;
     if (existing && (sameAddress || (update && !address))) {
-      if (!name || name === existing.name) return this.unchangedView("destinations");
-      return this.commitViewChanges(() => {
+      const ack = !name || name === existing.name ? this.unchangedView("destinations") : this.commitViewChanges(() => {
         existing.name = name;
         this.ctx.storage.kv.put("context", state);
         return { editor: ["destinations"] };
       });
+      return { ack, destination: destinationResource(existing) };
     }
     const replacement = address && {
       id: crypto.randomUUID(), ...(address.channel === "email" ? { ...address, confirmed: false } : address),
@@ -966,7 +989,7 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
       return replacement || existing ? { editor: editorScopes } : {};
     });
     if (job) await this.enqueueConfirmation(job);
-    return ack;
+    return { ack, destination: replacement ? destinationResource(replacement) : null };
   }
 
   async resendConfirmation(id: string, origin: string) {
@@ -2025,6 +2048,9 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   const previewPath = "/api/operator/schedule-preview";
   const ticketPath = "/api/operator/events/ticket";
   const destinationsPath = "/api/operator/destinations";
+  const versionedDestinationsPath = "/api/v1/destinations";
+  const versionedDestinationPath = versionedDestinationsPath + "/:id";
+  for (const path of [versionedDestinationsPath, versionedDestinationPath]) app.use(path, versionedAuthorization("write"));
   const apiKeysPath = "/api/operator/api-keys";
   const apiKeyPath = apiKeysPath + "/:id";
   const destinationPath = destinationsPath + "/:id";
@@ -2103,7 +2129,8 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
         { error: "Use application/json" },
         { status: 415 },
       );
-    const maxBytes = c.req.path === destinationsPath || c.req.path.startsWith(destinationsPath + "/") ? 16_384 : 4096;
+    const maxBytes = [destinationsPath, versionedDestinationsPath].some(path =>
+      c.req.path === path || c.req.path.startsWith(path + "/")) ? 16_384 : 4096;
     if (Number(request.headers.get("Content-Length")) > maxBytes)
       return new Response(null, { status: 413 });
     const selectedMonitorId = c.req.path === "/api/operator" ? await c.get("context").firstMonitorId() : null;
@@ -2193,39 +2220,74 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     if (destination === undefined) return Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
     return destinationResponse(c, await c.get("context").configureDestination(null, destination ? { channel: "webhook", url: destination } : null, true));
   });
-  function destinationResponse(c: Context<HttpEnv<E>>, result: MutationAck | null | "duplicate" | "duplicate-name" | "unconfigured" | "cooldown" | "paused", status = 200) {
+  function destinationError(result: DestinationError | null) {
     if (result === "unconfigured") return Response.json({ error: "Email sending is unavailable" }, { status: 503 });
     if (result === "duplicate") return Response.json({ error: "This inbox is already a destination" }, { status: 409 });
     if (result === "duplicate-name") return Response.json({ error: "A destination with this name already exists" }, { status: 409 });
     if (result === "paused") return Response.json({ error: "Confirmation is paused" }, { status: 409 });
     if (result === "cooldown") return Response.json({ error: "Wait five minutes between confirmations for this inbox" }, { status: 429 });
-    return result ? operatorMutationResponse(c, result, status) : Response.json({ error: "Destination not found" }, { status: 404 });
+    return Response.json({ error: "Destination not found" }, { status: 404 });
   }
-  const saveDestination = async (c: Context<HttpEnv<E>>) => {
-    const value = c.get("value");
+  function destinationResponse(c: Context<HttpEnv<E>>, result: MutationAck | DestinationError | null, status = 200) {
+    return result && typeof result === "object" ? operatorMutationResponse(c, result, status) : destinationError(result);
+  }
+  async function parseDestinationUpdate(value: unknown, creating: boolean, readSaved?: () => Promise<NotificationDestination | null>): Promise<DestinationUpdate | Response> {
     const fields = value && typeof value === "object" ? value as Record<string, unknown> : {};
     const name = typeof fields.name === "string" ? fields.name.trim() : undefined;
     if (fields.name !== undefined && (!name || name.length > 120 || /[\r\n]/.test(name)))
       return Response.json({ error: "Enter a destination name of up to 120 characters on one line" }, { status: 400 });
-    const creating = c.req.method === "POST";
     if (!creating && name && fields.channel === undefined && fields.url === undefined && fields.address === undefined)
-      return destinationResponse(c, await c.get("context").configureDestination(monitorId(c), { name }));
-    let destination: NewNotificationDestination & { name?: string };
-    let origin: string | undefined;
+      return { name };
     if (fields.channel === "email") {
       const address = parseEmailAddress(fields.address);
       if (!address) return Response.json({ error: "Enter an email address" }, { status: 400 });
-      origin = await confirmationOrigin(c);
-      destination = { channel: "email", address, name };
-    } else {
-      const url = parseWebhook(fields.url);
-      if (!url || (fields.channel !== undefined && fields.channel !== "webhook"))
-        return Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
-      destination = { channel: "webhook", url, name };
+      return { channel: "email", address, name };
     }
+    const invalidWebhook = () => Response.json({ error: "Enter an HTTPS webhook URL" }, { status: 400 });
+    if (fields.channel !== undefined && fields.channel !== "webhook") return invalidWebhook();
+    const normalized = parseWebhook(fields.url);
+    // A saved webhook can exceed the input limit after Discord normalization.
+    const saved = readSaved && typeof fields.url === "string" && normalized !== fields.url ? await readSaved() : null;
+    const url = saved?.channel === "webhook" && saved.url === fields.url ? saved.url : normalized;
+    return url ? { channel: "webhook", url, name } : invalidWebhook();
+  }
+  const prepareDestination = async (c: Context<HttpEnv<E>>, creating: boolean, versionedId?: string) => {
+    const destination = await parseDestinationUpdate(c.get("value"), creating,
+      versionedId === undefined ? undefined : () => c.get("context").versionedDestination(versionedId));
+    if (destination instanceof Response) return destination;
+    const origin = "channel" in destination && destination.channel === "email" ? await confirmationOrigin(c) : undefined;
+    return { destination, origin };
+  };
+  const saveDestination = async (c: Context<HttpEnv<E>>) => {
+    const creating = c.req.method === "POST";
+    const prepared = await prepareDestination(c, creating);
+    if (prepared instanceof Response) return prepared;
+    const { destination, origin } = prepared;
     const result = await c.get("context").configureDestination(creating ? null : monitorId(c), destination, false, origin);
     return destinationResponse(c, result, creating ? 201 : 200);
   };
+  const saveVersionedDestination = async (c: Context<HttpEnv<E>>, id: string | null) => {
+    const prepared = await prepareDestination(c, id === null, id ?? undefined);
+    if (prepared instanceof Response) return prepared;
+    const { destination, origin } = prepared;
+    const result = await c.get("context").saveVersionedDestination(id, destination, origin);
+    return result && typeof result === "object" ? c.json(result, id === null ? 201 : 200) : destinationError(result);
+  };
+  const versionedDestinationId = (c: Context<HttpEnv<E>>) => c.req.path.slice(versionedDestinationsPath.length + 1);
+  // Create idempotency belongs at this authorized entry point and in the destination commit.
+  app.post(versionedDestinationsPath, readBody, (c: Context<HttpEnv<E>>) => saveVersionedDestination(c, null));
+  app.all(versionedDestinationsPath, () => methodNotAllowed("POST"));
+  app.get(versionedDestinationPath, async c => {
+    if (c.req.method !== "GET") return methodNotAllowed("GET, PATCH, DELETE");
+    const destination = await c.get("context").versionedDestination(versionedDestinationId(c));
+    return destination ? c.json(destination) : destinationError(null);
+  });
+  app.patch(versionedDestinationPath, readBody, (c: Context<HttpEnv<E>>) => saveVersionedDestination(c, versionedDestinationId(c)));
+  app.delete(versionedDestinationPath, async c => {
+    const result = await c.get("context").configureDestination(versionedDestinationId(c), null);
+    return result && typeof result === "object" ? new Response(null, { status: 204 }) : destinationError(result);
+  });
+  app.all(versionedDestinationPath, () => methodNotAllowed("GET, PATCH, DELETE"));
   app.post(destinationsPath, readBody, saveDestination);
   app.put(destinationPath, readBody, saveDestination);
   app.post(resendPath, async c => {
