@@ -155,15 +155,21 @@ it('keeps Accounts authorization independent of hosted automation and ignores th
 it.each([null, 123, '', '   ', 'token\n'])('fails closed for an invalid configured secret %j', async installationSecret => {
   const invalid = createHostedWorker({
     contractVersion: '1',
-    resolve: () => ({ id: tenantA, monitorLimit: 1, permission: null, installationSecret: installationSecret as string }),
+    resolve: request => ({
+      id: tenantA, monitorLimit: 1, installationSecret: installationSecret as string,
+      permission: request.headers.get('Authorization') === 'Bearer account-editor' ? 'editor' : null,
+    }),
     contexts: () => [],
   });
   const response = await invalid.fetch(new Request('https://' + tenantA + status, {
     headers: { Authorization: 'Bearer ' + env.INSTALLATION_SECRET },
   }), env);
   expect(response.status).toBe(404);
-  const operator = await invalid.fetch(new Request('https://' + tenantA + '/api/operator'), env);
-  expect(operator.status).toBe(401);
+  const operator = await invalid.fetch(new Request('https://' + tenantA + '/api/operator', {
+    headers: { Authorization: 'Bearer account-editor' },
+  }), env);
+  expect(operator.status).toBe(200);
+  expect(await operator.json()).toMatchObject({ hosted: true, permission: 'editor' });
   const publicStatus = await invalid.fetch(new Request('https://' + tenantA + '/api/status'), env);
   expect(publicStatus.status).toBe(200);
 });
