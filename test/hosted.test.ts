@@ -9,7 +9,7 @@ const app = createHostedWorker({
     const host = new URL(request.url).hostname;
     if (!['a.example', 'b.example'].includes(host)) return null;
     const token = request.headers.get('authorization');
-    return { id: host, permission: token === 'Bearer editor' ? 'editor' : token === 'Bearer reader' ? 'reader' : null, monitorLimit: 1 };
+    return { id: host, permission: token === 'Bearer editor' ? 'editor' : token === 'Bearer reader' ? 'reader' : null, monitorLimit: 1, installationSecret: host === 'a.example' ? 'tenant-a-secret' : 'tenant-b-secret' };
   },
   contexts: () => ['a.example', 'b.example'],
 });
@@ -73,6 +73,60 @@ it('accepts exactly one concurrent Calendar Heartbeat creation at the hosted Mon
   expect(observed.incidents).toMatchObject([{ monitorId: accepted.monitor!.id, openedAt: start + 180_000, closedAt: null }]);
 });
 
+it('records a hosted receipt with the tenant installation secret', async () => {
+  const now = Date.UTC(2026, 10, 26);
+  vi.spyOn(Date, 'now').mockReturnValue(now);
+  const created = await request('a.example', '/api/operator/monitors', 'POST', { name: 'Producer', kind: 'heartbeat' });
+  expect(created.status).toBe(201);
+  const { monitor } = await created.json() as Status;
+  expect(monitor!.lastSeen).toBeNull();
+  expect((await request('a.example', '/heartbeat/' + monitor!.id, 'POST', undefined, 'tenant-a-secret')).status).toBe(204);
+  expect(await (await request('a.example', '/api/operator')).json()).toMatchObject({ monitor: { id: monitor!.id, lastSeen: now } });
+});
+
+it('rejects wrong credentials and keeps installation receipts within the resolved host', async () => {
+  const created = await request('a.example', '/api/operator/monitors', 'POST', { name: 'Tenant A', kind: 'heartbeat' });
+  expect(created.status).toBe(201);
+  const { monitor } = await created.json() as Status;
+  const other = await request('b.example', '/api/operator/monitors', 'POST', { name: 'Tenant B', kind: 'heartbeat' });
+  expect(other.status).toBe(201);
+  const path = '/heartbeat/' + monitor!.id;
+
+  for (const [host, token, status] of [
+    ['a.example', 'wrong', 401],
+    ['a.example', 'tenant-b-secret', 401],
+    ['a.example', 'test-installation-secret', 401],
+    ['b.example', 'tenant-a-secret', 401],
+    ['b.example', 'tenant-b-secret', 404],
+    ['unknown.example', 'tenant-a-secret', 404],
+  ] as const) {
+    expect((await request(host, path, 'POST', undefined, token)).status, `${host} with ${token}`).toBe(status);
+  }
+  for (const host of ['a.example', 'b.example']) {
+    expect(await (await request(host, '/api/operator')).json()).toMatchObject({ monitor: { lastSeen: null } });
+  }
+});
+
+it.each([undefined, '', 123])('keeps the installation receipt route unavailable for adapter secret %j', async installationSecret => {
+  const worker = createHostedWorker({
+    contractVersion: '1',
+    resolve: () => ({ id: 'a.example', permission: null, monitorLimit: 1,
+      ...(installationSecret === undefined ? {} : { installationSecret: installationSecret as string }),
+    }),
+    contexts: () => [],
+  });
+  const created = await request('a.example', '/api/operator/monitors', 'POST', { name: 'Producer', kind: 'heartbeat' });
+  expect(created.status).toBe(201);
+  const { monitor } = await created.json() as Status;
+  for (const token of ['test-installation-secret', '123']) {
+    const response = await worker.fetch(new Request('https://a.example/heartbeat/' + monitor!.id, {
+      method: 'POST', headers: { authorization: 'Bearer ' + token },
+    }), env);
+    expect(response.status).toBe(404);
+  }
+  expect(await (await request('a.example', '/api/operator')).json()).toMatchObject({ monitor: { lastSeen: null } });
+});
+
 it('filters credentials for readers and confines heartbeat credentials to their tenant with immediate rotation', async () => {
   await request('a.example', '/api/operator/monitors', 'POST', { name: 'Producer', kind: 'heartbeat' });
   const editor = await (await request('a.example', '/api/operator')).json() as { monitor: { id: string } };
@@ -91,7 +145,8 @@ it('filters credentials for readers and confines heartbeat credentials to their 
     expect((await app.fetch(new Request('https://a.example/heartbeat', { method: 'POST', headers: { authorization: 'Bearer ' + secret }, body }), env)).status).toBe(204);
   } finally { producer.close(); }
   expect((await request('b.example', '/heartbeat', 'POST', undefined, secret)).status).toBe(401);
-  expect((await request('a.example', '/heartbeat/' + editor.monitor.id, 'POST', undefined, 'test-installation-secret')).status).toBe(404);
+  expect((await request('a.example', '/heartbeat', 'POST', undefined, 'tenant-a-secret')).status).toBe(401);
+  expect((await request('a.example', '/heartbeat/' + editor.monitor.id, 'POST', undefined, secret)).status).toBe(401);
   const replacement = await (await request('a.example', path, 'POST')).json() as { secret: string };
   expect(replacement.secret).not.toBe(secret);
   expect((await request('a.example', '/heartbeat', 'POST', undefined, secret)).status).toBe(401);
@@ -159,8 +214,8 @@ it('restricts Maintenance to context editors and preserves hosted metadata and r
 it('preserves hosted method responses and reader authorization before dispatch', async () => {
   for (const [path, method, token, status, allow] of [
     ['/heartbeat', 'GET', 'unknown', 405, 'POST'],
-    ['/heartbeat/', 'POST', 'editor', 404, null],
-    ['/heartbeat/missing', 'GET', 'unknown', 404, null],
+    ['/heartbeat/', 'POST', 'tenant-a-secret', 404, null],
+    ['/heartbeat/missing', 'GET', 'tenant-a-secret', 405, 'POST'],
     ['/api/operator', 'HEAD', 'reader', 403, null],
     ['/api/operator/monitors/missing/heartbeat-secret', 'GET', 'reader', 405, 'POST'],
     ['/api/operator/monitors/missing/heartbeat-secret', 'POST', 'unknown', 401, null],

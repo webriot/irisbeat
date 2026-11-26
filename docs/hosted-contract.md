@@ -131,21 +131,29 @@ optional `stale: true` on previously successful aggregates.
 
 ## Heartbeat credentials
 
+To enable `POST /heartbeat/<monitor-id>` on a tenant host, generate a distinct
+random `installationSecret` for each tenant using visible ASCII characters.
+Return that tenant's secret from `resolve`, including for requests with
+`permission: null`. Send it in `Authorization: Bearer <installation secret>`.
+The route authenticates against the resolved tenant's secret and records the
+receipt in that tenant. The body is ignored and an accepted receipt returns 204.
+An unconfigured tenant returns 404. On a configured tenant, missing or incorrect
+authorization returns 401. With valid authorization, an unknown, deleted, or
+non-Heartbeat Monitor returns 404. Self-hosted installations use their
+`INSTALLATION_SECRET` binding for this path.
+
 An editor calls `POST /api/operator/monitors/:id/heartbeat-secret` to issue or
 rotate a Heartbeat Monitor's credential. No JSON body is needed. The 200 response
-`{ secret }` is the only time the credential is returned. New hosted Heartbeats
-require this explicit issuance; no installation-wide credential authorizes them.
+`{ secret }` is the only time the credential is returned.
 Non-Heartbeat, missing, deleted or other-context IDs return 404. Readers get 403.
 The ledger displays the returned Bearer value until editing ends or sign-out.
 
 Send `POST /heartbeat` to the trusted tenant host with `Authorization: Bearer
 <secret>`. The body is never read. The digest identifies an active Heartbeat in
 that context; invalid/cross-context/revoked credentials return 401. Non-POST is
-405; hosted `/heartbeat/:id` is 404. Rotation stores a new SHA-256 digest and
-revokes the old value before returning; receipt matching rereads after hashing
-and commits synchronously before any delivery awaits. A receipt already committed
-before rotation is retained. Personal `/heartbeat/:id` continues using the
-installation secret and ignores bodies.
+405. Rotation stores a new SHA-256 digest and revokes the old value before
+returning. Receipt matching rereads after hashing and commits synchronously
+before any delivery awaits. A receipt already committed before rotation is retained.
 
 ## Incident notifications
 
