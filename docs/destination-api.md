@@ -1,6 +1,6 @@
 # Notification destination API
 
-Send `Authorization: Bearer <credential>` with a Write API key or the installation secret. See [automation API authentication](api-v1.md) for authorization errors. These routes are available on self-hosted Workers.
+Send `Authorization: Bearer <credential>` with a Write API key or the installation secret. See [automation API authentication](api-v1.md) for hosted tenant access and authorization errors.
 
 ## Destination response
 

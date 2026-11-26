@@ -48,10 +48,15 @@ Hosted consumers own accounts, Stripe, hostname provisioning, and Email Service 
 `createHostedWorker(adapter)` returns Worker `fetch` and `scheduled` handlers.
 The adapter supplies just:
 
-- `resolve(request, env)`: return `{ id, permission, monitorLimit, paused?, policyRevision?, notificationOrigin? }` or `null` for
+- `resolve(request, env)`: return `{ id, permission, monitorLimit, installationSecret?, paused?, policyRevision?, notificationOrigin? }` or `null` for
   an unrecognized host. `id` is the stable Durable Object name; `permission` is
   `editor`, `reader`, or `null` for an anonymous visitor. `monitorLimit` is a
   nonnegative safe integer. Invalid resolved contexts fail closed with 500.
+  An optional `installationSecret` enables [API key administration and `/api/v1`](api-v1.md)
+  for the resolved tenant. Supply a unique random secret for each tenant from
+  trusted configuration. It must be a nonempty string of visible ASCII characters.
+  An omitted or invalid secret leaves automation routes unavailable (`404`). Hosted automation uses
+  the resolved tenant's secret exclusively for installation-secret authorization.
   An optional `notificationOrigin` is a trusted canonical HTTPS origin for the
   context's recipient-facing pages. Leave it unset for a context without email.
 - `contexts(env)`: return stable context names or `{ id, paused?, policyRevision?, notificationOrigin? }`
@@ -83,8 +88,9 @@ include the effective Interval or Calendar suspension details. [Monitor API](mon
 Creation passes the adapter's allowance into the same synchronous DO operation
 that checks the active collection and saves the new Monitor. Private Monitors
 count; deleted ones release capacity. Lowering the allowance does not delete
-existing configuration or prevent edits/checking. Hosted callers must create via
-`POST /api/operator/monitors`; legacy single-Monitor saves are rejected with 400
+existing configuration or prevent edits/checking. Hosted callers can create via
+`POST /api/operator/monitors` or, when automation is enabled, `POST /api/v1/monitors`.
+Legacy single-Monitor saves are rejected with 400
 so they cannot bypass the allowance. Page-only `PUT /api/operator` still works.
 The personal default export retains its complete existing interface and unlimited
 creation with the installation secret.

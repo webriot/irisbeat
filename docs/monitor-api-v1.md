@@ -1,10 +1,10 @@
 # Monitor configuration API v1
 
-On a self-hosted installation, send `Authorization: Bearer <write API key>`
-or use the installation secret as the Bearer credential. Every Monitor
+Send `Authorization: Bearer <write API key>` or use the installation secret
+as the Bearer credential. Every Monitor
 configuration operation requires Write access, including read by ID.
 The routes return `401` for missing, invalid, expired, or revoked credentials
-and `403` for Read API keys. Hosted Workers return `404` for these routes.
+and `403` for Read API keys.
 See the [automation API overview](api-v1.md) for key administration and the
 shared authentication response format.
 
@@ -16,6 +16,9 @@ shared authentication response format.
 | `DELETE /api/v1/monitors/:id` | `204` | Empty body |
 
 Use an [idempotency key](api-v1.md#retrying-creates) to safely retry creation.
+On a hosted tenant, creating a Monitor at the adapter's allowance returns
+`409` with `{"error":"Monitor allowance reached"}`. Successful creates can
+still be replayed at capacity.
 
 Monitor IDs are opaque and remain fixed throughout updates. Unknown and
 deleted IDs return `404`. Deletion stops checks and preserves the Monitor's
