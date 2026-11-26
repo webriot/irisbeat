@@ -33,6 +33,7 @@ function validPolicy(value: { paused?: unknown; policyRevision?: unknown }) {
 export type ResolvedContext = ScheduledContext & {
   permission: "editor" | "reader" | null;
   monitorLimit: number;
+  installationSecret?: string;
 };
 export interface HostedAdapter<E extends EngineEnv = EngineEnv> {
   contractVersion: string;
@@ -944,20 +945,20 @@ export class MonitoringContext<E extends EngineEnv = EngineEnv> extends DurableO
     );
   }
 
-  async createMonitorResource(value: unknown, request?: IdempotencyRequest) {
+  async createMonitorResource(value: unknown, request?: IdempotencyRequest, limit?: number) {
     const prepared = await this.monitorConfigurations.prepareCreate(value);
     // Check again after Calendar validation, which can yield.
     const concurrent = this.lookupCreateResult(monitorCollection, request);
     if (concurrent) return concurrent;
     if (!prepared) return;
     let response: CreateResult | undefined;
-    const result = this.monitorConfigurations.createPrepared(prepared, undefined, (state, current) => {
+    const result = this.monitorConfigurations.createPrepared(prepared, limit, (state, current) => {
       const created = createdResource(monitorResource(current), monitorCollection);
       response = created;
       return this.commitMonitorConfiguration(state, state.pageName, undefined, current, request
         ? () => this.recordCreateResult(monitorCollection, request, created) : undefined);
     });
-    if (result === destinationPendingConfirmation) return result;
+    if (result === null || result === destinationPendingConfirmation) return result;
     return response;
   }
 
@@ -2030,6 +2031,8 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     const resolved = adapter ? await adapter.resolve(c.req.raw, c.env) : undefined;
     if (resolved && (typeof resolved.id !== "string" || !resolved.id ||
         !["editor", "reader", null].includes(resolved.permission) ||
+        (resolved.installationSecret !== undefined &&
+          (typeof resolved.installationSecret !== "string" || !resolved.installationSecret || /[^!-~]/.test(resolved.installationSecret))) ||
         !Number.isSafeInteger(resolved.monitorLimit) || resolved.monitorLimit < 0 || !validPolicy(resolved)))
       throw new Error("Invalid hosted context");
     if (adapter && !resolved) return c.notFound();
@@ -2090,11 +2093,13 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   app.get("/", getOnly, (c: Context<HttpEnv<E>>) => publicRender(c, "/"));
   app.get("/api/status", getOnly, (c: Context<HttpEnv<E>>) =>
     publicRender(c, c.req.header("Accept") === viewMediaType ? "snapshot" : "/api/status"));
-  const versionedAuthorization = (required: ApiKeyRole): MiddlewareHandler<HttpEnv<E>> => async (c, next) => {
-    if (c.get("resolved")) return c.notFound();
+  const versionedAuthorization = (required: ApiKeyRole | "installation"): MiddlewareHandler<HttpEnv<E>> => async (c, next) => {
+    const resolved = c.get("resolved");
+    if (resolved && resolved.installationSecret === undefined) return c.notFound();
+    const secret = resolved ? resolved.installationSecret : c.env.INSTALLATION_SECRET;
     const authorization = canonicalBearer(c.req.header("Authorization"));
-    if (!(await authorized(authorization, c.env.INSTALLATION_SECRET))) {
-      const role = authorization?.startsWith("Bearer " + apiKeyPrefix)
+    if (!(await authorized(authorization, secret))) {
+      const role = required !== "installation" && authorization?.startsWith("Bearer " + apiKeyPrefix)
         ? await c.get("context").apiKeyRole(await credentialDigest(authorization)) : undefined;
       if (!role) return Response.json({ error: "Unauthorized" }, { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
       if (required === "write" && role !== "write") return Response.json({ error: "Forbidden" }, { status: 403 });
@@ -2166,12 +2171,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   const publicPartials = "/api/status/partials";
   const operatorPartials = "/api/operator/partials";
   const operatorPartialPaths = [operatorPartials, operatorPartials + "/:section", operatorPartials + "/monitor/:id"];
-  for (const path of [apiKeysPath, apiKeyPath]) app.use(path, async (c, next) => {
-    if (c.get("resolved")) return c.notFound();
-    if (!(await authorized(canonicalBearer(c.req.header("Authorization")), c.env.INSTALLATION_SECRET)))
-      return Response.json({ error: "Unauthorized" }, { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
-    await next();
-  });
+  for (const path of [apiKeysPath, apiKeyPath]) app.use(path, versionedAuthorization("installation"));
   const operatorPaths = [readinessPath, ...operatorPartialPaths, ticketPath, previewPath, destinationsPath, destinationPath, resendPath, "/api/operator", "/api/operator/webhook", "/api/operator/monitors", monitorPath, maintenancePath, rotationPath];
   for (const path of operatorPaths) app.use(path, async (c, next) => {
     const resolved = c.get("resolved");
@@ -2294,7 +2294,8 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     return monitor ? Response.json(monitor) : missingMonitor();
   });
   app.post(monitorCollection, readBody, async (c: Context<HttpEnv<E>>) => {
-    const monitor = await c.get("context").createMonitorResource(c.get("value"), c.get("idempotency"));
+    const monitor = await c.get("context").createMonitorResource(c.get("value"), c.get("idempotency"), c.get("resolved")?.monitorLimit);
+    if (monitor === null) return Response.json({ error: "Monitor allowance reached" }, { status: 409 });
     if (monitor === destinationPendingConfirmation) return pendingAssignment();
     return monitor ? createResponse(monitor) : invalidMonitor();
   });
