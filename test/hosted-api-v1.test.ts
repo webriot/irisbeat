@@ -161,6 +161,9 @@ it.each([null, 123, '', '   ', 'token\n'])('fails closed for an invalid configur
   const response = await invalid.fetch(new Request('https://' + tenantA + status, {
     headers: { Authorization: 'Bearer ' + env.INSTALLATION_SECRET },
   }), env);
-  expect(response.status).toBe(500);
-  expect(await response.json()).toEqual({ error: 'Internal server error' });
+  expect(response.status).toBe(404);
+  const operator = await invalid.fetch(new Request('https://' + tenantA + '/api/operator'), env);
+  expect(operator.status).toBe(401);
+  const publicStatus = await invalid.fetch(new Request('https://' + tenantA + '/api/status'), env);
+  expect(publicStatus.status).toBe(200);
 });

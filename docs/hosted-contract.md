@@ -55,7 +55,7 @@ The adapter supplies just:
   An optional `installationSecret` enables [API key administration and `/api/v1`](api-v1.md)
   for the resolved tenant. Supply a unique random secret for each tenant from
   trusted configuration. It must be a nonempty string of visible ASCII characters.
-  Leave it unset to return `404` on automation routes. Hosted automation uses
+  An omitted or invalid secret leaves automation routes unavailable (`404`). Hosted automation uses
   the resolved tenant's secret exclusively for installation-secret authorization.
   An optional `notificationOrigin` is a trusted canonical HTTPS origin for the
   context's recipient-facing pages. Leave it unset for a context without email.

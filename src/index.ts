@@ -1827,6 +1827,10 @@ function attachAvailability(status: StatusProjection, history: Map<string, Avail
   return { ...status, monitors, monitor: monitors[0] ?? null };
 }
 
+function hasHostedInstallationSecret(secret: unknown): secret is string {
+  return typeof secret === "string" && secret.length > 0 && !/[^!-~]/.test(secret);
+}
+
 async function authorized(authorization: string | undefined, secret: string | undefined) {
   if (!secret) return false;
   const [actual, expected] = await Promise.all([
@@ -2031,8 +2035,6 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     const resolved = adapter ? await adapter.resolve(c.req.raw, c.env) : undefined;
     if (resolved && (typeof resolved.id !== "string" || !resolved.id ||
         !["editor", "reader", null].includes(resolved.permission) ||
-        (resolved.installationSecret !== undefined &&
-          (typeof resolved.installationSecret !== "string" || !resolved.installationSecret || /[^!-~]/.test(resolved.installationSecret))) ||
         !Number.isSafeInteger(resolved.monitorLimit) || resolved.monitorLimit < 0 || !validPolicy(resolved)))
       throw new Error("Invalid hosted context");
     if (adapter && !resolved) return c.notFound();
@@ -2095,8 +2097,8 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     publicRender(c, c.req.header("Accept") === viewMediaType ? "snapshot" : "/api/status"));
   const versionedAuthorization = (required: ApiKeyRole | "installation"): MiddlewareHandler<HttpEnv<E>> => async (c, next) => {
     const resolved = c.get("resolved");
-    if (resolved && resolved.installationSecret === undefined) return c.notFound();
     const secret = resolved ? resolved.installationSecret : c.env.INSTALLATION_SECRET;
+    if (resolved && !hasHostedInstallationSecret(secret)) return c.notFound();
     const authorization = canonicalBearer(c.req.header("Authorization"));
     if (!(await authorized(authorization, secret))) {
       const role = required !== "installation" && authorization?.startsWith("Bearer " + apiKeyPrefix)
