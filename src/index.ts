@@ -1827,6 +1827,10 @@ function attachAvailability(status: StatusProjection, history: Map<string, Avail
   return { ...status, monitors, monitor: monitors[0] ?? null };
 }
 
+function hasHostedInstallationSecret(secret: unknown): secret is string {
+  return typeof secret === "string" && secret.length > 0 && !/[^!-~]/.test(secret);
+}
+
 async function authorized(authorization: string | undefined, secret: string | undefined) {
   if (!secret) return false;
   const [actual, expected] = await Promise.all([
@@ -2052,7 +2056,7 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
   app.all("/heartbeat/*", async (c: Context<HttpEnv<E>>) => {
     const resolved = c.get("resolved");
     const secret = resolved ? resolved.installationSecret : c.env.INSTALLATION_SECRET;
-    if (resolved && (typeof secret !== "string" || !secret)) return new Response(null, { status: 404 });
+    if (resolved && !hasHostedInstallationSecret(secret)) return new Response(null, { status: 404 });
     if (!(await authorized(c.req.header("Authorization"), secret)))
       return Response.json({ error: "Unauthorized" }, { status: 401 });
     if (c.req.method !== "POST") return methodNotAllowed("POST");

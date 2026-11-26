@@ -131,8 +131,9 @@ optional `stale: true` on previously successful aggregates.
 
 ## Heartbeat credentials
 
-To enable `POST /heartbeat/<monitor-id>` on a tenant host, return the tenant's
-non-empty `installationSecret` from `resolve`, including for requests with
+To enable `POST /heartbeat/<monitor-id>` on a tenant host, generate a distinct
+random `installationSecret` for each tenant using visible ASCII characters.
+Return that tenant's secret from `resolve`, including for requests with
 `permission: null`. Send it in `Authorization: Bearer <installation secret>`.
 The route authenticates against the resolved tenant's secret and records the
 receipt in that tenant. The body is ignored and an accepted receipt returns 204.
