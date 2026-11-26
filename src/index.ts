@@ -33,6 +33,7 @@ function validPolicy(value: { paused?: unknown; policyRevision?: unknown }) {
 export type ResolvedContext = ScheduledContext & {
   permission: "editor" | "reader" | null;
   monitorLimit: number;
+  installationSecret?: string;
 };
 export interface HostedAdapter<E extends EngineEnv = EngineEnv> {
   contractVersion: string;
@@ -2049,8 +2050,10 @@ function createApp<E extends EngineEnv>(adapter?: HostedAdapter<E>) {
     return new Response(null, { status: accepted ? 204 : 401 });
   });
   app.all("/heartbeat/*", async (c: Context<HttpEnv<E>>) => {
-    if (c.get("resolved")) return new Response(null, { status: 404 });
-    if (!(await authorized(c.req.header("Authorization"), c.env.INSTALLATION_SECRET)))
+    const resolved = c.get("resolved");
+    const secret = resolved ? resolved.installationSecret : c.env.INSTALLATION_SECRET;
+    if (resolved && (typeof secret !== "string" || !secret)) return new Response(null, { status: 404 });
+    if (!(await authorized(c.req.header("Authorization"), secret)))
       return Response.json({ error: "Unauthorized" }, { status: 401 });
     if (c.req.method !== "POST") return methodNotAllowed("POST");
     const accepted = await c.get("context").heartbeat(c.req.path.slice("/heartbeat/".length), Date.now());

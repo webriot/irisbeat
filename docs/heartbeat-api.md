@@ -44,8 +44,11 @@ authorization returns 401. With valid authorization, an unknown, deleted, or
 non-Heartbeat Monitor returns 404. Store the installation secret in your job's
 secret configuration and send it in the authorization header.
 
-Hosted Heartbeats use a Monitor-specific, rotatable credential and
-`POST /heartbeat`. See the [hosted credential reference](hosted-contract.md#heartbeat-credentials).
+On a hosted Worker, send `POST /heartbeat/<monitor-id>` to the tenant host with
+that tenant's installation secret. This path returns 404 when the hosted adapter
+has no installation secret configured for the tenant. Hosted Workers also
+accept Monitor-specific, rotatable credentials at `POST /heartbeat`. See the
+[hosted credential reference](hosted-contract.md#heartbeat-credentials).
 
 ## Calendar Heartbeats
 
